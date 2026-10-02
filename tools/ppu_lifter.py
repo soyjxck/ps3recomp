@@ -2531,9 +2531,15 @@ class PPULifter:
         # VMX integer compare
         if mn.startswith("vcmpequh"):
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            # The dot form (vcmpequh.) sets CR6 like the other vector compares:
+            # 8 = every lane equal, 2 = no lane equal. It used to leave CR6
+            # stale, so the `b[n]e cr6` after it followed an older compare.
             return (f"{{ uint16_t* a=(uint16_t*)&ctx->vr[{va}]; uint16_t* b=(uint16_t*)&ctx->vr[{vb}]; "
-                    f"uint16_t* d=(uint16_t*)&ctx->vr[{vd}]; "
-                    f"for(int i=0;i<8;i++) d[i]=a[i]==b[i]?(uint16_t)~0:0; }}")
+                    f"uint16_t* d=(uint16_t*)&ctx->vr[{vd}]; int t=0; "
+                    f"for(int i=0;i<8;i++){{ d[i]=a[i]==b[i]?(uint16_t)~0:0; t+=a[i]==b[i]; }}"
+                    + (" uint32_t c6=(t==8?8u:0u)|(t==0?2u:0u); "
+                       "ctx->cr=(ctx->cr & ~(0xFu<<4))|(c6<<4);" if mn.endswith(".") else "")
+                    + " }")
 
         if mn.startswith("vcmpequw"):
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
@@ -2794,9 +2800,13 @@ class PPULifter:
         # Byte compare equal
         if mn.startswith("vcmpequb"):
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            # Dot form: CR6 as for vcmpequh. above (8 = all lanes equal, 2 = none).
             return (f"{{ uint8_t* d=(uint8_t*)&ctx->vr[{vd}]; uint8_t* a=(uint8_t*)&ctx->vr[{va}]; "
-                    f"uint8_t* b=(uint8_t*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<16;i++) d[i]=a[i]==b[i]?0xFFu:0u; }}")
+                    f"uint8_t* b=(uint8_t*)&ctx->vr[{vb}]; int t=0; "
+                    f"for(int i=0;i<16;i++){{ d[i]=a[i]==b[i]?0xFFu:0u; t+=a[i]==b[i]; }}"
+                    + (" uint32_t c6=(t==16?8u:0u)|(t==0?2u:0u); "
+                       "ctx->cr=(ctx->cr & ~(0xFu<<4))|(c6<<4);" if mn.endswith(".") else "")
+                    + " }")
 
         # Saturating add
         if mn == "vaddsbs":
