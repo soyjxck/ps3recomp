@@ -161,7 +161,8 @@ static long long lwm_now_us(void){
     LARGE_INTEGER c; QueryPerformanceCounter(&c);
     return (long long)(c.QuadPart*1000000ll/freq.QuadPart);
 #else
-    return 0;
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000000ll + ts.tv_nsec / 1000;
 #endif
 }
 /* Find an EXISTING slot (no create) for hold-tracking. */
