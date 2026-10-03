@@ -338,15 +338,17 @@ static void sys_lwmutex_unlock(ppu_context* ctx)
  * EAs (the generic adapter would pass them raw and the C sysPrxForUser impl
  * deref'd them as host pointers -> AV during cellSpurs init). A no-op wait is
  * adequate here: the CRT/SPURS paths that reach us use these for one-shot init
- * handshakes, not long-term blocking. sys_lwcond_t: +0x00 lwmutex EA (be64),
- * +0x08 lwcond_queue id. */
+ * handshakes, not long-term blocking. sys_lwcond_t is 8 bytes: +0x00 lwmutex
+ * EA (be32), +0x04 lwcond_queue id (be32). Guest code reads the lwmutex word
+ * directly -- FIOS treats 0 there as "wait for invalid cond" -- and anything
+ * written past +0x08 lands in the next field of the caller's struct. */
 static void sys_lwcond_create(ppu_context* ctx)
 {
     static uint32_t s_lwcond_id = 0x4C000000u;
     uint32_t lwcond  = (uint32_t)ctx->gpr[3];
     uint32_t lwmutex = (uint32_t)ctx->gpr[4];
-    vm_write64(lwcond + 0x00, (uint64_t)lwmutex);
-    vm_write32(lwcond + 0x08, ++s_lwcond_id);
+    vm_write32(lwcond + 0x00, lwmutex);
+    vm_write32(lwcond + 0x04, ++s_lwcond_id);
     ctx->gpr[3] = 0;
 }
 static void sys_lwcond_destroy(ppu_context* ctx)    { ctx->gpr[3] = 0; }
@@ -360,7 +362,7 @@ static void sys_lwcond_signal_to(ppu_context* ctx)  { ctx->gpr[3] = 0; }
 static void sys_lwcond_wait(ppu_context* ctx)
 {
     uint32_t lwcond  = (uint32_t)ctx->gpr[3];
-    uint32_t lwmutex = (uint32_t)vm_read64(lwcond + 0x00);
+    uint32_t lwmutex = vm_read32(lwcond + 0x00);
 #ifdef _WIN32
     HANDLE s = lwm_sem(lwmutex);
     if (s) {
