@@ -1778,7 +1778,15 @@ static void gcm_rsx_process_fifo_unlocked(void)
                       fprintf(stderr, "[subch7] method=0x%04X data=0x%08X\n",
                               m, vm_read32(dea)); }
                 if (subch == 7 && m == 0x0B00u) {
+                    /* Two consumers, one per way a title drives the RSX: a
+                     * cellGcmSys title registered its handler with
+                     * cellGcmSetUserHandler, an lv2 sys_rsx one listens on the
+                     * gcm ISR queue. Raising only the latter dropped every user
+                     * command of an HLE-gcm title (handlers=0x0 qid=0) -- and
+                     * Drakengard 3's handler is what patches the park the FIFO
+                     * then waits on, so rendering stopped for good. */
                     extern void rsx_raise_user_cmd(u32 arg);
+                    if (s_user_handler_opd) cellGcmQueueUserCommand(vm_read32(dea));
                     rsx_raise_user_cmd(vm_read32(dea));
                     continue;
                 }
