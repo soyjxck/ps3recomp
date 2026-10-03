@@ -1281,6 +1281,10 @@ static u32 gcm_spu_block_for_put(u32 put)
  * is not, it deadlocks the title. Sweep the skipped range first. */
 static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
 {
+    /* GCM_FIFO_NO_RESYNC=1: never skip a parked or stalled FIFO -- keep waiting
+     * for the title to patch it. Resyncs past unmapped addresses still happen. */
+    { static int off = -1; if (off < 0) { const char* e = getenv("GCM_FIFO_NO_RESYNC"); off = e && *e == '1'; }
+      if (off && strncmp(why, "unmapped", 8) != 0) return; }
     static int n = 0;
     if (n++ < 8)
         fprintf(stderr, "[cellGcmSys] FIFO resync (%s) 0x%08X -> put 0x%08X\n",

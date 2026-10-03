@@ -107,6 +107,12 @@ static void write_be64(uint32_t addr, uint64_t val)
 int64_t sys_timer_usleep(ppu_context* ctx)
 {
     uint64_t usec = LV2_ARG_U64(ctx, 0);
+    /* A single sleep longer than a second is almost always a computed delay
+     * gone wrong (a negative interval, a timebase in the wrong units) -- and a
+     * thread asleep for an hour looks exactly like a hang. Say so. */
+    if (usec > 1000000ull) { static int n = 0; if (n++ < 32)
+        fprintf(stderr, "[timer] LONG usleep(%llu us = %.1f s) lr=0x%08llX tid=%u\n",
+                (unsigned long long)usec, usec / 1e6, (unsigned long long)ctx->lr, (unsigned)ctx->thread_id); }
     { extern unsigned long long ps3_qpc_us(void);
       static int n=0; if (n++ < 60)
         fprintf(stderr, "[WAIT] t=%lluus timer_usleep(%llu us) lr=0x%08llX cia=0x%08llX\n", ps3_qpc_us(),
