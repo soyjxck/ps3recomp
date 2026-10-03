@@ -257,10 +257,14 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
         # and clang-cl with no /O flag compiles at /Od -- a "Release" runtime
         # was unoptimised without a word. Duplicating a default -O2 is harmless.
         $<$<CONFIG:Release,RelWithDebInfo>:-O2>
-        # SSE4.1 (any x86-64 since ~2008): pshufb/blendv for spu_shufb, the
-        # hottest SPU op in lifted audio code.
-        -msse4.1
     )
+    # SSE4.1 (any x86-64 since ~2008): pshufb/blendv for spu_shufb, the
+    # hottest SPU op in lifted audio code. x86 only -- arm64 clang rejects the
+    # flag outright, and spu_helpers.h falls back without __SSE4_1__.
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i[3-6]86" AND
+       NOT CMAKE_OSX_ARCHITECTURES MATCHES "arm64")
+        target_compile_options(ps3recomp_runtime PRIVATE -msse4.1)
+    endif()
 elseif(MSVC)
     # Real cl.exe -- clang-cl reports its id as Clang and is handled above.
     #
