@@ -1,65 +1,40 @@
 /*
  * ps3recomp - cellOvis HLE implementation
  *
- * Stub. Init/term work, overlay creation succeeds as no-op.
+ * Every lifted SPU program is a whole image, so no title needs overlay tables:
+ * report an empty one. This also matches what RPCS3 answers.
+ *
+ * The previous version invented an API -- cellOvisInit plus an out-parameter
+ * for the size -- that libovis does not have. Titles never call the made-up
+ * init, so GetOverlayTableSize returned CELL_OVIS_ERROR_NOT_INITIALIZED
+ * (0x80410701), and since the real function returns a size, Drakengard 3's
+ * PhysX took that as one: it asked malloc for 0x80410701 + 0x84 bytes.
  */
 
 #include "cellOvis.h"
 #include <stdio.h>
-#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 
-/* Internal state */
-
-static int s_initialized = 0;
-static u32 s_next_handle = 1;
-
-/* API */
-
-s32 cellOvisInit(void)
+s32 cellOvisGetOverlayTableSize(u32 elf_ea)
 {
-    printf("[cellOvis] Init()\n");
-    if (s_initialized)
-        return (s32)CELL_OVIS_ERROR_ALREADY_INITIALIZED;
-    s_initialized = 1;
-    s_next_handle = 1;
+    static int n = 0;
+    if (n++ < 4) printf("[cellOvis] GetOverlayTableSize(elf=0x%08X) -> 0\n", elf_ea);
+    return 0;
+}
+
+s32 cellOvisInitializeOverlayTable(u32 ea_ovly_table, u32 elf_ea)
+{
+    static int n = 0;
+    if (n++ < 4) printf("[cellOvis] InitializeOverlayTable(table=0x%08X, elf=0x%08X)\n",
+                        ea_ovly_table, elf_ea);
     return CELL_OK;
 }
 
-s32 cellOvisTerm(void)
+void cellOvisFixSpuSegments(u32 r)
 {
-    printf("[cellOvis] Term()\n");
-    s_initialized = 0;
-    return CELL_OK;
+    (void)r;
 }
 
-s32 cellOvisGetOverlayTableSize(const char* filePath, u32* tableSize)
+void cellOvisInvalidateOverlappedSegments(u32 r, u32 num)
 {
-    (void)filePath;
-    if (!s_initialized) return (s32)CELL_OVIS_ERROR_NOT_INITIALIZED;
-    if (!tableSize) return (s32)CELL_OVIS_ERROR_INVALID_ARGUMENT;
-    vm_write32((u32)(uintptr_t)tableSize, (u32)0);
-    return CELL_OK;
-}
-
-s32 cellOvisCreateOverlay(const void* table, u32 tableSize, CellOvisHandle* handle)
-{
-    (void)table; (void)tableSize;
-    if (!s_initialized) return (s32)CELL_OVIS_ERROR_NOT_INITIALIZED;
-    if (!handle) return (s32)CELL_OVIS_ERROR_INVALID_ARGUMENT;
-    vm_write32((u32)(uintptr_t)handle, (u32)s_next_handle++);
-    return CELL_OK;
-}
-
-s32 cellOvisDestroyOverlay(CellOvisHandle handle)
-{
-    (void)handle;
-    if (!s_initialized) return (s32)CELL_OVIS_ERROR_NOT_INITIALIZED;
-    return CELL_OK;
-}
-
-s32 cellOvisInvalidateOverlay(CellOvisHandle handle)
-{
-    (void)handle;
-    if (!s_initialized) return (s32)CELL_OVIS_ERROR_NOT_INITIALIZED;
-    return CELL_OK;
+    (void)r; (void)num;
 }
