@@ -799,7 +799,32 @@ static DWORD WINAPI spu_async_thread(LPVOID p) {
     return 0;
 }
 #else
-static void* spu_async_thread(void* p) { spu_async_run((spu_async_job*)p); return NULL; }
+static void* spu_async_thread(void* p)
+{
+    spu_async_run((spu_async_job*)p);
+    /* Nothing on this stack may stay in the lock-line reserver set -- the
+     * same cleanup the Win32 thread does. Without it every SPU context that
+     * finished holding a reservation stayed registered after its stack was
+     * gone, and the next coherent store walked into the freed stack
+     * (spu_coh_notify_write, ~25 s into Drakengard 3 on macOS). */
+    { uintptr_t lo = 0, hi = 0;
+#if defined(__APPLE__)
+      pthread_t self = pthread_self();
+      hi = (uintptr_t)pthread_get_stackaddr_np(self);     /* top of stack */
+      lo = hi - pthread_get_stacksize_np(self);
+#else
+      pthread_attr_t a; void* base; size_t size;
+      if (pthread_getattr_np(pthread_self(), &a) == 0) {
+          if (pthread_attr_getstack(&a, &base, &size) == 0) {
+              lo = (uintptr_t)base; hi = lo + size;
+          }
+          pthread_attr_destroy(&a);
+      }
+#endif
+      extern void spu_coh_forget_range(uintptr_t, uintptr_t);
+      if (hi > lo) spu_coh_forget_range(lo, hi); }
+    return NULL;
+}
 #endif
 
 int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
