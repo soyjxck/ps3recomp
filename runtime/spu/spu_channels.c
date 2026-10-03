@@ -1583,6 +1583,17 @@ void spu_overlay_register_sig(const uint8_t sig[16], int image_id)
     }
 }
 
+/* Both of the above: a bounded image (translated at the LS addresses the
+ * title uses, see spu_overlay_register_region) whose source is a heap copy, so
+ * it is recognised by its first 16 bytes. MultiStream stages its DSP plugins
+ * this way -- one heap block, one GET into the mixer's plugin area. */
+void spu_overlay_register_sig_region(const uint8_t sig[16], uint32_t span, int image_id)
+{
+    if (!span || span > SPU_LS_SIZE || s_ovl_src_count >= SPU_OVL_SRC_MAX) return;
+    spu_overlay_register_sig(sig, image_id);
+    s_ovl_src[s_ovl_src_count - 1].span = span;
+}
+
 /* Called from the MFC GET path after the copy: ls points at the JUST-COPIED
  * bytes. EA match first (exact, cheap), then content signature for sizeable
  * chunks (overlay bodies are >= 0x500 bytes). */
