@@ -94,6 +94,9 @@ typedef struct {
     pthread_cond_t      cond;
 #endif
     int                 initialized;
+    /* A PPU thread is blocked in cellSpursEventFlagWait on this flag -- the
+     * HLE's stand-in for ctrl.ppuWaitMask. Guarded by the sync lock. */
+    int                 ppu_waiting;
 } EventFlagSync;
 
 static EventFlagSync s_ef_sync[MAX_EVENT_FLAGS];
@@ -134,6 +137,7 @@ static EventFlagSync* ef_sync_alloc(uint32_t ea)
     for (int i = 0; i < MAX_EVENT_FLAGS; i++) {
         if (!s_ef_sync[i].initialized) {
             s_ef_sync[i].ea = ea;
+            s_ef_sync[i].ppu_waiting = 0;
             { extern void (*g_spu_line_commit_hook)(uint32_t);
               g_spu_line_commit_hook = ef_line_committed; }
 #ifdef _WIN32
@@ -1949,6 +1953,17 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
 
     ef_lock(sync);
 
+    /* Only one PPU thread may wait on a flag at a time: real SPURS answers a
+     * second one CELL_SPURS_TASK_ERROR_BUSY (ctrl.ppuWaitMask is already set),
+     * whether or not the bits it wants are there, and titles handle that. Letting
+     * both block instead loses a wakeup: two SPU completions that land before
+     * either waiter runs set the bit once, one waiter consumes it and the other
+     * sleeps for good -- Drakengard 3's package loader stalled exactly so. */
+    if (sync->ppu_waiting) {
+        ef_unlock(sync);
+        return CELL_SPURS_TASK_ERROR_BUSY;
+    }
+
     /* Block until the requested bit pattern is satisfied in the GUEST struct
      * (BE events word at +0x00) — set by an SPU task (lifted code / taskset
      * syscall) or another PPU thread. Poll-based: ef_wait_timed ticks re-read
@@ -1976,6 +1991,7 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
                 break;
         }
 
+        sync->ppu_waiting = 1;
         if (!ef_wait_timed(sync, 2)) {
             /* Report the stall once per second, naming what would have to run. */
             if (++waits % 500 == 0) {
@@ -1998,6 +2014,7 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
         }
     }
 
+    sync->ppu_waiting = 0;
     __atomic_sub_fetch(&s_ef_ppu_waiters, 1, __ATOMIC_SEQ_CST);
     ef_wait_stats(ea, ef_t0.QuadPart);
     /* Hand back the observed bits; consume the received ones on AUTO clear. */
