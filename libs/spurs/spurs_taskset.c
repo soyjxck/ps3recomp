@@ -13,9 +13,35 @@
 /* Initialize a fresh taskset: clear all task bitsets and write the header fields.
  * spurs_ea = the CellSpurs object EA; args = taskset args doubleword; wid = workload
  * id; size = taskset size; evf1/evf2 = attached event-flag ids (0 if none). */
+/* (spurs, taskset) pairs seen by spurs_taskset_init, for spurs_tasksets_on(). */
+#define SPURS_TS_REG_MAX 64
+static volatile uint32_t s_ts_reg_spurs[SPURS_TS_REG_MAX];
+static volatile uint32_t s_ts_reg_taskset[SPURS_TS_REG_MAX];
+static volatile int      s_ts_reg_n = 0;
+
+static void spurs_taskset_register(uint32_t taskset_ea, uint32_t spurs_ea)
+{
+    int n = s_ts_reg_n;
+    for (int i = 0; i < n; i++)
+        if (s_ts_reg_taskset[i] == taskset_ea) { s_ts_reg_spurs[i] = spurs_ea; return; }
+    if (n < SPURS_TS_REG_MAX) {
+        s_ts_reg_spurs[n] = spurs_ea; s_ts_reg_taskset[n] = taskset_ea;
+        s_ts_reg_n = n + 1;
+    }
+}
+
+int spurs_tasksets_on(uint32_t spurs_ea, uint32_t* out, int max)
+{
+    int k = 0, n = s_ts_reg_n;
+    for (int i = 0; i < n; i++)
+        if (s_ts_reg_spurs[i] == spurs_ea) { if (k < max) out[k] = s_ts_reg_taskset[i]; k++; }
+    return k;
+}
+
 void spurs_taskset_init(uint32_t taskset_ea, uint32_t spurs_ea, uint64_t args,
                         uint32_t wid, uint32_t size, uint32_t evf1, uint32_t evf2)
 {
+    spurs_taskset_register(taskset_ea, spurs_ea);
     /* clear running/ready/pending_ready/enabled/signalled/waiting (each 16 bytes) */
     for (uint32_t off = CSTS_RUNNING; off <= CSTS_WAITING; off += 0x10) {
         vm_write64(taskset_ea + off + 0, 0);

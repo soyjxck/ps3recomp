@@ -148,6 +148,13 @@ void spurs_taskset_add_task(uint32_t taskset_ea, uint32_t taskId, uint64_t elf_e
                             const uint32_t ls_pattern[4]);
 void spurs_taskset_set_exit_handler(uint32_t taskset_ea, uint64_t handler_ea);
 
+/* Every taskset spurs_taskset_init has built on `spurs_ea`, in creation order.
+ * Writes up to `max` taskset EAs to `out` and returns how many there are. The
+ * HLE gives every taskset workload id 0, so a (wid << 8 | taskId) signal word
+ * -- what a SPURS-owned LFQueue hands its fpSendSignal -- cannot name the taskset
+ * on its own; this is how a caller finds the candidates. */
+int spurs_tasksets_on(uint32_t spurs_ea, uint32_t* out, int max);
+
 /* ---- PM logic (spurs_pm.c, phase B3) ------------------------------------- */
 int      spurs_pm_select_task(uint32_t taskset_ea, uint32_t last_scheduled_task);
 void     spurs_pm_mark_running(uint32_t taskset_ea, uint32_t taskId);
