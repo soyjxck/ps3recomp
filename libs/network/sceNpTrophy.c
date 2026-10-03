@@ -391,13 +391,17 @@ s32 sceNpTrophyGetGameInfo(SceNpTrophyContext context,
     details = GUEST_PTR(details, SceNpTrophyGameDetails*);
     data = GUEST_PTR(data, SceNpTrophyGameData*);
 
+    /* These structs live in guest memory, so every integer field is stored
+     * big-endian. Native stores left numTrophies=32 reading back as 0x20000000,
+     * and Drakengard 3 sized a buffer from it: malloc(0xA0000380). */
+
     if (details) {
         memset(details, 0, sizeof(SceNpTrophyGameDetails));
-        details->numTrophies = 32; /* default trophy set */
-        details->numPlatinum = 1;
-        details->numGold     = 2;
-        details->numSilver   = 8;
-        details->numBronze   = 21;
+        details->numTrophies = ps3_bswap32(32); /* default trophy set */
+        details->numPlatinum = ps3_bswap32(1);
+        details->numGold     = ps3_bswap32(2);
+        details->numSilver   = ps3_bswap32(8);
+        details->numBronze   = ps3_bswap32(21);
         strncpy(details->title, "PS3 Game",
                 SCE_NP_TROPHY_GAME_TITLE_MAX_SIZE - 1);
         strncpy(details->description, "Trophy set",
@@ -406,13 +410,14 @@ s32 sceNpTrophyGetGameInfo(SceNpTrophyContext context,
 
     if (data) {
         memset(data, 0, sizeof(SceNpTrophyGameData));
-        data->unlockedTrophies = trophy_count_unlocked(&s_contexts[context]);
+        u32 unlocked = (u32)trophy_count_unlocked(&s_contexts[context]);
         /* Count by grade would require per-trophy grade data;
          * return conservative estimates */
+        data->unlockedTrophies = ps3_bswap32(unlocked);
         data->unlockedPlatinum = 0;
         data->unlockedGold     = 0;
         data->unlockedSilver   = 0;
-        data->unlockedBronze   = data->unlockedTrophies;
+        data->unlockedBronze   = ps3_bswap32(unlocked);
     }
 
     printf("[sceNpTrophy] GetGameInfo(ctx=%d)\n", context);
@@ -442,10 +447,12 @@ s32 sceNpTrophyGetTrophyInfo(SceNpTrophyContext context,
     details = GUEST_PTR(details, SceNpTrophyDetails*);
     data = GUEST_PTR(data, SceNpTrophyData*);
 
+    /* Guest structs: integer fields big-endian (see GetGameInfo). */
+
     if (details) {
         memset(details, 0, sizeof(SceNpTrophyDetails));
-        details->trophyId = (u32)trophyId;
-        details->trophyGrade = SCE_NP_TROPHY_GRADE_BRONZE;
+        details->trophyId = ps3_bswap32((u32)trophyId);
+        details->trophyGrade = ps3_bswap32(SCE_NP_TROPHY_GRADE_BRONZE);
         snprintf(details->name, SCE_NP_TROPHY_NAME_MAX_SIZE,
                  "Trophy %d", trophyId);
         snprintf(details->description, SCE_NP_TROPHY_DESC_MAX_SIZE,
@@ -455,9 +462,9 @@ s32 sceNpTrophyGetTrophyInfo(SceNpTrophyContext context,
 
     if (data) {
         memset(data, 0, sizeof(SceNpTrophyData));
-        data->trophyId = (u32)trophyId;
+        data->trophyId = ps3_bswap32((u32)trophyId);
         data->unlocked = s_contexts[context].unlocked[trophyId];
-        data->timestamp = s_contexts[context].unlock_time[trophyId];
+        data->timestamp = ps3_bswap64((u64)s_contexts[context].unlock_time[trophyId]);
     }
 
     return CELL_OK;
