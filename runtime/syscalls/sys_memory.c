@@ -92,6 +92,8 @@ int64_t sys_memory_allocate(ppu_context* ctx)
     /* Check if we have room */
     if (g_sys_mem_bump_ptr + size > SYS_MEM_ALLOC_END) {
         bump_unlock();
+        fprintf(stderr, "[sys_memory] allocate(size=0x%X) -> ENOMEM: window exhausted (bump 0x%08X)\n",
+                size, g_sys_mem_bump_ptr);
         return (int64_t)(int32_t)CELL_ENOMEM;
     }
 
@@ -102,6 +104,8 @@ int64_t sys_memory_allocate(ppu_context* ctx)
     }
     if (slot < 0) {
         bump_unlock();
+        fprintf(stderr, "[sys_memory] allocate(size=0x%X) -> ENOMEM: all %d allocation slots in use\n",
+                size, SYS_MEMORY_ALLOC_MAX);
         return (int64_t)(int32_t)CELL_ENOMEM;
     }
 
