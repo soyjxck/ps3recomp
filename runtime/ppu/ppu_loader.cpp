@@ -1735,6 +1735,14 @@ static void ww_arm_inline_window(uint32_t ww)
 }
 static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra)
 {
+    /* GCM_PARK_WRITE_LOG=1: a 32-bit store of a JUMP-to-itself into the GCM
+     * FIFO window (value 0x20000000 | own IO offset) -- the PPU parking the RSX. */
+    { static int s_pk = -1; if (s_pk < 0) s_pk = getenv("GCM_PARK_WRITE_LOG") ? 1 : 0;
+      if (s_pk && width == 4 && a >= 0x40000000u && a < 0x40300000u && v == (0x20000000u | (a - 0x40000000u))) {
+          extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
+          fprintf(stderr, "[park-write] ea=0x%08X <- %08X tid=%u lr=0x%08X\n", a, v,
+                  g_active_ctx ? (unsigned)g_active_ctx->thread_id : 0u,
+                  g_active_ctx ? (uint32_t)g_active_ctx->lr : 0u); } }
     /* PPU_WVAL=<hexvalue>: log every PPU store that WRITES this value, wherever
      * it lands. PPU_WWATCH answers "who writes this address"; when a bad value is
      * copied from node to node down a list, that only ever catches the copy.

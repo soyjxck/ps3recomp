@@ -2729,6 +2729,25 @@ static s32 jc_start(u64 jc_ea, const char* who)
          * Drakengard 3's ShaderPatching jobs, one of which un-parks the GCM
          * FIFO, so rendering stopped the first time a Run overlapped a slow
          * walk. Queue it; jc_thread walks again when the current pass ends. */
+        /* SPURS_JC_SYNC=1: walk the chain on the calling PPU thread, inside this
+         * call. A real kicked chain finishes within the frame on the SPUs, and a
+         * title that re-fills its job descriptors every frame relies on that:
+         * Drakengard 3's render thread parks the GCM FIFO, points a job at the
+         * park, kicks, then refills the same descriptors for the next segment.
+         * The async walker can run a frame late and read the refilled
+         * descriptors, so one park is never cleared and rendering stops. The
+         * synchronous walk keeps the title's ordering. Not the default: a
+         * service-loop chain (Tokyo Jungle's audio) would never return. */
+        static int sync_walk = -1;
+        if (sync_walk < 0) sync_walk = getenv("SPURS_JC_SYNC") ? 1 : 0;
+        if (sync_walk) {
+            if (_InterlockedCompareExchange(&s_jobchains[i].running, 1, 0) == 0) {
+                jc_thread((LPVOID)(intptr_t)i);     /* walks, honours queued re-runs, clears running */
+            } else {
+                InterlockedExchange(&s_jobchains[i].rerun, 1);
+            }
+            return CELL_OK;
+        }
         if (_InterlockedCompareExchange(&s_jobchains[i].running, 1, 0) == 0) {
             HANDLE th = CreateThread(NULL, 1u << 20, jc_thread, (LPVOID)(intptr_t)i, 0, NULL);
             if (th) CloseHandle(th);

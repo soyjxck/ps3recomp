@@ -901,6 +901,20 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
       if (s_we == -2) { const char* e = getenv("SPU_WATCHEA");
                         s_we = e ? 1 : 0;
                         s_wa = e ? (uint32_t)strtoul(e, 0, 16) : 0u; }
+      /* SPU_PUT4_LOG=<image id>: every 4-byte put that image issues, with the
+       * word that was at the target before it -- the shape of a completion
+       * notify, such as the NOP a job writes over a GCM FIFO park. */
+      { static int s_p4 = -2; if (s_p4 == -2) { const char* e = getenv("SPU_PUT4_LOG"); s_p4 = e ? atoi(e) : -1; }
+        if (s_p4 >= 0 && spu->image_id == s_p4 && size == 4 && vm_base && (cmd & 0xF0u) == 0x20u &&
+            (uint32_t)ea >= 0x40000000u && (uint32_t)ea < 0x40300000u) {   /* the GCM FIFO window */
+            extern uint32_t g_spu_watchea_dyn;
+            uint32_t before; memcpy(&before, vm_base + (uint32_t)ea, 4);
+            before = (before >> 24) | ((before >> 8) & 0xFF00u) | ((before << 8) & 0xFF0000u) | (before << 24);
+            if (before != 0 || (uint32_t)ea == g_spu_watchea_dyn || getenv("SPU_PUT4_ALL")) {   /* un-parks, the watched word, or everything */
+                uint32_t after; memcpy(&after, spu->ls + (lsa & SPU_LS_MASK), 4);
+                after = (after >> 24) | ((after >> 8) & 0xFF00u) | ((after << 8) & 0xFF0000u) | (after << 24);
+                fprintf(stderr, "[put4] img=%d ea=0x%08X was=%08X now=%08X pc=0x%05X\n",
+                        spu->image_id, (uint32_t)ea, before, after, (uint32_t)spu->pc & SPU_LS_MASK); } } }
       extern uint32_t g_spu_watchea_dyn;   /* armed at run time by the GCM walker */
       if (g_spu_watchea_dyn && vm_base && (uint32_t)ea <= g_spu_watchea_dyn &&
           g_spu_watchea_dyn < (uint32_t)ea + size) {
