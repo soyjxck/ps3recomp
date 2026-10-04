@@ -72,7 +72,8 @@ void spu_lockline_unlock(void) { atomic_flag_clear_explicit(&g_lockline, memory_
 #define SPU_COH_LINES       (1u << (32 - SPU_COH_LINE_SHIFT))   /* 2^25 lines */
 #define SPU_COH_BITMAP_SZ   (SPU_COH_LINES / 8)                 /* 4 MiB */
 
-static unsigned char s_coh_bitmap[SPU_COH_BITMAP_SZ];
+unsigned char g_spu_coh_bitmap[SPU_COH_BITMAP_SZ];   /* read inline by ppu_vm_fast.h */
+#define s_coh_bitmap g_spu_coh_bitmap
 
 /* Zero until the first GETLLAR anywhere. Keeps the PPU fast path off the
  * bitmap entirely for a title that runs no SPU code, and keeps every existing

@@ -536,6 +536,31 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * peer that must WRITE the line waits for it (canersaka ticks the
          * GETLLAR fast+slow paths for exactly this reason). */
         yz_lockstep_tick(ctx);
+        /* Back off a poll loop. A task that re-reads one line whose content has
+         * not changed is waiting for another processor to write it; on the SPU
+         * that costs nothing, here it pins a host core (Drakengard 3's Edge
+         * zlib task polled its work queue this way at 100% of a core, hundreds
+         * of thousands of GETLLARs a second). After 64 unchanged re-reads
+         * sleep 50 us per poll, after 1024, 200 us: a real producer is seen
+         * within that, a spin stops costing. SPU_GETLLAR_BACKOFF=0 disables. */
+        { static SPU_THREAD_LOCAL uint32_t t_pea; static SPU_THREAD_LOCAL unsigned t_pn;
+          static SPU_THREAD_LOCAL uint8_t t_prev[MFC_ATOMIC_LINE];
+          static int s_bo = -1;
+          if (s_bo < 0) { const char* e = getenv("SPU_GETLLAR_BACKOFF"); s_bo = (e && *e == '0') ? 0 : 1; }
+          if (s_bo) {
+              const uint8_t* now = vm_base + ea;
+              if (ea == t_pea && memcmp(now, t_prev, MFC_ATOMIC_LINE) == 0) {
+                  if (++t_pn > 64) {
+                      struct timespec d = { 0, t_pn > 1024 ? 200000 : 50000 };
+#ifdef _WIN32
+                      Sleep(t_pn > 1024 ? 1 : 0);
+#else
+                      nanosleep(&d, NULL);
+#endif
+                  }
+              } else { t_pea = ea; t_pn = 0; }
+              memcpy(t_prev, now, MFC_ATOMIC_LINE);
+          } }
         spu_lockline_lock();
         /* Tell the PPU store paths this line is live, so a store into it goes
          * through the lock and raises SPU_EVENT_LR here instead of landing

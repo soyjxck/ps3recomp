@@ -1059,6 +1059,24 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
                 if (sz) {
                     /* Async: SPURS tasks are persistent workers — running them
                      * inline would block this PPU thread forever (deadlock). */
+                    /* SPURS_TASK_ARGDUMP=1: the task's 16-byte argument and 16
+                     * words at each EA it carries, as they are at creation. The
+                     * PhysX tasks read a request block through these; knowing
+                     * whether it is filled now or only later says whether a task
+                     * that starts at once reads it too early. */
+                    { static int s_ad = -1; if (s_ad < 0) s_ad = getenv("SPURS_TASK_ARGDUMP") ? 1 : 0;
+                      static int s_n = 0;
+                      if (s_ad && s_n++ < 64) {
+                          uint32_t a[4]; for (int k = 0; k < 4; k++) a[k] = vm_read32((uint32_t)(uintptr_t)argument_ea + k * 4);
+                          fprintf(stderr, "[task-args] taskset=0x%08X task=%u arg={%08X %08X %08X %08X}\n", taskset_ea, i, a[0], a[1], a[2], a[3]);
+                          for (int k = 0; k < 3; k++) {
+                              uint32_t ea = a[k] & ~0x7Fu;
+                              if (ea < 0x10000u || ea >= 0xD0000000u) continue;
+                              fprintf(stderr, "[task-args]   @%08X:", ea);
+                              for (int w = 0; w < 16; w++) fprintf(stderr, " %08X", vm_read32(ea + w * 4));
+                              fputc(10, stderr);
+                          }
+                      } }
                     spu_workload_dispatch_task(host_elf, (uint32_t)sz,
                                                (uint32_t)(uintptr_t)context, taskset_ea, i);
                 }

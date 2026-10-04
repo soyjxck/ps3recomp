@@ -130,6 +130,21 @@ int      ppu_stdcx64(uint64_t addr, uint64_t expected, uint64_t val);
 #ifdef __cplusplus
 }
 #endif
+#ifdef PPU_INLINE_VM
+/* Inline fast path for the accessors above (runtime/ppu/ppu_vm_fast.h): an
+ * ordinary in-range access becomes a bounds test and a byte-swapped load or
+ * store; watches, the null page, the raw SPU window and SPU reservations
+ * still take the runtime's functions. */
+#include "ppu_vm_fast.h"
+#define vm_read8(a)       vm_fast_read8(a)
+#define vm_read16(a)      vm_fast_read16(a)
+#define vm_read32(a)      vm_fast_read32(a)
+#define vm_read64(a)      vm_fast_read64(a)
+#define vm_write8(a, v)   vm_fast_write8((a), (v))
+#define vm_write16(a, v)  vm_fast_write16((a), (v))
+#define vm_write32(a, v)  vm_fast_write32((a), (v))
+#define vm_write64(a, v)  vm_fast_write64((a), (v))
+#endif
 
 /* Syscall handler */
 #ifdef __cplusplus
