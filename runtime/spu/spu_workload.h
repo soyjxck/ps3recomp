@@ -133,6 +133,10 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
 int spu_workload_dispatch_task(const uint8_t* image, uint32_t image_size,
                                uint32_t args_ea, uint32_t taskset_ea, uint32_t taskid);
 
+/* Mark a task slot running before dispatching it, so the exit-restart scan in
+ * the SPU workers does not dispatch it a second time (see spu_workload.c). */
+void spu_taskset_claim(uint32_t taskset_ea, uint32_t taskid);
+
 /* Number of currently registered lifted SPU binaries (diagnostics/tests). */
 unsigned spu_workload_count(void);
 

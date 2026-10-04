@@ -391,6 +391,19 @@ static void spu_taskset_mark(uint32_t taskset_ea, uint32_t t, int on)
     ts_unlock();
 }
 
+/* Claim a task slot for a dispatch that is about to happen. CreateTask marks
+ * the slot enabled+ready and then dispatches it; the running bit used to be
+ * set only when the job's host thread got going. In that window, any SPU
+ * worker whose task exited scanned for enabled+ready+not-running slots and
+ * dispatched this one too, so every task created while another was exiting
+ * ran twice (Drakengard 3: 163 duplicates of 293 tasks). When one copy
+ * exited it freed the slot, the next CreateTask reused it, and the surviving
+ * copy re-read its arguments from the overwritten task_info. */
+void spu_taskset_claim(uint32_t taskset_ea, uint32_t taskid)
+{
+    spu_taskset_mark(taskset_ea, taskid, 1);
+}
+
 static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
 {
     extern uint8_t* vm_base;

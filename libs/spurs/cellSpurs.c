@@ -942,6 +942,10 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
              * SELECT_TASK picks it. Slot index i = the SPURS taskId (bitset bit). */
             spurs_taskset_add_task(taskset_ea, i, (uint64_t)elf_ea,
                                    (uint64_t)context_ea, task_arg, task_lsp);
+            /* Claim the slot NOW, before anything else runs: add_task just made
+             * it enabled+ready, and an SPU worker's exit-restart scan dispatches
+             * any such slot it finds not running (spu_taskset_claim). */
+            if (elf) spu_taskset_claim(taskset_ea, i);
             /* Bridge to the image-22 dispatch so build_context uses this taskset+task. */
             g_ydkj_real_taskset_ea = taskset_ea;
             g_ydkj_real_taskid     = i;
@@ -1018,11 +1022,12 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
                  * as the guest EA (the SPU job's DMA uses guest EAs / r3). */
                 const uint8_t* host_elf = GUEST_PTR(elf, const uint8_t*);
                 size_t sz = spu_elf_image_size(host_elf, 2u * 1024 * 1024);
-                if (sz)
+                if (sz) {
                     /* Async: SPURS tasks are persistent workers — running them
                      * inline would block this PPU thread forever (deadlock). */
                     spu_workload_dispatch_task(host_elf, (uint32_t)sz,
                                                (uint32_t)(uintptr_t)context, taskset_ea, i);
+                }
             }
             return CELL_OK;
         }
