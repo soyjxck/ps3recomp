@@ -762,8 +762,9 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
       if (dd) {
           static int n = 0, saved = 0;
           if (n++ < 400 || (fmt & 0x9Fu) == 0x81u /* CELL_GCM_TEXTURE_B8, any layout flags */)
-              fprintf(stderr, "[tex-up] fmt=0x%02X %ux%u pitch=%u levels=%u loc=%u off=0x%08X remap=0x%04X cube=%d\n",
-                      fmt, w, h, pitch, levels, location, offset, remap, cube);
+              fprintf(stderr, "[tex-up] fmt=0x%02X %ux%u pitch=%u levels=%u loc=%u off=0x%08X ea=0x%08X remap=0x%04X cube=%d\n",
+                      fmt, w, h, pitch, levels, location, offset,
+                      cellGcmResolveLocated(location == RSX_LOCATION_LOCAL, offset), remap, cube);
           static int b8n = 0;
           if ((fmt & 0x9Fu) == 0x81u /* CELL_GCM_TEXTURE_B8, any layout flags */ && w >= 256 &&
               (b8n++ % 150) == 0 && saved < 80) {   /* one plane every ~1.5 s of video */
