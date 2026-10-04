@@ -920,6 +920,7 @@ static inline int resv_off() { static int v = -1; if (v < 0) v = getenv("PPU_RES
  * can give. Report the commit through the same path as an ordinary store. */
 extern "C" void ppu_ww_note_atomic(uint32_t ea, uint32_t val, int width, void* ra);
 extern "C" uint32_t g_ww_lo, g_ww_hi;
+extern "C" uint32_t g_ww_dyn;
 
 extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
 {
@@ -1708,6 +1709,7 @@ extern "C" uint32_t g_barrier_sync_watch = 0;
  * setting as below; kept as a pair so the inline check is two compares against
  * zeros when the watch is off. */
 extern "C" uint32_t g_ww_lo = 0, g_ww_hi = 0;
+extern "C" uint32_t g_ww_dyn = 0;   /* a word armed at run time, see barrier_watch_hit */
 
 extern "C" void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width)
 {
@@ -1790,7 +1792,10 @@ static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra
       if (!s_wwlen) { const char* e2 = getenv("PPU_WWATCH_LEN");
                       s_wwlen = e2 ? (uint32_t)strtoul(e2,0,0) : 0x20;
                       if (s_wwlen < 0x20) s_wwlen = 0x20; }
-      if (s_ww && a >= (s_ww & ~15u) && a < (s_ww & ~15u) + s_wwlen) {
+      /* g_ww_dyn: one word armed at run time (the GCM walker arms the FIFO
+       * park it is waiting on), reported through the same path. */
+      if ((s_ww && a >= (s_ww & ~15u) && a < (s_ww & ~15u) + s_wwlen) ||
+          (g_ww_dyn && a >= g_ww_dyn && a < g_ww_dyn + 4u)) {
           /* PPU_WW_GUARD=1: once the watched word is first SET, page-guard it.
            * The store watch only sees lifted guest stores -- a host-side memset
            * or an atomic clears a field invisibly. flOw loses its render config

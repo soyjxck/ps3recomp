@@ -1711,6 +1711,19 @@ static void gcm_rsx_process_fifo_unlocked(void)
                * CPU the guest needs. Stop this pass instead; the next one
                * re-reads the word, so a patched jump is still followed. */
               if (tgt == s_fifo_getoff) {
+                  /* GCM_PARK_WATCH=1: arm the PPU store watch and the SPU DMA
+                   * watch on this park word while `put` sits beyond it, so the
+                   * log names whoever patches it -- or shows that nobody did. */
+                  { static int pw = -1; if (pw < 0) pw = getenv("GCM_PARK_WATCH") ? 1 : 0;
+                    static u32 armed_io = 0, armed_word = 0;
+                    extern uint32_t g_ww_dyn, g_spu_watchea_dyn, g_ww_lo, g_ww_hi;
+                    if (pw && put != s_fifo_getoff && armed_io != s_fifo_getoff) {
+                        u32 pea = gcm_io2ea(s_fifo_getoff);
+                        armed_io = s_fifo_getoff; armed_word = w;
+                        g_ww_dyn = pea; g_spu_watchea_dyn = pea; g_ww_lo = pea & ~15u; g_ww_hi = (pea & ~15u) + 16;
+                        fprintf(stderr, "[park] parked at io=0x%08X ea=0x%08X word=%08X put=0x%08X -- watching writers\n",
+                                s_fifo_getoff, pea, w, put);
+                    } }
                   /* Parked. If the title has meanwhile moved `put` somewhere
                    * else, it has switched to its other segment and left this
                    * park standing -- it only patches a park when it reuses that
@@ -1723,6 +1736,12 @@ static void gcm_rsx_process_fifo_unlocked(void)
               s_fifo_getoff = tgt; }
             continue;
         }
+        /* A park we were watching has been patched: say so, with the new word. */
+        { static int pw2 = -1; if (pw2 < 0) pw2 = getenv("GCM_PARK_WATCH") ? 1 : 0;
+          extern uint32_t g_ww_dyn;
+          if (pw2 && g_ww_dyn && gcm_io2ea(s_fifo_getoff) == g_ww_dyn) {
+              fprintf(stderr, "[park] io=0x%08X patched -> %08X (walker moving on)\n", s_fifo_getoff, w);
+              g_ww_dyn = 0; } }
         if ((w & 3) == 2) {                    /* CALL: offset | 2 */
             { u32 tgt = w & 0x1FFFFFFCu;
               if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("CALL", tgt, w); gcm_fifo_resync_why("unmapped-CALL", &s_fifo_getoff, put); break; }

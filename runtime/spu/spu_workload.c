@@ -27,6 +27,8 @@ int g_cri_video_dma = 0;
 
 /* ---- fingerprint ------------------------------------------------------- */
 
+uint32_t g_spu_watchea_dyn = 0;   /* see spu_dma.h */
+
 uint64_t spu_workload_fingerprint(const void* data, size_t n)
 {
     const uint8_t* p = (const uint8_t*)data;

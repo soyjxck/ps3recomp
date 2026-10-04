@@ -901,6 +901,14 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
       if (s_we == -2) { const char* e = getenv("SPU_WATCHEA");
                         s_we = e ? 1 : 0;
                         s_wa = e ? (uint32_t)strtoul(e, 0, 16) : 0u; }
+      extern uint32_t g_spu_watchea_dyn;   /* armed at run time by the GCM walker */
+      if (g_spu_watchea_dyn && vm_base && (uint32_t)ea <= g_spu_watchea_dyn &&
+          g_spu_watchea_dyn < (uint32_t)ea + size) {
+          static int dn = 0; if (dn++ < 64)
+              fprintf(stderr, "[watchea-dyn] spu%u img=%d cmd=0x%02X ea=0x%08X size=%u lsa=0x%05X pc=0x%05X\n",
+                      spu->spu_id & 7u, spu->image_id, cmd & 0xFFu, (uint32_t)ea, size, lsa,
+                      (uint32_t)spu->pc & SPU_LS_MASK);
+      }
       if (s_we && vm_base && (uint32_t)ea <= s_wa && s_wa < (uint32_t)ea + size) {
           static unsigned long wn;
           /* SPU_WATCHEA_EVERY=<n> (default 64): print every nth hit. 1
