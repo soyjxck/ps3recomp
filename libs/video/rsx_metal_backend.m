@@ -3342,7 +3342,16 @@ void rsx_metal_backend_present(void)
     /* Under the draw engine the frame belongs to it: a host that drives the
      * flip itself (the harness, the boot smoke title) calls here, and a title
      * whose FIFO carries 0xE944 presents through the engine's own sink. */
-    if (s_eng_active) { rsx_draw_engine_present(); return; }
+    /* Present the buffer cellGcmSys says the guest flipped to. The engine
+     * only learns a buffer id when it decodes 0xE944 itself; a title that
+     * flips through cellGcmSetFlip never sends that, so the engine kept
+     * presenting display buffer 0 while the title drew into 1 and 2 --
+     * Drakengard 3 showed a black window over frames it was rendering. */
+    if (s_eng_active) {
+        extern u32 cellGcmGetCurrentDisplayBufferId(void);
+        rsx_draw_engine_present_buffer(cellGcmGetCurrentDisplayBufferId());
+        return;
+    }
     /* Block only when MTL_MAX_INFLIGHT frames are already queued. */
     if (!s_headless) dispatch_semaphore_wait(s_inflight, DISPATCH_TIME_FOREVER);
     @autoreleasepool {
