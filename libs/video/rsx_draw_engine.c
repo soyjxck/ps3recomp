@@ -754,6 +754,30 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     const u8* src = eng_guest_ptr(NULL, location, offset, span);
     if (!src) return 0;
 
+    /* TEX_DUMP_DIR=<dir>: log every upload, and write each 8-bit (B8) upload at
+     * least 256 wide -- a Bink video plane -- as a PPM, so "is the decoder
+     * producing pixels" can be answered by looking at the image. */
+    { static const char* dd = (const char*)1;
+      if (dd == (const char*)1) dd = getenv("TEX_DUMP_DIR");
+      if (dd) {
+          static int n = 0, saved = 0;
+          if (n++ < 400 || (fmt & 0x9Fu) == 0x81u /* CELL_GCM_TEXTURE_B8, any layout flags */)
+              fprintf(stderr, "[tex-up] fmt=0x%02X %ux%u pitch=%u levels=%u loc=%u off=0x%08X remap=0x%04X cube=%d\n",
+                      fmt, w, h, pitch, levels, location, offset, remap, cube);
+          static int b8n = 0;
+          if ((fmt & 0x9Fu) == 0x81u /* CELL_GCM_TEXTURE_B8, any layout flags */ && w >= 256 &&
+              (b8n++ % 150) == 0 && saved < 80) {   /* one plane every ~1.5 s of video */
+              char path[512]; snprintf(path, sizeof path, "%s/b8_%03d_%ux%u_%08X.ppm", dd, saved++, w, h, offset);
+              FILE* f = fopen(path, "wb");
+              if (f) { fprintf(f, "P6\n%u %u\n255\n", w, h);
+                  const u32 row = pitch ? pitch : w;
+                  unsigned long sum = 0;
+                  for (u32 y = 0; y < h; y++) for (u32 x = 0; x < w; x++) {
+                      u8 v = src[y * row + x]; sum += v; fputc(v, f); fputc(v, f); fputc(v, f); }
+                  fclose(f);
+                  fprintf(stderr, "[tex-up] saved %s mean=%lu\n", path, sum / ((unsigned long)w * h)); }
+          } } }
+
     const u32 handle = g.be->texture_create(g.be->user, eng_texfmt(lv[0].tl.fmt),
                                             w, h, nlv, faces, remap, fmt);
     if (!handle) return 0;
