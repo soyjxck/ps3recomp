@@ -125,6 +125,14 @@ int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
 int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
                                 uint32_t args_ea);
 
+/* The same, for a SPURS task whose taskset and task slot the caller knows.
+ * Prefer this: dispatch_async takes the pair from a global that every SPU
+ * worker thread also writes when it restarts a task (spu_taskset_task_exited),
+ * so a CreateTask on the PPU that lost the race built its context from another
+ * task's slot -- and ran with that task's arguments. */
+int spu_workload_dispatch_task(const uint8_t* image, uint32_t image_size,
+                               uint32_t args_ea, uint32_t taskset_ea, uint32_t taskid);
+
 /* Number of currently registered lifted SPU binaries (diagnostics/tests). */
 unsigned spu_workload_count(void);
 

@@ -422,7 +422,7 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
         fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X "
                         "(after task %u exited)\n", t, taskset_ea, elf, done_task);
         g_ydkj_real_taskset_ea = taskset_ea; g_ydkj_real_taskid = t;
-        spu_workload_dispatch_async(vm_base + elf, (uint32_t)sz, ctx);
+        spu_workload_dispatch_task(vm_base + elf, (uint32_t)sz, ctx, taskset_ea, t);
     }
     ts_unlock();
 }
@@ -1164,6 +1164,14 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
 int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
                                 uint32_t args_ea)
 {
+    extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
+    return spu_workload_dispatch_task(image, image_size, args_ea,
+                                      g_ydkj_real_taskset_ea, g_ydkj_real_taskid);
+}
+
+int spu_workload_dispatch_task(const uint8_t* image, uint32_t image_size,
+                               uint32_t args_ea, uint32_t taskset_ea, uint32_t taskid)
+{
     if (!image || image_size == 0) return 0;
 
     uint64_t fp = spu_workload_fingerprint(image, image_size);
@@ -1202,12 +1210,14 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
     if (!j) return 0;
     j->image = image; j->image_size = image_size; j->args_ea = args_ea;
     j->fn = fn; j->image_id = image_id;
-    /* Capture the taskset+taskid NOW (PPU thread, right after cellSpursCreateTask
-     * set the globals for THIS task). Reading them later in the async thread races
-     * the next CreateTask overwriting the single-slot globals -- with two audio
-     * tasks that made both run task 1's descriptor. */
-    { extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
-      j->taskset_ea = g_ydkj_real_taskset_ea; j->taskid = g_ydkj_real_taskid; }
+    /* The taskset+taskid come in as arguments: they used to be read from the
+     * globals here, which the next CreateTask -- and, from any SPU worker
+     * thread, spu_taskset_task_exited's restart of another task -- overwrote
+     * in the window between CreateTask setting them and this line. Drakengard
+     * 3's memory-manager tasks then ran with a sibling task's arguments once
+     * in ~40 starts, read a block pointer of 0, and halted holding the game's
+     * malloc lock. */
+    j->taskset_ea = taskset_ea; j->taskid = taskid;
     /* Capture the SPURS task r3 NOW (PPU thread, synchronous) from the game's
      * descriptor at eaContext+0x10 = {0x40-marker handle, workload EAs}; the
      * async SPU thread reading it later would race the PPU stack. word1 is
