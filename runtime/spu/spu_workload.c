@@ -305,7 +305,121 @@ typedef struct {
     int                 have_r3;
     uint32_t            taskset_ea;   /* captured race-free at dispatch (globals get clobbered) */
     uint32_t            taskid;
+    long                ticket;       /* creation-order turn in a serial taskset, -1 = none */
 } spu_async_job;
+
+/* ---- Single-SPU tasksets: tasks run one at a time, in creation order ------
+ *
+ * A taskset created with maxContention 1 (or a priority on one SPU only) runs
+ * its tasks strictly in the order the PPU created them, and a title builds on
+ * that: Drakengard 3's memory manager creates five tasks back to back that
+ * work on ONE shared request block in main memory, each stage consuming the
+ * previous stage's output. Started as concurrent host threads they raced:
+ * a stage read the block before its predecessor wrote it (a zero record, a
+ * dispatch byte of 0 -> null handler -> the task died, a 2 KB PUT to EA
+ * 0x800), and the game hung on the next load. Tickets handed out at
+ * dispatch time (on the creating thread, so in creation order) restore the
+ * sequence; the thread waits for its turn before the task's first
+ * instruction. */
+/* Independently of contention, SPURS starts a taskset's tasks in the order
+ * they were created (its ready queue is a FIFO); concurrent host threads may
+ * start in any order. SPURS_TASK_START_ORDER=0 disables the ordering. */
+#define SERIAL_TS_MAX 8
+static struct {
+    uint32_t ea;
+    long next_ticket, now_serving;
+    int  start_only;            /* 1: order the starts only; 0: one task at a time */
+#ifdef _WIN32
+    CRITICAL_SECTION m; CONDITION_VARIABLE cv;
+#else
+    pthread_mutex_t m; pthread_cond_t cv;
+#endif
+} s_serial_ts[SERIAL_TS_MAX];
+static int s_serial_ts_n;
+
+static int serial_ts_add(uint32_t taskset_ea, int start_only);
+
+void spu_taskset_set_serial(uint32_t taskset_ea, int on)
+{
+    for (int i = 0; i < s_serial_ts_n; i++)
+        if (s_serial_ts[i].ea == taskset_ea) { s_serial_ts[i].start_only = !on; return; }
+    if (!on) return;
+    if (serial_ts_add(taskset_ea, 0) >= 0)
+        fprintf(stderr, "[spu_workload] taskset 0x%08X: tasks run one at a time, in creation order\n", taskset_ea);
+}
+
+static int serial_ts_add(uint32_t taskset_ea, int start_only)
+{
+    if (s_serial_ts_n >= SERIAL_TS_MAX) return -1;
+    s_serial_ts[s_serial_ts_n].ea = taskset_ea;
+    s_serial_ts[s_serial_ts_n].start_only = start_only;
+    s_serial_ts[s_serial_ts_n].next_ticket = s_serial_ts[s_serial_ts_n].now_serving = 0;
+#ifdef _WIN32
+    InitializeCriticalSection(&s_serial_ts[s_serial_ts_n].m);
+    InitializeConditionVariable(&s_serial_ts[s_serial_ts_n].cv);
+#else
+    pthread_mutex_init(&s_serial_ts[s_serial_ts_n].m, NULL);
+    pthread_cond_init(&s_serial_ts[s_serial_ts_n].cv, NULL);
+#endif
+    return s_serial_ts_n++;
+}
+
+static int serial_ts_find(uint32_t ea)
+{
+    for (int i = 0; i < s_serial_ts_n; i++) if (ea && s_serial_ts[i].ea == ea) return i;
+    return -1;
+}
+
+/* Called at dispatch (creating thread): every taskset gets start ordering. */
+static int serial_ts_find_or_add(uint32_t ea)
+{
+    int i = serial_ts_find(ea);
+    if (i >= 0 || !ea) return i;
+    static int s_on = -1;
+    if (s_on < 0) { const char* e = getenv("SPURS_TASK_START_ORDER"); s_on = (e && *e == '0') ? 0 : 1; }
+    return s_on ? serial_ts_add(ea, 1) : -1;
+}
+
+static long serial_ts_take_ticket(uint32_t ea)
+{
+    int i = serial_ts_find_or_add(ea);
+    if (i < 0) return -1;
+    long t;
+#ifdef _WIN32
+    EnterCriticalSection(&s_serial_ts[i].m); t = s_serial_ts[i].next_ticket++; LeaveCriticalSection(&s_serial_ts[i].m);
+#else
+    pthread_mutex_lock(&s_serial_ts[i].m); t = s_serial_ts[i].next_ticket++; pthread_mutex_unlock(&s_serial_ts[i].m);
+#endif
+    return t;
+}
+
+static void serial_ts_wait_turn(uint32_t ea, long ticket)
+{
+    int i = serial_ts_find(ea);
+    if (i < 0 || ticket < 0) return;
+#ifdef _WIN32
+    EnterCriticalSection(&s_serial_ts[i].m);
+    while (s_serial_ts[i].now_serving != ticket) SleepConditionVariableCS(&s_serial_ts[i].cv, &s_serial_ts[i].m, INFINITE);
+    if (s_serial_ts[i].start_only) { s_serial_ts[i].now_serving = ticket + 1; WakeAllConditionVariable(&s_serial_ts[i].cv); }
+    LeaveCriticalSection(&s_serial_ts[i].m);
+#else
+    pthread_mutex_lock(&s_serial_ts[i].m);
+    while (s_serial_ts[i].now_serving != ticket) pthread_cond_wait(&s_serial_ts[i].cv, &s_serial_ts[i].m);
+    if (s_serial_ts[i].start_only) { s_serial_ts[i].now_serving = ticket + 1; pthread_cond_broadcast(&s_serial_ts[i].cv); }
+    pthread_mutex_unlock(&s_serial_ts[i].m);
+#endif
+}
+
+static void serial_ts_done_turn(uint32_t ea, long ticket)
+{
+    int i = serial_ts_find(ea);
+    if (i < 0 || ticket < 0 || s_serial_ts[i].start_only) return;   /* start-only: advanced at start */
+#ifdef _WIN32
+    EnterCriticalSection(&s_serial_ts[i].m); s_serial_ts[i].now_serving = ticket + 1; WakeAllConditionVariable(&s_serial_ts[i].cv); LeaveCriticalSection(&s_serial_ts[i].m);
+#else
+    pthread_mutex_lock(&s_serial_ts[i].m); s_serial_ts[i].now_serving = ticket + 1; pthread_cond_broadcast(&s_serial_ts[i].cv); pthread_mutex_unlock(&s_serial_ts[i].m);
+#endif
+}
 
 /* ---- Persistent per-taskset local store (LBP_PERSIST_LS) ------------------
  * Real SPURS time-multiplexes a taskset's tasks onto SPUs, saving/restoring a
@@ -779,6 +893,7 @@ static void spu_async_run(spu_async_job* j)
                 }
                 #undef RDBE32
             }
+            serial_ts_wait_turn(j->taskset_ea, j->ticket);   /* single-SPU taskset: my turn? */
             spu_serial_acquire();       /* one SPU task runs at a time (LBP_SPU_SERIAL) */
             int32_t rc = spu_run_lifted_job_abi(j->fn, ls, j->args_ea, j->image_id,
                                                 1, j->have_r3 ? j->r3 : 0, 0);
@@ -836,6 +951,7 @@ static void spu_async_run(spu_async_job* j)
                     "(job ran to completion, did not loop)\n", j->image_id, rc);
             spu_serial_release();
             if (j->taskset_ea) spu_taskset_task_exited(j->taskset_ea, j->taskid);
+            serial_ts_done_turn(j->taskset_ea, j->ticket);
         }
         /* Persistent LS is retained in its taskset slot for the next task; a
          * per-dispatch LS is freed. */
@@ -1302,6 +1418,7 @@ int spu_workload_dispatch_task(const uint8_t* image, uint32_t image_size,
      * in ~40 starts, read a block pointer of 0, and halted holding the game's
      * malloc lock. */
     j->taskset_ea = taskset_ea; j->taskid = taskid;
+    j->ticket = serial_ts_take_ticket(taskset_ea);   /* on the creating thread: creation order */
     /* Capture the SPURS task r3 NOW (PPU thread, synchronous) from the game's
      * descriptor at eaContext+0x10 = {0x40-marker handle, workload EAs}; the
      * async SPU thread reading it later would race the PPU stack. word1 is

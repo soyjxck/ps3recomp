@@ -2278,9 +2278,19 @@ void spu_indirect_branch(spu_context* ctx)
             if ((w >> 21) == 0u) {                 /* stop / stopd */
                 ctx->stop_code = w & 0x3FFFu;
                 static int _n = 0;
-                if (_n++ < 8)
+                if (_n++ < 8) {
                     fprintf(stderr, "[spu] img=%d exit: synthesised stop 0x%04X at LS 0x%05X\n",
                             ctx->image_id, ctx->stop_code, p0);
+                    /* A zero word is also what unloaded local store reads as, so
+                     * say where the branch came from: the last host-function
+                     * entries on this thread, newest last. */
+                    extern unsigned spu_recent_pcs(uint32_t* out, unsigned max);
+                    uint32_t pcs[32]; unsigned n = spu_recent_pcs(pcs, 32);
+                    fprintf(stderr, "[spu]   recent pcs:");
+                    for (unsigned i = 0; i < n; i++) fprintf(stderr, " %05X", pcs[i]);
+                    fprintf(stderr, " | lr=0x%05X r3=0x%08X r4=0x%08X\n",
+                            ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->gpr[3]._u32[0], ctx->gpr[4]._u32[0]);
+                }
                 spu_halt(ctx);
                 return;
             }

@@ -815,8 +815,24 @@ s32 cellSpursCreateTasksetWithAttribute(CellSpurs* spurs,
                                         CellSpursTaskset* taskset,
                                         const CellSpursTasksetAttribute* attr)
 {
-    (void)attr;
-    return cellSpursCreateTaskset(spurs, taskset, 0, NULL, 0);
+    uint32_t taskset_ea = (uint32_t)(uintptr_t)taskset;
+    const CellSpursTasksetAttribute* a = GUEST_PTR(attr, const CellSpursTasksetAttribute*);
+    s32 rc = cellSpursCreateTaskset(spurs, taskset, a ? a->args : 0, NULL, a ? a->maxContention : 0);
+    if (rc != CELL_OK) return rc;
+    /* One SPU only -- maxContention 1, or a priority on a single SPU -- means
+     * the tasks run one at a time in creation order on hardware, and a title
+     * may depend on it (see spu_workload.c, spu_taskset_set_serial).
+     * SPURS_TASKSET_SERIAL=<hex ea>|all forces it, =off disables. */
+    int spus = 0;
+    if (a) for (int i = 0; i < CELL_SPURS_MAX_SPU; i++) spus += a->priority[i] != 0;
+    int serial = a && (a->maxContention == 1 || spus == 1);
+    { const char* e = getenv("SPURS_TASKSET_SERIAL");
+      if (e && !strcmp(e, "off")) serial = 0;
+      else if (e && !strcmp(e, "all")) serial = 1;
+      else if (e && strtoul(e, 0, 16) == taskset_ea) serial = 1; }
+    extern void spu_taskset_set_serial(uint32_t, int);
+    if (serial) spu_taskset_set_serial(taskset_ea, 1);
+    return rc;
 }
 
 s32 cellSpursDestroyTaskset(CellSpursTaskset* taskset)
@@ -1176,12 +1192,21 @@ s32 _cellSpursTasksetAttributeInitialize(CellSpursTasksetAttribute* attr,
                                          u32 revision, u32 sdkVersion, u64 argTaskset,
                                          u64 priority, u32 maxContention)
 {
-    (void)sdkVersion; (void)argTaskset; (void)priority; (void)maxContention;
+    (void)sdkVersion;
     if (!attr) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
     attr = GUEST_PTR(attr, CellSpursTasksetAttribute*);
     memset(attr, 0, sizeof(CellSpursTasksetAttribute));
     attr->revision = revision ? revision : 1;
-    printf("[cellSpurs] _TasksetAttributeInitialize(rev=%u)\n", revision);
+    attr->args = argTaskset;
+    /* priority is `const uint8_t[8]`: a guest EA. Keep it with maxContention;
+     * CreateTasksetWithAttribute decides from them whether the taskset is
+     * single-SPU (its tasks then run strictly in creation order). */
+    attr->maxContention = maxContention;
+    { uint32_t pea = (uint32_t)priority;
+      if (pea && pea < 0xD0000000u) memcpy(attr->priority, vm_base + pea, CELL_SPURS_MAX_SPU); }
+    printf("[cellSpurs] _TasksetAttributeInitialize(rev=%u prio=%02X%02X%02X%02X%02X%02X%02X%02X maxContention=%u)\n",
+           revision, attr->priority[0], attr->priority[1], attr->priority[2], attr->priority[3],
+           attr->priority[4], attr->priority[5], attr->priority[6], attr->priority[7], maxContention);
     return CELL_OK;
 }
 
