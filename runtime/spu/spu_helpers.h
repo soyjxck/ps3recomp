@@ -179,7 +179,31 @@ static inline u128 spu_selb(u128 a, u128 b, u128 c) {
  *   sel & 0xE0 == 0xE0 -> 0x80
  *   sel & 0xC0 == 0xC0 -> 0xFF
  *   sel & 0xC0 == 0x80 -> 0x00
- *   otherwise           -> concat{a,b}[sel & 0x1F] */
+ *   otherwise           -> concat{a,b}[sel & 0x1F]
+ *
+ * The byte loop is the reference (tests/test_spu_shufb.c checks the vector
+ * versions against it). shufb is defined on SPU byte positions. Our u128 is
+ * host-native LE, so SPU byte P lives at _u8[SPU_W(P)]; map every access (the
+ * concat source, the control, and the result) through SPU_W so a control
+ * supplied as an immediate (ila/il) or an LS-loaded constant -- already in
+ * true SPU byte order -- is interpreted correctly. The cbd/chd/cwd/cdd
+ * generators below produce true SPU-byte-order selectors to match. */
+static inline u128 spu_shufb_ref(u128 a, u128 b, u128 c) {
+    uint8_t cat[32];
+    for (int j=0;j<16;j++) cat[j]    = a._u8[SPU_W(j)];   /* concat SPU byte j  = a SPU byte j */
+    for (int j=0;j<16;j++) cat[16+j] = b._u8[SPU_W(j)];   /* concat SPU byte 16+j = b SPU byte j */
+    u128 r;
+    for (int t=0;t<16;t++) {                              /* result SPU byte t */
+        uint8_t s = c._u8[SPU_W(t)];                      /* control SPU byte t */
+        uint8_t v;
+        if      ((s & 0xE0)==0xE0) v=0x80;
+        else if ((s & 0xC0)==0xC0) v=0xFF;
+        else if ((s & 0xC0)==0x80) v=0x00;
+        else                       v=cat[s & 0x1F];       /* concat SPU byte (s & 0x1F) */
+        r._u8[SPU_W(t)] = v;
+    }
+    return r;
+}
 #if defined(__SSE4_1__)
 #include <smmintrin.h>
 /* pshufb version: one of the hottest SPU ops (~11% of GH3's FMOD mixer task
@@ -200,53 +224,28 @@ static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
     r = _mm_shuffle_epi8(_mm_blendv_epi8(r, special, m80), sw);
     u128 out; memcpy(&out, &r, 16); return out;
 }
-/* The byte loop stays as the reference (tests/test_spu_shufb.c checks both). */
-static inline u128 spu_shufb_ref(u128 a, u128 b, u128 c) {
-    /* shufb is defined on SPU byte positions. Our u128 is host-native LE, so SPU
-     * byte P lives at _u8[SPU_W(P)]; map every access (the concat source, the
-     * control, and the result) through SPU_W so a control supplied as an immediate
-     * (ila/il) or an LS-loaded constant -- already in true SPU byte order -- is
-     * interpreted correctly. The cbd/chd/cwd/cdd generators below produce true
-     * SPU-byte-order selectors to match. */
-    uint8_t cat[32];
-    for (int j=0;j<16;j++) cat[j]    = a._u8[SPU_W(j)];   /* concat SPU byte j  = a SPU byte j */
-    for (int j=0;j<16;j++) cat[16+j] = b._u8[SPU_W(j)];   /* concat SPU byte 16+j = b SPU byte j */
-    u128 r;
-    for (int t=0;t<16;t++) {                              /* result SPU byte t */
-        uint8_t s = c._u8[SPU_W(t)];                      /* control SPU byte t */
-        uint8_t v;
-        if      ((s & 0xE0)==0xE0) v=0x80;
-        else if ((s & 0xC0)==0xC0) v=0xFF;
-        else if ((s & 0xC0)==0x80) v=0x00;
-        else                       v=cat[s & 0x1F];       /* concat SPU byte (s & 0x1F) */
-        r._u8[SPU_W(t)] = v;
-    }
-    return r;
+#elif defined(__aarch64__) || defined(__ARM_NEON)
+#include <arm_neon.h>
+/* NEON twin of the pshufb version. On Apple Silicon the byte loop was the top
+ * leaf of every SPU audio thread in Drakengard 3 (MultiStream's mixer and DSP
+ * overlays), about one host core between them. vqtbl2q selects from the
+ * 32-byte {A,B} table in one instruction, so no from-B blend is needed. */
+static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
+    const uint8x16_t sw = { 3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12 };
+    uint8x16_t A, B, C; memcpy(&A, &a, 16); memcpy(&B, &b, 16); memcpy(&C, &c, 16);
+    A = vqtbl1q_u8(A, sw); B = vqtbl1q_u8(B, sw); C = vqtbl1q_u8(C, sw);
+    uint8x16x2_t tbl; tbl.val[0] = A; tbl.val[1] = B;
+    uint8x16_t r = vqtbl2q_u8(tbl, vandq_u8(C, vdupq_n_u8(0x1F)));
+    /* Special selectors: 10x -> 0x00, 110 -> 0xFF, 111 -> 0x80. */
+    const uint8x16_t m80 = vceqq_u8(vandq_u8(C, vdupq_n_u8(0x80)), vdupq_n_u8(0x80));
+    const uint8x16_t mC0 = vceqq_u8(vandq_u8(C, vdupq_n_u8(0xC0)), vdupq_n_u8(0xC0));
+    const uint8x16_t mE0 = vceqq_u8(vandq_u8(C, vdupq_n_u8(0xE0)), vdupq_n_u8(0xE0));
+    const uint8x16_t special = vbslq_u8(mE0, vdupq_n_u8(0x80), mC0);
+    r = vqtbl1q_u8(vbslq_u8(m80, special, r), sw);
+    u128 out; memcpy(&out, &r, 16); return out;
 }
 #else
-static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
-    /* shufb is defined on SPU byte positions. Our u128 is host-native LE, so SPU
-     * byte P lives at _u8[SPU_W(P)]; map every access (the concat source, the
-     * control, and the result) through SPU_W so a control supplied as an immediate
-     * (ila/il) or an LS-loaded constant -- already in true SPU byte order -- is
-     * interpreted correctly. The cbd/chd/cwd/cdd generators below produce true
-     * SPU-byte-order selectors to match. */
-    uint8_t cat[32];
-    for (int j=0;j<16;j++) cat[j]    = a._u8[SPU_W(j)];   /* concat SPU byte j  = a SPU byte j */
-    for (int j=0;j<16;j++) cat[16+j] = b._u8[SPU_W(j)];   /* concat SPU byte 16+j = b SPU byte j */
-    u128 r;
-    for (int t=0;t<16;t++) {                              /* result SPU byte t */
-        uint8_t s = c._u8[SPU_W(t)];                      /* control SPU byte t */
-        uint8_t v;
-        if      ((s & 0xE0)==0xE0) v=0x80;
-        else if ((s & 0xC0)==0xC0) v=0xFF;
-        else if ((s & 0xC0)==0x80) v=0x00;
-        else                       v=cat[s & 0x1F];       /* concat SPU byte (s & 0x1F) */
-        r._u8[SPU_W(t)] = v;
-    }
-    return r;
-}
-#define spu_shufb_ref spu_shufb
+static inline u128 spu_shufb(u128 a, u128 b, u128 c) { return spu_shufb_ref(a, b, c); }
 #endif
 
 /* ---- shift / rotate immediate (word lanes) ---- */

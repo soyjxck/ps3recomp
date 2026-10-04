@@ -766,6 +766,7 @@ extern "C" void ppu_log_host_chain(const char* tag);  /* fwd decl (defined below
  * work was posted. spu_coh_is_reserved reads a global that stays zero until an
  * SPU reserves its first line, so an ordinary store pays one branch. */
 extern "C" int  spu_coh_is_reserved(uint32_t addr);
+extern "C" int  g_spu_coh_armed;   /* 0 until an SPU reserves a line: skip the call */
 extern "C" void spu_lockline_lock(void);
 extern "C" void spu_lockline_unlock(void);
 extern "C" void spu_coh_notify_write(uint32_t addr);
@@ -1365,6 +1366,14 @@ static int vm_null_sweep(uint32_t a)
 }
 
 /* Hot path: one predictable compare, cold half out of line. */
+/* PPU_HOTREAD=1 arms the hot-poll detectors in the load accessors (a thread
+ * reading one address 200k times in a row). They kept two thread-locals per
+ * load width and touched both on EVERY load, and on macOS each thread-local
+ * access is a call through _tlv_get_addr: measured at ~15% of Drakengard 3's
+ * render thread. Diagnostics, so off unless asked. */
+static int g_hotread_on = -1;
+static void ppu_hotread_init(void) { g_hotread_on = getenv("PPU_HOTREAD") ? 1 : 0; }
+
 static inline int vm_null_store(uint32_t a, uint32_t v, int width, void* ra)
 {
     if (__builtin_expect(a >= 0x1000u, 1)) {
@@ -1439,7 +1448,7 @@ static PPU_THREAD_LOCAL int      g_vcall_sp = 0;
  * them, until SPU code runs) it is the plain memcpy it replaced. */
 #define VM_WRITE_COH(a, src, n)                                               \
     do {                                                                      \
-        if (spu_coh_is_reserved((uint32_t)(a))) {                             \
+        if (g_spu_coh_armed && spu_coh_is_reserved((uint32_t)(a))) {         \
             spu_lockline_lock();                                              \
             memcpy(vm_base + (uint32_t)(a), (src), (n));                      \
             spu_coh_notify_write((uint32_t)(a));                              \
@@ -1451,8 +1460,18 @@ static PPU_THREAD_LOCAL int      g_vcall_sp = 0;
 
 extern "C" {
 /* PPU_RWATCH=<hex>[,len] -- see the note in vm_read8. */
+static void ppu_rwatch_hit_slow(uint32_t a, int width, void* ra);
+static int g_rw_on = -1;     /* same shape as g_ww_slow, for PPU_RWATCH */
 static inline void ppu_rwatch_hit(uint32_t a, int width, void* ra)
 {
+    if (__builtin_expect(g_rw_on == 0, 1)) return;
+    ppu_rwatch_hit_slow(a, width, ra);
+}
+
+static __attribute__((noinline, cold)) void ppu_rwatch_hit_slow(uint32_t a, int width, void* ra)
+{
+    if (g_rw_on < 0) g_rw_on = getenv("PPU_RWATCH") ? 1 : 0;
+    if (!g_rw_on) return;
     static int64_t s_lo = -2; static uint32_t s_len = 0x10;
     if (s_lo == -2) {
         const char* e = getenv("PPU_RWATCH");
@@ -1546,7 +1565,7 @@ uint8_t  vm_read8 (uint64_t a) { if (vm_oob((uint32_t)a,1)) return 0; vm_hotmap(
      * Every width shares one window so a byte-at-a-time strcmp is caught as
      * readily as a word load. */
     ppu_rwatch_hit((uint32_t)a, 1, __builtin_return_address(0));
-    { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
+    if (__builtin_expect(g_hotread_on > 0, 0)) { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
       if ((uint32_t)a==last) { if (++n==200000) {
           fprintf(stderr, "[HOTREAD8] spinning on 0x%08X val=0x%02X tid=%lu guest-fn=0x%08X\n",
                   (uint32_t)a, vm_base[(uint32_t)a], GetCurrentThreadId(),
@@ -1555,7 +1574,7 @@ uint8_t  vm_read8 (uint64_t a) { if (vm_oob((uint32_t)a,1)) return 0; vm_hotmap(
       else { last=(uint32_t)a; n=0; } }
     return vm_base[(uint32_t)a]; }
 uint16_t vm_read16(uint64_t a) { if (vm_oob((uint32_t)a,2)) return 0; ppu_rwatch_hit((uint32_t)a, 2, __builtin_return_address(0)); vm_hotmap((uint32_t)a,2); uint16_t v; memcpy(&v, vm_base + (uint32_t)a, 2);
-    { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
+    if (__builtin_expect(g_hotread_on > 0, 0)) { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
       if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD16] spinning on 0x%08X\n", (uint32_t)a); n=0; } } else { last=(uint32_t)a; n=0; } }
     return __builtin_bswap16(v); }
 uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch_hit((uint32_t)a, 4, __builtin_return_address(0));
@@ -1637,7 +1656,7 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch
           for(uint32_t i=0;i<NB;i++) cnt[i]=0; } } }
     /* Hot-poll detector: a thread spinning on the same address (e.g. a GCM FIFO
      * get-pointer / label waiting on RSX) reads it thousands of times in a row. */
-    { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
+    if (__builtin_expect(g_hotread_on > 0, 0)) { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
       if ((uint32_t)a==last) { if (++n==200000) { if (((uint32_t)a & ~0xFFFu) == (VM_HLE_INJECT_BASE + 0x2000u)) {
               /* A spin on the GCM control block is a fence/FIFO wait. Print the
                * WHOLE block: put vs get says whether the RSX side is behind or
@@ -1676,7 +1695,7 @@ uint64_t vm_read64(uint64_t a) { if (vm_oob((uint32_t)a,8)) return 0; vm_hotmap(
 #ifdef VM_SAMPLE_READS
     { static uint64_t c=0; if ((++c % 2000000ull)==0) fprintf(stderr, "[sample] read64 0x%08X\n", (uint32_t)a); }
 #endif
-    { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
+    if (__builtin_expect(g_hotread_on > 0, 0)) { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
       if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD64] spinning on 0x%08X (=0x%016llX) guest-fn=0x%08X\n", (uint32_t)a, (unsigned long long)__builtin_bswap64(v), ppu_prof_resolve_host(__builtin_return_address(0))); n=0;
 #ifdef _WIN32
         { static int64_t wa=-2; if(wa==-2){const char*e=getenv("PPU_SPINBT"); wa=e?(int64_t)strtoul(e,0,0):-1;}
@@ -1733,8 +1752,24 @@ static void ww_arm_inline_window(uint32_t ww)
     g_ww_lo = ww & ~15u;
     g_ww_hi = (ww & ~15u) + len;
 }
+/* The store-side diagnostics below are armed by environment variables that
+ * stay unset in a normal run, yet every lifted store paid the whole function:
+ * it was the top leaf of Drakengard 3's render thread. One flag test on the
+ * hot path; g_ww_dyn is the one watch armed at run time (by the GCM walker),
+ * so it is tested too. */
+static void barrier_watch_hit_slow(uint32_t a, uint32_t v, int width, void* ra);
+static int g_ww_slow = -1;   /* -1 undecided, 0 nothing armed, 1 run the diagnostics */
 static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra)
 {
+    if (__builtin_expect(g_ww_slow == 0, 1) && __builtin_expect(g_ww_dyn == 0, 1)) return;
+    barrier_watch_hit_slow(a, v, width, ra);
+}
+
+static __attribute__((noinline, cold)) void barrier_watch_hit_slow(uint32_t a, uint32_t v, int width, void* ra)
+{
+    if (g_ww_slow < 0)
+        g_ww_slow = (getenv("GCM_PARK_WRITE_LOG") || getenv("PPU_WVAL") ||
+                     getenv("PPU_WWATCH") || getenv("PPU_WW_GUARD")) ? 1 : 0;
     /* GCM_PARK_WRITE_LOG=1: a 32-bit store of a JUMP-to-itself into the GCM
      * FIFO window (value 0x20000000 | own IO offset) -- the PPU parking the RSX. */
     { static int s_pk = -1; if (s_pk < 0) s_pk = getenv("GCM_PARK_WRITE_LOG") ? 1 : 0;
@@ -3659,6 +3694,7 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
 
 extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
 {
+    ppu_hotread_init();
     /* Line-buffer stdout: HLE logs mix printf (stdout) with probe fprintf
      * (stderr); with a redirected block-buffered stdout, printf lines sat in
      * the buffer for minutes and were LOST when the run was killed -- which

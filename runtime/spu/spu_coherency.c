@@ -79,7 +79,8 @@ static unsigned char s_coh_bitmap[SPU_COH_BITMAP_SZ];
  * test that stores through vm_write* paying one compare against a hot global.
  * Written once, under the lock; read unlocked, where a stale zero costs at most
  * one missed event on the very first reservation of the run. */
-static int s_coh_armed;
+int g_spu_coh_armed;            /* tested inline by VM_WRITE_COH (ppu_memory.h) */
+#define s_coh_armed g_spu_coh_armed
 
 /* The SPU contexts that have reserved a line. Sized to match the MFC engine
  * registry in spu_channels.c, which is the ceiling on live SPU contexts. */

@@ -132,6 +132,7 @@ void        ppu_resv_break_store(uint64_t ea);
  * spu_coh_is_reserved is a load of a global that stays zero until an SPU
  * reserves its first line, so the ordinary store pays one predictable branch. */
 int         spu_coh_is_reserved(uint32_t addr);
+extern int  g_spu_coh_armed;   /* 0 until an SPU reserves its first line */
 void        spu_lockline_lock(void);
 void        spu_lockline_unlock(void);
 void        spu_coh_notify_write(uint32_t addr);
@@ -141,7 +142,7 @@ void        spu_coh_notify_write(uint32_t addr);
 
 #define VM_WRITE_COH(addr, src, n)                                            \
     do {                                                                      \
-        if (spu_coh_is_reserved((uint32_t)(addr))) {                          \
+        if (g_spu_coh_armed && spu_coh_is_reserved((uint32_t)(addr))) {      \
             spu_lockline_lock();                                              \
             memcpy(vm_ptr8((uint32_t)(addr)), (src), (n));                    \
             spu_coh_notify_write((uint32_t)(addr));                           \
