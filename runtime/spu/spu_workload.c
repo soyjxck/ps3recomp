@@ -51,6 +51,24 @@ uint64_t spu_workload_fingerprint(const void* data, size_t n)
 #else
 #  define SPU_WL_TLS __thread
 #endif
+
+#ifdef _WIN32
+#include <windows.h>
+static uint64_t spu_wl_now_ns(void)
+{
+    static LARGE_INTEGER f; LARGE_INTEGER c;
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (uint64_t)((double)c.QuadPart * 1e9 / (double)f.QuadPart);
+}
+#else
+#include <time.h>
+static uint64_t spu_wl_now_ns(void)
+{
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+#endif
 static uint64_t spu_workload_fingerprint_cached(const uint8_t* image, uint32_t n)
 {
     typedef struct { const uint8_t* image; uint32_t size; uint64_t fp;
@@ -930,7 +948,25 @@ int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
                 (unsigned long long)fp, image_id, job_ea);
         fflush(stderr);
     }
+    /* SPURS_JOB_STATS=1: jobs per second and the mean wall time per job, every
+     * 5 s, per thread. The answer to "is the render thread slow because of
+     * how many jobs it runs or how long each one takes". */
+    static int s_stats = -1;
+    if (s_stats < 0) s_stats = getenv("SPURS_JOB_STATS") ? 1 : 0;
+    uint64_t t0 = s_stats ? spu_wl_now_ns() : 0;
     int rc = spu_run_spurs_job(fn, image_id, job_ea, job_desc_size);
+    if (s_stats) {
+        static SPU_WL_TLS uint64_t n, tot, last;
+        uint64_t t1 = spu_wl_now_ns();
+        n++; tot += t1 - t0;
+        if (!last) last = t1;
+        if (t1 - last >= 5000000000ull) {
+            fprintf(stderr, "[job-stats] image=%d %llu jobs in %.1f s: %.0f/s, mean %.1f us, %.0f%% of this thread\n",
+                    image_id, (unsigned long long)n, (t1 - last) / 1e9, n / ((t1 - last) / 1e9),
+                    tot / 1e3 / (double)n, 100.0 * tot / (double)(t1 - last));
+            n = tot = 0; last = t1;
+        }
+    }
     if (verbose) {
         fprintf(stderr, "[spurs-job] job 0x%08X RETURNED rc=%d\n", job_ea, rc);
         fflush(stderr);

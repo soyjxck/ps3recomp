@@ -210,7 +210,6 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
 
     /* ---- binary at LS 0 (PIC, so delta 0 keeps the lifted addresses) ---- */
     memcpy(ls, vm_base + ea_bin, size_bin);
-    memset(ls + size_bin, 0, SPU_LS_SIZE - size_bin);
 
     /* ---- regions, following _cellSpursCheckJob's own arithmetic --------- */
     uint32_t p         = ALIGN1024(size_bin);
@@ -234,6 +233,13 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     uint32_t s_ls      = p;
     uint32_t stack_top = p + ss_size;
     p += ss_size;
+    /* Zero what the job owns -- io, out, scratch and stack -- and the context
+     * block at the top; the cache-hinted inputs below are copied whole, with
+     * their alignment padding zeroed as they land. Everything else keeps the
+     * previous job's bytes, as a real local store does under jm2. Zeroing the
+     * full 256 KB was ~7 us of a 32 us job. */
+    if (p > size_bin) memset(ls + size_bin, 0, (p > SPU_LS_SIZE ? SPU_LS_SIZE : p) - size_bin);
+    memset(ls + SPU_LS_SIZE - 0x440, 0, 0x440);
 
     /* ---- cache-hinted read-only inputs ---------------------------------- */
     uint32_t dma_base   = job_ea + JH_SIZE;          /* input list ... */
@@ -247,6 +253,8 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
         if (p + sz > SPU_LS_SIZE) break;
         cache_ls[i] = p;
         memcpy(ls + p, vm_base + eal, sz);
+        if (ALIGN1024(sz) > sz && p + ALIGN1024(sz) <= SPU_LS_SIZE)
+            memset(ls + p + sz, 0, ALIGN1024(sz) - sz);
         p += ALIGN1024(sz);
     }
 
