@@ -4,6 +4,7 @@
 
 #include "sys_memory.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ---------------------------------------------------------------------------
@@ -105,8 +106,13 @@ int64_t sys_memory_allocate(ppu_context* ctx)
                 g_sys_mem_bump_ptr, SYS_MEM_OVERFLOW_BASE, SYS_MEM_OVERFLOW_END);
         g_sys_mem_bump_ptr = SYS_MEM_OVERFLOW_BASE;
     }
+    /* SYS_MEM_OVERFLOW_END=<hex>: move the end of the overflow window (an
+     * experiment knob; past 0x80000000 a signed pointer compare misfires). */
+    static uint32_t s_ovf_end = 0;
+    if (!s_ovf_end) { const char* e = getenv("SYS_MEM_OVERFLOW_END");
+                      s_ovf_end = e ? (uint32_t)strtoul(e, 0, 16) : SYS_MEM_OVERFLOW_END; }
     if (g_sys_mem_bump_ptr + size > (g_sys_mem_bump_ptr >= SYS_MEM_OVERFLOW_BASE
-                                     ? SYS_MEM_OVERFLOW_END : SYS_MEM_ALLOC_END)) {
+                                     ? s_ovf_end : SYS_MEM_ALLOC_END)) {
         bump_unlock();
         fprintf(stderr, "[sys_memory] allocate(size=0x%X) -> ENOMEM: window exhausted (bump 0x%08X)\n",
                 size, g_sys_mem_bump_ptr);
