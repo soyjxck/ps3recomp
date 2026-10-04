@@ -2214,6 +2214,33 @@ class PPULifter:
                     f"uint8_t* d = (uint8_t*)&ctx->vr[{vd}]; "
                     f"for (int i = 0; i < 16; i++) d[i] = ((uint32_t)i >= 16u - sh) ? m[i - (int)(16u - sh)] : 0; }}")
 
+        # The store mirrors: stvlx writes the leftmost 16-(EA&15) bytes of vS
+        # at EA (to the end of that quadword), stvrx the rightmost EA&15 bytes
+        # at the start of the quadword containing EA-1 -- nothing when EA is
+        # aligned. Compilers pair them (stvlx v,base ; stvrx v,base+16) for one
+        # unaligned 16-byte store. These were TODO no-ops: Drakengard 3's Bink
+        # decoder writes its YUV output rows with them, so every movie came out
+        # as whatever the planes held before -- audio playing over black.
+        if mn in ("stvlx", "stvlxl"):
+            vs = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
+            ra = _reg_idx(ops[1])
+            rb = _reg_idx(ops[2])
+            return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
+                    f"uint32_t sh = (uint32_t)(ea & 0xF); "
+                    f"uint8_t* m = vm_base + (uint32_t)(ea & ~0xFULL); "
+                    f"const uint8_t* s = (const uint8_t*)&ctx->vr[{vs}]; "
+                    f"for (uint32_t i = 0; sh + i < 16u; i++) m[sh + i] = s[i]; }}")
+
+        if mn in ("stvrx", "stvrxl"):
+            vs = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
+            ra = _reg_idx(ops[1])
+            rb = _reg_idx(ops[2])
+            return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
+                    f"uint32_t sh = (uint32_t)(ea & 0xF); "
+                    f"uint8_t* m = vm_base + (uint32_t)(ea & ~0xFULL); "
+                    f"const uint8_t* s = (const uint8_t*)&ctx->vr[{vs}]; "
+                    f"for (uint32_t i = 0; i < sh; i++) m[i] = s[16u - sh + i]; }}")
+
         if mn == "lvebx" or mn == "lvehx" or mn == "lvewx":
             vd = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
             ra = _reg_idx(ops[1])
