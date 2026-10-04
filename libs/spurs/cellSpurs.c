@@ -35,8 +35,26 @@ uint32_t g_ydkj_real_spurs_ea   = 0;   /* real CellSpurs instance EA (for the ta
 
 #ifdef _WIN32
 #include <windows.h>
+typedef CRITICAL_SECTION    jc_mutex_t;
+typedef CONDITION_VARIABLE  jc_cond_t;
+#define JC_MUTEX_INIT(m)    InitializeCriticalSection(m)
+#define JC_COND_INIT(c)     InitializeConditionVariable(c)
+#define JC_LOCK(m)          EnterCriticalSection(m)
+#define JC_UNLOCK(m)        LeaveCriticalSection(m)
+#define JC_WAIT(c, m)       SleepConditionVariableCS((c), (m), INFINITE)
+#define JC_SIGNAL(c)        WakeConditionVariable(c)
+#define JC_BROADCAST(c)     WakeAllConditionVariable(c)
 #else
 #include <pthread.h>
+typedef pthread_mutex_t     jc_mutex_t;
+typedef pthread_cond_t      jc_cond_t;
+#define JC_MUTEX_INIT(m)    pthread_mutex_init((m), NULL)
+#define JC_COND_INIT(c)     pthread_cond_init((c), NULL)
+#define JC_LOCK(m)          pthread_mutex_lock(m)
+#define JC_UNLOCK(m)        pthread_mutex_unlock(m)
+#define JC_WAIT(c, m)       pthread_cond_wait((c), (m))
+#define JC_SIGNAL(c)        pthread_cond_signal(c)
+#define JC_BROADCAST(c)     pthread_cond_broadcast(c)
 #include <time.h>
 #endif
 
@@ -2186,6 +2204,20 @@ static struct {
     int run_count;
     volatile long running;
     volatile LONG rerun;      /* a Run arrived while a walk was in progress */   /* 1 while a host thread walks this chain */
+    /* Where a walk halted by END resumes. jm2 keeps the chain's pc across
+     * the halt: the next Run re-fetches the slot that held END. Drakengard 3
+     * appends each shader-patching job by overwriting that END with a JOB and
+     * writing a new END behind it, then calls Run again -- hundreds of times
+     * a frame. Restarting from the entry re-executed every earlier job each
+     * time (quadratic: ~33k job runs/s for a few hundred real jobs) and
+     * re-patched FIFO memory the ring had already reused, which is where the
+     * garbage SET_REFERENCE values and the unpatched-park stalls came from. */
+    u32        resume_pc;
+    /* SPURS_JC_ASYNC: this chain's walker thread and its handshake */
+    int        async_started;
+    int        async_req;     /* a Run is waiting to be walked */
+    int        async_busy;    /* a run is in flight (walked, or jobs still executing) */
+    jc_cond_t  cv_req, cv_idle;
 } s_jobchains[MAX_JOBCHAINS];
 
 static void jc_dump_commands(const char* tag, u32 ea, int max_words)
@@ -2249,6 +2281,7 @@ static s32 jc_register(u32 jc_ea, u32 entry_ea, u16 size_desc, u16 max_grab,
         if (!s_jobchains[i].jc_ea || s_jobchains[i].jc_ea == jc_ea) {
             s_jobchains[i].jc_ea     = jc_ea;
             s_jobchains[i].entry_ea  = entry_ea;
+            s_jobchains[i].resume_pc = 0;
             s_jobchains[i].size_desc = size_desc;
             s_jobchains[i].max_grab  = max_grab;
             s_jobchains[i].run_count = 0;
@@ -2610,9 +2643,11 @@ static void jc_signal_done(u32 jc_ea)
     }
 }
 
-static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
+static void jc_execute(int slot)
 {
-    u32 pc = entry_ea, ret_pc = 0;
+    const u32 jc_ea = s_jobchains[slot].jc_ea, size_desc = s_jobchains[slot].size_desc;
+    u32 pc = s_jobchains[slot].resume_pc ? s_jobchains[slot].resume_pc : s_jobchains[slot].entry_ea;
+    u32 ret_pc = 0;
     int jobs = 0;
     /* Bound IDLE steps, not total steps. A SPURS job chain is frequently a
      * SERVICE LOOP -- guard, job, sync, next, repeat -- and is meant to run for
@@ -2647,7 +2682,9 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
         if (op == 4) { ret_pc = pc + 8; pc = (u32)(cmd & ~7ull); continue; }  /* CALL */
         if (op == 7) {
             if (ext == (7 | (15 << 3))) {                     /* END */
-                printf("[cellSpurs] chain 0x%08X: END after %d job(s) at pc=0x%08X\n", jc_ea, jobs, pc);
+                { static int _n = 0; if (_n++ < 8)
+                    printf("[cellSpurs] chain 0x%08X: END after %d job(s) at pc=0x%08X (resumes there)\n", jc_ea, jobs, pc); }
+                s_jobchains[slot].resume_pc = pc;             /* halted: the next Run re-fetches this slot */
                 if (jobs) jc_signal_done(jc_ea);
                 return;
             }
@@ -2674,6 +2711,218 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
            jc_ea, jobs);
 }
 
+/* ---------------------------------------------------------------------------
+ * SPURS_JC_ASYNC=<n>: walk chains off the calling thread, with n job workers.
+ *
+ * jm2 runs a kicked chain on the SPUs while the PPU goes on building the next
+ * segment. SPURS_JC_SYNC made the PPU walk the chain itself because the old
+ * host walker could run a whole frame late and read refilled descriptors;
+ * Drakengard 3's render thread then spent most of its time executing shader
+ * patching jobs (~30k/s at the menu, 4-7 fps). This keeps the ordering
+ * guarantee differently: at most one run of a chain is in flight, and a Run
+ * that arrives while the previous one is still executing waits for it. The
+ * descriptors of the new run are already written by then, and the ones the
+ * in-flight run reads are not touched before the Run after that. Within a
+ * run, the JOB commands between two ordering commands (SYNC, FLUSH, GUARD,
+ * END, RET) are independent, exactly as on hardware where every SPU grabs
+ * the next one, so they are spread over the workers and the walker waits for
+ * all of them at each ordering command. GUARD waits now block a walker, not
+ * the title's thread.
+ * -----------------------------------------------------------------------*/
+typedef struct { volatile int pending; } jc_run_t;
+typedef struct { u32 job_ea, jc_ea, size_desc; int idx; jc_run_t* run; } jc_job_item;
+
+#define JC_POOL_QDEPTH 4096
+static struct {
+    jc_mutex_t  m;
+    jc_cond_t   cv_work;     /* an item was queued */
+    jc_cond_t   cv_done;     /* an item finished (runs and full-queue waiters) */
+    jc_job_item q[JC_POOL_QDEPTH];
+    unsigned    head, tail;
+    int         inited;
+} s_jcpool;
+
+static void jc_run_one_job(u32 job_ea, int idx, u32 size_desc);
+
+#ifdef _WIN32
+static DWORD WINAPI jc_pool_worker(LPVOID arg)
+#else
+static void* jc_pool_worker(void* arg)
+#endif
+{
+    (void)arg;
+    for (;;) {
+        JC_LOCK(&s_jcpool.m);
+        while (s_jcpool.head == s_jcpool.tail) JC_WAIT(&s_jcpool.cv_work, &s_jcpool.m);
+        jc_job_item it = s_jcpool.q[s_jcpool.head++ % JC_POOL_QDEPTH];
+        JC_UNLOCK(&s_jcpool.m);
+
+        { extern u32 g_spurs_job_ls_handle; g_spurs_job_ls_handle = it.jc_ea; }
+        jc_run_one_job(it.job_ea, it.idx, it.size_desc);
+        jc_signal_done(it.jc_ea);               /* per job, as the inline walk does */
+
+        JC_LOCK(&s_jcpool.m);
+        it.run->pending--;
+        JC_BROADCAST(&s_jcpool.cv_done);
+        JC_UNLOCK(&s_jcpool.m);
+    }
+    return 0;
+}
+
+static void jc_spawn(
+#ifdef _WIN32
+    DWORD (WINAPI *fn)(LPVOID),
+#else
+    void* (*fn)(void*),
+#endif
+    void* arg, const char* what)
+{
+#ifdef _WIN32
+    HANDLE th = CreateThread(NULL, 8u << 20, fn, arg, 0, NULL);
+    if (th) CloseHandle(th); else fprintf(stderr, "[cellSpurs] %s: CreateThread failed\n", what);
+#else
+    pthread_attr_t a; pthread_t th;
+    pthread_attr_init(&a);
+    pthread_attr_setstacksize(&a, 8u << 20);   /* lifted SPU code runs on it */
+    pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&th, &a, fn, arg) != 0)
+        fprintf(stderr, "[cellSpurs] %s: pthread_create failed\n", what);
+    pthread_attr_destroy(&a);
+#endif
+}
+
+static void jc_pool_init(int workers)
+{
+    if (s_jcpool.inited) return;
+    s_jcpool.inited = 1;
+    JC_MUTEX_INIT(&s_jcpool.m);
+    JC_COND_INIT(&s_jcpool.cv_work);
+    JC_COND_INIT(&s_jcpool.cv_done);
+    if (workers < 1) workers = 1;
+    if (workers > 16) workers = 16;
+    for (int i = 0; i < workers; i++) jc_spawn(jc_pool_worker, NULL, "job worker");
+    printf("[cellSpurs] SPURS_JC_ASYNC: %d job worker thread(s)\n", workers);
+}
+
+static void jc_async_enqueue(jc_run_t* run, u32 job_ea, u32 jc_ea, int idx, u32 size_desc)
+{
+    JC_LOCK(&s_jcpool.m);
+    while (s_jcpool.tail - s_jcpool.head >= JC_POOL_QDEPTH) JC_WAIT(&s_jcpool.cv_done, &s_jcpool.m);
+    jc_job_item* it = &s_jcpool.q[s_jcpool.tail++ % JC_POOL_QDEPTH];
+    it->job_ea = job_ea; it->jc_ea = jc_ea; it->size_desc = size_desc; it->idx = idx; it->run = run;
+    run->pending++;
+    JC_SIGNAL(&s_jcpool.cv_work);
+    JC_UNLOCK(&s_jcpool.m);
+}
+
+static void jc_async_barrier(jc_run_t* run)
+{
+    JC_LOCK(&s_jcpool.m);
+    while (run->pending > 0) JC_WAIT(&s_jcpool.cv_done, &s_jcpool.m);
+    JC_UNLOCK(&s_jcpool.m);
+}
+
+/* jc_execute with the JOB commands handed to the pool; same command set. */
+static void jc_execute_async(int slot)
+{
+    const u32 jc_ea = s_jobchains[slot].jc_ea, size_desc = s_jobchains[slot].size_desc;
+    jc_run_t run; run.pending = 0;
+    u32 pc = s_jobchains[slot].resume_pc ? s_jobchains[slot].resume_pc : s_jobchains[slot].entry_ea;
+    u32 ret_pc = 0;
+    int jobs = 0, idle = 0;
+    for (;; idle++) {
+        if (idle > 4096) break;
+        u64 cmd = vm_read64(pc);
+        u32 op  = (u32)(cmd & 7);
+        u32 ext = (u32)(cmd & 127);
+
+        if (cmd != 0 && op == 0) {                                   /* JOB */
+            jc_async_enqueue(&run, (u32)(cmd & ~7ull), jc_ea, jobs++, size_desc);
+            idle = 0;
+            pc += 8; continue;
+        }
+        if (op == 1) { pc = (u32)(cmd & ~7ull); continue; }           /* RESET_PC */
+        if (op == 3) { pc = (u32)(cmd & ~7ull); continue; }           /* NEXT     */
+        if (op == 4) { ret_pc = pc + 8; pc = (u32)(cmd & ~7ull); continue; }   /* CALL */
+        if (op == 7) {
+            if (ext == (7 | (15 << 3))) {                             /* END */
+                jc_async_barrier(&run);
+                { static int _n = 0; if (_n++ < 4)
+                    printf("[cellSpurs] chain 0x%08X: END after %d job(s) at pc=0x%08X (async, resumes there)\n", jc_ea, jobs, pc); }
+                s_jobchains[slot].resume_pc = pc;
+                if (jobs) jc_signal_done(jc_ea);
+                return;
+            }
+            if (ext == (7 | (14 << 3))) {                             /* RET */
+                jc_async_barrier(&run);
+                if (!ret_pc) return;
+                pc = ret_pc; ret_pc = 0; continue;
+            }
+            if (ext == (7 | (0 << 3))) {                              /* ABORT */
+                jc_async_barrier(&run);
+                printf("[cellSpurs] chain 0x%08X: ABORT\n", jc_ea);
+                return;
+            }
+            if (ext == (7 | (1 << 3))) {                              /* GUARD */
+                jc_async_barrier(&run);
+                u32 g_ea = (u32)(cmd & ~127ull);
+                if (!jg_wait(g_ea)) return;                           /* still closed */
+                pc += 8; continue;
+            }
+        }
+        if (op == 2 || op == 5) jc_async_barrier(&run);               /* SYNC / LWSYNC / FLUSH */
+        pc += 8;                                                      /* NOP / JOBLIST / SET_LABEL */
+    }
+    jc_async_barrier(&run);
+    printf("[cellSpurs] chain 0x%08X: 4096 commands with no job run after %d job(s) -- malformed? (async)\n",
+           jc_ea, jobs);
+}
+
+#ifdef _WIN32
+static DWORD WINAPI jc_slot_walker(LPVOID p)
+#else
+static void* jc_slot_walker(void* p)
+#endif
+{
+    int slot = (int)(intptr_t)p;
+    for (;;) {
+        JC_LOCK(&s_jcpool.m);
+        while (!s_jobchains[slot].async_req) JC_WAIT(&s_jobchains[slot].cv_req, &s_jcpool.m);
+        s_jobchains[slot].async_req = 0;
+        JC_UNLOCK(&s_jcpool.m);
+
+        jc_execute_async(slot);
+        jc_signal_done(s_jobchains[slot].jc_ea);   /* end of walk, as jc_thread */
+
+        JC_LOCK(&s_jcpool.m);
+        s_jobchains[slot].async_busy = 0;
+        s_jobchains[slot].running    = 0;          /* JoinJobChain watches this */
+        JC_BROADCAST(&s_jobchains[slot].cv_idle);
+        JC_UNLOCK(&s_jcpool.m);
+    }
+    return 0;
+}
+
+/* Called on the title's thread by Run/Kick. Blocks only while the previous
+ * run of THIS chain is still executing. */
+static void jc_async_run(int slot, int workers)
+{
+    jc_pool_init(workers);
+    JC_LOCK(&s_jcpool.m);
+    if (!s_jobchains[slot].async_started) {
+        s_jobchains[slot].async_started = 1;
+        JC_COND_INIT(&s_jobchains[slot].cv_req);
+        JC_COND_INIT(&s_jobchains[slot].cv_idle);
+        jc_spawn(jc_slot_walker, (void*)(intptr_t)slot, "chain walker");
+    }
+    while (s_jobchains[slot].async_busy) JC_WAIT(&s_jobchains[slot].cv_idle, &s_jcpool.m);
+    s_jobchains[slot].async_busy = 1;
+    s_jobchains[slot].running    = 1;
+    s_jobchains[slot].async_req  = 1;
+    JC_SIGNAL(&s_jobchains[slot].cv_req);
+    JC_UNLOCK(&s_jcpool.m);
+}
+
 static DWORD WINAPI jc_thread(LPVOID p)
 {
     int slot = (int)(intptr_t)p;
@@ -2685,8 +2934,7 @@ static DWORD WINAPI jc_thread(LPVOID p)
     { const char* d = getenv("SPURS_JC_DELAY");
       if (d && *d) Sleep((unsigned)atoi(d)); }
     for (;;) {
-        jc_execute(s_jobchains[slot].entry_ea, s_jobchains[slot].jc_ea,
-                   s_jobchains[slot].size_desc);
+        jc_execute(slot);
         if (InterlockedExchange(&s_jobchains[slot].rerun, 0)) continue;
         s_jobchains[slot].running = 0;
         /* A request that landed between the check above and the clear: take
@@ -2722,6 +2970,27 @@ static s32 jc_start(u64 jc_ea, const char* who)
     static int s_off = -1;
     if (s_off < 0) s_off = getenv("PS3_NO_JOBCHAIN") ? 1 : 0;
 
+    /* SPURS_JOB_STATS=1 (see spu_workload.c): chain runs per second, to set
+     * against the jobs per second -- how much work one Run hands over. */
+    { static int st = -1; if (st < 0) st = getenv("SPURS_JOB_STATS") ? 1 : 0;
+      if (st) {
+          static unsigned long long runs, last_ms;
+          unsigned long long now_ms;
+#ifdef _WIN32
+          now_ms = GetTickCount64();
+#else
+          struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+          now_ms = (unsigned long long)ts.tv_sec * 1000ull + (unsigned long long)ts.tv_nsec / 1000000ull;
+#endif
+          runs++;
+          if (!last_ms) last_ms = now_ms;
+          if (now_ms - last_ms >= 5000) {
+              fprintf(stderr, "[jc-stats] %llu chain runs in %.1f s: %.0f/s\n",
+                      runs, (now_ms - last_ms) / 1e3, runs / ((now_ms - last_ms) / 1e3));
+              runs = 0; last_ms = now_ms;
+          }
+      } }
+
     for (int i = 0; i < MAX_JOBCHAINS; i++) {
         if (s_jobchains[i].jc_ea != (u32)jc_ea) continue;
         s_jobchains[i].run_count++;
@@ -2749,6 +3018,9 @@ static s32 jc_start(u64 jc_ea, const char* who)
          * descriptors, so one park is never cleared and rendering stops. The
          * synchronous walk keeps the title's ordering. Not the default: a
          * service-loop chain (Tokyo Jungle's audio) would never return. */
+        static int async_n = -1;
+        if (async_n < 0) { const char* e = getenv("SPURS_JC_ASYNC"); async_n = e ? atoi(e) : 0; }
+        if (async_n > 0) { jc_async_run(i, async_n); return CELL_OK; }
         static int sync_walk = -1;
         if (sync_walk < 0) sync_walk = getenv("SPURS_JC_SYNC") ? 1 : 0;
         if (sync_walk) {
