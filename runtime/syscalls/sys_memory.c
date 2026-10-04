@@ -131,6 +131,20 @@ int64_t sys_memory_allocate(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ENOMEM;
     }
 
+    /* SYS_MEM_TRACE=<hex bump>: once the bump pointer passes this, log the guest
+     * call chain of every 16th allocation -- who keeps growing the heap. */
+    { static uint32_t s_tr = 0xFFFFFFFFu; static unsigned s_trn = 0;
+      if (s_tr == 0xFFFFFFFFu) { const char* e = getenv("SYS_MEM_TRACE"); s_tr = e ? (uint32_t)strtoul(e, 0, 16) : 0; }
+      if (s_tr && g_sys_mem_bump_ptr >= s_tr && (s_trn++ % 16) == 0 && s_trn < 16 * 400) {
+          uint32_t sp = (uint32_t)ctx->gpr[1];
+          fprintf(stderr, "[memtrace] size=0x%X lr=%08X chain:", size, (uint32_t)ctx->lr);
+          for (int k = 0; k < 16 && sp && sp < 0xF0000000u; k++) {
+              sp = __builtin_bswap32(*(uint32_t*)vm_to_host(sp + 4));
+              if (!sp || sp >= 0xF0000000u) break;
+              fprintf(stderr, " %08X", __builtin_bswap32(*(uint32_t*)vm_to_host(sp + 0x14)));
+          }
+          fprintf(stderr, "\n");
+      } }
     uint32_t alloc_addr = g_sys_mem_bump_ptr;
     g_sys_mem_bump_ptr += size;
     s_total_allocated += size;

@@ -2586,6 +2586,17 @@ static void jc_signal_done(u32 jc_ea)
         d3 = g_spurs_job_mbox_intr; (void)d3;
         g_spurs_job_mbox_valid = 0;
     }
+    /* SPURS_JC_DONE_EVENTS=0: do not post job completions to the lv2 queues the
+     * title attached to SPURS. Those queues are attached for the SPU tasks'
+     * own notifications (cellSpursAttachLv2EventQueue hands out a port for
+     * them); a job chain's completion only reaches a queue a title asked for.
+     * Broadcasting it to all of them fed Drakengard 3's CellMemoryManager an
+     * event per ShaderPatching job -- thousands a second, each read as a
+     * request record at the chain's address -- and it allocated 400 MB in five
+     * seconds and took the engine down with an OOM. Default on: Tokyo Jungle
+     * and GT5P wait on these events. */
+    { static int on = -1; if (on < 0) { const char* e = getenv("SPURS_JC_DONE_EVENTS"); on = (e && *e == '0') ? 0 : 1; }
+      if (!on) return; }
     for (int i = 0; i < s_spurs_event_queue_n; i++) {
         int rc = sys_event_queue_push_by_id(s_spurs_event_queue[i],
                                             SPURS_EVENT_PORT, jc_ea, 0,

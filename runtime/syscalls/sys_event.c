@@ -569,6 +569,10 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     ctx->gpr[5] = evt.data1;
     ctx->gpr[6] = evt.data2;
     ctx->gpr[7] = evt.data3;
+    { static long s_lq = -2; if (s_lq == -2) { const char* e = getenv("EVT_LOG_QUEUE"); s_lq = e ? atol(e) : -1; }
+      if (s_lq >= 0 && (long)queue_id == s_lq) { static int n = 0; if (n++ < 600)
+          fprintf(stderr, "[evt-recv] q=%u tid=%u r4=0x%llX r5=0x%llX r6=0x%llX r7=0x%llX\n", queue_id, (unsigned)ctx->thread_id,
+                  (unsigned long long)ctx->gpr[4], (unsigned long long)ctx->gpr[5], (unsigned long long)ctx->gpr[6], (unsigned long long)ctx->gpr[7]); } }
     { static int _r=0; if (getenv("PS3_EVT_RECV_TRACE") && _r++<60) fprintf(stderr,
         "[RECV] q=%u source=0x%llX data1=0x%llX data2=0x%llX\n", queue_id,
         (unsigned long long)evt.source, (unsigned long long)evt.data1,
