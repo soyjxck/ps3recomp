@@ -72,6 +72,9 @@ static CAMetalLayer*       s_layer;      /* windowed only   */
 static id<MTLTexture>      s_offscreen;  /* headless only   */
 static id<MTLTexture>      s_depth;      /* depth + stencil, both surfaces  */
 static NSWindow*           s_window;
+static volatile uint8_t    s_keys[256];    /* host keys down, by macOS virtual keycode */
+static volatile int        s_key_focus;    /* game window is key and the app is active */
+static id                  s_key_monitor;
 static int                 s_headless;
 static int                 s_closed;
 static int                 s_ready;
@@ -488,6 +491,36 @@ static int create_window_impl(const char* title)
 
     [s_window makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
+
+    /* Keyboard for cellPad's fallback (libs/input/cellPad.c). A local monitor
+     * sees every key event this app receives before dispatch, so no view has
+     * to be first responder. Plain key events are swallowed -- an unhandled
+     * keyDown would otherwise beep -- while Cmd-chords pass through so Cmd-Q
+     * still quits. Focus comes from notifications on this thread, and losing
+     * it releases every key: AppKit never delivers the keyUp for a key that
+     * was held across a focus change. */
+    s_key_monitor = [NSEvent addLocalMonitorForEventsMatchingMask:
+                                 (NSEventMaskKeyDown | NSEventMaskKeyUp)
+                                             handler:^NSEvent*(NSEvent* ev) {
+        unsigned kc  = (unsigned)ev.keyCode & 0xFFu;
+        int      cmd = (ev.modifierFlags & NSEventModifierFlagCommand) != 0;
+        if (ev.type == NSEventTypeKeyDown) { if (!cmd) s_keys[kc] = 1; }
+        else                                 s_keys[kc] = 0;
+        return cmd ? ev : nil;
+    }];
+    void (^focus)(NSNotification*) = ^(NSNotification* n) {
+        (void)n;
+        int f = [NSApp isActive] && [s_window isKeyWindow];
+        if (!f) memset((void*)s_keys, 0, sizeof s_keys);
+        s_key_focus = f;
+    };
+    NSNotificationCenter* nc = [NSNotificationCenter defaultCenter];
+    for (NSNotificationName name in @[ NSWindowDidBecomeKeyNotification,
+                                       NSWindowDidResignKeyNotification,
+                                       NSApplicationDidBecomeActiveNotification,
+                                       NSApplicationDidResignActiveNotification ])
+        [nc addObserverForName:name object:nil queue:nil usingBlock:focus];
+    s_key_focus = 1;
     return 0;
 }
 
@@ -3299,6 +3332,20 @@ void rsx_metal_backend_shutdown(void)
         s_dev       = nil;
         s_ready     = 0;
     }
+}
+
+int rsx_metal_backend_key_down(unsigned keycode)
+{
+    return keycode < 256u ? (int)s_keys[keycode] : 0;
+}
+
+int rsx_metal_backend_window_focused(void)
+{
+#if !TARGET_OS_IPHONE
+    return s_window != nil && s_key_focus;
+#else
+    return 0;
+#endif
 }
 
 static int pump_messages_impl(void)

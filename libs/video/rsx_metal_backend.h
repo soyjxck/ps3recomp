@@ -32,6 +32,12 @@ void rsx_metal_backend_shutdown(void);
  * 0 otherwise. Always returns 0 in headless mode. */
 int  rsx_metal_backend_pump_messages(void);
 
+/* Host keyboard, for cellPad's keyboard fallback: whether the key with this
+ * macOS virtual keycode is down, and whether the game window is key (every
+ * key reads released once it is not). Both read 0 in headless mode. */
+int  rsx_metal_backend_key_down(unsigned keycode);
+int  rsx_metal_backend_window_focused(void);
+
 /* Present one frame: clear the drawable to the colour last received through the
  * RSX clear method, then hand it to the compositor. */
 void rsx_metal_backend_present(void);

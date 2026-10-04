@@ -129,7 +129,11 @@ static u8 pad_xinput_stick_to_u8(short raw, short deadzone)
  *
  * Arrows = d-pad, Z/X/A/S = cross/circle/square/triangle, Q/W = L1/R1,
  * 1/2 = L2/R2, Enter = START, Tab = SELECT. The left stick mirrors the d-pad
- * so a title that reads the stick instead is playable too. */
+ * so a title that reads the stick instead is playable too.
+ *
+ * macOS has the same fallback (plus Space = cross) when SDL2 found no pad on
+ * port 0, fed by the Metal backend's key monitor rather than a poll of the
+ * system keyboard, so it needs no Input Monitoring permission. */
 #ifdef _WIN32
 static int pad_host_window_focused(void)
 {
@@ -390,6 +394,64 @@ static void pad_shutdown_backend(void)
 
 #endif /* PAD_BACKEND_SDL2 */
 
+#if defined(__APPLE__)
+/* Keys come from the Metal backend's NSEvent monitor (rsx_metal_backend.m),
+ * which only sees events while the game window is key, so typing elsewhere
+ * cannot drive the game. Weak: a host built without that backend still
+ * links, and the fallback simply stays off. */
+extern int rsx_metal_backend_key_down(unsigned keycode) __attribute__((weak));
+extern int rsx_metal_backend_window_focused(void) __attribute__((weak));
+
+static void pad_poll_keyboard(void)
+{
+    static int off = -1;
+    if (off < 0) off = getenv("PAD_NO_KEYBOARD") ? 1 : 0;
+    if (off || !rsx_metal_backend_key_down || !rsx_metal_backend_window_focused)
+        return;
+
+    PadHostState* hs = &s_host_state[0];
+    if (!rsx_metal_backend_window_focused()) {
+        hs->buttons = 0;
+        hs->analog_lx = hs->analog_ly = 128;
+        hs->analog_rx = hs->analog_ry = 128;
+        hs->connected = 1;
+        return;
+    }
+
+    /* macOS virtual keycodes (kVK_* in HIToolbox/Events.h): physical keys,
+     * independent of the keyboard layout. */
+    static const struct { unsigned kc; u16 btn; } map[] = {
+        { 0x7E, CELL_PAD_CTRL_UP },     { 0x7D, CELL_PAD_CTRL_DOWN },
+        { 0x7B, CELL_PAD_CTRL_LEFT },   { 0x7C, CELL_PAD_CTRL_RIGHT },
+        { 0x06, CELL_PAD_CTRL_CROSS },  { 0x31, CELL_PAD_CTRL_CROSS },    /* Z, Space */
+        { 0x07, CELL_PAD_CTRL_CIRCLE },                                   /* X        */
+        { 0x00, CELL_PAD_CTRL_SQUARE }, { 0x01, CELL_PAD_CTRL_TRIANGLE }, /* A, S     */
+        { 0x0C, CELL_PAD_CTRL_L1 },     { 0x0D, CELL_PAD_CTRL_R1 },       /* Q, W     */
+        { 0x12, CELL_PAD_CTRL_L2 },     { 0x13, CELL_PAD_CTRL_R2 },       /* 1, 2     */
+        { 0x24, CELL_PAD_CTRL_START },  { 0x30, CELL_PAD_CTRL_SELECT },   /* Return, Tab */
+    };
+
+    u16 btns = 0;
+    for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++)
+        if (rsx_metal_backend_key_down(map[i].kc)) btns |= map[i].btn;
+
+    hs->buttons   = btns;
+    hs->connected = 1;
+    hs->analog_lx = (u8)((btns & CELL_PAD_CTRL_LEFT) ? 0 :
+                         (btns & CELL_PAD_CTRL_RIGHT) ? 255 : 128);
+    hs->analog_ly = (u8)((btns & CELL_PAD_CTRL_UP) ? 0 :
+                         (btns & CELL_PAD_CTRL_DOWN) ? 255 : 128);
+    hs->analog_rx = hs->analog_ry = 128;
+    hs->trigger_l2 = (u8)((btns & CELL_PAD_CTRL_L2) ? 255 : 0);
+    hs->trigger_r2 = (u8)((btns & CELL_PAD_CTRL_R2) ? 255 : 0);
+
+    { static int said = 0;
+      if (!said && btns) { said = 1;
+          printf("[cellPad] keyboard fallback active on port 0 (no SDL2 pad)\n");
+          fflush(stdout); } }
+}
+#endif /* __APPLE__ */
+
 /* ---------------------------------------------------------------------------
  * Poll dispatcher
  * -----------------------------------------------------------------------*/
@@ -439,7 +501,7 @@ static void pad_poll_backend(void)
 #elif PAD_BACKEND_SDL2
     pad_poll_sdl2();
 #endif
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
     if (!s_host_state[0].connected) pad_poll_keyboard();
 #endif
 }
