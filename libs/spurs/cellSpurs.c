@@ -719,7 +719,11 @@ s32 cellSpursAttachLv2EventQueue(CellSpurs* spurs, u32 queue, u8* port,
      * landed on port 0 and the SPU's real port number routed nowhere. */
     u32 p = *port_h;
     if (isDynamic) {
+        /* SPURS_DYNPORT_LOW=1: hand out the lowest free port from 1 up, as lv2
+         * does, instead of 0x10 first. */
+        static int low = -1; if (low < 0) low = getenv("SPURS_DYNPORT_LOW") ? 1 : 0;
         p = 64;
+        if (low) for (u32 i = 1; i < 64 && p == 64; i++) if (!s_spurs_port_queue[i]) p = i;
         for (u32 i = 0x10; i < 64 && p == 64; i++) if (!s_spurs_port_queue[i]) p = i;
         for (u32 i = 0; i < 0x10 && p == 64; i++) if (!s_spurs_port_queue[i]) p = i;
         if (p == 64) return CELL_SPURS_CORE_ERROR_BUSY;
