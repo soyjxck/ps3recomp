@@ -42,6 +42,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stddef.h>
 
 extern uint8_t* vm_base;
 extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
@@ -146,10 +147,37 @@ SPURS_JOB_TLS uint32_t g_spurs_job_mbox, g_spurs_job_mbox_intr;
 SPURS_JOB_TLS uint32_t g_spurs_job_cmd;
 SPURS_JOB_TLS int g_spurs_job_mbox_valid;
 
+/* One context per host thread, reused across jobs. Each job used to pay a
+ * 256 KB calloc, the 256 KB+ memset of a stack-local context, a 256 KB copy
+ * into it and a 256 KB copy out of it -- about 1 MB of memory traffic before
+ * the job ran its first instruction. Drakengard 3 dispatches its shader
+ * patching job once per draw call from the render thread, ~2700 jobs/s, and
+ * that overhead alone held it at 4 fps. */
+static SPURS_JOB_TLS spu_context* s_jctx;
+
+/* spu_context_init minus the local-store memset: every field before ls_store
+ * and every field after it. jm2 runs jobs in a dirty local store anyway; the
+ * caller zeroes what is past the binary to keep the state jobs saw here. */
+_Static_assert(offsetof(spu_context, ls_store) < offsetof(spu_context, ls),
+               "spu_context layout: ls_store must precede ls");
+static void spu_context_init_regs(spu_context* ctx)
+{
+    memset(ctx, 0, offsetof(spu_context, ls_store));
+    memset((char*)ctx + offsetof(spu_context, ls), 0,
+           sizeof(*ctx) - offsetof(spu_context, ls));
+    ctx->ls     = ctx->ls_store;
+    ctx->spu_id = 0;
+    ctx->status = SPU_STATUS_STOPPED;
+}
+
 int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
                       uint32_t job_ea, uint32_t job_desc_size)
 {
     if (!entry || !job_ea) return -1;
+    /* getenv per job is a linear scan of the environment on the hot path. */
+    static int s_dd = -1, s_jd = -1;
+    if (s_dd < 0) { const char* e = getenv("SPURS_JOB_DESCDUMP"); s_dd = e ? atoi(e) : 0; }
+    if (s_jd < 0) s_jd = getenv("SPURS_JOB_DUMP") ? 1 : 0;
 
     /* ---- descriptor ---------------------------------------------------- */
     uint32_t ea_bin   = (uint32_t)(g64(job_ea + JH_EA_BINARY) & ~1ull);
@@ -170,11 +198,19 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
         return -1;
     }
 
-    uint8_t* ls = (uint8_t*)calloc(1, SPU_LS_SIZE);
-    if (!ls) return -1;
+    spu_context* ctx = s_jctx;
+    if (!ctx) {
+        ctx = (spu_context*)calloc(1, sizeof(*ctx));
+        if (!ctx) return -1;
+        s_jctx = ctx;
+    }
+    spu_context_init_regs(ctx);
+    ctx->image_id = image_id;
+    uint8_t* ls = ctx->ls;
 
     /* ---- binary at LS 0 (PIC, so delta 0 keeps the lifted addresses) ---- */
     memcpy(ls, vm_base + ea_bin, size_bin);
+    memset(ls + size_bin, 0, SPU_LS_SIZE - size_bin);
 
     /* ---- regions, following _cellSpursCheckJob's own arithmetic --------- */
     uint32_t p         = ALIGN1024(size_bin);
@@ -268,7 +304,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
      * its DMA and atomic EAs from these words, so when a job spins on a
      * lock-line address that is not backed, this is what to read first. */
     { static int _d = 0;
-      if (getenv("SPURS_JOB_DESCDUMP") && _d++ < 4) {
+      if (s_dd && _d++ < 4) {
           fprintf(stderr, "[spurs-job] desc @0x%08X (%u bytes):", job_ea, dsz);
           for (uint32_t o = 0; o < dsz && o < 128; o += 4) {
               if ((o & 31) == 0) fprintf(stderr, "\n    +%02X:", o);
@@ -279,7 +315,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
            * data (past JH_SIZE) and dump what they point at. The job reads its
            * parameters from there, so a wild DMA/atomic address usually
            * originates in one of these blocks. */
-          if (atoi(getenv("SPURS_JOB_DESCDUMP")) >= 2) {
+          if (s_dd >= 2) {
               for (uint32_t o = JH_SIZE; o < dsz && o < 128; o += 4) {
                   uint32_t v = g32(job_ea + o);
                   if (v < 0x10000u || v >= 0xD0000000u) continue;
@@ -298,7 +334,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
      * The header's input-DMA-list/io fields are legitimately zero for it. Dump
      * the user data + that command block so the bail path is attributable. */
     uint32_t dump_cmd = 0;
-    if (getenv("SPURS_JOB_DUMP")) {
+    if (s_jd) {
         uint64_t ud  = g64(job_ea + JH_SIZE);        /* desc+0x30 */
         uint32_t cmd = (uint32_t)ud;                 /* low word = EA */
         fprintf(stderr, "[spurs-job] job 0x%08X userdata: %016llX %016llX %016llX %016llX\n",
@@ -333,22 +369,18 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     }
 
     /* ---- enter the job -------------------------------------------------- */
-    spu_context ctx;
-    spu_context_init(&ctx, 0);
-    ctx.image_id = image_id;
-    memcpy(ctx.ls, ls, SPU_LS_SIZE);
-    ctx.gpr[1]._u32[0] = (stack_top - 16u) & ~15u;   /* SPU stack grows down */
+    ctx->gpr[1]._u32[0] = (stack_top - 16u) & ~15u;   /* SPU stack grows down */
     /* Link register: where the job returns when it is done. The job manager
      * would pass an address inside itself; 0 makes the job re-enter its own
      * entry at LS 0 and run a bogus second lap. */
-    ctx.gpr[0]._u32[0] = 0x3FF00u;                   /* SPU_JOB_RETURN_LS */
-    ctx.gpr[3]._u32[0] = ctx_ls;                     /* CellSpursJobContext2* */
-    ctx.gpr[4]._u32[0] = desc_ls;                    /* CellSpursJob256*      */
+    ctx->gpr[0]._u32[0] = 0x3FF00u;                   /* SPU_JOB_RETURN_LS */
+    ctx->gpr[3]._u32[0] = ctx_ls;                     /* CellSpursJobContext2* */
+    ctx->gpr[4]._u32[0] = desc_ls;                    /* CellSpursJob256*      */
 
     { static int _n = 0;
       if (_n++ < 4)
           fprintf(stderr, "[spurs-job] ENTER r3=%08X r4=%08X r1=%08X entry-fn image=%d\n",
-                  ctx.gpr[3]._u32[0], ctx.gpr[4]._u32[0], ctx.gpr[1]._u32[0],
+                  ctx->gpr[3]._u32[0], ctx->gpr[4]._u32[0], ctx->gpr[1]._u32[0],
                   image_id); }
     /* NOTE: after its work the job's runtime jumps to LS 0 ("return to the
      * jm2 kernel" -- real layout has the kernel at 0, jobs above; we load the
@@ -356,7 +388,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
      * and trips its parameter guard, which HALTS -- ending the run. So the
      * HALT-ASSERT heqi 0x1650 seen once per jm2 job is NORMAL COMPLETION
      * noise, not a failure: the job's real work finished before the jump. */
-    spu_run_with_halt(entry, &ctx);
+    spu_run_with_halt(entry, ctx);
 
     /* Capture the job's outbound mailbox. These are LS POINTERS TO STRINGS for
      * the SPU printf service, NOT query results -- value 0x83C0 from the sound
@@ -364,14 +396,17 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
      * comment here claimed they carried the title's bus counts; they do not,
      * and feeding them into the completion event turned 0x40000000 into a 1 GB
      * allocation request. Kept because the printf service needs them. */
-    memcpy(s_job_ls, ctx.ls, SPU_LS_SIZE);   /* keep the store readable */
-    s_job_ls_valid = 1;
-
-    g_spurs_job_mbox      = spu_channel_has_data(&ctx.ch_out_mbox)
-                          ? ctx.ch_out_mbox.value : 0;
-    g_spurs_job_mbox_intr = spu_channel_has_data(&ctx.ch_out_intr_mbox)
-                          ? ctx.ch_out_intr_mbox.value : 0;
+    g_spurs_job_mbox      = spu_channel_has_data(&ctx->ch_out_mbox)
+                          ? ctx->ch_out_mbox.value : 0;
+    g_spurs_job_mbox_intr = spu_channel_has_data(&ctx->ch_out_intr_mbox)
+                          ? ctx->ch_out_intr_mbox.value : 0;
     g_spurs_job_mbox_valid = g_spurs_job_mbox || g_spurs_job_mbox_intr;
+    /* Only a job that posted something has strings worth reading back. */
+    s_job_ls_valid = 0;
+    if (g_spurs_job_mbox_valid) {
+        memcpy(s_job_ls, ctx->ls, SPU_LS_SIZE);   /* keep the store readable */
+        s_job_ls_valid = 1;
+    }
     { uint32_t _cb = g32(job_ea + 0x4C);
       g_spurs_job_cmd = _cb ? (g32(_cb) >> 16) : 0; }
     { static int s_t = -1; if (s_t < 0) s_t = getenv("SPURS_JOB_MBOX") ? 1 : 0;
@@ -380,9 +415,9 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
           fprintf(stderr, "[spurs-job] job 0x%08X posted mbox=0x%08X intr=0x%08X\n",
                   job_ea, g_spurs_job_mbox, g_spurs_job_mbox_intr); }
 
-    if (getenv("SPURS_JOB_DUMP")) {
+    if (s_jd) {
         fprintf(stderr, "[spurs-job] job 0x%08X exit: status=0x%X stop=0x%X pc=0x%05X\n",
-                job_ea, ctx.status, ctx.stop_code, ctx.pc);
+                job_ea, ctx->status, ctx->stop_code, ctx->pc);
         /* Post-run view of the same command block: the game polls result/status
          * fields the job writes back -- a before/after diff shows whether the
          * handler delivered its completion or the PPU waits on stale state. */
@@ -397,7 +432,6 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
         fflush(stderr);
     }
 
-    spu_coh_unregister(&ctx);   /* stack local: out of the reserver set */
-    free(ls);
+    spu_coh_unregister(ctx);    /* reused next job: out of the reserver set */
     return 0;
 }

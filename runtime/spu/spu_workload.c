@@ -40,6 +40,39 @@ uint64_t spu_workload_fingerprint(const void* data, size_t n)
     return h;
 }
 
+/* The same, cached per (address, size). A job chain dispatches one binary over
+ * and over: Drakengard 3's shader patching job is 34 KB and runs once per draw
+ * call, so hashing it in full each time was a third of its render thread. Per
+ * thread so no lock is needed; 32 quadwords spread over the image are
+ * re-checked on every hit, so a different blob loaded at the same address
+ * still gets hashed in full. */
+#if defined(_MSC_VER)
+#  define SPU_WL_TLS __declspec(thread)
+#else
+#  define SPU_WL_TLS __thread
+#endif
+static uint64_t spu_workload_fingerprint_cached(const uint8_t* image, uint32_t n)
+{
+    typedef struct { const uint8_t* image; uint32_t size; uint64_t fp;
+                     uint64_t sample[32]; } fp_cache_ent;
+    static SPU_WL_TLS fp_cache_ent s_fpc[8];
+    static SPU_WL_TLS unsigned     s_fpc_next;
+    if (n < 64) return spu_workload_fingerprint(image, n);
+
+    uint64_t sample[32];
+    for (unsigned i = 0; i < 32; i++)
+        memcpy(&sample[i], image + ((uint64_t)(n - 8) * i) / 31, 8);
+    for (unsigned i = 0; i < 8; i++)
+        if (s_fpc[i].image == image && s_fpc[i].size == n &&
+            memcmp(s_fpc[i].sample, sample, sizeof sample) == 0)
+            return s_fpc[i].fp;
+    uint64_t fp = spu_workload_fingerprint(image, n);
+    fp_cache_ent* e = &s_fpc[s_fpc_next++ & 7];
+    e->image = image; e->size = n; e->fp = fp;
+    memcpy(e->sample, sample, sizeof sample);
+    return fp;
+}
+
 /* ---- registry ---------------------------------------------------------- */
 
 #ifndef SPU_WORKLOAD_MAX
@@ -847,7 +880,7 @@ int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
 {
     if (!image || image_size == 0) return 0;
 
-    uint64_t fp = spu_workload_fingerprint(image, image_size);
+    uint64_t fp = spu_workload_fingerprint_cached(image, image_size);
     spu_lifted_entry_fn fn = NULL;
     int image_id = 0;
     for (unsigned i = 0; i < s_registry_count; i++)
