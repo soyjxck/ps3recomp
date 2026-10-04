@@ -2184,7 +2184,8 @@ static struct {
     u16 size_desc;
     u16 max_grab;
     int run_count;
-    volatile long running;   /* 1 while a host thread walks this chain */
+    volatile long running;
+    volatile LONG rerun;      /* a Run arrived while a walk was in progress */   /* 1 while a host thread walks this chain */
 } s_jobchains[MAX_JOBCHAINS];
 
 static void jc_dump_commands(const char* tag, u32 ea, int max_words)
@@ -2617,6 +2618,8 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
         u32 ext = (u32)(cmd & 127);
 
         if (cmd != 0 && op == 0) {                    /* JOB */
+            { static int jl = -1; if (jl < 0) { const char* e = getenv("SPURS_JC_LOG"); jl = e ? atoi(e) : 0; }
+              if (jl >= 2) fprintf(stderr, "[jc]   job[%d] pc=0x%08X ea=0x%08X\n", jobs, pc, (u32)(cmd & ~7ull)); }
             { extern u32 g_spurs_job_ls_handle; g_spurs_job_ls_handle = jc_ea; }
             jc_run_one_job((u32)(cmd & ~7ull), jobs++, size_desc);
             idle = 0;                    /* real work: the chain is healthy */
@@ -2633,7 +2636,7 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
         if (op == 4) { ret_pc = pc + 8; pc = (u32)(cmd & ~7ull); continue; }  /* CALL */
         if (op == 7) {
             if (ext == (7 | (15 << 3))) {                     /* END */
-                printf("[cellSpurs] chain 0x%08X: END after %d job(s)\n", jc_ea, jobs);
+                printf("[cellSpurs] chain 0x%08X: END after %d job(s) at pc=0x%08X\n", jc_ea, jobs, pc);
                 if (jobs) jc_signal_done(jc_ea);
                 return;
             }
@@ -2670,9 +2673,20 @@ static DWORD WINAPI jc_thread(LPVOID p)
      * Confirms timing-vs-never before committing to the async rewrite. */
     { const char* d = getenv("SPURS_JC_DELAY");
       if (d && *d) Sleep((unsigned)atoi(d)); }
-    jc_execute(s_jobchains[slot].entry_ea, s_jobchains[slot].jc_ea,
-               s_jobchains[slot].size_desc);
-    s_jobchains[slot].running = 0;
+    for (;;) {
+        jc_execute(s_jobchains[slot].entry_ea, s_jobchains[slot].jc_ea,
+                   s_jobchains[slot].size_desc);
+        if (InterlockedExchange(&s_jobchains[slot].rerun, 0)) continue;
+        s_jobchains[slot].running = 0;
+        /* A request that landed between the check above and the clear: take
+         * the chain back if nobody else has. */
+        if (s_jobchains[slot].rerun &&
+            _InterlockedCompareExchange(&s_jobchains[slot].running, 1, 0) == 0) {
+            InterlockedExchange(&s_jobchains[slot].rerun, 0);
+            continue;
+        }
+        break;
+    }
     /* Tell the application the chain is done. Without this the walk finishes
      * in silence and a thread waiting on the attached queue never runs again. */
     jc_signal_done(s_jobchains[slot].jc_ea);
@@ -2700,17 +2714,30 @@ static s32 jc_start(u64 jc_ea, const char* who)
     for (int i = 0; i < MAX_JOBCHAINS; i++) {
         if (s_jobchains[i].jc_ea != (u32)jc_ea) continue;
         s_jobchains[i].run_count++;
+        { static int jl = -1; if (jl < 0) jl = getenv("SPURS_JC_LOG") ? 1 : 0;   /* every call */
+          if (jl) fprintf(stderr, "[jc] %s #%d jc=0x%08X running=%ld\n", who, s_jobchains[i].run_count,
+                          (u32)jc_ea, (long)s_jobchains[i].running); }
         if (s_jobchains[i].run_count <= 3) {
             printf("[cellSpurs] %s(jc=0x%08X) run#%d entry=0x%08X\n",
                    who, (u32)jc_ea, s_jobchains[i].run_count, s_jobchains[i].entry_ea);
             jc_dump_commands(who, s_jobchains[i].entry_ea, 16);
         }
         if (s_off || !s_jobchains[i].entry_ea) return CELL_OK;
-        /* Coalesce: a chain already being walked must not start twice. */
+        /* A chain already being walked must not start twice -- but a Run that
+         * arrives mid-walk is not nothing: the title has rewritten the chain
+         * with this frame's jobs and expects them to execute. Dropping it lost
+         * Drakengard 3's ShaderPatching jobs, one of which un-parks the GCM
+         * FIFO, so rendering stopped the first time a Run overlapped a slow
+         * walk. Queue it; jc_thread walks again when the current pass ends. */
         if (_InterlockedCompareExchange(&s_jobchains[i].running, 1, 0) == 0) {
             HANDLE th = CreateThread(NULL, 1u << 20, jc_thread, (LPVOID)(intptr_t)i, 0, NULL);
             if (th) CloseHandle(th);
             else s_jobchains[i].running = 0;
+        } else {
+            InterlockedExchange(&s_jobchains[i].rerun, 1);
+            static int n = 0;
+            if (n++ < 8) printf("[cellSpurs] %s(jc=0x%08X) while a walk is in progress -- queued a re-walk\n",
+                                who, (u32)jc_ea);
         }
         return CELL_OK;
     }
