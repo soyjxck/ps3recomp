@@ -147,6 +147,12 @@ typedef struct rsx_draw_backend {
     /* Resolve a depth target into a sampleable texture and return it; 0 when
      * the backend cannot. The engine only asks after a depth-writing draw. */
     u32  (*depth_snapshot)(void* user, u32 depth, u32 w, u32 h);
+    /* A copy of a colour target as it stands at this point of the stream,
+     * for a draw that samples the target it writes (a title's in-place
+     * post-process, legal on the RSX and undefined on every host API); 0
+     * when the backend cannot. The engine binds the copy, with the unit's
+     * crossbar, in place of the live target. */
+    u32  (*color_snapshot)(void* user, u32 surface);
 
     /* Pipelines, from the decompilers' HLSL plus the state that selects a
      * variant. This is the one call that hides D3DCompile against glslang

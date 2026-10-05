@@ -1954,7 +1954,10 @@ static void gcm_rsx_process_fifo_unlocked(void)
                      * tells the title every queried object is occluded. */
                     if (m == 0x1800) {
                         const u32 v = vm_read32(dea), idx = (v & 0xFFFFFFu) / 16u;
-                        { static int rn = 0; if (rn++ < 6) printf("[GET_REPORT] type=%u idx=%u%c", v >> 24, idx, 10); }
+                        /* GCM_REPORT_LOG=1: every report command, uncapped (how
+                         * many queries a frame issues, and of which type). */
+                        { static int rn = 0, all = -1; if (all < 0) all = getenv("GCM_REPORT_LOG") ? 1 : 0;
+                          if (all || rn++ < 6) printf("[GET_REPORT] type=%u idx=%u%c", v >> 24, idx, 10); }
                         if (idx < CELL_GCM_MAX_REPORT_COUNT) {
                             s_report_data[idx].timestamp = get_timestamp_ns();
                             s_report_data[idx].value = (v >> 24) == 1u ? 0xFFFFu : 0u;
@@ -1970,13 +1973,32 @@ static void gcm_rsx_process_fifo_unlocked(void)
                          * every queried object occluded, hidden until the next
                          * re-test. Characters, props and distant buildings
                          * flickered in for a frame and vanished again. */
-                        if (s_config.localAddress && (v & 0xFFFFFFu) + 16u <= s_config.localSize) {
-                            const u32 rea = s_config.localAddress + 0x0E000000u + (v & 0xFFFFFFu);
+                        {
                             const u64 ts = get_timestamp_ns();
-                            vm_write32(rea + 0, (u32)(ts >> 32));
-                            vm_write32(rea + 4, (u32)ts);
-                            vm_write32(rea + 8, (v >> 24) == 1u ? 0xFFFFu : 0u);
-                            vm_write32(rea + 12, 0u);
+                            const u32 off = v & 0xFFFFFFu;
+                            const u32 val = (v >> 24) == 1u ? 0xFFFFu : 0u;
+                            /* The local report area follows the 256 labels in the
+                             * same window (notify, labels, reports: the layout the
+                             * real system exposes through cellGcmGetLabelAddress,
+                             * and the one a title's inline report readers derive
+                             * from it). The HLE window has 0x1000 bytes between the
+                             * labels and the control block, room for 256 reports;
+                             * a title that uses more is reported once. */
+                            if (off + 16u <= 0x1000u) {
+                                const u32 rea = GCM_LABEL_GUEST_BASE + 0x1000u + off;
+                                vm_write32(rea + 0, (u32)(ts >> 32));
+                                vm_write32(rea + 4, (u32)ts);
+                                vm_write32(rea + 8, val);
+                                vm_write32(rea + 12, 0u);
+                            } else { static int _n = 0; if (_n++ < 4)
+                                printf("[GET_REPORT] index %u beyond the 256 the label window holds\n", idx); }
+                            if (s_config.localAddress && off + 16u <= s_config.localSize) {
+                                const u32 rea = s_config.localAddress + 0x0E000000u + off;
+                                vm_write32(rea + 0, (u32)(ts >> 32));
+                                vm_write32(rea + 4, (u32)ts);
+                                vm_write32(rea + 8, val);
+                                vm_write32(rea + 12, 0u);
+                            }
                         }
                     }
                 } else

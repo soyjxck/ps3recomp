@@ -1108,11 +1108,23 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     if (vi > 0 && fi > 0)
         handle = g.be->pipeline_create(g.be->user, s_vs_hlsl, s_ps_hlsl, rs,
                                        layout, layout->stride, rt_fmt, rt_count);
-    { static u32 logs = 0; if (logs++ < 32)
+    /* RSX_PIPE_LOG=1 lifts the cap: the draw trace names pipelines by handle,
+     * and the fragment program's FNV hash is what the shader dump files carry. */
+    { static u32 logs = 0; static int uncapped = -1;
+      if (uncapped < 0) uncapped = getenv("RSX_PIPE_LOG") ? 1 : 0;
+      if (uncapped || logs++ < 32) {
+        unsigned long long fh = 1469598103934665603ull;
+        for (u32 i = 0; fp_uc && i < fp_size; i++) fh = (fh ^ fp_uc[i]) * 1099511628211ull;
+        /* The HLSL hashes are the names the shader dump files carry
+         * (PS3RECOMP_METAL_SHADER_DUMP writes vp_<hash>.msl / fp_<hash>.msl). */
+        unsigned long long vh = 1469598103934665603ull, ph = 1469598103934665603ull;
+        for (const char* c = s_vs_hlsl; *c; c++) vh = (vh ^ (unsigned char)*c) * 1099511628211ull;
+        for (const char* c = s_ps_hlsl; *c; c++) ph = (ph ^ (unsigned char)*c) * 1099511628211ull;
         fprintf(stderr, "[rsx engine] pipeline %016llx: %s vp %d, fp %d,"
-                        " %u constants -> %s\n",
+                        " %u constants -> %s handle=%u fp-hash=%016llx fp-size=%u blend=%u(%X/%X) vp-hlsl=%016llx fp-hlsl=%016llx\n",
                 (unsigned long long)key, fixed ? "built-in" : "guest",
-                vi, fi, nconst, handle ? "ok" : "FAILED (draw dropped)"); }
+                vi, fi, nconst, handle ? "ok" : "FAILED (draw dropped)", handle, fh, fp_size,
+                rs->blend_enable, rs->sf_rgb, rs->df_rgb, vh, ph); } }
 
     g.pipelines[g.n_pipelines].key = key;
     g.pipelines[g.n_pipelines].handle = handle;
@@ -1327,10 +1339,27 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
              * one of them. */
             int own = 0;
             for (u32 k = 0; k < n_targets; k++) if (target_slots[k] == i) own = 1;
-            if (own) break;
+            if (own) {
+                /* The draw samples the target it writes. Drakengard 3's
+                 * post-process runs in place in the back buffer it then
+                 * flips; binding the live target is undefined, and the old
+                 * fallback -- the guest's stale bytes -- came out white on
+                 * every such frame. Sample a copy taken at this point. */
+                const u32 snap = g.be->color_snapshot
+                    ? g.be->color_snapshot(g.be->user, g.surfaces[i].handle) : 0;
+                if (snap) {
+                    const u32 view = g.be->surface_view
+                        ? g.be->surface_view(g.be->user, snap, t.remap & 0xFFFFu, t.format) : 0;
+                    textures[u] = view ? view : snap;
+                    { static int _n = 0; if (_n++ < 4)
+                        fprintf(stderr, "[rsx engine] unit %u samples its own target s%u: bound a copy\n", u, i); }
+                }
+                break;
+            }
             sampled = (int)i;
             break;
         }
+        if (textures[u]) continue;
         if (sampled >= 0) {
             const u32 view = g.be->surface_view
                 ? g.be->surface_view(g.be->user, g.surfaces[sampled].handle,
@@ -1383,6 +1412,7 @@ static u32 sink_bind_vertex_textures(
  * counts, the enabled vertex attributes (type/size/stride/location/offset),
  * the index array, textures and the outcome. */
 static struct { unsigned long issued, drop_topo, drop_fetch, drop_targets, drop_pipeline, drop_empty; } s_dstat;
+static unsigned s_surf_draws[ENG_MAX_SURFACES];   /* draws per surface since the last present */
 static int s_dstat_on = -1; static long s_dtrace_frame = -2;
 static void eng_draw_stats_tick(void)
 {
@@ -1397,8 +1427,50 @@ static void eng_draw_stats_report(void)
             s_dstat.drop_pipeline, s_dstat.drop_empty);
     memset(&s_dstat, 0, sizeof s_dstat);
 }
+/* Retroactive trace: with RSX_TRACE_ON_WHITE set, every draw and clear is
+ * also formatted into a ring of the last 512 records, and a present that
+ * reads back white dumps the ring -- the draws that PRODUCED the white
+ * buffer, which a trace armed after the fact can never show. */
+#define ENG_RING_N 512
+static char s_ring[ENG_RING_N][400];
+static u32  s_ring_head = 0, s_ring_used = 0;
+static int  s_ring_on = -1;
+static void eng_ring_push(const char* line)
+{
+    size_t n = strlen(line); if (n >= sizeof s_ring[0]) n = sizeof s_ring[0] - 1;
+    memcpy(s_ring[s_ring_head], line, n); s_ring[s_ring_head][n] = 0;
+    s_ring_head = (s_ring_head + 1) % ENG_RING_N; if (s_ring_used < ENG_RING_N) s_ring_used++;
+}
+static void eng_ring_dump(const char* why)
+{
+    fprintf(stderr, "[ring] ---- %s: last %u records ----\n", why, s_ring_used);
+    for (u32 i = 0; i < s_ring_used; i++)
+        fprintf(stderr, "[ring] %s\n", s_ring[(s_ring_head + ENG_RING_N - s_ring_used + i) % ENG_RING_N]);
+    fprintf(stderr, "[ring] ---- end ----\n");
+}
+static void eng_ring_draw(const char* outcome, u32 prim, int indexed, u32 n_draw, u32 pipeline, u32 tex_mask)
+{
+    if (s_ring_on < 0) s_ring_on = getenv("RSX_TRACE_ON_WHITE") ? 1 : 0;
+    if (!s_ring_on) return;
+    rsx_be_render_state trs; rsx_draw_engine_decode_render_state(&g.rsx, &trs);
+    u32 tt[RSX_BE_MAX_COLOR_TARGETS]; const u32 tn = eng_current_target_set(tt);
+    rsx_dsp_surface tsf; rsx_dsp_get_surface(&g.rsx, &tsf);
+    char line[400]; int o = snprintf(line, sizeof line,
+        "f%u %s prim=%u verts=%u idx=%d n=%u pipe=%u tex=0x%X target=s%d(fmt%u) zeta=0x%08X clip=%ux%u blend=%u(%X/%X) alpha=%u depth=%u/%u/%X cull=%u mask=0x%X",
+        g.frames, outcome, prim, dc.n_verts, indexed, n_draw, pipeline, tex_mask,
+        tn ? (int)tt[0] : -1, tn ? (u32)g.surfaces[tt[0]].fmt : 0, tsf.zeta_offset, tsf.clip_w, tsf.clip_h,
+        trs.blend_enable, trs.sf_rgb, trs.df_rgb, trs.alpha_test_enable, trs.depth_test, trs.depth_write, trs.depth_func,
+        trs.cull_enable, trs.color_mask);
+    if (dc.n_verts && dc.n_verts <= 4 && dc.verts && dc.layout.stride && o > 0 && o < (int)sizeof line - 40) {
+        const float* v = (const float*)dc.verts;
+        for (u32 k = 0; k < 8 && k < dc.layout.stride / 4 && o < (int)sizeof line - 12; k++)
+            o += snprintf(line + o, sizeof line - o, "%s%.3g", k ? " " : " v0=", v[k]);
+    }
+    eng_ring_push(line);
+}
 static void eng_draw_trace(const char* outcome, u32 prim, int indexed, u32 n_draw, u32 pipeline, u32 tex_mask)
 {
+    eng_ring_draw(outcome, prim, indexed, n_draw, pipeline, tex_mask);
     /* Four consecutive frames: a title that presents each rendered frame
      * twice has every other frame empty of draws. */
     if (s_dtrace_frame < 0 || (long)g.frames < s_dtrace_frame || (long)g.frames >= s_dtrace_frame + 4) return;
@@ -1416,10 +1488,14 @@ static void eng_draw_trace(const char* outcome, u32 prim, int indexed, u32 n_dra
     /* The first decoded vertex of a small draw: a full-screen quad's position
      * and its vertex colour are what decide whether it covers the frame. */
     if (dc.n_verts && dc.n_verts <= 8 && dc.verts && dc.layout.stride) {
-        const float* v = (const float*)dc.verts;
-        fprintf(stderr, " v0=[");
-        for (u32 k = 0; k < dc.layout.stride / 4 && k < 16; k++) fprintf(stderr, "%s%.3g", k ? " " : "", v[k]);
-        fprintf(stderr, "]");
+        /* Every vertex of a small draw, first 8 floats each: a quad's four
+         * corners and colours say whether it covers the frame and with what. */
+        for (u32 n = 0; n < dc.n_verts; n++) {
+            const float* v = (const float*)(dc.verts + (size_t)n * dc.layout.stride);
+            fprintf(stderr, " v%u=[", n);
+            for (u32 k = 0; k < dc.layout.stride / 4 && k < 8; k++) fprintf(stderr, "%s%.3g", k ? " " : "", v[k]);
+            fprintf(stderr, "]");
+        }
     }
     fprintf(stderr, " attrs:");
     for (u32 i = 0; i < 16; i++) {
@@ -1428,6 +1504,19 @@ static void eng_draw_trace(const char* outcome, u32 prim, int indexed, u32 n_dra
         fprintf(stderr, " %u:t%u/%u/s%u/L%u/0x%08X", i, a.type, a.size, a.stride, a.location, a.offset);
     }
     fputc('\n', stderr);
+    /* A GPU-skinned draw (an unnormalised-byte attribute carries its bone
+     * indices): the constants Drakengard 3's skinning program reads -- bone
+     * rows from c207, the unpack factors in c463, position scale/offset in
+     * c465/c466 -- as the dispatcher holds them for this draw. */
+    { int skinned = 0;
+      for (u32 i = 0; i < 16 && !skinned; i++) { rsx_dsp_vertex_attr a; rsx_dsp_get_vertex_attr(&g.rsx, i, &a); if (a.type == 7) skinned = 1; }
+      if (skinned) {
+          static const u32 slots[] = { 204, 207, 208, 209, 210, 211, 212, 462, 463, 464, 465, 466, 467 };
+          fprintf(stderr, "[draw-trace]   constants:");
+          for (u32 k = 0; k < sizeof slots / sizeof slots[0]; k++) {
+              const float* c = g.rsx.constants[slots[k]];
+              fprintf(stderr, " c%u=(%.3g %.3g %.3g %.3g)", slots[k], c[0], c[1], c[2], c[3]); }
+          fputc('\n', stderr); } }
 }
 static void sink_end(void* user, const rsx_dispatch* r)
 {
@@ -1471,6 +1560,16 @@ static void sink_end(void* user, const rsx_dispatch* r)
 
     rsx_be_render_state rs;
     rsx_draw_engine_decode_render_state(&g.rsx, &rs);
+    /* RSX_SKIP_BLEND=<sf>/<df> (hex blend factors): drop every blended draw
+     * using that pair -- an experiment switch to tell whether one blend mode's
+     * draws are what wrecks a frame. */
+    { static long sk_sf = -2, sk_df = 0;
+      if (sk_sf == -2) { const char* e = getenv("RSX_SKIP_BLEND"); sk_sf = -1;
+          if (e) { char* d; sk_sf = strtol(e, &d, 16); if (*d == '/') sk_df = strtol(d + 1, 0, 16); } }
+      if (sk_sf >= 0 && rs.blend_enable && (long)rs.sf_rgb == sk_sf && (long)rs.df_rgb == sk_df) {
+          static unsigned long nskip = 0; if (++nskip <= 4 || (nskip % 1000) == 0)
+              fprintf(stderr, "[rsx engine] RSX_SKIP_BLEND: dropped draw #%lu (blend %lX/%lX)\n", nskip, sk_sf, sk_df);
+          return; } }
 
     u32 targets[RSX_BE_MAX_COLOR_TARGETS];
     const u32 n_targets = eng_current_target_set(targets);
@@ -1504,8 +1603,22 @@ static void sink_end(void* user, const rsx_dispatch* r)
      * program would draw the geometry in the wrong colours, which is harder to
      * see than a missing object and hides the translation failure. */
     int pipeline_is_fixed = 1;
-    const u32 pipeline = eng_pipeline_get(&layout, &rs,
-                                          eng_surface_format(sf.color_format),
+    /* The pipeline's colour attachment format must be the format of the
+     * texture that is really bound, which is the one the surface was
+     * registered with. A pass that declares another format for the same
+     * offset -- Drakengard 3's depth pre-pass binds a display buffer -- would
+     * otherwise get a pipeline whose attachment format disagrees with the
+     * attachment, and what Metal then renders is undefined. */
+    rsx_be_format rt_fmt = eng_surface_format(sf.color_format);
+    if (g.surfaces[target].fmt != RSX_BE_FMT_NONE && g.surfaces[target].fmt != rt_fmt) {
+        static unsigned long n_mismatch = 0;
+        if (++n_mismatch <= 12 || (n_mismatch % 5000) == 0)
+            fprintf(stderr, "[rsx engine] surface s%u (off=0x%08X) declared fmt %u but registered as %u -- using the registered one (#%lu, mask=0x%X)\n",
+                    target, g.surfaces[target].offset, (unsigned)rt_fmt, (unsigned)g.surfaces[target].fmt,
+                    n_mismatch, rs.color_mask);
+        rt_fmt = g.surfaces[target].fmt;
+    }
+    const u32 pipeline = eng_pipeline_get(&layout, &rs, rt_fmt,
                                           n_targets, &pipeline_is_fixed);
     if (!pipeline) { s_dstat.drop_pipeline++; eng_draw_trace("DROP-pipeline", prim, indexed, n_draw, 0, tex_mask); return; }
 
@@ -1606,6 +1719,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
      * evidence that the decompile-translate-compile path worked. */
     if (!pipeline_is_fixed) g.guest_draws++;
     s_dstat.issued++;
+    if (target < ENG_MAX_SURFACES) s_surf_draws[target]++;
     eng_draw_trace(pipeline_is_fixed ? "OK-fixed" : "OK", prim, indexed, n_draw, pipeline, tex_mask);
 
     if (zslot != ENG_INVALID && rs.depth_test && rs.depth_write)
@@ -1618,6 +1732,11 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
     if (!g.ready) return;
     u32 targets[RSX_BE_MAX_COLOR_TARGETS];
     const u32 n_targets = eng_current_target_set(targets);
+    if (s_ring_on < 0) s_ring_on = getenv("RSX_TRACE_ON_WHITE") ? 1 : 0;
+    if (s_ring_on) { char line[160];
+        snprintf(line, sizeof line, "f%u CLEAR mask=0x%X color=0x%08X target=s%d", g.frames, mask,
+                 rsx_dsp_clear_color(&g.rsx), n_targets ? (int)targets[0] : -1);
+        eng_ring_push(line); }
     if (!n_targets) return;
 
     if (mask & (RSX_CLEAR_COLOR_R | RSX_CLEAR_COLOR_G |
@@ -1759,8 +1878,33 @@ static void eng_present(u32 buffer_id)
     g.last_present_surface = target;
     g.be->present(g.be->user, g.surfaces[target].handle);
     eng_surface_dump_frame();
+    /* RSX_PRESENT_LOG=<from frame>: one line per present from that frame on:
+     * the guest's buffer id, the surface it resolved to, the draws each
+     * 1280x720 colour surface received since the last present, and the mean
+     * brightness of what was presented. The dump strides of 120 and 240
+     * frames are multiples of a three-buffer rotation, so they could not
+     * tell "one buffer in three is white" from "a white episode". */
+    { static long from = -2; if (from == -2) { const char* e = getenv("RSX_PRESENT_LOG"); from = e ? atol(e) : -1; }
+      if (from >= 0 && (long)g.frames >= from) {
+          double mean = -1.0;
+          const eng_surface* ps = &g.surfaces[target];
+          if (ps->fmt == RSX_BE_FMT_R8G8B8A8 && ps->w && ps->h) {
+              u8* buf = (u8*)malloc((size_t)ps->w * ps->h * 4);
+              if (buf) { g.be->readback(g.be->user, ps->handle, 0, 0, ps->w, ps->h, buf, ps->w * 4);
+                  unsigned long long sum = 0; u32 n = 0;
+                  for (u32 p = 0; p < ps->w * ps->h; p += 61) { sum += buf[p * 4] + buf[p * 4 + 1] + buf[p * 4 + 2]; n += 3; }
+                  mean = n ? (double)sum / n : 0.0; free(buf); } }
+          fprintf(stderr, "[present] f=%u buffer=%u -> s%u(off=%08X) mean=%.0f draws:", g.frames, buffer_id, target, ps->offset, mean);
+          for (u32 i = 0; i < g.n_surfaces; i++)
+              if (s_surf_draws[i]) fprintf(stderr, " s%u=%u", i, s_surf_draws[i]);
+          fputc('\n', stderr);
+      }
+      memset(s_surf_draws, 0, sizeof s_surf_draws); }
     /* RSX_TRACE_ON_WHITE=1: read the presented frame back; when it comes out
      * (nearly) all white, trace the next four frames draw by draw. */
+    if (s_ring_on > 0) { char line[120];
+        snprintf(line, sizeof line, "f%u PRESENT buffer=%u -> s%u(off=%08X)", g.frames, buffer_id, target, g.surfaces[target].offset);
+        eng_ring_push(line); }
     { static long on = -1; if (on < 0) { const char* e = getenv("RSX_TRACE_ON_WHITE"); on = e ? atol(e) : 0; }
       /* The value is the first frame to watch from (a title's own fade-from-
        * white at a level start is not the bug); each episode traces four
@@ -1777,6 +1921,7 @@ static void eng_present(u32 buffer_id)
               for (u32 p = 0; p < w * h; p += step) { sum += buf[p * 4] + buf[p * 4 + 1] + buf[p * 4 + 2]; n += 3; }
               const double mean = n ? (double)sum / n : 0.0;
               if (mean > 250.0) {
+                  eng_ring_dump("white present");
                   armed = 1; armed_at = g.frames; s_dtrace_frame = (long)g.frames + 1;
                   fprintf(stderr, "[draw-trace] frame %u presented WHITE (mean %.1f): tracing frames %ld..%ld\n",
                           g.frames, mean, s_dtrace_frame, s_dtrace_frame + 3);
