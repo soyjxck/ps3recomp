@@ -1453,13 +1453,23 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
         }
         const u32 base_fmt = t.format & RSX_TEX_FMT_BASE_MASK & ~(u32)RSX_TEX_FMT_UNNORM;
         if (base_fmt == RSX_TEX_FMT_DEPTH24_D8) {
+            int found = 0;
             for (u32 i = 0; i < g.n_zdepths; i++)
                 if (g.zdepths[i].location == t.location &&
                     g.zdepths[i].offset == t.offset && current_zslot != i) {
+                    found = 1;
                     const u32 snap = eng_zdepth_snapshot(i);
                     if (snap) textures[u] = snap;
+                    else { static int n = 0; if (n++ < 6)
+                        fprintf(stderr, "[rsx engine] depth texture unit %u (loc %u off 0x%08X %ux%u): tracked zeta %u has no snapshot (handle %u had_write %u)\n",
+                                u, t.location, t.offset, t.width, t.height, i, g.zdepths[i].handle, g.zdepths[i].had_write); }
                     break;
                 }
+            if (!found) { static int n = 0; if (n++ < 6) {
+                fprintf(stderr, "[rsx engine] depth texture unit %u (loc %u off 0x%08X %ux%u zfunc %u): no tracked zeta matches; zetas:",
+                        u, t.location, t.offset, t.width, t.height, (t.wrap >> 28) & 0xFu);
+                for (u32 i = 0; i < g.n_zdepths; i++) fprintf(stderr, " %u:%u/0x%08X/%ux%u%s", i, g.zdepths[i].location, g.zdepths[i].offset, g.zdepths[i].w, g.zdepths[i].h, current_zslot == i ? "(bound)" : "");
+                fputc('\n', stderr); } }
             if (textures[u]) continue;
         }
         textures[u] = eng_texture_slot(t.location, t.offset, t.format,

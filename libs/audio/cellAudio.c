@@ -607,17 +607,53 @@ static void* audio_mix_thread_func(void* arg)
 {
     (void)arg;
     printf("[cellAudio] Mixing thread started\n");
+#ifdef __APPLE__
+    /* The mixer is what keeps the device fed: let the scheduler treat it so. */
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+
+    /* Pace to the device, as the Windows loop does. This used to mix a block
+     * and then sleep a flat 2 ms (5 ms once four blocks were queued): faster
+     * than the 5.33 ms a block lasts, so the mixer ran ahead of real time and
+     * read the guest's port ring before the guest had written the block --
+     * stale or silent 5 ms slices in the output, heard as crackling -- while a
+     * 2 ms sleep that overslept under load let the four-block queue run dry.
+     * Now: mix one block whenever the device holds less than
+     * AUDIO_QUEUE_BLOCKS (default 8, 43 ms) and otherwise wait 1 ms, so blocks
+     * leave at the device's rate and the guest is notified at it too. With no
+     * device, pace on the clock. AUDIO_RATE=1 reports blocks/s and underruns. */
+    int target = 8;
+    { const char* e = getenv("AUDIO_QUEUE_BLOCKS"); if (e && atoi(e) > 0) target = atoi(e); }
+    struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+    unsigned long long blocks = 0;
+    int rate_on = getenv("AUDIO_RATE") ? 1 : 0;
+    struct timespec r0 = t0; unsigned rn = 0, dry = 0;
 
     while (s_mix_thread_running) {
+        if (s_sdl_audio_dev) {
+            const u32 queued = audio_backend_queued_samples();
+            if (queued >= (u32)target * CELL_AUDIO_BLOCK_SAMPLES) { usleep(1000); continue; }
+            if (queued == 0 && blocks > (unsigned long long)target) dry++;
+        } else {
+            struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+            const double el = (now.tv_sec - t0.tv_sec) + (now.tv_nsec - t0.tv_nsec) * 1e-9;
+            const double due = (double)blocks * CELL_AUDIO_BLOCK_SAMPLES / CELL_AUDIO_SAMPLE_RATE;
+            if (el < due) { usleep(1000); continue; }
+            if (el - due > 0.05) t0 = now, blocks = 0;   /* far behind: drop the backlog */
+        }
+        blocks++;
         audio_mix_one_block();
         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
         audio_notify_event_queues();
-
-        u32 queued = audio_backend_queued_samples();
-        if (queued > CELL_AUDIO_BLOCK_SAMPLES * 4) {
-            usleep(5000);
-        } else {
-            usleep(2000);
+        if (rate_on) {
+            rn++;
+            struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+            const double el = (now.tv_sec - r0.tv_sec) + (now.tv_nsec - r0.tv_nsec) * 1e-9;
+            if (el >= 5.0) {
+                fprintf(stderr, "[audio-rate] %.1f blocks/s (real time 187.5), queue ran dry %u times, queued %u samples\n",
+                        rn / el, dry, audio_backend_queued_samples());
+                rn = 0; dry = 0; r0 = now;
+            }
         }
     }
 

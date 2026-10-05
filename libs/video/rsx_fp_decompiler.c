@@ -426,7 +426,8 @@ void rsx_fp_set_shadow_units(u32 mask, const u8* funcs)
     for (u32 u = 0; u < 16; u++) s_shadow_func[u] = funcs ? (u8)(funcs[u] & 7u) : 0;
 }
 
-/* The comparison a shadow unit applies, as "reference OP texel". */
+/* A shadow unit's comparison written as "reference OP texel" (GL order); the
+ * helper below flips it to the RSX's "texel OP reference" by default. */
 static const char* fp_shadow_op(u32 f)
 {
     static const char* op[8] = { "<", "<", "==", "<=", ">", "!=", ">=", "<" };
@@ -943,20 +944,43 @@ static int rsx_fp_decompile_internal(
         char tn[24], fn[1400];
         snprintf(tn, sizeof tn, tex_cube_mask ? "rsx_tex%u" : "rsx_tex[%u]", u);
         const char* op = fp_shadow_op(s_shadow_func[u]);
+        /* RSX_SHADOW_FORWARD=1: the GL order, "reference OP texel". The
+         * default is the RSX's own, "texel OP reference" (RPCS3 builds its
+         * compare samplers with the direction reversed for the same reason).
+         * Drakengard 3's shadow projection binds its shadow map with GEQUAL
+         * and multiplies the light by the result: lit where the stored
+         * occluder depth is at or beyond the receiver. In GL order every
+         * receiver with no caster in front came out shadowed -- solid dark
+         * boxes the size of each shadow volume. */
+        { static int fwd = -1; if (fwd < 0) fwd = getenv("RSX_SHADOW_FORWARD") ? 1 : 0;
+          if (!fwd) { static const char* flip[8] = { ">", ">", "==", ">=", "<", "!=", "<=", ">" };
+                      op = flip[s_shadow_func[u] & 7u]; } }
         if (s_shadow_func[u] == 7u)
             snprintf(fn, sizeof fn, "float4 rsx_shadow%u(float3 c) { return (float4)1.0; }\n", u);
         else
+            /* The four texels of the bilinear footprint, fetched by integer
+             * coordinate (a gather at the exact texel corner can round into
+             * the neighbouring block, which speckled self-shadowed surfaces),
+             * clamped to the map, and compared the way the RSX does: both
+             * depths as 24-bit integers, so a receiver that IS the stored
+             * occluder compares equal instead of flipping on float noise. */
             snprintf(fn, sizeof fn,
                 "float4 rsx_shadow%u(float3 c) {\n"
                 "    float w, h; %s.GetDimensions(w, h);\n"
                 "    float2 st = c.xy * float2(w, h) - 0.5;\n"
                 "    float2 f = frac(st);\n"
-                "    float4 d = %s.GatherRed(rsx_samp[%u], (floor(st) + 1.0) / float2(w, h));\n"
-                "    float4 p = float4(c.z %s d.x ? 1.0 : 0.0, c.z %s d.y ? 1.0 : 0.0,\n"
-                "                      c.z %s d.z ? 1.0 : 0.0, c.z %s d.w ? 1.0 : 0.0);\n"
-                "    float v = lerp(lerp(p.w, p.z, f.x), lerp(p.x, p.y, f.x), f.y);\n"
+                "    int2 i0 = (int2)floor(st);\n"
+                "    int2 lim = int2((int)w - 1, (int)h - 1);\n"
+                "    int2 a = clamp(i0, int2(0, 0), lim), b = clamp(i0 + int2(1, 1), int2(0, 0), lim);\n"
+                "    float4 d = float4(%s.Load(int3(a.x, a.y, 0)).x, %s.Load(int3(b.x, a.y, 0)).x,\n"
+                "                      %s.Load(int3(a.x, b.y, 0)).x, %s.Load(int3(b.x, b.y, 0)).x);\n"
+                "    float4 dq = floor(saturate(d) * 16777215.0 + 0.5);\n"
+                "    float rq = floor(saturate(c.z) * 16777215.0 + 0.5);\n"
+                "    float4 p = float4(rq %s dq.x ? 1.0 : 0.0, rq %s dq.y ? 1.0 : 0.0,\n"
+                "                      rq %s dq.z ? 1.0 : 0.0, rq %s dq.w ? 1.0 : 0.0);\n"
+                "    float v = lerp(lerp(p.x, p.y, f.x), lerp(p.z, p.w, f.x), f.y);\n"
                 "    return (float4)v;\n"
-                "}\n", u, tn, tn, u, op, op, op, op);
+                "}\n", u, tn, tn, tn, tn, tn, op, op, op, op);
         out_puts(&p, fn);
     }
     if (buffered) {
