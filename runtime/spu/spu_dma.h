@@ -168,6 +168,17 @@ static inline int mfc_is_fence(uint32_t cmd)
 static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                                    uint32_t size, uint32_t cmd)
 {
+    /* Memory ordering against the PPU threads. On the Cell the MFC sees main
+     * memory coherently and the guest's PPU barriers (lwsync/eieio before
+     * publishing a count or pointer) are what order a producer's stores; the
+     * SPU's GET that follows sees them. Here each SPU is a host thread doing
+     * plain memcpys, and on a weakly ordered host (Apple Silicon) a GET can
+     * observe the published count before the records it covers -- Drakengard
+     * 3's PhysX task then read an all-zero request, dispatched type 0 to a
+     * null handler and died, and the level hung seconds in. Acquire before a
+     * GET, release before a PUT pair with the PPU's fences. Free on x86. */
+    if ((cmd & 0xF0u) == 0x40u) __atomic_thread_fence(__ATOMIC_ACQUIRE);   /* GET*  */
+    else                        __atomic_thread_fence(__ATOMIC_RELEASE);   /* PUT*  */
     /* SPU_DMA_WATCH=<hex>: report any transfer whose destination RANGE covers
      * this guest address. A DMA landing in the loaded ELF image is always a
      * bug, and it is invisible to the sampling traces -- YDKJ had an SPU job

@@ -42,6 +42,7 @@ extern uint32_t      g_ww_dyn;             /* word watch armed at run time      
 extern uint32_t      g_null_sweep_hi;      /* null-store sweep in progress      */
 extern int           g_ppu_vm_slow_reads;  /* a read diagnostic is armed        */
 extern int           g_ppu_vm_slow_stores; /* a store diagnostic is armed       */
+extern uint32_t      ppu_hle_inject_base;  /* GCM control block at +0x2000      */
 
 uint8_t  vm_read8_slow (uint64_t addr);
 uint16_t vm_read16_slow(uint64_t addr);
@@ -88,7 +89,11 @@ static inline uint16_t vm_fast_read16(uint64_t ea)
 static inline uint32_t vm_fast_read32(uint64_t ea)
 {
     uint32_t a = (uint32_t)ea;
-    if (__builtin_expect(!g_ppu_vm_slow_reads && ppu_vm_fast_ok(a, 4), 1)) {
+    /* A read of the GCM ref register is not a plain load: the slow path
+     * publishes the next queued RSX fence on it (GCM_REFPOLL), and a title
+     * spinning on it in cellGcmFinish waits forever without that. */
+    if (__builtin_expect(!g_ppu_vm_slow_reads && ppu_vm_fast_ok(a, 4) &&
+                         a != ppu_hle_inject_base + 0x2008u, 1)) {
         uint32_t v = *(volatile uint32_t*)(vm_base + a); return __builtin_bswap32(v);
     }
     return vm_read32_slow(ea);
