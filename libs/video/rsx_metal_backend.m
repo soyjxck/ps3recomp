@@ -2204,7 +2204,16 @@ static u32 eng_obj_add(id<MTLTexture> t)
     if (s_eng_obj_free_count) {
         slot = s_eng_obj_free[--s_eng_obj_free_count];
     } else {
-        if (s_eng_obj_count >= ENG_MAX_OBJECTS) return 0;
+        if (s_eng_obj_count >= ENG_MAX_OBJECTS) {
+            /* Every texture, target and snapshot the engine creates from here
+             * on fails. Say so: silently, it looked like missing textures and
+             * green movies minutes into a session. */
+            static unsigned long n = 0;
+            if (n++ % 10000 == 0)
+                fprintf(stderr, "[rsx engine/metal] object table full (%u live, %u retired-pending): texture creation FAILS (#%lu)\n",
+                        s_eng_obj_count, s_eng_obj_count - s_eng_obj_free_count, n);
+            return 0;
+        }
         slot = s_eng_obj_count++;
     }
     s_eng_obj[slot] = t;
@@ -3245,6 +3254,13 @@ static void eng_dump_frame(id<MTLTexture> src)
 static void eng_present(void* user, u32 surface)
 {
     (void)user;
+    /* RSX_OBJ_STATS=1: the object table's occupancy every 600 presents -- a
+     * leak shows as a climbing live count long before the table fills. */
+    { static int on = -1; static unsigned n = 0;
+      if (on < 0) on = getenv("RSX_OBJ_STATS") ? 1 : 0;
+      if (on && (++n % 600) == 0)
+          fprintf(stderr, "[rsx engine/metal] objects: %u slots used, %u free, %u live (present %u)\n",
+                  s_eng_obj_count, s_eng_obj_free_count, s_eng_obj_count - s_eng_obj_free_count, n); }
     id<MTLTexture> src = eng_obj(surface);
     if (!src) { eng_encode_and_commit(nil); return; }
     eng_encode_and_commit(src);

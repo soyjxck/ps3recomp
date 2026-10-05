@@ -656,6 +656,7 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
 
     eng_zdepth* z = &g.zdepths[slot];
     if (z->handle) g.be->depth_target_release(g.be->user, z->handle);
+    if (z->snapshot && g.be->texture_release) g.be->texture_release(g.be->user, z->snapshot);
     z->location = location; z->offset = offset;
     z->w = want_w; z->h = want_h;
     z->handle = handle;
@@ -677,6 +678,18 @@ static u32 eng_zdepth_snapshot(u32 slot)
     if (!z->handle || !z->had_write) return 0;
     if (z->snapshot_valid && z->snapshot) return z->snapshot;
     if (!g.be->depth_snapshot) return 0;
+    /* The previous image of this zeta is stale (a clear invalidated it), so
+     * hand it back before resolving a new one. It never was: every shadow-map
+     * clear leaked one backend texture -- a frame's worth of them per frame --
+     * until the backend's 4096-entry object table filled, a few minutes into
+     * play, and from then on EVERY new texture failed to create. In
+     * Drakengard 3 that is the in-game cutscene sampling three missing video
+     * planes (solid green), and the player's body vanishing for good once its
+     * textures were next re-uploaded. Draws already recorded against the old
+     * snapshot keep it: the backend retires the handle and recycles it only
+     * after the frame is encoded. */
+    if (z->snapshot && g.be->texture_release) g.be->texture_release(g.be->user, z->snapshot);
+    z->snapshot = 0;
     const u32 tex = g.be->depth_snapshot(g.be->user, z->handle, z->w, z->h);
     if (!tex) return 0;
     z->snapshot = tex;

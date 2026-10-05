@@ -2950,13 +2950,31 @@ s32 cellGcmAddressToOffset(u32 address, u32* offset)
  * heap (all zeros) and the RSX walker consumed every frame's commands as
  * no-ops (no draws, label fence never written, guest waited forever). */
 static u32 s_io_alloc_next = 0;
+/* First fit over the IO space the active mappings leave free, from past the
+ * Init window. It used to be a bump allocator that never took back what
+ * cellGcmUnmapIoAddress released: Drakengard 3 maps three 1 MB video planes
+ * per movie and unmaps them after, so every movie took fresh IO pages and a
+ * long session would run off the end. libgcm reuses freed pages, and a title
+ * may rely on a remapped buffer landing where it did before. */
 static u32 gcm_io_alloc(u32 size)
 {
-    if (s_io_alloc_next == 0)
-        s_io_alloc_next = (s_config.ioSize + 0xFFFFFu) & ~0xFFFFFu;
-    if (s_io_alloc_next < 0x100000u) s_io_alloc_next = 0x100000u;
-    u32 io = s_io_alloc_next;
-    s_io_alloc_next += (size + 0xFFFFFu) & ~0xFFFFFu;
+    u32 base = (s_config.ioSize + 0xFFFFFu) & ~0xFFFFFu;
+    if (base < 0x100000u) base = 0x100000u;
+    size = (size + 0xFFFFFu) & ~0xFFFFFu;
+    u32 io = base;
+    for (int pass = 0; pass < CELL_GCM_MAX_IO_MAPPINGS + 1; pass++) {
+        int moved = 0;
+        for (int i = 0; i < CELL_GCM_MAX_IO_MAPPINGS; i++) {
+            const IoMapping* m = &s_io_mappings[i];
+            if (!m->active || !m->size) continue;
+            if (io < m->io + m->size && m->io < io + size) {   /* overlaps */
+                io = (m->io + m->size + 0xFFFFFu) & ~0xFFFFFu;
+                moved = 1;
+            }
+        }
+        if (!moved) break;
+    }
+    if (io + size > s_io_alloc_next) s_io_alloc_next = io + size;   /* high-water mark */
     return io;
 }
 
