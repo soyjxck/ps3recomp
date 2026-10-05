@@ -1959,6 +1959,25 @@ static void gcm_rsx_process_fifo_unlocked(void)
                             s_report_data[idx].timestamp = get_timestamp_ns();
                             s_report_data[idx].value = (v >> 24) == 1u ? 0xFFFFu : 0u;
                         }
+                        /* The report lands in GUEST memory as well: the SDK's
+                         * cellGcmGetReportDataAddress and friends are inline
+                         * helpers that compute localAddress + 0x0E000000 +
+                         * index * 16 and read the CellGcmReportData there
+                         * ({timestamp, value, zero}, big-endian). Only the host
+                         * array above was ever written, so a title that polls the
+                         * area -- Drakengard 3's UE3 renderer, for every occlusion
+                         * query it issues -- read value 0: "no pixels passed",
+                         * every queried object occluded, hidden until the next
+                         * re-test. Characters, props and distant buildings
+                         * flickered in for a frame and vanished again. */
+                        if (s_config.localAddress && (v & 0xFFFFFFu) + 16u <= s_config.localSize) {
+                            const u32 rea = s_config.localAddress + 0x0E000000u + (v & 0xFFFFFFu);
+                            const u64 ts = get_timestamp_ns();
+                            vm_write32(rea + 0, (u32)(ts >> 32));
+                            vm_write32(rea + 4, (u32)ts);
+                            vm_write32(rea + 8, (v >> 24) == 1u ? 0xFFFFu : 0u);
+                            vm_write32(rea + 12, 0u);
+                        }
                     }
                 } else
                     gcm_2d_method(subch, m, vm_read32(dea));

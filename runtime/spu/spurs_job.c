@@ -170,6 +170,23 @@ static void spu_context_init_regs(spu_context* ctx)
     ctx->status = SPU_STATUS_STOPPED;
 }
 
+
+/* Monotonic nanoseconds for the job-shape histogram (spu_workload.c keeps
+ * its own copy private). */
+#ifdef _WIN32
+static uint64_t sj_now_ns(void)
+{
+    LARGE_INTEGER f, c; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&c);
+    return (uint64_t)((double)c.QuadPart * 1e9 / (double)f.QuadPart);
+}
+#else
+#include <time.h>
+static uint64_t sj_now_ns(void)
+{
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+#endif
 int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
                       uint32_t job_ea, uint32_t job_desc_size)
 {
@@ -197,6 +214,38 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
                 job_ea, size_bin);
         return -1;
     }
+    /* SPURS_JOB_STATS=1 also keeps a histogram of job SHAPES: a title that
+     * packs several job kinds into one binary (UE3's shader patcher and its
+     * Edge geometry jobs share 0x01785E00) is told apart by the descriptor --
+     * io/out/scratch sizes, DMA-list length and the first user word. Printed
+     * with the rate line, once per 5 s per thread. */
+    { static int s_sh = -1; if (s_sh < 0) s_sh = getenv("SPURS_JOB_STATS") ? 1 : 0;
+      if (s_sh) {
+          enum { NSHAPE = 96 };
+          static struct { uint32_t io, out, scr, ndma, user; unsigned long long n; } sh[NSHAPE];
+          static int nsh = 0; static uint64_t last_print = 0;
+          static unsigned long long overflow = 0;
+          static uint32_t max_io = 0, max_out = 0, max_dma = 0, max_scr = 0;
+          uint32_t user = g32(job_ea + JH_SIZE + n_dma * 8u + n_cache * 8u);
+          if (size_io > max_io) max_io = size_io;  if (size_out > max_out) max_out = size_out;
+          if (n_dma > max_dma) max_dma = n_dma;    if (size_scr > max_scr) max_scr = size_scr;
+          int k = 0;
+          for (; k < nsh; k++)
+              if (sh[k].io == size_io && sh[k].out == size_out && sh[k].scr == size_scr &&
+                  sh[k].ndma == n_dma && sh[k].user == user) break;
+          if (k == nsh && nsh < NSHAPE) { sh[k].io = size_io; sh[k].out = size_out; sh[k].scr = size_scr;
+                                          sh[k].ndma = n_dma; sh[k].user = user; sh[k].n = 0; nsh++; }
+          if (k < nsh) sh[k].n++; else overflow++;
+          uint64_t now = sj_now_ns();
+          if (!last_print) last_print = now;
+          if (now - last_print >= 5000000000ull) {
+              last_print = now;
+              for (int i = 0; i < nsh; i++)
+                  fprintf(stderr, "[job-shape] io=%u out=%u scratch=%u dma=%u user0=0x%08X : %llu jobs\n",
+                          sh[i].io, sh[i].out, sh[i].scr, sh[i].ndma, sh[i].user, sh[i].n);
+              fprintf(stderr, "[job-shape] max io=%u out=%u scratch=%u dma=%u; %llu jobs of untracked shapes\n",
+                      max_io, max_out, max_scr, max_dma, overflow);
+          } } }
 
     spu_context* ctx = s_jctx;
     if (!ctx) {

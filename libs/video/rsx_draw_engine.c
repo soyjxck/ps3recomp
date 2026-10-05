@@ -16,6 +16,7 @@
 #include "rsx_primitives.h"
 #include "rsx_restart_cuts.h"
 #include "rsx_vertex_formats.h"
+#include <math.h>
 #include "rsx_vp_decompiler.h"
 
 #include <stdio.h>
@@ -1375,10 +1376,48 @@ static u32 sink_bind_vertex_textures(
     return bound;
 }
 
+/* RSX_DRAW_STATS=1: every 120 frames, how many draws reached the backend and
+ * how many were dropped at each silent return below (a dropped draw is an
+ * object missing from the frame, and until now nothing said so).
+ * RSX_DRAW_TRACE_FRAME=<n>: every draw of frame n in full -- primitive,
+ * counts, the enabled vertex attributes (type/size/stride/location/offset),
+ * the index array, textures and the outcome. */
+static struct { unsigned long issued, drop_topo, drop_fetch, drop_targets, drop_pipeline, drop_empty; } s_dstat;
+static int s_dstat_on = -1; static long s_dtrace_frame = -2;
+static void eng_draw_stats_tick(void)
+{
+    if (s_dstat_on < 0) s_dstat_on = getenv("RSX_DRAW_STATS") ? 1 : 0;
+    if (s_dtrace_frame == -2) { const char* e = getenv("RSX_DRAW_TRACE_FRAME"); s_dtrace_frame = e ? atol(e) : -1; }
+}
+static void eng_draw_stats_report(void)
+{
+    if (s_dstat_on != 1 || (g.frames % 120u) != 0u) return;
+    fprintf(stderr, "[draw-stats] frame %u: issued %lu, dropped topo=%lu fetch=%lu targets=%lu pipeline=%lu empty=%lu\n",
+            g.frames, s_dstat.issued, s_dstat.drop_topo, s_dstat.drop_fetch, s_dstat.drop_targets,
+            s_dstat.drop_pipeline, s_dstat.drop_empty);
+    memset(&s_dstat, 0, sizeof s_dstat);
+}
+static void eng_draw_trace(const char* outcome, u32 prim, int indexed, u32 n_draw, u32 pipeline, u32 tex_mask)
+{
+    /* Four consecutive frames: a title that presents each rendered frame
+     * twice has every other frame empty of draws. */
+    if (s_dtrace_frame < 0 || (long)g.frames < s_dtrace_frame || (long)g.frames >= s_dtrace_frame + 4) return;
+    rsx_dsp_index_array ia; rsx_dsp_get_index_array(&g.rsx, &ia);
+    fprintf(stderr, "[draw-trace] f%u %s prim=%u packets=%u refs=%u verts=%u indexed=%d n=%u pipe=%u tex=0x%X idx(loc=%u off=0x%08X u32=%d) attrs:",
+            g.frames, outcome, prim, dc.n_packets, dc.n_source_refs, dc.n_verts, indexed, n_draw, pipeline, tex_mask,
+            ia.location, ia.offset, ia.is_u32);
+    for (u32 i = 0; i < 16; i++) {
+        rsx_dsp_vertex_attr a; rsx_dsp_get_vertex_attr(&g.rsx, i, &a);
+        if (!a.type) continue;
+        fprintf(stderr, " %u:t%u/%u/s%u/L%u/0x%08X", i, a.type, a.size, a.stride, a.location, a.offset);
+    }
+    fputc('\n', stderr);
+}
 static void sink_end(void* user, const rsx_dispatch* r)
 {
     (void)user; (void)r;
     if (!g.ready || !dc.n_packets) return;
+    eng_draw_stats_tick();
 
     const u32 prim = g.rsx.current_primitive;
     /* Everything that becomes triangles -- lists, strips, fans, quads, quad
@@ -1393,33 +1432,33 @@ static void sink_end(void* user, const rsx_dispatch* r)
     int scratch = 0;
     const int rebuild = eng_topology_rebuild(prim, 0, &scratch) != 0;
     if (!rebuild) {
-        if (rsx_primitive_needs_expansion(prim)) return;
+        if (rsx_primitive_needs_expansion(prim)) { s_dstat.drop_topo++; eng_draw_trace("DROP-topology", prim, 0, 0, 0, 0); return; }
         topology = rsx_primitive_topology(prim);
-        if (topology == RSX_TOPOLOGY_UNSUPPORTED) return;
+        if (topology == RSX_TOPOLOGY_UNSUPPORTED) { s_dstat.drop_topo++; eng_draw_trace("DROP-topology", prim, 0, 0, 0, 0); return; }
     }
 
     rsx_vertex_layout_plan layout;
     eng_vertex_layout(&layout);
     dc_fetch(&layout, rebuild);
-    if (!dc.n_verts || !dc.fetch_ok) return;
+    if (!dc.n_verts || !dc.fetch_ok) { s_dstat.drop_fetch++; eng_draw_trace(dc.fetch_ok ? "DROP-noverts" : "DROP-fetch", prim, 0, 0, 0, 0); return; }
 
     int indexed = 0;
     u32 n_draw = dc.n_source_refs;
     if (rebuild) {
-        if (!eng_topology_rebuild(prim, dc.refs_remapped, &indexed)) return;
+        if (!eng_topology_rebuild(prim, dc.refs_remapped, &indexed)) { s_dstat.drop_topo++; eng_draw_trace("DROP-rebuild", prim, 0, 0, 0, 0); return; }
         n_draw = indexed
             ? rsx_draw_engine_topology_index_count(prim, dc.n_source_refs,
                                                    dc.cuts, dc.n_cuts)
             : dc.n_source_refs - dc.n_source_refs % 3u;
     }
-    if (!n_draw) return;
+    if (!n_draw) { s_dstat.drop_empty++; eng_draw_trace("DROP-empty", prim, indexed, 0, 0, 0); return; }
 
     rsx_be_render_state rs;
     rsx_draw_engine_decode_render_state(&g.rsx, &rs);
 
     u32 targets[RSX_BE_MAX_COLOR_TARGETS];
     const u32 n_targets = eng_current_target_set(targets);
-    if (!n_targets) return;
+    if (!n_targets) { s_dstat.drop_targets++; eng_draw_trace("DROP-targets", prim, indexed, n_draw, 0, 0); return; }
     const u32 target = targets[0];
 
     rsx_dsp_surface sf;
@@ -1452,7 +1491,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
     const u32 pipeline = eng_pipeline_get(&layout, &rs,
                                           eng_surface_format(sf.color_format),
                                           n_targets, &pipeline_is_fixed);
-    if (!pipeline) return;
+    if (!pipeline) { s_dstat.drop_pipeline++; eng_draw_trace("DROP-pipeline", prim, indexed, n_draw, 0, tex_mask); return; }
 
     if (indexed) {
         if (!dc_reserve_indices(n_draw)) return;
@@ -1550,6 +1589,8 @@ static void sink_end(void* user, const rsx_dispatch* r)
      * the test hook means: a draw through the built-in pair is a draw, not
      * evidence that the decompile-translate-compile path worked. */
     if (!pipeline_is_fixed) g.guest_draws++;
+    s_dstat.issued++;
+    eng_draw_trace(pipeline_is_fixed ? "OK-fixed" : "OK", prim, indexed, n_draw, pipeline, tex_mask);
 
     if (zslot != ENG_INVALID && rs.depth_test && rs.depth_write)
         g.zdepths[zslot].had_write = 1;
@@ -1620,6 +1661,71 @@ static u32 eng_present_surface(u32 buffer_id)
     return eng_current_surface();
 }
 
+/* RSX_SURF_DUMP_DIR=<dir> [RSX_SURF_DUMP_FROM=<frame> RSX_SURF_DUMP_EVERY=<n>
+ * RSX_SURF_DUMP_COUNT=<k>]: after a present, read every registered colour
+ * surface back and write it as a PPM (an FP16 target clamped to 0..1), with a
+ * log line carrying its mean and maximum. The whole post-process chain of one
+ * frame side by side: which stage goes white is then a matter of looking. */
+static void eng_surface_dump_frame(void)
+{
+    static const char* dir = (const char*)1; static long from, every, count, done;
+    if (dir == (const char*)1) {
+        dir = getenv("RSX_SURF_DUMP_DIR");
+        const char* e;
+        from  = (e = getenv("RSX_SURF_DUMP_FROM"))  ? atol(e) : 0;
+        every = (e = getenv("RSX_SURF_DUMP_EVERY")) ? atol(e) : 240; if (every <= 0) every = 240;
+        count = (e = getenv("RSX_SURF_DUMP_COUNT")) ? atol(e) : 8;
+    }
+    if (!dir || !*dir || done >= count || (long)g.frames < from || ((long)g.frames - from) % every) return;
+    done++;
+    for (u32 i = 0; i < g.n_surfaces; i++) {
+        const eng_surface* sf = &g.surfaces[i];
+        if (!sf->handle || !sf->w || !sf->h) continue;
+        const int fp16 = sf->fmt == RSX_BE_FMT_R16G16B16A16F;
+        const int f32  = sf->fmt == RSX_BE_FMT_R32F;
+        if (!fp16 && !f32 && sf->fmt != RSX_BE_FMT_R8G8B8A8) continue;
+        const u32 bpp = fp16 ? 8u : 4u;
+        u8* buf = (u8*)malloc((size_t)sf->w * sf->h * bpp);
+        if (!buf) continue;
+        memset(buf, 0, (size_t)sf->w * sf->h * bpp);
+        g.be->readback(g.be->user, sf->handle, 0, 0, sf->w, sf->h, buf, sf->w * bpp);
+        double sum[3] = {0, 0, 0}, mx[3] = {0, 0, 0}; unsigned long nan = 0;
+        char path[1024];
+        snprintf(path, sizeof path, "%s/f%06u_s%02u_%ux%u_%s.ppm", dir, g.frames, i, sf->w, sf->h,
+                 fp16 ? "fp16" : f32 ? "r32f" : "rgba8");
+        FILE* f = fopen(path, "wb");
+        if (f) fprintf(f, "P6\n%u %u\n255\n", sf->w, sf->h);
+        for (u32 p = 0; p < sf->w * sf->h; p++) {
+            float c[3];
+            if (fp16) {
+                const u16* h = (const u16*)(buf + (size_t)p * 8);
+                for (int k = 0; k < 3; k++) {
+                    u16 v = h[k]; u32 sgn = (v >> 15) & 1, ex = (v >> 10) & 0x1F, mant = v & 0x3FF; float out;
+                    if (ex == 0) out = (float)mant / 1024.0f / 16384.0f;
+                    else if (ex == 31) { out = mant ? 0.0f : 1e30f; if (mant) nan++; }
+                    else out = (1.0f + mant / 1024.0f) * (float)pow(2.0, (int)ex - 15);
+                    c[k] = sgn ? -out : out;
+                }
+            } else if (f32) {
+                float v; memcpy(&v, buf + (size_t)p * 4, 4); c[0] = c[1] = c[2] = v;
+            } else {
+                c[0] = buf[p * 4] / 255.0f; c[1] = buf[p * 4 + 1] / 255.0f; c[2] = buf[p * 4 + 2] / 255.0f;
+            }
+            u8 rgb[3];
+            for (int k = 0; k < 3; k++) {
+                if (c[k] == c[k]) { sum[k] += c[k]; if (c[k] > mx[k]) mx[k] = c[k]; }
+                float t = c[k] < 0 ? 0 : c[k] > 1 ? 1 : c[k]; rgb[k] = (u8)(t * 255.0f + 0.5f);
+            }
+            if (f) fwrite(rgb, 1, 3, f);
+        }
+        if (f) fclose(f);
+        const double n = (double)sf->w * sf->h;
+        fprintf(stderr, "[surf-dump] f%u s%u %ux%u %s off=0x%08X mean=(%.3f %.3f %.3f) max=(%.2f %.2f %.2f) nan=%lu -> %s\n",
+                g.frames, i, sf->w, sf->h, fp16 ? "fp16" : f32 ? "r32f" : "rgba8", sf->offset,
+                sum[0] / n, sum[1] / n, sum[2] / n, mx[0], mx[1], mx[2], nan, path);
+        free(buf);
+    }
+}
 static void eng_present(u32 buffer_id)
 {
     if (!g.ready) return;
@@ -1636,7 +1742,9 @@ static void eng_present(u32 buffer_id)
     }
     g.last_present_surface = target;
     g.be->present(g.be->user, g.surfaces[target].handle);
+    eng_surface_dump_frame();
     g.frames++;
+    eng_draw_stats_report();
     g.last_guest_draws = g.guest_draws;
     g.guest_draws = 0;
 }
