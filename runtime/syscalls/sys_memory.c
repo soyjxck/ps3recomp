@@ -39,6 +39,60 @@ uint32_t g_sys_mem_bump_ptr = 0;
 
 static uint32_t s_total_allocated = 0;
 
+/* Freed ranges, reused by sys_memory_allocate. The bump allocator alone never
+ * gave a byte back: sys_memory_free retired the record and the window kept
+ * growing. Drakengard 3's UE3 heap (FMallocPS3DL, dlmalloc on
+ * sys_memory_allocate/free) asked for 640 MB over five minutes of play while
+ * keeping far less live; with the 213 MB user pool plus the overflow window
+ * exhausted, the allocator reported ENOMEM, UE3's OOM handler parked holding
+ * the malloc lock and the game froze. Real hardware recycles freed pages, so
+ * the same play never ran out. First-fit, split, coalesced on free; blocks are
+ * page multiples so a linear scan over a few hundred entries is nothing. */
+#define SYS_MEM_FREE_MAX 1024
+static struct { uint32_t addr, size; } s_free[SYS_MEM_FREE_MAX];
+static int s_free_n = 0;
+static uint32_t s_free_bytes = 0;
+
+/* Under bump_lock: carve `size` bytes at `alignment` out of a free block. */
+static uint32_t sys_mem_reuse(uint32_t size, uint32_t alignment)
+{
+    for (int i = 0; i < s_free_n; i++) {
+        uint32_t a = VM_ALIGN_UP(s_free[i].addr, alignment);
+        uint32_t end = s_free[i].addr + s_free[i].size;
+        if (a < s_free[i].addr || a + size > end || a + size < a) continue;
+        uint32_t head = a - s_free[i].addr, tail = end - (a + size);
+        s_free_bytes -= size;
+        if (head && tail && s_free_n < SYS_MEM_FREE_MAX) {
+            s_free[i].size = head;
+            s_free[s_free_n].addr = a + size; s_free[s_free_n].size = tail; s_free_n++;
+        } else if (head) {
+            s_free[i].size = head;            /* tail (if any) is lost: table full */
+            if (tail) s_free_bytes -= tail;
+        } else if (tail) {
+            s_free[i].addr = a + size; s_free[i].size = tail;
+        } else {
+            s_free[i] = s_free[--s_free_n];
+        }
+        return a;
+    }
+    return 0;
+}
+
+/* Under bump_lock: give a range back, merging with neighbours. */
+static void sys_mem_release(uint32_t addr, uint32_t size)
+{
+    s_free_bytes += size;
+    for (int i = 0; i < s_free_n; i++) {
+        if (s_free[i].addr + s_free[i].size == addr) { s_free[i].size += size; addr = s_free[i].addr; size = s_free[i].size;
+            s_free[i] = s_free[--s_free_n]; i = -1; continue; }
+        if (addr + size == s_free[i].addr) { size += s_free[i].size;
+            s_free[i] = s_free[--s_free_n]; i = -1; continue; }
+    }
+    if (s_free_n < SYS_MEM_FREE_MAX) { s_free[s_free_n].addr = addr; s_free[s_free_n].size = size; s_free_n++; }
+    else { s_free_bytes -= size;
+           static int _n = 0; if (_n++ < 4) fprintf(stderr, "[sys_memory] free list full, 0x%X bytes at 0x%08X not recycled\n", size, addr); }
+}
+
 /* Guest threads are real host threads; serialize the bump allocator. */
 #ifdef _WIN32
 static SRWLOCK s_bump_lock = SRWLOCK_INIT;
@@ -91,6 +145,28 @@ int64_t sys_memory_allocate(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_EINVAL;
 
     bump_lock();
+
+    /* A freed range first: the pages are already committed, so only the
+     * contents need clearing to look like fresh ones. */
+    { uint32_t r = sys_mem_reuse(size, alignment);
+      if (r) {
+          int slot = -1;
+          for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; i++)
+              if (!g_sys_mem_allocs[i].active) { slot = i; break; }
+          if (slot >= 0) {
+              s_total_allocated += size;
+              sys_mem_alloc_info* a = &g_sys_mem_allocs[slot];
+              a->active = 1; a->addr = r; a->size = size; a->container_id = 0; a->page_size = alignment;
+              bump_unlock();
+              memset(vm_to_host(r), 0, size);
+              { static long _n = 0; if (_n++ < 40 || (_n % 200) == 0)
+                  fprintf(stderr, "[sys_memory] allocate -> 0x%08X (reused; live=%u MB, free %u MB in %d blocks)\n",
+                          r, s_total_allocated >> 20, s_free_bytes >> 20, s_free_n); }
+              if (addr_out != 0) write_be32(addr_out, r);
+              return CELL_OK;
+          }
+          sys_mem_release(r, size);   /* no record slot: put it back, fall through to the usual error */
+      } }
 
     /* Initialize bump pointer on first call */
     if (g_sys_mem_bump_ptr == 0)
@@ -165,7 +241,7 @@ int64_t sys_memory_allocate(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ENOMEM;
     }
 
-    fprintf(stderr, "[sys_memory] allocate -> 0x%08X\n", alloc_addr);
+    fprintf(stderr, "[sys_memory] allocate -> 0x%08X (live=%u MB)\n", alloc_addr, s_total_allocated >> 20);
 
     if (addr_out != 0) {
         write_be32(addr_out, alloc_addr);
@@ -183,13 +259,22 @@ int64_t sys_memory_free(ppu_context* ctx)
 {
     uint32_t addr = LV2_ARG_U32(ctx, 0);
 
+    bump_lock();
     for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; i++) {
         if (g_sys_mem_allocs[i].active && g_sys_mem_allocs[i].addr == addr) {
-            s_total_allocated -= g_sys_mem_allocs[i].size;
+            uint32_t size = g_sys_mem_allocs[i].size;
+            s_total_allocated -= size;
             g_sys_mem_allocs[i].active = 0;
+            sys_mem_release(addr, size);
+            bump_unlock();
+            { static long _n = 0; if (_n++ < 40 || (_n % 200) == 0)
+                fprintf(stderr, "[sys_memory] free(0x%08X) size=0x%X (live=%u MB, free %u MB in %d blocks)\n",
+                        addr, size, s_total_allocated >> 20, s_free_bytes >> 20, s_free_n); }
             return CELL_OK;
         }
     }
+    bump_unlock();
+    { static int _n = 0; if (_n++ < 8) fprintf(stderr, "[sys_memory] free(0x%08X): not an allocation -> EINVAL\n", addr); }
 
     return (int64_t)(int32_t)CELL_EINVAL;
 }

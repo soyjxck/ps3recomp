@@ -2684,6 +2684,8 @@ s32 cellGcmMapMainMemory(u32 ea, u32 size, u32* offset)
     s_io_mapping_count++;
 
     populate_offset_table(ea, io_offset, size);
+    printf("[cellGcmSys] MapMainMemory -> io=0x%08X (ea 0x%08X, %u mappings active)\n",
+           io_offset, ea, s_io_mapping_count);
 
     vm_write32((uint32_t)(uintptr_t)offset, io_offset);   /* guest out-param */
     return CELL_OK;
@@ -2750,7 +2752,7 @@ s32 cellGcmUnmapIoAddress(u32 io)
     if (!mapping)
         return CELL_GCM_ERROR_FAILURE;
 
-    printf("[cellGcmSys] UnmapIoAddress(io=0x%08X)\n", io);
+    printf("[cellGcmSys] UnmapIoAddress(io=0x%08X) ea=0x%08X size=0x%X\n", io, mapping->ea, mapping->size);
 
     clear_offset_table(mapping->ea, mapping->io, mapping->size);
     mapping->active = 0;

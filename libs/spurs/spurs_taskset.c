@@ -68,8 +68,10 @@ void spurs_taskset_add_task(uint32_t taskset_ea, uint32_t taskId, uint64_t elf_e
     vm_write64(ti + TI_CONTEXT, context);
     for (int i = 0; i < 4; i++)
         vm_write32(ti + TI_LS_PATTERN + i * 4, ls_pattern ? ls_pattern[i] : 0);
-    spurs_bitset_set(taskset_ea + CSTS_ENABLED, taskId);
-    spurs_bitset_set(taskset_ea + CSTS_READY,   taskId);
+    /* enabled + ready, under the taskset lock the exit scan's clears use:
+     * an unlocked read-modify-write here resurrected a sibling's bits. */
+    { extern void spu_taskset_publish(uint32_t taskset_ea, uint32_t taskId);
+      spu_taskset_publish(taskset_ea, taskId); }
 }
 
 /* Set the taskset's on-task-exit handler EA (CellSpursTaskset.x78). */

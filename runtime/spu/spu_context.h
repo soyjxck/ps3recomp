@@ -20,6 +20,21 @@
 extern "C" {
 #endif
 
+/* Which SPU image is You Don't Know Jack's cri media task. The runtime grew a
+ * set of cri-specific behaviours keyed on image id 22 (a context built from
+ * the CreateTask globals, "golden" context fields, an EXIT syscall that returns
+ * to the bootstrap instead of ending the task, DMA traces). Image ids are just
+ * the index of the ELF in a title's image list, so for any other title id 22
+ * is an ordinary task: Drakengard 3's PhysX task 22 never returned from its
+ * first EXIT and the serialised taskset stalled behind it. SPU_CRI_IMAGE=<id>
+ * names the cri image (default 22); -1 turns the cri handling off. */
+static inline int spu_cri_image(void)
+{
+    static int v = -2;
+    if (v == -2) { const char* e = getenv("SPU_CRI_IMAGE"); v = e ? atoi(e) : 22; }
+    return v;
+}
+
 /* Portable 16-byte alignment (MSVC __declspec vs GCC/clang __attribute__). */
 #if defined(_MSC_VER)
 #  define SPU_ALIGN16 __declspec(align(16))

@@ -222,7 +222,7 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
             ctx.gpr[3]._u32[2] = r3_override[2];   /* queue/lock EA            */
             ctx.gpr[3]._u32[3] = r3_override[3];
             if (!ctx.gpr[3]._u32[1]) ctx.gpr[3]._u32[1] = args_ea;
-        } else if (image_id == 22) {
+        } else if (image_id == spu_cri_image()) {
             /* cri_mpv leaf (func_00003E68) gate is `rotmai(r3.word0, 112) == 64`
              * = an ARITHMETIC RIGHT-SHIFT BY 16 then ceqi 64, i.e. it wants
              * (r3.word0 >> 16) == 0x40  ->  r3.word0 = 0x0040xxxx (0x40 in bits
@@ -278,7 +278,7 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
      * (planted by spurs_pm_build_context). Without it the leaf reads a garbage SPURS base
      * and DMAs from a bad address / bails at init. Set for image 22 (cri) when the context
      * carries a non-zero spurs ptr. */
-    if (spurs_task_abi && (image_id == 22 || taskset_ctx)) {
+    if (spurs_task_abi && (image_id == spu_cri_image() || taskset_ctx)) {
         uint32_t spurs_lo = _LB(0x2764);
         if (spurs_lo) {
             ctx.gpr[4]._u32[0] = _LB(0x2768);  /* args hi (d0) */

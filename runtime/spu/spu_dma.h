@@ -473,7 +473,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
      * (large, from a non-context EA) as opposed to the 64-byte context handshake
      * DMAs. Set a flag the dispatcher polls to know the task got real work. */
     { extern int g_cri_video_dma;
-      if (spu->image_id == 22 && mfc_is_get(cmd) && size > 0x100)
+      if (spu->image_id == spu_cri_image() && mfc_is_get(cmd) && size > 0x100)
           g_cri_video_dma = 1; }
     /* SPU_DSP_IMAGE_EA -- recover an SPU image load whose source address the
      * title lost. You Don't Know Jack's FMOD mixer relocates a DSP plugin into
@@ -1278,7 +1278,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                            only==-3 ? "ALL images" : "one image id "
                                                      "(a bare number is an IMAGE ID, not on/off)");
         }
-        if ((dt && (spu->image_id==22 || spu->image_id==23)) ||
+        if ((dt && (spu->image_id == spu_cri_image() || spu->image_id==23)) ||
             only==-3 || (only >= 0 && spu->image_id == only)) {
             static int _n=0; if (_n++ < 160)
                 fprintf(stderr, "[DMA] img%d cmd=0x%02X lsa=0x%05X ea=0x%09llX size=0x%X tag=%u\n",
@@ -1492,7 +1492,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      * can tell if eaContext holds valid SPURS work data or garbage. */
     {
         static int64_t dt2=-2; if (dt2==-2){ const char* e=getenv("SPU_DMATRACE_ALL"); dt2=e?1:0; }
-        if (dt2 && spu->image_id==22 && cmd==0x40 /*GET*/ && size<=0x80) {
+        if (dt2 && spu->image_id == spu_cri_image() && cmd==0x40 /*GET*/ && size<=0x80) {
             static int _g=0; if (_g++ < 6) {
                 const uint8_t* p = spu->ls + (lsa & 0x3FFFF);
                 fprintf(stderr, "[DMA] GET data @LS0x%05X (from ea=0x%09llX):", lsa, (unsigned long long)ea);

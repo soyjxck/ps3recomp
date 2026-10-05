@@ -627,6 +627,27 @@ void spu_taskset_unclaim(uint32_t taskset_ea, uint32_t taskid)
     spu_taskset_mark(taskset_ea, taskid, 0);
 }
 
+/* Publish a registered task: set its enabled and ready bits under the
+ * taskset lock. spurs_taskset_add_task used to set them with two unlocked
+ * read-modify-writes of the bitset word, racing spu_taskset_task_exited's
+ * clears of a SIBLING task's bits in the same word: the exiting task's
+ * enabled+ready bits came back (the PPU wrote its stale word copy over the
+ * clear), with the running bit already gone, and the next exit scan started
+ * that slot again from its old TaskInfo -- a task run twice with the same
+ * queue, a stale completion, and the PPU running ahead of the SPU. Seen
+ * once or twice per 10,000 tasks in Drakengard 3's PhysX step. */
+void spu_taskset_publish(uint32_t taskset_ea, uint32_t taskid)
+{
+    extern uint8_t* vm_base;
+    if (!taskset_ea || taskid >= 128 || !vm_base) return;
+    ts_lock();
+    uint8_t* ts = vm_base + taskset_ea;
+    uint8_t m = (uint8_t)(0x80u >> (taskid & 7));
+    ts[0x30 + taskid / 8] |= m;      /* enabled */
+    ts[0x10 + taskid / 8] |= m;      /* ready   */
+    ts_unlock();
+}
+
 static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
 {
     extern uint8_t* vm_base;
@@ -653,10 +674,18 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
         if (!elf) continue;
         size_t sz = spu_elf_image_size(vm_base + elf, 2u * 1024 * 1024);
         if (!sz) continue;
+        /* The slot's state as the scan saw it: a PPU-created task is claimed
+         * (running) from CreateTask until its own exit, so a slot found here
+         * was either created by SPU code or had its running bit cleared by
+         * someone else's exit -- the bits say which. */
+        fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X "
+                        "(after task %u exited) bits: ready=%u pending=%u enabled=%u "
+                        "signalled=%u waiting=%u guest-running=%u\n", t, taskset_ea, elf, done_task,
+                (ts[0x10 + t / 8] & m) ? 1 : 0, (ts[0x20 + t / 8] & m) ? 1 : 0,
+                (ts[0x30 + t / 8] & m) ? 1 : 0, (ts[0x40 + t / 8] & m) ? 1 : 0,
+                (ts[0x50 + t / 8] & m) ? 1 : 0, (ts[0x00 + t / 8] & m) ? 1 : 0);
         ts[0x20 + t / 8] &= (uint8_t)~m;                 /* pending -> started */
         run[t / 8] |= m;
-        fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X "
-                        "(after task %u exited)\n", t, taskset_ea, elf, done_task);
         g_ydkj_real_taskset_ea = taskset_ea; g_ydkj_real_taskid = t;
         spu_workload_dispatch_task(vm_base + elf, (uint32_t)sz, ctx, taskset_ea, t);
     }
@@ -670,7 +699,7 @@ static void spu_async_run(spu_async_job* j)
      * back to a fresh per-dispatch LS when disabled / no taskset. */
     spu_ts_ls_slot* ts_slot = NULL;
     int did_load = 0;           /* whether THIS dispatch (re)loaded the image */
-    if (spu_persist_ls_enabled() && j->taskset_ea && j->image_id != 22)
+    if (spu_persist_ls_enabled() && j->taskset_ea && j->image_id != spu_cri_image())
         ts_slot = ts_ls_get(j->taskset_ea, j->taskid);
     uint8_t* ls;
     if (ts_slot) {
@@ -707,7 +736,7 @@ static void spu_async_run(spu_async_job* j)
              * the policy module (libsre @0x30021480 -> LS 0xA00) and write the
              * task descriptor {0xFFFFFFFF, 0x400, 0x2700, 0x3000} at 0x2FB0, then
              * run the cri task, to see how much further it gets. Diagnostic only. */
-            if (j->image_id == 22 && getenv("YDKJ_CRI_TASKSET")) {
+            if (j->image_id == spu_cri_image() && getenv("YDKJ_CRI_TASKSET")) {
                 /* cri build: load the TASKSET POLICY module (libsre 0x23680 ->
                  * LS 0xA00) alongside the cri task (already at 0x3000), then RUN
                  * THE POLICY ENTRY (tsp_spu_func_00000A00) under image 23. The
@@ -751,7 +780,7 @@ static void spu_async_run(spu_async_job* j)
              * trampoline (LS 0xA70, intercepted in spu_channels.c) + the task
              * descriptor @0x2FB0. Adopted from JonathanDC64/ps3recomp (aaea4158).
              * Gate: default on for image 22 unless YDKJ_NO_CRI_CTX. */
-            if (j->image_id == 22 && !getenv("YDKJ_NO_CRI_CTX")) {
+            if (j->image_id == spu_cri_image() && !getenv("YDKJ_NO_CRI_CTX")) {
                 extern uint64_t spurs_pm_build_context(uint8_t*, uint32_t, uint32_t, uint32_t, uint32_t);
                 extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
                 #define LSBE32(o,v) do{uint32_t _v=(v);ls[(o)+0]=(uint8_t)(_v>>24);ls[(o)+1]=(uint8_t)(_v>>16);ls[(o)+2]=(uint8_t)(_v>>8);ls[(o)+3]=(uint8_t)_v;}while(0)
@@ -810,7 +839,7 @@ static void spu_async_run(spu_async_job* j)
              * (r3.word1 = args_ea). This is the job the game's cri_mpv PPU layer is
              * supposed to populate (video-data EA, output buffer). If it's zero/garbage
              * the PPU layer never wrote a real job -> the task decodes nothing. */
-            if (j->image_id == 22 && j->args_ea) {
+            if (j->image_id == spu_cri_image() && j->args_ea) {
                 extern uint8_t* vm_base;
                 const uint8_t* c = vm_base + (j->args_ea & 0x0FFFFFFFu);
                 fprintf(stderr, "[cri] eaContext=0x%08X 64B decode-context:", j->args_ea);
@@ -837,7 +866,7 @@ static void spu_async_run(spu_async_job* j)
              * buffer slightly LATER, delaying the run lets it see real data (=>
              * timing bug, fix = defer/re-dispatch on signal); if it still loops on
              * a null base, the buffer is never filled (=> an audio HLE gap). */
-            if (j->image_id != 22) {
+            if (j->image_id != spu_cri_image()) {
                 const char* d = getenv("LBP_TASK_DELAY");
                 if (d && *d) {
 #ifdef _WIN32
@@ -855,7 +884,7 @@ static void spu_async_run(spu_async_job* j)
              * Planting it makes the mixer read the real FMOD control block
              * (0x0094F5xx) and the EventFlag handshake completes. Default ON;
              * LBP_NO_TASKSET restores the old direct-dispatch for comparison. */
-            if (j->image_id != 22 && !getenv("LBP_NO_TASKSET")) {
+            if (j->image_id != spu_cri_image() && !getenv("LBP_NO_TASKSET")) {
                 extern uint64_t spurs_pm_build_context(uint8_t*, uint32_t, uint32_t, uint32_t, uint32_t);
                 /* Use the taskset+taskid captured for THIS job at dispatch (not the
                  * globals, which the next CreateTask clobbers -- the race that made
@@ -961,7 +990,7 @@ static void spu_async_run(spu_async_job* j)
              * in a bounded loop until it actually DECODES (a >256B video GET sets
              * g_cri_video_dma) or we time out. This does NOT fake data: the task
              * only decodes if the PPU genuinely populated real work meanwhile. */
-            if (j->image_id == 22 && getenv("YDKJ_CRI_RESUME") && !g_cri_video_dma) {
+            if (j->image_id == spu_cri_image() && getenv("YDKJ_CRI_RESUME") && !g_cri_video_dma) {
                 for (int attempt = 0; attempt < 400 && !g_cri_video_dma; attempt++) {
 #ifdef _WIN32
                     Sleep(3);
@@ -988,7 +1017,7 @@ static void spu_async_run(spu_async_job* j)
             /* YDKJ_CRI_WAKE probe: on cri task (image 22) completion, wake any PPU
              * completion-waiter (the SPU->PPU cellSpursEventFlag completion isn't
              * propagated yet). Tests whether the game then advances to draw content. */
-            if (j->image_id == 22 && getenv("YDKJ_CRI_WAKE")) {
+            if (j->image_id == spu_cri_image() && getenv("YDKJ_CRI_WAKE")) {
                 extern void ydkj_wake_all_event_flags(void);
                 ydkj_wake_all_event_flags();
                 fprintf(stderr, "[cri] YDKJ_CRI_WAKE: woke all event-flag waiters on cri completion\n");

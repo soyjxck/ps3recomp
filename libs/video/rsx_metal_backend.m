@@ -3118,7 +3118,15 @@ static void eng_dump_frame(id<MTLTexture> src)
     const char* path = getenv("PS3RECOMP_METAL_FRAME_DUMP");
     if (!path || !*path) return;
     static unsigned frame;
-    if ((++frame % 120) != 0) return;
+    /* PS3RECOMP_METAL_FRAME_EVERY=<n> frames (default 120);
+     * PS3RECOMP_METAL_FRAME_SEQ=1 keeps every capture as <path>.<frame>.ppm
+     * instead of overwriting one file, so a run can be read back as a strip. */
+    static unsigned every = 0; static int seq = -1;
+    if (!every) { const char* e = getenv("PS3RECOMP_METAL_FRAME_EVERY"); every = e ? (unsigned)atoi(e) : 120u; if (!every) every = 120u; }
+    if (seq < 0) seq = getenv("PS3RECOMP_METAL_FRAME_SEQ") ? 1 : 0;
+    if ((++frame % every) != 0) return;
+    char seqpath[1024];
+    if (seq) { snprintf(seqpath, sizeof seqpath, "%s.%06u.ppm", path, frame); path = seqpath; }
     if ([src pixelFormat] != MTLPixelFormatRGBA8Unorm &&
         [src pixelFormat] != MTLPixelFormatBGRA8Unorm) return;
     size_t w = [src width], h = [src height];
