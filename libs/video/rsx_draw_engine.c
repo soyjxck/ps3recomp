@@ -1761,9 +1761,13 @@ static void eng_present(u32 buffer_id)
     eng_surface_dump_frame();
     /* RSX_TRACE_ON_WHITE=1: read the presented frame back; when it comes out
      * (nearly) all white, trace the next four frames draw by draw. */
-    { static int on = -1; if (on < 0) on = getenv("RSX_TRACE_ON_WHITE") ? 1 : 0;
-      static int armed = 0;
-      if (on && !armed && g.surfaces[target].fmt == RSX_BE_FMT_R8G8B8A8 && g.surfaces[target].w && g.surfaces[target].h) {
+    { static long on = -1; if (on < 0) { const char* e = getenv("RSX_TRACE_ON_WHITE"); on = e ? atol(e) : 0; }
+      /* The value is the first frame to watch from (a title's own fade-from-
+       * white at a level start is not the bug); each episode traces four
+       * frames and the watch re-arms 600 frames later. */
+      static int armed = 0; static u32 armed_at = 0;
+      if (armed && g.frames > armed_at + 600u) armed = 0;
+      if (on > 0 && (long)g.frames >= on && !armed && g.surfaces[target].fmt == RSX_BE_FMT_R8G8B8A8 && g.surfaces[target].w && g.surfaces[target].h) {
           const u32 w = g.surfaces[target].w, h = g.surfaces[target].h;
           u8* buf = (u8*)malloc((size_t)w * h * 4);
           if (buf) {
@@ -1773,7 +1777,7 @@ static void eng_present(u32 buffer_id)
               for (u32 p = 0; p < w * h; p += step) { sum += buf[p * 4] + buf[p * 4 + 1] + buf[p * 4 + 2]; n += 3; }
               const double mean = n ? (double)sum / n : 0.0;
               if (mean > 250.0) {
-                  armed = 1; s_dtrace_frame = (long)g.frames + 1;
+                  armed = 1; armed_at = g.frames; s_dtrace_frame = (long)g.frames + 1;
                   fprintf(stderr, "[draw-trace] frame %u presented WHITE (mean %.1f): tracing frames %ld..%ld\n",
                           g.frames, mean, s_dtrace_frame, s_dtrace_frame + 3);
               }
