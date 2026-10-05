@@ -683,6 +683,31 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
             { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
               spu_lockguard_check(ctx, ea, ls, MFC_ATOMIC_LINE, "PUTLLC"); }
             memcpy(mem, ls, MFC_ATOMIC_LINE);          /* commit local store */
+            /* The run-time range watch (spu_dma.h) sees plain DMA only; an
+             * atomic commit into the watched line is reported here too. */
+            { extern uint32_t g_spu_watchea_dyn, g_spu_watchea_dyn_len;
+              extern uint32_t g_spu_dma_rng_lo, g_spu_dma_rng_hi; extern void spu_dma_range_init(void);
+              static int s_init = 0; if (!s_init) { s_init = 1; spu_dma_range_init(); }
+              if (g_spu_dma_rng_hi && ea < g_spu_dma_rng_hi && g_spu_dma_rng_lo < ea + MFC_ATOMIC_LINE) {
+                  static long rn = 0; extern long g_spu_dma_rng_cap;
+                  if (g_spu_dma_rng_cap == 0 || ++rn <= g_spu_dma_rng_cap) {
+                      uint32_t off = (g_spu_dma_rng_lo > ea ? g_spu_dma_rng_lo - ea : 0) & ~15u;
+                      fprintf(stderr, "[dma-range] img=%d PUTLLC line=0x%08X pc=0x%05X at+0x%02X:",
+                              ctx->image_id, ea, (uint32_t)ctx->pc & SPU_LS_MASK, off);
+                      for (uint32_t k = off; k < off + 32 && k < MFC_ATOMIC_LINE; k += 4)
+                          fprintf(stderr, " %02X%02X%02X%02X", ls[k], ls[k+1], ls[k+2], ls[k+3]);
+                      fputc('\n', stderr); } }
+              if (g_spu_watchea_dyn && ea < g_spu_watchea_dyn + g_spu_watchea_dyn_len &&
+                  g_spu_watchea_dyn < ea + MFC_ATOMIC_LINE) {
+                  static long wn = 0, wcap = -1;
+                  if (wcap < 0) { const char* e = getenv("SPU_WATCHEA_DYN_MAX"); wcap = e ? atol(e) : 64; }
+                  if (wcap == 0 || ++wn <= wcap) {
+                      uint32_t off = (g_spu_watchea_dyn - ea) & ~15u;
+                      fprintf(stderr, "[watchea-dyn] spu%u img=%d PUTLLC line=0x%08X pc=0x%05X at+0x%02X:",
+                              ctx->spu_id & 7u, ctx->image_id, ea, (uint32_t)ctx->pc & SPU_LS_MASK, off);
+                      for (uint32_t k = off; k < off + 32 && k < MFC_ATOMIC_LINE; k += 4)
+                          fprintf(stderr, " %02X%02X%02X%02X", ls[k], ls[k+1], ls[k+2], ls[k+3]);
+                      fputc('\n', stderr); } } }
             /* A committing PUTLLC is a line write like any other, so every
              * PEER reservation on it is lost and its SPU takes SPU_EVENT_LR.
              * Silent, this is the same lost update the PPU half was added to

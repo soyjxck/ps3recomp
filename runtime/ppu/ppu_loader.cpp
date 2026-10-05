@@ -1745,6 +1745,7 @@ extern "C" uint32_t g_barrier_sync_watch = 0;
  * zeros when the watch is off. */
 extern "C" uint32_t g_ww_lo = 0, g_ww_hi = 0;
 extern "C" uint32_t g_ww_dyn = 0;   /* a word armed at run time, see barrier_watch_hit */
+extern "C" uint32_t g_ww_dyn_len = 4;   /* ...and how many bytes it covers (a diagnostic may widen it) */
 
 extern "C" void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width)
 {
@@ -1854,7 +1855,7 @@ static __attribute__((noinline, cold)) void barrier_watch_hit_slow(uint32_t a, u
       /* g_ww_dyn: one word armed at run time (the GCM walker arms the FIFO
        * park it is waiting on), reported through the same path. */
       if ((s_ww && a >= (s_ww & ~15u) && a < (s_ww & ~15u) + s_wwlen) ||
-          (g_ww_dyn && a >= g_ww_dyn && a < g_ww_dyn + 4u)) {
+          (g_ww_dyn && a >= g_ww_dyn && a < g_ww_dyn + g_ww_dyn_len)) {
           /* PPU_WW_GUARD=1: once the watched word is first SET, page-guard it.
            * The store watch only sees lifted guest stores -- a host-side memset
            * or an atomic clears a field invisibly. flOw loses its render config

@@ -943,9 +943,14 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
      * ponytail: s_tasks[] is shared by every taskset and now only records the
      * last task per slot id -- enough for JoinTask2's lookup; key it by
      * (taskset, id) if a title joins tasks in two tasksets at once. */
-    u32 free_slot = CELL_SPURS_MAX_TASK;
-    for (u32 t = 0; t < CELL_SPURS_MAX_TASK; t++)
-        if (!(vm_read8(taskset_ea + 0x30 + t / 8) & (0x80u >> (t % 8)))) { free_slot = t; break; }
+    /* The slot is picked AND claimed (running bit set) in one critical
+     * section, before add_task publishes it enabled+ready: see
+     * spu_taskset_claim_free for the double dispatch that the old
+     * scan-then-add-then-claim sequence allowed. */
+    extern int  spu_taskset_claim_free(uint32_t taskset_ea);
+    extern void spu_taskset_unclaim(uint32_t taskset_ea, uint32_t taskid);
+    int claimed = spu_taskset_claim_free(taskset_ea);
+    u32 free_slot = claimed >= 0 ? (u32)claimed : CELL_SPURS_MAX_TASK;
     if (free_slot < CELL_SPURS_MAX_TASK) {
         u32 i = free_slot;
         {
@@ -976,10 +981,10 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
              * SELECT_TASK picks it. Slot index i = the SPURS taskId (bitset bit). */
             spurs_taskset_add_task(taskset_ea, i, (uint64_t)elf_ea,
                                    (uint64_t)context_ea, task_arg, task_lsp);
-            /* Claim the slot NOW, before anything else runs: add_task just made
-             * it enabled+ready, and an SPU worker's exit-restart scan dispatches
-             * any such slot it finds not running (spu_taskset_claim). */
-            if (elf) spu_taskset_claim(taskset_ea, i);
+            /* The slot was claimed before add_task published it; a task with no
+             * ELF is never dispatched here, so hand its claim back and let the
+             * taskset's own scheduling (the exit scan) own it. */
+            if (!elf) spu_taskset_unclaim(taskset_ea, i);
             /* Bridge to the image-22 dispatch so build_context uses this taskset+task. */
             g_ydkj_real_taskset_ea = taskset_ea;
             g_ydkj_real_taskid     = i;

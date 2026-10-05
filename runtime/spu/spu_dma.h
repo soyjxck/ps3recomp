@@ -198,14 +198,22 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                       (uint32_t)s_w); } }
     /* SPU_DMA_RANGE=<lo>-<hi> (hex EAs): log transfers touching [lo,hi), first
      * 64 -- who reads or writes a buffer the RSX shares with the SPUs. */
-    { static uint32_t s_lo = 1, s_hi;
-      if (s_lo == 1) { const char* e = getenv("SPU_DMA_RANGE"); s_lo = 0;
-          if (e) { char* d; s_lo = (uint32_t)strtoul(e, &d, 16); if (*d == '-') s_hi = (uint32_t)strtoul(d + 1, 0, 16); } }
+    { extern uint32_t g_spu_dma_rng_lo, g_spu_dma_rng_hi; extern long g_spu_dma_rng_cap;
+      extern void spu_dma_range_init(void);
+      static int s_init = 0; if (!s_init) { s_init = 1; spu_dma_range_init(); }
+      const uint32_t s_lo = g_spu_dma_rng_lo, s_hi = g_spu_dma_rng_hi;
       if (s_hi && (uint32_t)ea < s_hi && (uint32_t)ea + size > s_lo) {
-          static int _n = 0;
-          if (_n++ < 64)
-              fprintf(stderr, "[dma-range] pc=0x%05X cmd=0x%X lsa=0x%05X ea=0x%08X size=%u\n",
-                      (uint32_t)spu->pc & SPU_LS_MASK, cmd, lsa, (uint32_t)ea, size);
+          static long _n = 0;
+          if (g_spu_dma_rng_cap == 0 || ++_n <= g_spu_dma_rng_cap) {
+              fprintf(stderr, "[dma-range] img=%d pc=0x%05X cmd=0x%X lsa=0x%05X ea=0x%08X size=%u",
+                      spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, cmd, lsa, (uint32_t)ea, size);
+              /* For a PUT, the first words being written. */
+              if ((cmd & 0xF0u) == 0x20u) {
+                  fprintf(stderr, " data:");
+                  for (uint32_t k = 0; k < size && k < 32; k += 4) {
+                      uint32_t w; memcpy(&w, spu->ls + ((lsa + k) & SPU_LS_MASK), 4);
+                      fprintf(stderr, " %02X%02X%02X%02X", w & 0xFF, (w >> 8) & 0xFF, (w >> 16) & 0xFF, w >> 24); } }
+              fputc('\n', stderr); }
           /* ...and every 5 s, the bytes PUT into / GOT from the range. */
           { static volatile long long s_put, s_get; static unsigned long long s_t0;
             extern unsigned long long ps3_ms_now(void);
@@ -926,13 +934,24 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                 after = (after >> 24) | ((after >> 8) & 0xFF00u) | ((after << 8) & 0xFF0000u) | (after << 24);
                 fprintf(stderr, "[put4] img=%d ea=0x%08X was=%08X now=%08X pc=0x%05X\n",
                         spu->image_id, (uint32_t)ea, before, after, (uint32_t)spu->pc & SPU_LS_MASK); } } }
-      extern uint32_t g_spu_watchea_dyn;   /* armed at run time by the GCM walker */
-      if (g_spu_watchea_dyn && vm_base && (uint32_t)ea <= g_spu_watchea_dyn &&
+      extern uint32_t g_spu_watchea_dyn;       /* armed at run time by the GCM walker */
+      extern uint32_t g_spu_watchea_dyn_len;   /* ...and a diagnostic may widen it to a range */
+      if (g_spu_watchea_dyn && vm_base && (uint32_t)ea < g_spu_watchea_dyn + g_spu_watchea_dyn_len &&
           g_spu_watchea_dyn < (uint32_t)ea + size) {
-          static int dn = 0; if (dn++ < 64)
-              fprintf(stderr, "[watchea-dyn] spu%u img=%d cmd=0x%02X ea=0x%08X size=%u lsa=0x%05X pc=0x%05X\n",
+          /* SPU_WATCHEA_DYN_MAX=<n>: hits to print (default 64, 0 = unlimited). */
+          static long dn = 0, dcap = -1;
+          if (dcap < 0) { const char* e = getenv("SPU_WATCHEA_DYN_MAX"); dcap = e ? atol(e) : 64; }
+          if (dcap == 0 || ++dn <= dcap) {
+              fprintf(stderr, "[watchea-dyn] spu%u img=%d cmd=0x%02X ea=0x%08X size=%u lsa=0x%05X pc=0x%05X",
                       spu->spu_id & 7u, spu->image_id, cmd & 0xFFu, (uint32_t)ea, size, lsa,
                       (uint32_t)spu->pc & SPU_LS_MASK);
+              /* For a PUT, the first words being written (what will land there). */
+              if ((cmd & 0xF0u) == 0x20u) {
+                  fprintf(stderr, " data:");
+                  for (uint32_t k = 0; k < size && k < 32; k += 4) {
+                      uint32_t w; memcpy(&w, spu->ls + ((lsa + k) & SPU_LS_MASK), 4);
+                      fprintf(stderr, " %02X%02X%02X%02X", w & 0xFF, (w >> 8) & 0xFF, (w >> 16) & 0xFF, w >> 24); } }
+              fputc('\n', stderr); }
       }
       if (s_we && vm_base && (uint32_t)ea <= s_wa && s_wa < (uint32_t)ea + size) {
           static unsigned long wn;

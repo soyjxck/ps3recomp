@@ -28,6 +28,19 @@ int g_cri_video_dma = 0;
 /* ---- fingerprint ------------------------------------------------------- */
 
 uint32_t g_spu_watchea_dyn = 0;   /* see spu_dma.h */
+uint32_t g_spu_watchea_dyn_len = 1;   /* bytes covered from g_spu_watchea_dyn */
+/* SPU_DMA_RANGE=<lo>-<hi> (hex EAs), parsed once: transfers and atomic
+ * commits touching [lo,hi) are reported (spu_dma.h, spu_channels.c). */
+uint32_t g_spu_dma_rng_lo = 0, g_spu_dma_rng_hi = 0;
+long     g_spu_dma_rng_cap = -1;   /* SPU_DMA_RANGE_MAX: hits to print, default 64, 0 = unlimited */
+void spu_dma_range_init(void)
+{
+    static int done = 0; if (done) return; done = 1;
+    const char* e = getenv("SPU_DMA_RANGE");
+    if (e) { char* d; g_spu_dma_rng_lo = (uint32_t)strtoul(e, &d, 16);
+             if (*d == '-') g_spu_dma_rng_hi = (uint32_t)strtoul(d + 1, 0, 16); }
+    const char* m = getenv("SPU_DMA_RANGE_MAX"); g_spu_dma_rng_cap = m ? atol(m) : 64;
+}
 
 uint64_t spu_workload_fingerprint(const void* data, size_t n)
 {
@@ -569,6 +582,49 @@ static void spu_taskset_mark(uint32_t taskset_ea, uint32_t t, int on)
 void spu_taskset_claim(uint32_t taskset_ea, uint32_t taskid)
 {
     spu_taskset_mark(taskset_ea, taskid, 1);
+}
+
+/* Pick the taskset's first free slot and claim it in ONE critical section.
+ *
+ * Claiming after spurs_taskset_add_task left a window: add_task publishes
+ * the slot enabled+ready in guest memory, and an SPU task of the same taskset
+ * exiting in that window ran spu_taskset_task_exited's scan, which starts
+ * every enabled, ready, not-running slot -- this one included. CreateTask then
+ * claimed and dispatched it as well, so the task ran twice and pushed its
+ * completion into its SPURS queue twice. Drakengard 3's PhysX step pops one
+ * completion per task, so from then on every pop returned a stale item at
+ * once and the PPU read the broad-phase pair table before the SPU had written
+ * it (negative pair count -> a -3004-byte allocation -> the allocator's OOM
+ * handler parked holding the malloc lock). 17 duplicates in a 4-minute run.
+ *
+ * A slot is free when its enabled bit is clear AND nothing has claimed it
+ * here; the running bit is set before add_task publishes the slot, so the exit
+ * scan skips it, and a second creator cannot pick the same slot either.
+ * Returns the slot, or -1 when all 128 are taken. */
+int spu_taskset_claim_free(uint32_t taskset_ea)
+{
+    extern uint8_t* vm_base;
+    if (!taskset_ea || !vm_base) return -1;
+    int slot = -1;
+    ts_lock();
+    uint8_t* r = ts_running(taskset_ea);
+    const uint8_t* en = vm_base + taskset_ea + 0x30;
+    for (uint32_t t = 0; t < 128; t++) {
+        uint8_t m = (uint8_t)(0x80u >> (t & 7));
+        if (en[t / 8] & m) continue;
+        if (r && (r[t / 8] & m)) continue;
+        if (r) r[t / 8] |= m;
+        slot = (int)t;
+        break;
+    }
+    ts_unlock();
+    return slot;
+}
+
+/* Give a claimed slot back (a task that will never be dispatched here). */
+void spu_taskset_unclaim(uint32_t taskset_ea, uint32_t taskid)
+{
+    spu_taskset_mark(taskset_ea, taskid, 0);
 }
 
 static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
