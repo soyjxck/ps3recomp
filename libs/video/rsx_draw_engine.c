@@ -783,7 +783,7 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                   b8mean = sum / (((h + 3) / 4) * ((w + 3) / 4)); }
               fprintf(stderr, "[tex-up] f%u fmt=0x%02X %ux%u pitch=%u levels=%u loc=%u off=0x%08X ea=0x%08X remap=0x%04X cube=%d mean=%lu\n",
                       g.frames, fmt, w, h, pitch, levels, location, offset,
-                      cellGcmResolveLocated(location == RSX_LOCATION_LOCAL, offset), remap, cube);
+                      cellGcmResolveLocated(location == RSX_LOCATION_LOCAL, offset), remap, cube, b8mean);
           }
           static int b8n = 0;
           /* TEX_DUMP_FROM=<frame>: spend the PPM budget from that frame on. */
@@ -1448,6 +1448,10 @@ static u32 sink_bind_vertex_textures(
  * the index array, textures and the outcome. */
 static struct { unsigned long issued, drop_topo, drop_fetch, drop_targets, drop_pipeline, drop_empty; } s_dstat;
 static unsigned s_surf_draws[ENG_MAX_SURFACES];   /* draws per surface since the last present */
+/* GPU-skinned colour draws since the last present (bone indices in attribute
+ * 7 as unnormalised bytes, colour writes on) and their vertex total: whether a
+ * character that vanished from the picture is still being submitted. */
+static unsigned s_skin_draws, s_skin_verts;
 static int s_dstat_on = -1; static long s_dtrace_frame = -2;
 static void eng_draw_stats_tick(void)
 {
@@ -1551,6 +1555,22 @@ static void eng_draw_trace(const char* outcome, u32 prim, int indexed, u32 n_dra
         rsx_dsp_vertex_attr a; rsx_dsp_get_vertex_attr(&g.rsx, i, &a);
         if (!a.type) continue;
         fprintf(stderr, " %u:t%u/%u/s%u/L%u/0x%08X", i, a.type, a.size, a.stride, a.location, a.offset);
+    }
+    /* For a quad-sized draw (a movie, a post-process or UI pass), each bound
+     * texture: location, offset, format, size, and the mean of its first
+     * row -- whether the planes a video quad samples hold any picture. */
+    if (dc.n_verts && dc.n_verts <= 8) {
+        fprintf(stderr, " texunits:");
+        for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
+            if (!(tex_mask & (1u << u))) continue;
+            rsx_dsp_texture t; rsx_dsp_get_texture(&g.rsx, u, &t);
+            const u32 row = t.pitch ? t.pitch : t.width;
+            const u8* p = (t.width && row) ? eng_guest_ptr(NULL, t.location, t.offset, row) : NULL;
+            unsigned long sum = 0; for (u32 k = 0; p && k < row && k < 4096; k++) sum += p[k];
+            fprintf(stderr, " %u:L%u/0x%08X/f%02X/%ux%u/p%u/ea%08X/m%lu", u, t.location, t.offset, t.format, t.width, t.height, t.pitch,
+                    cellGcmResolveLocated(t.location == RSX_LOCATION_LOCAL, t.offset),
+                    p ? sum / (row < 4096 ? row : 4096) : 9999ul);
+        }
     }
     fputc('\n', stderr);
     /* A GPU-skinned draw (an unnormalised-byte attribute carries its bone
@@ -1778,6 +1798,8 @@ static void sink_end(void* user, const rsx_dispatch* r)
     if (!pipeline_is_fixed) g.guest_draws++;
     s_dstat.issued++;
     if (target < ENG_MAX_SURFACES) s_surf_draws[target]++;
+    if (rs.color_mask) { rsx_dsp_vertex_attr a7; rsx_dsp_get_vertex_attr(&g.rsx, 7, &a7);
+        if (a7.type == 7) { s_skin_draws++; s_skin_verts += dc.n_verts; } }
     eng_draw_trace(pipeline_is_fixed ? "OK-fixed" : "OK", prim, indexed, n_draw, pipeline, tex_mask);
 
     if (zslot != ENG_INVALID && rs.depth_test && rs.depth_write)
@@ -1953,12 +1975,12 @@ static void eng_present(u32 buffer_id)
                   unsigned long long sum = 0; u32 n = 0;
                   for (u32 p = 0; p < ps->w * ps->h; p += 61) { sum += buf[p * 4] + buf[p * 4 + 1] + buf[p * 4 + 2]; n += 3; }
                   mean = n ? (double)sum / n : 0.0; free(buf); } }
-          fprintf(stderr, "[present] f=%u buffer=%u -> s%u(off=%08X) %s mean=%.0f draws:", g.frames, buffer_id, target, ps->offset, s_present_src, mean);
+          fprintf(stderr, "[present] f=%u buffer=%u -> s%u(off=%08X) %s mean=%.0f skin=%u/%u draws:", g.frames, buffer_id, target, ps->offset, s_present_src, mean, s_skin_draws, s_skin_verts);
           for (u32 i = 0; i < g.n_surfaces; i++)
               if (s_surf_draws[i]) fprintf(stderr, " s%u=%u", i, s_surf_draws[i]);
           fputc('\n', stderr);
       }
-      memset(s_surf_draws, 0, sizeof s_surf_draws); }
+      memset(s_surf_draws, 0, sizeof s_surf_draws); s_skin_draws = s_skin_verts = 0; }
     /* RSX_TRACE_ON_WHITE=1: read the presented frame back; when it comes out
      * (nearly) all white, trace the next four frames draw by draw. */
     if (s_ring_on > 0) { char line[120];
