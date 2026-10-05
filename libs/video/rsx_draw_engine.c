@@ -1403,9 +1403,25 @@ static void eng_draw_trace(const char* outcome, u32 prim, int indexed, u32 n_dra
      * twice has every other frame empty of draws. */
     if (s_dtrace_frame < 0 || (long)g.frames < s_dtrace_frame || (long)g.frames >= s_dtrace_frame + 4) return;
     rsx_dsp_index_array ia; rsx_dsp_get_index_array(&g.rsx, &ia);
-    fprintf(stderr, "[draw-trace] f%u %s prim=%u packets=%u refs=%u verts=%u indexed=%d n=%u pipe=%u tex=0x%X idx(loc=%u off=0x%08X u32=%d) attrs:",
+    rsx_be_render_state trs; rsx_draw_engine_decode_render_state(&g.rsx, &trs);
+    u32 ttargets[RSX_BE_MAX_COLOR_TARGETS]; const u32 tnt = eng_current_target_set(ttargets);
+    fprintf(stderr, "[draw-trace] f%u %s prim=%u packets=%u refs=%u verts=%u indexed=%d n=%u pipe=%u tex=0x%X idx(loc=%u off=0x%08X u32=%d)"
+            " target=s%d(%ux%u fmt%u) blend=%u(%X/%X eq%X) alpha=%u depth=%u/%u cull=%u mask=0x%X",
             g.frames, outcome, prim, dc.n_packets, dc.n_source_refs, dc.n_verts, indexed, n_draw, pipeline, tex_mask,
-            ia.location, ia.offset, ia.is_u32);
+            ia.location, ia.offset, ia.is_u32,
+            tnt ? (int)ttargets[0] : -1, tnt ? g.surfaces[ttargets[0]].w : 0, tnt ? g.surfaces[ttargets[0]].h : 0,
+            tnt ? (u32)g.surfaces[ttargets[0]].fmt : 0,
+            trs.blend_enable, trs.sf_rgb, trs.df_rgb, trs.eq_rgb, trs.alpha_test_enable, trs.depth_test, trs.depth_write,
+            trs.cull_enable, trs.color_mask);
+    /* The first decoded vertex of a small draw: a full-screen quad's position
+     * and its vertex colour are what decide whether it covers the frame. */
+    if (dc.n_verts && dc.n_verts <= 8 && dc.verts && dc.layout.stride) {
+        const float* v = (const float*)dc.verts;
+        fprintf(stderr, " v0=[");
+        for (u32 k = 0; k < dc.layout.stride / 4 && k < 16; k++) fprintf(stderr, "%s%.3g", k ? " " : "", v[k]);
+        fprintf(stderr, "]");
+    }
+    fprintf(stderr, " attrs:");
     for (u32 i = 0; i < 16; i++) {
         rsx_dsp_vertex_attr a; rsx_dsp_get_vertex_attr(&g.rsx, i, &a);
         if (!a.type) continue;
@@ -1743,6 +1759,27 @@ static void eng_present(u32 buffer_id)
     g.last_present_surface = target;
     g.be->present(g.be->user, g.surfaces[target].handle);
     eng_surface_dump_frame();
+    /* RSX_TRACE_ON_WHITE=1: read the presented frame back; when it comes out
+     * (nearly) all white, trace the next four frames draw by draw. */
+    { static int on = -1; if (on < 0) on = getenv("RSX_TRACE_ON_WHITE") ? 1 : 0;
+      static int armed = 0;
+      if (on && !armed && g.surfaces[target].fmt == RSX_BE_FMT_R8G8B8A8 && g.surfaces[target].w && g.surfaces[target].h) {
+          const u32 w = g.surfaces[target].w, h = g.surfaces[target].h;
+          u8* buf = (u8*)malloc((size_t)w * h * 4);
+          if (buf) {
+              g.be->readback(g.be->user, g.surfaces[target].handle, 0, 0, w, h, buf, w * 4);
+              unsigned long long sum = 0; const u32 step = 61;
+              u32 n = 0;
+              for (u32 p = 0; p < w * h; p += step) { sum += buf[p * 4] + buf[p * 4 + 1] + buf[p * 4 + 2]; n += 3; }
+              const double mean = n ? (double)sum / n : 0.0;
+              if (mean > 250.0) {
+                  armed = 1; s_dtrace_frame = (long)g.frames + 1;
+                  fprintf(stderr, "[draw-trace] frame %u presented WHITE (mean %.1f): tracing frames %ld..%ld\n",
+                          g.frames, mean, s_dtrace_frame, s_dtrace_frame + 3);
+              }
+              free(buf);
+          }
+      } }
     g.frames++;
     eng_draw_stats_report();
     g.last_guest_draws = g.guest_draws;
