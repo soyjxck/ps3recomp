@@ -415,6 +415,24 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, u32 ctrl, char* out, u32 ou
     return rsx_fp_decompile_ex(ucode, max_bytes, ctrl, 0u, out, out_size);
 }
 
+/* Depth-compare (shadow map) units for the next decompile; see
+ * rsx_fp_set_shadow_units in the header. */
+static u32 s_shadow_mask;
+static u8  s_shadow_func[16];
+
+void rsx_fp_set_shadow_units(u32 mask, const u8* funcs)
+{
+    s_shadow_mask = mask & 0xFFFFu;
+    for (u32 u = 0; u < 16; u++) s_shadow_func[u] = funcs ? (u8)(funcs[u] & 7u) : 0;
+}
+
+/* The comparison a shadow unit applies, as "reference OP texel". */
+static const char* fp_shadow_op(u32 f)
+{
+    static const char* op[8] = { "<", "<", "==", "<=", ">", "!=", ">=", "<" };
+    return op[f & 7u];
+}
+
 static int rsx_fp_decompile_internal(
     const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
     int buffered, char* out, u32 out_size, u32* out_constant_count)
@@ -672,7 +690,9 @@ static int rsx_fp_decompile_internal(
         case OP_SNE: snprintf(rhs, sizeof(rhs), "(float4)((%s) != (%s))", a, b); break;
         case OP_SEQ: snprintf(rhs, sizeof(rhs), "(float4)((%s) == (%s))", a, b); break;
         case OP_TEX:
-            if ((tex_cube_mask >> tex_unit) & 1u)
+            if ((s_shadow_mask >> tex_unit) & 1u)
+                snprintf(rhs, sizeof(rhs), "rsx_shadow%u((%s).xyz)", tex_unit, a);
+            else if ((tex_cube_mask >> tex_unit) & 1u)
                 /* Cubemap: sample with the full 3-component direction vector. */
                 snprintf(rhs, sizeof(rhs),
                          "rsx_tex%u.Sample(rsx_samp[%u], (%s).xyz)", tex_unit, tex_unit, a);
@@ -684,7 +704,9 @@ static int rsx_fp_decompile_internal(
                          "rsx_tex[%u].Sample(rsx_samp[%u], (%s).xy)", tex_unit, tex_unit, a);
             break;
         case OP_TXP:
-            if ((tex_cube_mask >> tex_unit) & 1u)
+            if ((s_shadow_mask >> tex_unit) & 1u)
+                snprintf(rhs, sizeof(rhs), "rsx_shadow%u((%s).xyz / (%s).w)", tex_unit, a, a);
+            else if ((tex_cube_mask >> tex_unit) & 1u)
                 /* Projective divide is meaningless for a cube lookup; sample
                  * the direction directly. */
                 snprintf(rhs, sizeof(rhs),
@@ -698,7 +720,12 @@ static int rsx_fp_decompile_internal(
                          "rsx_tex[%u].Sample(rsx_samp[%u], (%s).xy / (%s).w)",
                          tex_unit, tex_unit, a, a);
             break;
-        case OP_TXB: case OP_TXL: {
+        case OP_TXB: case OP_TXL:
+            if ((s_shadow_mask >> tex_unit) & 1u) {
+                snprintf(rhs, sizeof(rhs), "rsx_shadow%u((%s).xyz)", tex_unit, a);
+                break;
+            }
+        {
             /* Biased / explicit-LOD sample; bias or LOD is src1.x (RPCS3
              * TEXTURE_SAMPLE2D_BIAS / _LOD). GH3's fret buttons and fret lines
              * are TXB: unhandled, they sampled nothing and output alpha 0. */
@@ -904,6 +931,34 @@ static int rsx_fp_decompile_internal(
     out_puts(&p,
         "SamplerState rsx_samp[16] : register(s0);\n"
     );
+    /* Shadow-map units: a depth texture whose unit has a compare function
+     * returns, on the RSX, the fraction of the 2x2 footprint whose depth
+     * passes "reference OP texel" (percentage-closer filtering), replicated
+     * to all four components -- not the depth. The depth arrives here as a
+     * float snapshot in .r, so compare the four gathered texels and filter
+     * the results bilinearly. Sampled as plain depth, Drakengard 3's shadow
+     * projections came out as solid dark rectangles, and whole floors black. */
+    for (u32 u = 0; u < 16; u++) {
+        if (!((s_shadow_mask >> u) & 1u) || ((tex_cube_mask >> u) & 1u)) continue;
+        char tn[24], fn[1400];
+        snprintf(tn, sizeof tn, tex_cube_mask ? "rsx_tex%u" : "rsx_tex[%u]", u);
+        const char* op = fp_shadow_op(s_shadow_func[u]);
+        if (s_shadow_func[u] == 7u)
+            snprintf(fn, sizeof fn, "float4 rsx_shadow%u(float3 c) { return (float4)1.0; }\n", u);
+        else
+            snprintf(fn, sizeof fn,
+                "float4 rsx_shadow%u(float3 c) {\n"
+                "    float w, h; %s.GetDimensions(w, h);\n"
+                "    float2 st = c.xy * float2(w, h) - 0.5;\n"
+                "    float2 f = frac(st);\n"
+                "    float4 d = %s.GatherRed(rsx_samp[%u], (floor(st) + 1.0) / float2(w, h));\n"
+                "    float4 p = float4(c.z %s d.x ? 1.0 : 0.0, c.z %s d.y ? 1.0 : 0.0,\n"
+                "                      c.z %s d.z ? 1.0 : 0.0, c.z %s d.w ? 1.0 : 0.0);\n"
+                "    float v = lerp(lerp(p.w, p.z, f.x), lerp(p.x, p.y, f.x), f.y);\n"
+                "    return (float4)v;\n"
+                "}\n", u, tn, tn, u, op, op, op, op);
+        out_puts(&p, fn);
+    }
     if (buffered) {
         char constants_decl[192];
         snprintf(

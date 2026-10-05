@@ -928,6 +928,30 @@ static u32 eng_vtex_mask(void)
     return mask;
 }
 
+/* Shadow-map units: an enabled depth-format texture (DEPTH24_D8, DEPTH16 and
+ * their float variants) whose TEXTURE_ADDRESS carries a compare function
+ * (bits 28-31, CELL_GCM_TEXTURE_ZFUNC_*; 0 = NEVER = no comparison). Such a
+ * unit returns the comparison result, not the depth (see
+ * rsx_fp_set_shadow_units). RSX_NO_SHADOW_CMP=1 turns it off. */
+static u32 eng_shadow_units(u8 funcs[16])
+{
+    static int off = -1; if (off < 0) off = getenv("RSX_NO_SHADOW_CMP") ? 1 : 0;
+    u32 mask = 0;
+    memset(funcs, 0, 16);
+    if (off) return 0;
+    for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES && u < 16; u++) {
+        rsx_dsp_texture t;
+        rsx_dsp_get_texture(&g.rsx, u, &t);
+        if (!t.enabled) continue;
+        const u32 base = t.format & RSX_TEX_FMT_BASE_MASK & ~(u32)RSX_TEX_FMT_UNNORM;
+        if (base < 0x90u || base > 0x93u) continue;
+        const u32 zf = (t.wrap >> 28) & 0xFu;
+        if (!zf || zf > 7u) continue;
+        mask |= 1u << u; funcs[u] = (u8)zf;
+    }
+    return mask;
+}
+
 static u32 eng_cube_mask(void)
 {
     u32 mask = 0;
@@ -1070,6 +1094,8 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     const u32 fp_ctrl  = rsx_dsp_shader_control(&g.rsx);
     const u32 cube_mask = eng_cube_mask();
     const u32 vtex_mask = eng_vtex_mask();
+    u8 shadow_funcs[16];
+    const u32 shadow_mask = eng_shadow_units(shadow_funcs);
 
     memset(&g.fp_constants, 0, sizeof g.fp_constants);
     if (!fixed && rsx_fp_collect_constants(fp_uc, fp_size, &g.fp_constants) < 0)
@@ -1092,6 +1118,10 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         key = eng_fnv1a(&fp_ctrl_key, sizeof fp_ctrl_key, key);
         key = eng_fnv1a(&cube_mask, sizeof cube_mask, key);
         key = eng_fnv1a(&vtex_mask, sizeof vtex_mask, key);
+        if (shadow_mask) {
+            key = eng_fnv1a(&shadow_mask, sizeof shadow_mask, key);
+            key = eng_fnv1a(shadow_funcs, sizeof shadow_funcs, key);
+        }
     }
     key = eng_fnv1a(&layout->mask, sizeof layout->mask, key);
     key = eng_fnv1a(&layout->stride, sizeof layout->stride, key);
@@ -1118,8 +1148,13 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         vi = rsx_vp_decompile_compact_ex(vp_uc, vp_instrs * 16u, vtex_mask,
                                          layout->mask, s_vs_hlsl,
                                          sizeof s_vs_hlsl);
+        rsx_fp_set_shadow_units(shadow_mask, shadow_funcs);
         fi = rsx_fp_decompile_buffered_ex(fp_uc, fp_size, fp_ctrl, cube_mask,
                                           s_ps_hlsl, sizeof s_ps_hlsl, &nconst);
+        rsx_fp_set_shadow_units(0, NULL);
+        if (shadow_mask) { static int n = 0; if (n++ < 6)
+            fprintf(stderr, "[rsx engine] shadow-compare units 0x%X (func of first: %u)\n",
+                    shadow_mask, shadow_funcs[__builtin_ctz(shadow_mask)]); }
         if (fi > 0 && nconst != g.fp_constants.count) fi = -1;
         if (fi > 0 && rs->alpha_test_enable &&
             rsx_fp_apply_alpha_test_buffered(s_ps_hlsl, sizeof s_ps_hlsl,

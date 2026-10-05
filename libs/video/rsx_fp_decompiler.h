@@ -105,6 +105,12 @@ float rsx_fp_alpha_ref(u32 raw, u32 surface_color_format);
  * TextureCube SRV at register tN, and a 2D unit a Texture2D SRV. See the
  * fragment lane report (scratch/a010_reports/fragment.md) for replay_main.c
  * call-site guidance. */
+/* Shadow-map units for the NEXT decompile call: bit u of mask makes unit u a
+ * depth-compare sample with function funcs[u] (CELL_GCM_TEXTURE_ZFUNC_*,
+ * 1 LESS .. 7 ALWAYS, from TEXTURE_ADDRESS bits 28-31). The caller sets it
+ * from the textures bound at draw time, keys its pipeline on it, and resets
+ * it to 0 afterwards. */
+void rsx_fp_set_shadow_units(u32 mask, const u8* funcs);
 int rsx_fp_decompile_ex(const u8* ucode, u32 max_bytes, u32 ctrl,
                         u32 tex_cube_mask, char* out, u32 out_size);
 
