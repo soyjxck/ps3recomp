@@ -254,6 +254,10 @@ void rsx_draw_engine_flush(void);
 void rsx_draw_engine_present(void);
 /* A runner retiring a queued flip names the buffer explicitly. */
 void rsx_draw_engine_present_buffer(u32 buffer_id);
+/* A flip the GCM drain decoded from the FIFO (a 0xFEADxxxx word): presented
+ * here, in order with the draws, exactly as a 0xE944 flip is. Returns 1 when
+ * the engine presented; from then on the host clock's presents are ignored. */
+int rsx_draw_engine_fifo_flip(u32 buffer_id);
 
 /* --- test hooks ---------------------------------------------------------- */
 

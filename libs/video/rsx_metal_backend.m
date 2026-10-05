@@ -671,6 +671,15 @@ static void dump_shader(const char* name, const char* text)
 static MTLCompileOptions* guest_compile_options(void)
 {
     MTLCompileOptions* o = [MTLCompileOptions new];
+    /* Position invariance across pipelines. A title's depth pre-pass and its
+     * base pass run DIFFERENT vertex programs over the same geometry and test
+     * the base pass with LEQUAL against the pre-pass depth; the RSX computes
+     * both bit-identically, instruction by instruction. Without this the
+     * compiler may contract or reorder the two translations differently,
+     * the base pass lands a rounding step below or above the pre-pass, and
+     * the test fails over the whole mesh: Drakengard 3's GPU-skinned
+     * characters were submitted every frame and never seen. */
+    if (@available(macOS 11.0, *)) o.preserveInvariance = YES;
     /* IEEE comparisons. The decompilers flush a NaN result to zero with
      * `x == x`, and the alpha test compares with isunordered; Metal's default
      * fast math is free to fold both away. */

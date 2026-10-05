@@ -110,7 +110,7 @@ typedef struct {
     u64 last_use_serial;
 } eng_texture;
 
-typedef struct { u64 key; u32 handle; u8 fixed; } eng_pipeline;
+typedef struct { u64 key; u32 handle; u8 fixed; u64 vp_fnv; u64 vp_hlsl; } eng_pipeline;
 
 typedef struct { u32 first, count; } eng_batch;
 
@@ -143,6 +143,7 @@ static struct {
     u32 last_guest_draws;
     u32 last_present_surface;
     u32 last_flip_buffer;
+    u32 sink_flips;          /* flips decoded from the FIFO (0xE944), in draw order */
 
     /* staging: decoded texture levels, the constant blocks, the index list */
     u8* tex_staging;
@@ -758,16 +759,29 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     /* TEX_DUMP_DIR=<dir>: log every upload, and write each 8-bit (B8) upload at
      * least 256 wide -- a Bink video plane -- as a PPM, so "is the decoder
      * producing pixels" can be answered by looking at the image. */
-    { static const char* dd = (const char*)1;
+    { static const char* dd = (const char*)1; static int ul = -1;
       if (dd == (const char*)1) dd = getenv("TEX_DUMP_DIR");
-      if (dd) {
+      if (ul < 0) ul = getenv("TEX_UP_LOG") ? 1 : 0;   /* the log line alone, no PPMs */
+      if (dd || ul) {
           static int n = 0, saved = 0;
-          if (n++ < 400 || (fmt & 0x9Fu) == 0x81u /* CELL_GCM_TEXTURE_B8, any layout flags */)
-              fprintf(stderr, "[tex-up] fmt=0x%02X %ux%u pitch=%u levels=%u loc=%u off=0x%08X ea=0x%08X remap=0x%04X cube=%d\n",
-                      fmt, w, h, pitch, levels, location, offset,
+          if (n++ < 400 || (fmt & 0x9Fu) == 0x81u /* CELL_GCM_TEXTURE_B8, any layout flags */) {
+              /* A B8 plane's mean, so "are the decoder's pixels there" is in
+               * the log line itself: a Bink plane of a real picture averages
+               * tens to a hundred-odd; all-zero planes shade the YUV->RGB
+               * quad solid green (0,135,0). */
+              unsigned long b8mean = 0;
+              if ((fmt & 0x9Fu) == 0x81u && w && h) {
+                  const u32 row = pitch ? pitch : w; unsigned long sum = 0;
+                  for (u32 y = 0; y < h; y += 4) for (u32 x = 0; x < w; x += 4) sum += src[y * row + x];
+                  b8mean = sum / (((h + 3) / 4) * ((w + 3) / 4)); }
+              fprintf(stderr, "[tex-up] f%u fmt=0x%02X %ux%u pitch=%u levels=%u loc=%u off=0x%08X ea=0x%08X remap=0x%04X cube=%d mean=%lu\n",
+                      g.frames, fmt, w, h, pitch, levels, location, offset,
                       cellGcmResolveLocated(location == RSX_LOCATION_LOCAL, offset), remap, cube);
+          }
           static int b8n = 0;
-          if ((fmt & 0x9Fu) == 0x81u /* CELL_GCM_TEXTURE_B8, any layout flags */ && w >= 256 &&
+          /* TEX_DUMP_FROM=<frame>: spend the PPM budget from that frame on. */
+          static long dfrom = -1; if (dfrom < 0) { const char* e = getenv("TEX_DUMP_FROM"); dfrom = e ? atol(e) : 0; }
+          if (dd && (long)g.frames >= dfrom && (fmt & 0x9Fu) == 0x81u /* CELL_GCM_TEXTURE_B8, any layout flags */ && w >= 256 &&
               (b8n++ % 150) == 0 && saved < 80) {   /* one plane every ~1.5 s of video */
               char path[512]; snprintf(path, sizeof path, "%s/b8_%03d_%ux%u_%08X.ppm", dd, saved++, w, h, offset);
               FILE* f = fopen(path, "wb");
@@ -1121,14 +1135,28 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         for (const char* c = s_vs_hlsl; *c; c++) vh = (vh ^ (unsigned char)*c) * 1099511628211ull;
         for (const char* c = s_ps_hlsl; *c; c++) ph = (ph ^ (unsigned char)*c) * 1099511628211ull;
         fprintf(stderr, "[rsx engine] pipeline %016llx: %s vp %d, fp %d,"
-                        " %u constants -> %s handle=%u fp-hash=%016llx fp-size=%u blend=%u(%X/%X) vp-hlsl=%016llx fp-hlsl=%016llx\n",
+                        " %u constants -> %s handle=%u fp-hash=%016llx fp-size=%u blend=%u(%X/%X) vp-hlsl=%016llx fp-hlsl=%016llx vp-start=%u vp-instrs=%u\n",
                 (unsigned long long)key, fixed ? "built-in" : "guest",
                 vi, fi, nconst, handle ? "ok" : "FAILED (draw dropped)", handle, fh, fp_size,
-                rs->blend_enable, rs->sf_rgb, rs->df_rgb, vh, ph); } }
+                rs->blend_enable, rs->sf_rgb, rs->df_rgb, vh, ph, rsx_dsp_vp_start(&g.rsx), vp_instrs);
+        /* RSX_VP_HEX=<vp-hlsl hash>: that program's microcode, four words per
+         * instruction, for decoding a field by hand against the decompiler. */
+        { static unsigned long long want = 0; static int got = -1;
+          if (got < 0) { const char* e = getenv("RSX_VP_HEX"); want = e ? strtoull(e, 0, 16) : 0; got = 0; }
+          if (want && vh == want && !got && vp_uc) { got = 1;
+              fprintf(stderr, "[vp-hex] vp-hlsl=%016llx start=%u instrs=%u\n", vh, rsx_dsp_vp_start(&g.rsx), vp_instrs);
+              for (u32 i = 0; i < vp_instrs; i++) {
+                  const u32* w = (const u32*)(vp_uc + i * 16);
+                  fprintf(stderr, "[vp-hex] %3u: %08X %08X %08X %08X\n", i, w[0], w[1], w[2], w[3]); } } } } }
 
     g.pipelines[g.n_pipelines].key = key;
     g.pipelines[g.n_pipelines].handle = handle;
     g.pipelines[g.n_pipelines].fixed = (u8)fixed;
+    { u64 vf = 1469598103934665603ull, vh2 = 1469598103934665603ull;
+      for (u32 i = 0; vp_uc && i < vp_instrs * 16u; i++) vf = (vf ^ vp_uc[i]) * 1099511628211ull;
+      for (const char* c = s_vs_hlsl; *c; c++) vh2 = (vh2 ^ (unsigned char)*c) * 1099511628211ull;
+      g.pipelines[g.n_pipelines].vp_fnv = vf;
+      g.pipelines[g.n_pipelines].vp_hlsl = fixed ? 0 : vh2; }
     g.n_pipelines++;
     *out_fixed = fixed;
     return handle;
@@ -1419,6 +1447,7 @@ static void eng_draw_stats_tick(void)
     if (s_dstat_on < 0) s_dstat_on = getenv("RSX_DRAW_STATS") ? 1 : 0;
     if (s_dtrace_frame == -2) { const char* e = getenv("RSX_DRAW_TRACE_FRAME"); s_dtrace_frame = e ? atol(e) : -1; }
 }
+uint32_t g_rsx_engine_frame = 0;   /* the present count, for frame-gated logs elsewhere */
 static void eng_draw_stats_report(void)
 {
     if (s_dstat_on != 1 || (g.frames % 120u) != 0u) return;
@@ -1450,7 +1479,7 @@ static void eng_ring_dump(const char* why)
 }
 static void eng_ring_draw(const char* outcome, u32 prim, int indexed, u32 n_draw, u32 pipeline, u32 tex_mask)
 {
-    if (s_ring_on < 0) s_ring_on = getenv("RSX_TRACE_ON_WHITE") ? 1 : 0;
+    if (s_ring_on < 0) s_ring_on = (getenv("RSX_TRACE_ON_WHITE") || getenv("RSX_TRACE_ON_COLOR")) ? 1 : 0;
     if (!s_ring_on) return;
     rsx_be_render_state trs; rsx_draw_engine_decode_render_state(&g.rsx, &trs);
     u32 tt[RSX_BE_MAX_COLOR_TARGETS]; const u32 tn = eng_current_target_set(tt);
@@ -1471,9 +1500,22 @@ static void eng_ring_draw(const char* outcome, u32 prim, int indexed, u32 n_draw
 static void eng_draw_trace(const char* outcome, u32 prim, int indexed, u32 n_draw, u32 pipeline, u32 tex_mask)
 {
     eng_ring_draw(outcome, prim, indexed, n_draw, pipeline, tex_mask);
+    /* RSX_TRACE_SKINNED_FROM=<frame>: from that frame on, the first 40 draws
+     * into a full-size target that carry an unnormalised-byte attribute (a
+     * GPU-skinned mesh's bone indices), whatever frame they fall in. */
+    int skinned_pick = 0;
+    { static long from = -2; static int left = 40;
+      if (from == -2) { const char* e = getenv("RSX_TRACE_SKINNED_FROM"); from = e ? atol(e) : -1; }
+      if (from >= 0 && (long)g.frames >= from && left > 0) {
+          u32 tt[RSX_BE_MAX_COLOR_TARGETS]; const u32 tn = eng_current_target_set(tt);
+          if (tn && g.surfaces[tt[0]].w >= 1280) {
+              /* Bone indices ride in attribute 7 as unnormalised bytes; a rigid
+               * mesh's packed tangents are unnormalised bytes too, in 2 and 5. */
+              rsx_dsp_vertex_attr a; rsx_dsp_get_vertex_attr(&g.rsx, 7, &a);
+              if (a.type == 7) { skinned_pick = 1; left--; } } } }
     /* Four consecutive frames: a title that presents each rendered frame
      * twice has every other frame empty of draws. */
-    if (s_dtrace_frame < 0 || (long)g.frames < s_dtrace_frame || (long)g.frames >= s_dtrace_frame + 4) return;
+    if (!skinned_pick && (s_dtrace_frame < 0 || (long)g.frames < s_dtrace_frame || (long)g.frames >= s_dtrace_frame + 4)) return;
     rsx_dsp_index_array ia; rsx_dsp_get_index_array(&g.rsx, &ia);
     rsx_be_render_state trs; rsx_draw_engine_decode_render_state(&g.rsx, &trs);
     u32 ttargets[RSX_BE_MAX_COLOR_TARGETS]; const u32 tnt = eng_current_target_set(ttargets);
@@ -1512,6 +1554,15 @@ static void eng_draw_trace(const char* outcome, u32 prim, int indexed, u32 n_dra
       for (u32 i = 0; i < 16 && !skinned; i++) { rsx_dsp_vertex_attr a; rsx_dsp_get_vertex_attr(&g.rsx, i, &a); if (a.type == 7) skinned = 1; }
       if (skinned) {
           static const u32 slots[] = { 204, 207, 208, 209, 210, 211, 212, 462, 463, 464, 465, 466, 467 };
+          { const u8* vu = NULL; const u8* fu = NULL; u32 vi2 = 0, fs2 = 0;
+            u64 vf = 1469598103934665603ull;
+            if (eng_guest_programs(&vu, &vi2, &fu, &fs2))
+                for (u32 i = 0; i < vi2 * 16u; i++) vf = (vf ^ vu[i]) * 1099511628211ull;
+            u64 pf = 0, ph2 = 0;
+            for (u32 i = 0; i < g.n_pipelines; i++) if (g.pipelines[i].handle == pipeline) { pf = g.pipelines[i].vp_fnv; ph2 = g.pipelines[i].vp_hlsl; break; }
+            fprintf(stderr, "[draw-trace]   vp resident=%016llx (start=%u instrs=%u) pipeline's=%016llx %s vp-hlsl=%016llx\n",
+                    (unsigned long long)vf, rsx_dsp_vp_start(&g.rsx), vi2, (unsigned long long)pf, vf == pf ? "same" : "DIFFERENT",
+                    (unsigned long long)ph2); }
           fprintf(stderr, "[draw-trace]   constants:");
           for (u32 k = 0; k < sizeof slots / sizeof slots[0]; k++) {
               const float* c = g.rsx.constants[slots[k]];
@@ -1732,7 +1783,7 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
     if (!g.ready) return;
     u32 targets[RSX_BE_MAX_COLOR_TARGETS];
     const u32 n_targets = eng_current_target_set(targets);
-    if (s_ring_on < 0) s_ring_on = getenv("RSX_TRACE_ON_WHITE") ? 1 : 0;
+    if (s_ring_on < 0) s_ring_on = (getenv("RSX_TRACE_ON_WHITE") || getenv("RSX_TRACE_ON_COLOR")) ? 1 : 0;
     if (s_ring_on) { char line[160];
         snprintf(line, sizeof line, "f%u CLEAR mask=0x%X color=0x%08X target=s%d", g.frames, mask,
                  rsx_dsp_clear_color(&g.rsx), n_targets ? (int)targets[0] : -1);
@@ -1861,6 +1912,7 @@ static void eng_surface_dump_frame(void)
         free(buf);
     }
 }
+static const char* s_present_src = "host";   /* "fifo": the title's own flip method */
 static void eng_present(u32 buffer_id)
 {
     if (!g.ready) return;
@@ -1894,7 +1946,7 @@ static void eng_present(u32 buffer_id)
                   unsigned long long sum = 0; u32 n = 0;
                   for (u32 p = 0; p < ps->w * ps->h; p += 61) { sum += buf[p * 4] + buf[p * 4 + 1] + buf[p * 4 + 2]; n += 3; }
                   mean = n ? (double)sum / n : 0.0; free(buf); } }
-          fprintf(stderr, "[present] f=%u buffer=%u -> s%u(off=%08X) mean=%.0f draws:", g.frames, buffer_id, target, ps->offset, mean);
+          fprintf(stderr, "[present] f=%u buffer=%u -> s%u(off=%08X) %s mean=%.0f draws:", g.frames, buffer_id, target, ps->offset, s_present_src, mean);
           for (u32 i = 0; i < g.n_surfaces; i++)
               if (s_surf_draws[i]) fprintf(stderr, " s%u=%u", i, s_surf_draws[i]);
           fputc('\n', stderr);
@@ -1905,7 +1957,13 @@ static void eng_present(u32 buffer_id)
     if (s_ring_on > 0) { char line[120];
         snprintf(line, sizeof line, "f%u PRESENT buffer=%u -> s%u(off=%08X)", g.frames, buffer_id, target, g.surfaces[target].offset);
         eng_ring_push(line); }
-    { static long on = -1; if (on < 0) { const char* e = getenv("RSX_TRACE_ON_WHITE"); on = e ? atol(e) : 0; }
+    { static long on = -1; static int cr = -1, cg = 0, cb = 0, ctol = 12;
+      if (on < 0) { const char* e = getenv("RSX_TRACE_ON_WHITE"); on = e ? atol(e) : 0;
+          /* RSX_TRACE_ON_COLOR=r,g,b[,tol]: the same trigger for a frame whose
+           * mean colour is within tol of r,g,b. The all-green Bink cutscene
+           * is (0,135,0): the YUV->RGB of three planes that read as zero. */
+          if ((e = getenv("RSX_TRACE_ON_COLOR"))) {
+              if (sscanf(e, "%d,%d,%d,%d", &cr, &cg, &cb, &ctol) >= 3) { if (!on) on = 1; } else cr = -1; } }
       /* The value is the first frame to watch from (a title's own fade-from-
        * white at a level start is not the bug); each episode traces four
        * frames and the watch re-arms 600 frames later. */
@@ -1916,20 +1974,25 @@ static void eng_present(u32 buffer_id)
           u8* buf = (u8*)malloc((size_t)w * h * 4);
           if (buf) {
               g.be->readback(g.be->user, g.surfaces[target].handle, 0, 0, w, h, buf, w * 4);
-              unsigned long long sum = 0; const u32 step = 61;
+              unsigned long long sr = 0, sg = 0, sb = 0; const u32 step = 61;
               u32 n = 0;
-              for (u32 p = 0; p < w * h; p += step) { sum += buf[p * 4] + buf[p * 4 + 1] + buf[p * 4 + 2]; n += 3; }
-              const double mean = n ? (double)sum / n : 0.0;
-              if (mean > 250.0) {
-                  eng_ring_dump("white present");
+              for (u32 p = 0; p < w * h; p += step) { sr += buf[p * 4]; sg += buf[p * 4 + 1]; sb += buf[p * 4 + 2]; n++; }
+              const double mr = n ? (double)sr / n : 0.0, mg = n ? (double)sg / n : 0.0, mb = n ? (double)sb / n : 0.0;
+              const double mean = (mr + mg + mb) / 3.0;
+              const int white = mean > 250.0;
+              const int colour = cr >= 0 && mr >= cr - ctol && mr <= cr + ctol && mg >= cg - ctol && mg <= cg + ctol &&
+                                 mb >= cb - ctol && mb <= cb + ctol;
+              if (white || colour) {
+                  eng_ring_dump(white ? "white present" : "colour present");
                   armed = 1; armed_at = g.frames; s_dtrace_frame = (long)g.frames + 1;
-                  fprintf(stderr, "[draw-trace] frame %u presented WHITE (mean %.1f): tracing frames %ld..%ld\n",
-                          g.frames, mean, s_dtrace_frame, s_dtrace_frame + 3);
+                  fprintf(stderr, "[draw-trace] frame %u presented %s (mean %.0f,%.0f,%.0f): tracing frames %ld..%ld\n",
+                          g.frames, white ? "WHITE" : "the watched colour", mr, mg, mb, s_dtrace_frame, s_dtrace_frame + 3);
               }
               free(buf);
           }
       } }
     g.frames++;
+    g_rsx_engine_frame = g.frames;
     eng_draw_stats_report();
     g.last_guest_draws = g.guest_draws;
     g.guest_draws = 0;
@@ -1939,7 +2002,28 @@ static void sink_flip(void* user, const rsx_dispatch* r, u32 arg)
 {
     (void)user; (void)r;
     g.last_flip_buffer = arg & 7u;
+    g.sink_flips++;
+    s_present_src = "fifo";
     eng_present(g.last_flip_buffer);
+    s_present_src = "host";
+}
+
+/* A title whose FIFO carries its flips -- the 0xE944 method, or the
+ * 0xFEADxxxx word libgcm's flip and prepare-flip commands write -- presents
+ * through sink_flip or rsx_draw_engine_fifo_flip, in order with its draws.
+ * Once that has happened the host clock's presents are not harmless repeats:
+ * by the time the clock runs, the drain may have gone through several more
+ * frames of commands, and the buffer it names then holds a later frame's
+ * clear. Drakengard 3 clears each display buffer to white for its
+ * light-attenuation pass before drawing into it, so those late presents
+ * flashed white, cyan (a shadow mask) and half-built frames between the
+ * real ones, and its characters and distant buildings seemed to flicker. */
+static int eng_host_present_allowed(void)
+{
+    if (!g.sink_flips) return 1;
+    static int said = 0;
+    if (!said++) fprintf(stderr, "[rsx engine] host presents ignored from now on: this title flips through its FIFO\n");
+    return 0;
 }
 
 /* ---- public API ---------------------------------------------------------- */
@@ -2065,13 +2149,26 @@ void rsx_draw_engine_present(void)
      * re-present a double-buffered title's OTHER scanout. Presenting twice is
      * harmless either way -- the engine never clears the surface, so a second
      * present just blits the same image again. */
+    if (!eng_host_present_allowed()) return;
     eng_present(g.last_flip_buffer);
 }
 
 void rsx_draw_engine_present_buffer(u32 buffer_id)
 {
+    if (!eng_host_present_allowed()) return;
     g.last_flip_buffer = buffer_id & 7u;
     eng_present(g.last_flip_buffer);
+}
+
+int rsx_draw_engine_fifo_flip(u32 buffer_id)
+{
+    if (!g.ready) return 0;
+    g.last_flip_buffer = buffer_id & 7u;
+    g.sink_flips++;
+    s_present_src = "fifo";
+    eng_present(g.last_flip_buffer);
+    s_present_src = "host";
+    return 1;
 }
 
 u32 rsx_draw_engine_guest_draws(void)

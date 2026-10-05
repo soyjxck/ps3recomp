@@ -97,6 +97,15 @@ static u32 s_current_display_buffer_id = 0;
 static volatile int s_flip_pending = 0;
 /* A flip _cellGcmSetFlipCommand queued in the FIFO: | bufferId, bit 8 = ours. */
 #define GCM_FLIP_MARKER 0xFEAD0100u
+/* Queued by cellGcmSetPrepareFlip: the drain flips when it reaches it. */
+#define GCM_PREPARE_MARKER 0xFEAD0200u
+/* The buffer whose prepare marker the drain reached last (-1: none), and
+ * whether this title has ever prepared a flip. cellGcmSetFlipImmediate on a
+ * prepared title succeeds only for that buffer -- the hardware fails it until
+ * the RSX has executed the preparation, and a title paces on that. */
+static volatile int s_prepared_id = -1;
+static int s_prepare_used = 0;
+static s32 gcm_flip_request(u32 bufferId, int in_fifo);   /* defined with the flip HLE below */
 /* ponytail: fixed headroom, far above one frame's commands (Simpsons ~10 KB);
  * derive it from the observed per-frame volume if a title outgrows it. */
 #define GCM_FLIP_WRAP_BYTES 0x40000u
@@ -1046,8 +1055,86 @@ static void nv3089_blit(void)
                out_w, out_h, f, src, in_pitch, dst, dst_pitch, out_x, out_y); } }
 }
 
+/* NV0039 memory-to-memory copy (libgcm binds it on subchannels 1 and 6:
+ * cellGcmSetTransferData and friends). LINE_COUNT lines of LINE_LENGTH_IN
+ * bytes go from (BUFFER_IN, OFFSET_IN) to (BUFFER_OUT, OFFSET_OUT), each line
+ * PITCH_IN / PITCH_OUT apart; BUFFER_NOTIFY starts the copy. The DMA objects
+ * are the usual 0xFEED0000 (local) and 0xFEED0001 (main) -- and 0x66626660,
+ * CELL_GCM_CONTEXT_DMA_FROM_MEMORY_GET_REPORT, which reads the RSX's own
+ * report area. That one is how a title gets its occlusion-query results
+ * without the PPU ever touching the report window: cellGcmSetTransferReportData
+ * copies the CellGcmReportData records into a main-memory buffer the title
+ * then reads. Drakengard 3 (Unreal Engine 3) issues one of these per
+ * occlusion query; with the copy unimplemented its buffer stayed zero, every
+ * queried primitive read "no pixels passed" after its first test, and the
+ * player, enemies and distant buildings vanished a few frames after they
+ * appeared, for good. */
+static struct {
+    u32 dma_in, dma_out, off_in, off_out, pitch_in, pitch_out, len, lines, fmt;
+} s_nv0039;
+
+static void nv0039_report_bytes(u32 report_off, u8* out)
+{
+    /* The report area is 16-byte CellGcmReportData records, big-endian:
+     * {u64 timestamp; u32 value; u32 zero}. */
+    const u32 idx = report_off / 16u, rem = report_off % 16u;
+    u8 rec[16]; memset(rec, 0, sizeof rec);
+    if (idx < CELL_GCM_MAX_REPORT_COUNT) {
+        const u64 ts = s_report_data[idx].timestamp; const u32 v = s_report_data[idx].value;
+        for (int i = 0; i < 8; i++) rec[i] = (u8)(ts >> (56 - 8 * i));
+        for (int i = 0; i < 4; i++) rec[8 + i] = (u8)(v >> (24 - 8 * i));
+    }
+    *out = rec[rem];
+}
+
+static void nv0039_copy(void)
+{
+    const u32 len = s_nv0039.len, lines = s_nv0039.lines ? s_nv0039.lines : 1u;
+    const u32 in_pitch = s_nv0039.pitch_in ? s_nv0039.pitch_in : len;
+    const u32 out_pitch = s_nv0039.pitch_out ? s_nv0039.pitch_out : len;
+    const int from_report = (s_nv0039.dma_in == 0x66626660u);
+    if (!len) return;
+    const u32 src = from_report ? s_nv0039.off_in
+                  : cellGcmResolveLocated(s_nv0039.dma_in != 0xFEED0001u, s_nv0039.off_in);
+    const u32 dst = cellGcmResolveLocated(s_nv0039.dma_out != 0xFEED0001u, s_nv0039.off_out);
+    { static int n = 0, all = -1; if (all < 0) all = getenv("GCM_M2MF_LOG") ? 1 : 0;
+      if (all || n++ < 8)
+          printf("[NV0039] copy in=0x%08X+0x%08X%s -> out=0x%08X+0x%08X (ea 0x%08X) len=%u lines=%u pitch=%u/%u fmt=0x%X\n",
+                 s_nv0039.dma_in, s_nv0039.off_in, from_report ? " (report area)" : "",
+                 s_nv0039.dma_out, s_nv0039.off_out, dst, len, lines, in_pitch, out_pitch, s_nv0039.fmt); }
+    if (!dst || (!from_report && !src)) {
+        static int n = 0; if (n++ < 4)
+            printf("[NV0039] copy dropped: unresolved %s (in dma 0x%08X off 0x%08X, out dma 0x%08X off 0x%08X)\n",
+                   dst ? "source" : "destination", s_nv0039.dma_in, s_nv0039.off_in, s_nv0039.dma_out, s_nv0039.off_out);
+        return;
+    }
+    for (u32 l = 0; l < lines; l++) {
+        const u32 s0 = src + l * in_pitch, d0 = dst + l * out_pitch;
+        if (from_report) {
+            for (u32 i = 0; i < len; i++) { u8 b; nv0039_report_bytes(s0 + i, &b); vm_write8(d0 + i, b); }
+        } else {
+            for (u32 i = 0; i < len; i++) vm_write8(d0 + i, vm_read8(s0 + i));
+        }
+    }
+}
+
 static void gcm_2d_method(u32 subch, u32 method, u32 data)
 {
+    if (subch == 1 || subch == 6) {         /* NV0039 memory to memory */
+        switch (method) {
+        case 0x0184: s_nv0039.dma_in    = data; return;
+        case 0x0188: s_nv0039.dma_out   = data; return;
+        case 0x030C: s_nv0039.off_in    = data; return;
+        case 0x0310: s_nv0039.off_out   = data; return;
+        case 0x0314: s_nv0039.pitch_in  = data; return;
+        case 0x0318: s_nv0039.pitch_out = data; return;
+        case 0x031C: s_nv0039.len       = data; return;
+        case 0x0320: s_nv0039.lines     = data; return;
+        case 0x0324: s_nv0039.fmt       = data; return;
+        case 0x0328: nv0039_copy();             return;
+        }
+        return;
+    }
     /* GCM2D_TRACE=1: histogram of (subchannel, method) actually seen. The
      * subchannel a title binds each 2D object to is libgcm-version-specific and
      * SET_OBJECT binds are not tracked, so state landing on an unexpected
@@ -1679,9 +1766,20 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 s_current_display_buffer_id = w & 7u;
                 s_flip_pending = 1;
                 s_flip_request_count++;
+            } else if ((w & 0xFFFFFF00u) == GCM_PREPARE_MARKER) {
+                /* Queued by cellGcmSetPrepareFlip: the frame in this buffer
+                 * is complete here, so flip (and let the ticker present) now,
+                 * and let cellGcmSetFlipImmediate(id) succeed from here on. */
+                gcm_flip_request(w & 7u, 0);
+                s_prepared_id = (int)(w & 7u);
             } else {
                 cellGcmSetFlipCommand(w & 0xFFu);
             }
+            /* Present here, in order with the draws, when the draw engine is
+             * up. The ticker's present comes later, and by then this drain
+             * may have run through several more frames (the catch-up below),
+             * so the buffer it names already holds a later frame's clear. */
+            rsx_draw_engine_fifo_flip(s_current_display_buffer_id);
             /* ...unless the FIFO is badly backlogged. One flip per drain is
              * right while `get` is keeping up with `put`; when it is megabytes
              * behind it is a deadlock, because the title's ring can only be
@@ -2384,15 +2482,14 @@ s32 cellGcmSetFlipCommand(u32 bufferId) { return gcm_flip_request(bufferId, 0); 
  * at ctx->current instead; the drain stops at it and fires the flip there,
  * exactly as it does for the 0xFEAD words a statically-linked libgcm emits.
  * Returns 0 when there is no room or ctx is not a mapped command buffer. */
-static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
+static int gcm_word_into_fifo(u32 ctx, u32 word)
 {
-    if (!ctx || bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM ||
-        !s_display_buffer_set[bufferId]) return 0;
+    if (!ctx) return 0;
     const u32 end = vm_read32(ctx + 4), cur = vm_read32(ctx + 8);
     /* Never near the end: those bytes are the title's reserve before its
      * ring wraps, and the recycle above keys on them. */
     if (cur + 8 + GCM_RECYCLE_SLACK > end || gcm_ea2io(cur) == 0xFFFFFFFFu) return 0;
-    vm_write32(cur, GCM_FLIP_MARKER | bufferId);
+    vm_write32(cur, word);
     /* Wrap here, on the guest thread, once the ring is nearly used -- what the
      * SDK's buffer-full callback does. Otherwise the drain thread recycles it
      * (see "recycled the title's own ring"), rewriting ctx->current and put
@@ -2409,6 +2506,11 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
     }
     vm_write32(ctx + 8, cur + 4);
     return 1;
+}
+static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
+{
+    if (bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM || !s_display_buffer_set[bufferId]) return 0;
+    return gcm_word_into_fifo(ctx, GCM_FLIP_MARKER | bufferId);
 }
 
 /* cellGcmSetFlip(context, buffer_id) — immediate flip request. PSL1GHT's
@@ -2436,29 +2538,35 @@ s32 cellGcmSetFlipCommandWithWaitLabel(u32 bufferId, u32 labelIndex, u32 labelVa
 /* NID: 0xA2478CA3 */
 s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
 {
-    (void)ctx;  /* command buffer context -- not used in HLE */
-
+    /* libgcm writes the preparation into the command buffer and RETURNS THE
+     * BUFFER ID; the flip itself is the RSX's when it reaches the command,
+     * or the PPU's through cellGcmSetFlipImmediate(id) once it has. Unreal
+     * Engine 3 on PS3 (Drakengard 3) carries that return value through a
+     * user command to its vblank handler, which calls SetFlipImmediate with
+     * it every second vblank. This HLE used to flip on the spot -- before
+     * the frame's commands had been drained, so the host presented the
+     * buffer the drain was still drawing into -- and return CELL_OK, so the
+     * title then flipped to buffer 0 every frame as well: that buffer is the
+     * light-attenuation scratch the title clears to white while another is
+     * displayed, and the picture flashed white, cyan and half-drawn. */
     if (bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM)
         return CELL_GCM_ERROR_INVALID_VALUE;
 
     if (!s_display_buffer_set[bufferId])
         return CELL_GCM_ERROR_INVALID_VALUE;
 
-    printf("[cellGcmSys] SetPrepareFlip(bufferId=%u)\n", bufferId);
+    { static int n = 0; if (n++ < 8)
+        printf("[cellGcmSys] SetPrepareFlip(bufferId=%u) -> queued in the FIFO\n", bufferId); }
 
-    s_current_display_buffer_id = bufferId;
-    s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
-    s_flip_request_count++;
-    s_last_flip_time = get_timestamp_ns();
-
-    /* Invoke the guest flip handler via OPD resolution -- s_flip_handler holds
-     * the raw guest OPD (e.g. 0x530D70); calling it as a host function pointer
-     * jumps into guest code and crashes. See cellGcmSetFlipCommand for why
-     * GCM_FLIPCB_ONTICK exists. */
-    if (s_flip_handler_opd && g_ps3_guest_caller && !gcm_flipcb_on_tick_only())
-        g_ps3_guest_caller(s_flip_handler_opd, 0, 0, 0, 0, 0, 0, 0, 0);
-
-    return CELL_OK;
+    if (gcm_word_into_fifo((u32)(uintptr_t)ctx, GCM_PREPARE_MARKER | bufferId)) {
+        s_prepare_used = 1;
+        return (s32)bufferId;
+    }
+    /* No command buffer to queue into: flip now, as before. */
+    gcm_flip_request(bufferId, 0);
+    s_prepared_id = (int)bufferId;
+    s_prepare_used = 1;
+    return (s32)bufferId;
 }
 
 /* NID: 0x1BFAB6EE */
@@ -3366,7 +3474,19 @@ u32 cellGcmGetDefaultSegmentWordSize(void)
 /* Immediate flip — perform flip right now */
 s32 cellGcmSetFlipImmediate(u32 bufferId)
 {
-    printf("[cellGcmSys] SetFlipImmediate(bufferId=%u)\n", bufferId);
+    { static int n = 0; if (n++ < 8)
+        printf("[cellGcmSys] SetFlipImmediate(bufferId=%u) prepared=%d\n", bufferId, s_prepared_id); }
+    if (s_prepare_used) {
+        /* The flip the drain performed at this buffer's prepare marker IS
+         * this flip; a second one would re-present the same buffer. Until
+         * the drain gets there the hardware answer is failure, and the title
+         * keeps the id pending and asks again next vblank. */
+        if (s_prepared_id == (int)bufferId) { s_prepared_id = -1; return CELL_OK; }
+        { static unsigned long n = 0; if (++n <= 4 || (n % 2000) == 0)
+            fprintf(stderr, "[cellGcmSys] SetFlipImmediate(%u): not prepared yet (#%lu, prepared=%d)\n",
+                    bufferId, n, s_prepared_id); }
+        return CELL_GCM_ERROR_FAILURE;
+    }
     return cellGcmSetFlipCommand(bufferId);
 }
 

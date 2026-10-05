@@ -346,12 +346,20 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
             rsx->constants[slot][word & 3] = arg;
         /* RSX_CONST_LOG=<lo>,<hi>: every transform-constant upload into that
          * slot range (first 400) -- what a shader's constants really were. */
-        { static int lo = -2, hi = 0, n = 0;
+        /* RSX_CONST_LOG_FRAME=<n>: only while the draw engine's frame counter
+         * is n or n+1 (the cap used to be spent on the title screen);
+         * RSX_CONST_LOG_MAX=<lines> raises the 400-line cap. */
+        { static int lo = -2, hi = 0; static long n = 0, cap = 400, from = -1;
+          extern uint32_t g_rsx_engine_frame;
           if (lo == -2) { const char* e = getenv("RSX_CONST_LOG"); lo = -1;
-                          if (e) sscanf(e, "%d,%d", &lo, &hi); }
-          if (lo >= 0 && (int)slot >= lo && (int)slot <= hi && n < 400) { n++;
-              fprintf(stderr, "[const-load] c[%u].%c = 0x%08X (method 0x%04X id=%u)\n", slot,
-                      "xyzw"[word & 3], arg, method, rsx->regs[M_VP_UPLOAD_CONST_ID >> 2]); } }
+                          if (e) sscanf(e, "%d,%d", &lo, &hi);
+                          if ((e = getenv("RSX_CONST_LOG_MAX"))) cap = atol(e);
+                          if ((e = getenv("RSX_CONST_LOG_FRAME"))) from = atol(e); }
+          if (lo >= 0 && (int)slot >= lo && (int)slot <= hi && n < cap &&
+              (from < 0 || ((long)g_rsx_engine_frame >= from && (long)g_rsx_engine_frame < from + 2))) { n++;
+              float fv; memcpy(&fv, &arg, 4);
+              fprintf(stderr, "[const-load] f%u c[%u].%c = 0x%08X (%.4g) (method 0x%04X id=%u)\n", g_rsx_engine_frame, slot,
+                      "xyzw"[word & 3], arg, fv, method, rsx->regs[M_VP_UPLOAD_CONST_ID >> 2]); } }
         return;
     }
 
