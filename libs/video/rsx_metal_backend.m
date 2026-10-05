@@ -47,6 +47,7 @@
  * so it cannot grow into the real pipeline.
  */
 #import <Metal/Metal.h>
+#include <sys/stat.h>
 #import <QuartzCore/CAMetalLayer.h>
 #if !TARGET_OS_IPHONE
 #  import <AppKit/AppKit.h>
@@ -2541,10 +2542,39 @@ static id<MTLFunction> eng_function(const char* hlsl, int stage,
     char name[64];
     snprintf(name, sizeof name, "%s_%016llx.hlsl", what, (unsigned long long)hash);
     dump_shader(name, hlsl);
-    if (rsx_hlsl_to_msl(hlsl, stage, s_msl, sizeof s_msl, s_log, sizeof s_log) != 0) {
+    /* PS3RECOMP_MSL_CACHE=<dir>: keep each translation's MSL on disk, keyed on
+     * the HLSL and the stage. HLSL -> SPIR-V (glslang plus the spirv-opt
+     * legalisation passes) -> MSL was most of a pipeline's cost, and the
+     * engine compiles on the FIFO walker's thread: a burst of new shaders held
+     * the walker for 8 s in one Drakengard 3 run. Metal keeps its own cache of
+     * compiled source, so a warm run skips both halves. Bump the tag when the
+     * translator's output changes. */
+    static const char* cache_dir = (const char*)1;
+    if (cache_dir == (const char*)1) {
+        cache_dir = getenv("PS3RECOMP_MSL_CACHE");
+        if (cache_dir && *cache_dir) mkdir(cache_dir, 0755); else cache_dir = NULL;
+    }
+    char cpath[1024] = "";
+    int cached = 0;
+    if (cache_dir) {
+        const u64 key = fnv1a64("msl-v1", 6, hash ^ (u64)(stage + 1) * 0x9E3779B97F4A7C15ull);
+        snprintf(cpath, sizeof cpath, "%s/%s_%016llx.msl", cache_dir, what, (unsigned long long)key);
+        FILE* cf = fopen(cpath, "rb");
+        if (cf) {
+            const size_t n = fread(s_msl, 1, sizeof s_msl - 1, cf);
+            fclose(cf);
+            if (n > 0 && n < sizeof s_msl - 1) { s_msl[n] = 0; cached = 1; }
+        }
+    }
+    if (!cached && rsx_hlsl_to_msl(hlsl, stage, s_msl, sizeof s_msl, s_log, sizeof s_log) != 0) {
         fprintf(stderr, "[rsx engine/metal] %s %016llx: %s\n", what,
                 (unsigned long long)hash, s_log);
     } else {
+        if (cache_dir && !cached && cpath[0]) {
+            char tmp[1100]; snprintf(tmp, sizeof tmp, "%s.tmp", cpath);
+            FILE* cf = fopen(tmp, "wb");
+            if (cf) { fwrite(s_msl, 1, strlen(s_msl), cf); fclose(cf); rename(tmp, cpath); }
+        }
         snprintf(name, sizeof name, "%s_%016llx.msl", what, (unsigned long long)hash);
         dump_shader(name, s_msl);
         snprintf(name, sizeof name, "%s %016llx", what, (unsigned long long)hash);
