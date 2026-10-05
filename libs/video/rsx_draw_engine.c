@@ -267,6 +267,13 @@ void rsx_draw_engine_decode_render_state(const rsx_dispatch* rsx,
     rs->bs_fail      = rsx_dsp_reg(rsx, M_BACK_STENCIL_OP_FAIL);
     rs->bs_zfail     = rsx_dsp_reg(rsx, M_BACK_STENCIL_OP_ZFAIL);
     rs->bs_zpass     = rsx_dsp_reg(rsx, M_BACK_STENCIL_OP_ZPASS);
+    /* RSX_FORCE=<list>: experiment overrides. "nostencil" disables the
+     * stencil test, "alpharef0" zeroes the alpha-test reference, "noalpha"
+     * disables the alpha test. */
+    { static int f = -1, ns = 0, ar = 0, na = 0;
+      if (f < 0) { const char* e = getenv("RSX_FORCE"); f = e ? 1 : 0;
+          if (e) { ns = strstr(e, "nostencil") != NULL; ar = strstr(e, "alpharef0") != NULL; na = strstr(e, "noalpha") != NULL; } }
+      if (f) { if (ns) rs->stencil_enable = 0; if (ar) rs->alpha_ref_raw = 0; if (na) rs->alpha_test_enable = 0; } }
 }
 
 u64 rsx_draw_engine_hash_render_state(const rsx_be_render_state* rs, u64 hash)
@@ -1485,10 +1492,10 @@ static void eng_ring_draw(const char* outcome, u32 prim, int indexed, u32 n_draw
     u32 tt[RSX_BE_MAX_COLOR_TARGETS]; const u32 tn = eng_current_target_set(tt);
     rsx_dsp_surface tsf; rsx_dsp_get_surface(&g.rsx, &tsf);
     char line[400]; int o = snprintf(line, sizeof line,
-        "f%u %s prim=%u verts=%u idx=%d n=%u pipe=%u tex=0x%X target=s%d(fmt%u) zeta=0x%08X clip=%ux%u blend=%u(%X/%X) alpha=%u depth=%u/%u/%X cull=%u mask=0x%X",
+        "f%u %s prim=%u verts=%u idx=%d n=%u pipe=%u tex=0x%X target=s%d(fmt%u) zeta=0x%08X clip=%ux%u blend=%u(%X/%X) alpha=%u(f%X ref=0x%X fmt%u -> %.4g) depth=%u/%u/%X cull=%u mask=0x%X",
         g.frames, outcome, prim, dc.n_verts, indexed, n_draw, pipeline, tex_mask,
         tn ? (int)tt[0] : -1, tn ? (u32)g.surfaces[tt[0]].fmt : 0, tsf.zeta_offset, tsf.clip_w, tsf.clip_h,
-        trs.blend_enable, trs.sf_rgb, trs.df_rgb, trs.alpha_test_enable, trs.depth_test, trs.depth_write, trs.depth_func,
+        trs.blend_enable, trs.sf_rgb, trs.df_rgb, trs.alpha_test_enable, trs.alpha_func, trs.alpha_ref_raw, trs.alpha_ref_format, (double)rsx_fp_alpha_ref(trs.alpha_ref_raw, trs.alpha_ref_format), trs.depth_test, trs.depth_write, trs.depth_func,
         trs.cull_enable, trs.color_mask);
     if (dc.n_verts && dc.n_verts <= 4 && dc.verts && dc.layout.stride && o > 0 && o < (int)sizeof line - 40) {
         const float* v = (const float*)dc.verts;
@@ -1520,12 +1527,12 @@ static void eng_draw_trace(const char* outcome, u32 prim, int indexed, u32 n_dra
     rsx_be_render_state trs; rsx_draw_engine_decode_render_state(&g.rsx, &trs);
     u32 ttargets[RSX_BE_MAX_COLOR_TARGETS]; const u32 tnt = eng_current_target_set(ttargets);
     fprintf(stderr, "[draw-trace] f%u %s prim=%u packets=%u refs=%u verts=%u indexed=%d n=%u pipe=%u tex=0x%X idx(loc=%u off=0x%08X u32=%d)"
-            " target=s%d(%ux%u fmt%u) blend=%u(%X/%X eq%X) alpha=%u depth=%u/%u cull=%u mask=0x%X",
+            " target=s%d(%ux%u fmt%u) blend=%u(%X/%X eq%X) alpha=%u(f%X ref=0x%X fmt%u -> %.4g) depth=%u/%u cull=%u mask=0x%X",
             g.frames, outcome, prim, dc.n_packets, dc.n_source_refs, dc.n_verts, indexed, n_draw, pipeline, tex_mask,
             ia.location, ia.offset, ia.is_u32,
             tnt ? (int)ttargets[0] : -1, tnt ? g.surfaces[ttargets[0]].w : 0, tnt ? g.surfaces[ttargets[0]].h : 0,
             tnt ? (u32)g.surfaces[ttargets[0]].fmt : 0,
-            trs.blend_enable, trs.sf_rgb, trs.df_rgb, trs.eq_rgb, trs.alpha_test_enable, trs.depth_test, trs.depth_write,
+            trs.blend_enable, trs.sf_rgb, trs.df_rgb, trs.eq_rgb, trs.alpha_test_enable, trs.alpha_func, trs.alpha_ref_raw, trs.alpha_ref_format, (double)rsx_fp_alpha_ref(trs.alpha_ref_raw, trs.alpha_ref_format), trs.depth_test, trs.depth_write,
             trs.cull_enable, trs.color_mask);
     /* The first decoded vertex of a small draw: a full-screen quad's position
      * and its vertex colour are what decide whether it covers the frame. */
@@ -1991,6 +1998,18 @@ static void eng_present(u32 buffer_id)
               free(buf);
           }
       } }
+    /* RSX_TRACE_BUSY=<draws>[,<from frame>]: trace the four frames after the
+     * first one (from that frame on) that issued more than <draws> draws --
+     * a gameplay frame, wherever the run's timing put it. Once per run. */
+    { static long busy = -2, bfrom = 0; static int done = 0;
+      if (busy == -2) { const char* e = getenv("RSX_TRACE_BUSY"); busy = -1;
+          if (e) { char* d; busy = strtol(e, &d, 0); if (*d == ',') bfrom = strtol(d + 1, 0, 0); } }
+      if (busy > 0 && (g.frames % 250) == 0)
+          fprintf(stderr, "[draw-trace] busy watch: frame %u guest_draws=%u\n", g.frames, g.guest_draws);
+      if (busy > 0 && !done && (long)g.frames >= bfrom && (long)g.guest_draws > busy) {
+          done = 1; s_dtrace_frame = (long)g.frames + 1;
+          fprintf(stderr, "[draw-trace] frame %u issued %u draws: tracing frames %ld..%ld\n",
+                  g.frames, g.guest_draws, s_dtrace_frame, s_dtrace_frame + 3); } }
     g.frames++;
     g_rsx_engine_frame = g.frames;
     eng_draw_stats_report();
