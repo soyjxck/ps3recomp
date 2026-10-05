@@ -230,9 +230,13 @@ static void sys_lwmutex_lock(ppu_context* ctx)
              * then block. Bounded diagnostics for park hunts; uncapped while the
              * probe window is open (g_nd_inpump). */
             static long _bl = 0; long _b = ++_bl;
-            if (g_nd_inpump || _b <= 40) fprintf(stderr, "[LWM-BLOCK] tid=%llu lwm=0x%08X owner=%u recur=%u tmo=%lluus\n",
+            /* LWM_BLOCK_LOG=<n>: raise the cap (the freeze-time blocks come
+             * long after the first 40), and say where the lock was taken. */
+            static long s_cap = -1;
+            if (s_cap < 0) { const char* e = getenv("LWM_BLOCK_LOG"); s_cap = e ? atol(e) : 40; }
+            if (g_nd_inpump || _b <= s_cap) fprintf(stderr, "[LWM-BLOCK] tid=%llu lwm=0x%08X owner=%u recur=%u tmo=%lluus lr=0x%08X\n",
                 (unsigned long long)ctx->thread_id, lwm, vm_read32(lwm + LWM_OWNER), vm_read32(lwm + LWM_RECUR),
-                (unsigned long long)timeout_us);
+                (unsigned long long)timeout_us, (uint32_t)ctx->lr);
             if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm);
                 long h = sl ? sl->holder : 0; long long held = (sl && h) ? (lwm_now_us() - sl->acq_us) : 0;
                 fprintf(stderr, "[LWM-CONVOY] tid=%llu BLOCKs lwm=0x%08X -> held-by-tid=%ld for %lldus (guest-owner=%u)\n",
