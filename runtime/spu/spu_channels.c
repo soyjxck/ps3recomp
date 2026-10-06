@@ -21,6 +21,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <setjmp.h>
+/* Plain setjmp/longjmp save and restore the signal mask on macOS -- a system
+ * call each, on every SPURS job. Nothing in the SPU runtime touches the mask. */
+#ifndef _WIN32
+#define SPU_SETJMP(env)     _setjmp(env)
+#define SPU_LONGJMP(env, v) _longjmp(env, v)
+#else
+#define SPU_SETJMP(env)     setjmp(env)
+#define SPU_LONGJMP(env, v) longjmp(env, v)
+#endif
 #ifndef _WIN32
 #include <sched.h>   /* sched_yield */
 #endif
@@ -108,12 +117,23 @@ void spu_ls_watch_slow(uint32_t lsa, int is_write, const uint8_t* p, uint32_t pc
 static SPU_TLS jmp_buf s_spu_halt_env;
 static SPU_TLS int     s_spu_halt_armed = 0;
 
+/* A pooled SPU task thread (spu_workload.c) runs one task after another, so
+ * state a task keeps per host thread is reset at the start of each one; code
+ * that counts "per task" in a thread-local compares g_spu_task_serial. */
+SPU_THREAD_LOCAL unsigned g_spu_task_serial;
+void spu_task_begin(void)
+{
+    g_spu_task_serial++;
+    g_spu_trampoline_fn = 0;
+    s_spu_halt_armed = 0;
+}
+
 /* A non-local return replaces the old host call chain without changing
  * any architectural registers, local store, or pending guest work. */
 void spu_restart_dispatch(spu_context* ctx)
 {
     g_spu_trampoline_fn = 0;
-    if (s_spu_halt_armed) longjmp(s_spu_halt_env, 2);
+    if (s_spu_halt_armed) SPU_LONGJMP(s_spu_halt_env, 2);
     fprintf(stderr, "[spu] non-local return outside execution driver at 0x%05X\n", ctx->pc);
     ctx->status = SPU_STATUS_STOPPED_BY_HALT;
 }
@@ -151,7 +171,7 @@ void spu_halt(spu_context* ctx)
                 ctx->gpr[80]._u32[0], ctx->gpr[85]._u32[0]);
         fflush(stderr);
       } }
-    if (s_spu_halt_armed) { s_spu_halt_armed = 0; longjmp(s_spu_halt_env, 1); }
+    if (s_spu_halt_armed) { s_spu_halt_armed = 0; SPU_LONGJMP(s_spu_halt_env, 1); }
 }
 
 /* Diagnostic: dump the taskset-policy scheduler's working tables (LS 0x2700..)
@@ -238,7 +258,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
      * executes at a time. No-op when unarmed. The thread-local halt env above
      * makes a token pause/resume mid-run safe. */
     yz_lockstep_register(ctx);
-    switch (setjmp(s_spu_halt_env)) {
+    switch (SPU_SETJMP(s_spu_halt_env)) {
     case 1:
         halted = 1;
         g_spu_trampoline_fn = 0;
@@ -1545,11 +1565,13 @@ void spu_overlay_register_region(uint32_t content_ea, uint32_t span, int image_i
  * unrelated overlays using the same address. Registration precedes execution. */
 static struct { uint32_t entry; int image_id; } s_stack_reset[16];
 static unsigned s_stack_reset_count;
+unsigned g_spu_stack_reset_count;      /* spu_hop's inline test */
 void spu_register_stack_reset_entry(uint32_t entry, int image_id)
 {
     if (s_stack_reset_count < 16) {
         s_stack_reset[s_stack_reset_count].entry = entry & SPU_LS_MASK;
         s_stack_reset[s_stack_reset_count++].image_id = image_id;
+        g_spu_stack_reset_count = s_stack_reset_count;
     }
 }
 
@@ -1557,12 +1579,14 @@ void spu_register_stack_reset_entry(uint32_t entry, int image_id)
  * a stack-switching routine without going through spu_indirect_branch. */
 void spu_check_stack_reset(spu_context* ctx, void (*fn)(spu_context*))
 {
-    if (!ctx->host_depth || !s_spu_halt_armed || ctx->policy_mode) return;
+    /* Nothing registered is the common case: answer it before the
+     * thread-local halt flag, which costs a call on every hop on macOS. */
+    if (!s_stack_reset_count || !ctx->host_depth || ctx->policy_mode || !s_spu_halt_armed) return;
     for (unsigned i = 0; i < s_stack_reset_count; ++i)
         if (ctx->pc == s_stack_reset[i].entry &&
             fn == spu_lookup(ctx->pc, s_stack_reset[i].image_id)) {
             g_spu_trampoline_fn = 0;
-            longjmp(s_spu_halt_env, 2);
+            SPU_LONGJMP(s_spu_halt_env, 2);
         }
 }
 
@@ -1834,6 +1858,8 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
      * woken). Honour the first call, halt on the rest. Each task runs on its own
      * host thread, so a thread-local count is per task. */
     static _Thread_local int s_exit_seen = 0;
+    static _Thread_local unsigned s_exit_serial;
+    if (s_exit_serial != g_spu_task_serial) { s_exit_serial = g_spu_task_serial; s_exit_seen = 0; }
     if (num == 0 && ctx->image_id == spu_cri_image() && !getenv("YDKJ_CRI_EXIT_HALT")) {
         if (s_exit_seen++ == 0) { ctx->gpr[3]._u32[0] = 0; return; }   /* bootstrap */
         { static int _n = 0; if (_n++ < 8)
@@ -2256,7 +2282,7 @@ void spu_indirect_branch(spu_context* ctx)
              * Resume at depth zero so SPU_RET follows the restored guest link. */
             ctx->resident_task = ti;
             g_spu_trampoline_fn = 0;
-            longjmp(s_spu_halt_env, 2);
+            SPU_LONGJMP(s_spu_halt_env, 2);
         }
         if (!ti && !ctx->resident_task) ti = spu_taskset_task_image(ctx->pc);
         if (ti) ctx->resident_task = ti;
@@ -2334,8 +2360,8 @@ void spu_indirect_branch(spu_context* ctx)
                     /* A zero word is also what unloaded local store reads as, so
                      * say where the branch came from: the last host-function
                      * entries on this thread, newest last. */
-                    extern unsigned spu_recent_pcs(uint32_t* out, unsigned max);
-                    uint32_t pcs[32]; unsigned n = spu_recent_pcs(pcs, 32);
+                    extern unsigned spu_recent_pcs(const spu_context*, uint32_t* out, unsigned max);
+                    uint32_t pcs[32]; unsigned n = spu_recent_pcs(ctx, pcs, 32);
                     fprintf(stderr, "[spu]   recent pcs:");
                     for (unsigned i = 0; i < n; i++) fprintf(stderr, " %05X", pcs[i]);
                     fprintf(stderr, " | lr=0x%05X r3=0x%08X r4=0x%08X\n",
@@ -2358,8 +2384,8 @@ void spu_indirect_branch(spu_context* ctx)
                     ctx->image_id, ctx->pc, ctx->gpr[0]._u32[0] & SPU_LS_MASK);
             { fprintf(stderr, "      last dispatched PCs (oldest first):");
               for (unsigned q = 0; q < 8; q++) {
-                  unsigned idx = (g_spu_pch_n + q) & 7u;
-                  if (g_spu_pch_n > q || g_spu_pch[idx]) fprintf(stderr, " 0x%05X", g_spu_pch[idx]);
+                  unsigned idx = (ctx->dbg_pch_n + q) & 7u;
+                  if (ctx->dbg_pch_n > q || ctx->dbg_pch[idx]) fprintf(stderr, " 0x%05X", ctx->dbg_pch[idx]);
               }
               fprintf(stderr, "%c", 10); }
             /* Is there real code at the target, or is the pc garbage? Eight

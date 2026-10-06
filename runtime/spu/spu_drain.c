@@ -7,6 +7,15 @@
  * place -- later milestones only replace the bodies. */
 #include "spu_context.h"
 #include <setjmp.h>
+/* Plain setjmp/longjmp save and restore the signal mask on macOS -- a system
+ * call each, on every SPURS job. Nothing in the SPU runtime touches the mask. */
+#ifndef _WIN32
+#define SPU_SETJMP(env)     _setjmp(env)
+#define SPU_LONGJMP(env, v) _longjmp(env, v)
+#else
+#define SPU_SETJMP(env)     setjmp(env)
+#define SPU_LONGJMP(env, v) longjmp(env, v)
+#endif
 
 /* See spu_context.h `irq_frame`. */
 typedef struct spu_irq_frame {
@@ -48,18 +57,37 @@ void* volatile    g_pm_flow_ctx = 0;
 extern void spu_halt(spu_context*);
 /* Last 32 drain steps on this host thread (pc), for post-mortems of a run that
  * ended where it should not have (spurs_policy.c, [pm-end]). */
-static _Thread_local uint32_t t_recent[32];
-static _Thread_local uint32_t t_recent_n;
-unsigned spu_recent_pcs(uint32_t* out, unsigned max)
+/* spu_hop (spu_context.h): the slow path is taken when any per-hop debug
+ * switch is set, so each of them still behaves as it always has. */
+int g_spu_hop_slow = -1;
+void spu_hop_init(void)
 {
-    unsigned n = t_recent_n < 32 ? t_recent_n : 32, k = n < max ? n : max;
-    for (unsigned i = 0; i < k; i++) out[i] = t_recent[(t_recent_n - k + i) & 31];
+    static const char* const sw[] = { "SPU_NO_LS0_END", "SPU_EXITTRACE", "SPU_STEPTRACE",
+                                      "SPU_JOBDRAIN", "SPU_PCHIST", "SPU_HOP_SLOW" };
+    int slow = 0;
+    for (unsigned i = 0; i < sizeof sw / sizeof sw[0]; i++) if (getenv(sw[i])) slow = 1;
+    g_spu_hop_slow = slow;
+}
+/* A SPURS job returning to LS 0 is finished: spu_task_launch_check's rule. */
+void spu_hop_ls0_end(spu_context* ctx)
+{
+    static int _n = 0;
+    if (_n++ < 8)
+        fprintf(stderr, "[spurs-job] img=%d branched to LS 0 -- job complete\n",
+                ctx->image_id);
+    spu_halt(ctx);
+}
+
+unsigned spu_recent_pcs(const spu_context* ctx, uint32_t* out, unsigned max)
+{
+    unsigned n = ctx->dbg_recent_n < 32 ? ctx->dbg_recent_n : 32, k = n < max ? n : max;
+    for (unsigned i = 0; i < k; i++) out[i] = ctx->dbg_recent[(ctx->dbg_recent_n - k + i) & 31];
     return k;
 }
 
 void spu_task_launch_check(spu_context* ctx, void* fn)
 {
-    t_recent[t_recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
+    ctx->dbg_recent[ctx->dbg_recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
     extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
     spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
     /* A SPURS job returning to LS 0 is finished -- its crt tail-jumps to the
@@ -258,7 +286,7 @@ int spu_irq_regs_maybe_restore(spu_context* ctx)
                       if (s_it && _n++ < 200)
                           fprintf(stderr, "[irq] IRET at depth %u unwinds to taking frame depth %u (srr0=0x%05X)\n",
                                   ctx->host_depth, f->depth, ctx->pc & SPU_LS_MASK); }
-                    longjmp(f->env, 1);
+                    SPU_LONGJMP(f->env, 1);
                 }
                 if (!f && ctx->host_depth > 0) {
                     /* Taken by the top-level driver loop (depth 0), which
@@ -416,8 +444,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
             void (*fn)(spu_context*) = g_spu_trampoline_fn;
             g_spu_trampoline_fn = 0;
             ctx->drain_ret_pc = return_pc & SPU_LS_MASK;   /* re-set: a nested drain changed it */
-            yz_lockstep_tick(ctx);
-            spu_task_launch_check(ctx, (void*)fn);
+            spu_hop(ctx, fn);
             if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) {
                 void (*vf)(spu_context*) = spu_take_interrupt(ctx, fn);
                 if (!ctx->int_enable) {   /* taken (a take clears the enable; a deferral leaves it) */
@@ -429,7 +456,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
                         f.image_id = ctx->image_id;
                         ctx->irq_frame = &f;
                     }
-                    if (setjmp(f.env) == 0) {
+                    if (SPU_SETJMP(f.env) == 0) {
                         vf(ctx);
                     } else {
                         /* iret fired deeper: registers restored, pc = srr0 */

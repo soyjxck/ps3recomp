@@ -405,6 +405,15 @@ typedef struct spu_context {
      * manager then ran its buffer loop a second time on the job's registers
      * and died in its own assert (the song-freeze). */
     uint32_t drain_ret_pc;
+
+    /* Post-mortem rings, written on every trampoline hop: the last host
+     * function entries (spu_task_launch_check) and the last dispatched pcs
+     * (SPU_DRAIN). They lived in thread-local storage, and on macOS every
+     * thread-local access is a call -- a large share of a SPURS job's time. */
+    uint32_t dbg_recent[32];
+    uint32_t dbg_recent_n;
+    uint32_t dbg_pch[8];
+    uint32_t dbg_pch_n;
 } spu_context;
 
 /* Reserved LS addresses (inside the kernel area, below the 0xA00 policy-module
@@ -860,6 +869,45 @@ static inline void spu_pchist_tick(const spu_context* ctx)
     }
 }
 
+/* The per-hop hooks, inlined for the common case. Every SPU control transfer
+ * ran yz_lockstep_tick, spu_task_launch_check and spu_pchist_tick as calls,
+ * each re-testing its own environment switches and touching thread-local
+ * state -- about a third of a SPURS job's time. When no debug switch is set
+ * (one global, g_spu_hop_slow, -1 until the first hop decides it) only what
+ * changes execution stays: lockstep when it is on, a registered stack reset,
+ * the end of a job at LS 0, and the post-mortem ring. */
+extern int g_spu_hop_slow;
+extern volatile int g_yz_lockstep_on;
+extern unsigned g_spu_stack_reset_count;
+extern uint32_t g_pm_flow_buf[8192];
+extern volatile unsigned g_pm_flow_n;
+extern void* volatile g_pm_flow_ctx;
+void spu_hop_init(void);
+void spu_hop_ls0_end(spu_context* ctx);
+void spu_check_stack_reset(spu_context* ctx, void (*fn)(spu_context*));
+static inline void spu_hop(spu_context* ctx, void (*tf)(spu_context*))
+{
+    if (__builtin_expect(g_spu_hop_slow != 0, 0)) {
+        if (g_spu_hop_slow < 0) spu_hop_init();
+        if (g_spu_hop_slow) {
+            yz_lockstep_tick(ctx);
+            spu_task_launch_check(ctx, (void*)tf);
+            spu_pchist_tick(ctx);
+            return;
+        }
+    }
+    if (__builtin_expect(g_yz_lockstep_on != 0, 0)) yz_lockstep_tick(ctx);
+    ctx->dbg_recent[ctx->dbg_recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
+    if (__builtin_expect(g_spu_stack_reset_count != 0, 0)) spu_check_stack_reset(ctx, tf);
+    if (ctx->steps++ && (ctx->pc & SPU_LS_MASK) == 0 &&
+        !ctx->policy_mode && ctx->image_id > 0) {
+        spu_hop_ls0_end(ctx);
+        return;
+    }
+    if (__builtin_expect(g_pm_flow_ctx == (void*)ctx, 0) && g_pm_flow_n < 8192)
+        g_pm_flow_buf[g_pm_flow_n++] = ctx->pc;
+}
+
 /* Drain the pending trampoline chain: run each queued transfer target until
  * none remain. The one central hook site for the faithful execution model. */
 #define SPU_DRAIN(ctx) do {                                    \
@@ -880,13 +928,11 @@ static inline void spu_pchist_tick(const spu_context* ctx)
             }                                                              \
             void (*_tf)(spu_context*) = g_spu_trampoline_fn;    \
             g_spu_trampoline_fn = 0;                            \
-            yz_lockstep_tick(ctx);                             \
-            spu_task_launch_check((ctx), (void*)_tf);          \
+            spu_hop((ctx), _tf);                               \
             if ((ctx)->int_enable &&                            \
                 ((ctx)->event_status & (ctx)->event_mask))      \
                 _tf = spu_take_interrupt((ctx), _tf);          \
-            spu_pchist_tick(ctx);                              \
-            g_spu_pch[g_spu_pch_n++ & 7u] =                    \
+            (ctx)->dbg_pch[(ctx)->dbg_pch_n++ & 7u] =          \
                 (uint32_t)((ctx)->pc & SPU_LS_MASK);           \
             _tf(ctx);                                          \
         }                                                      \

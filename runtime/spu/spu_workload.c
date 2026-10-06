@@ -891,9 +891,11 @@ static void spu_async_run(spu_async_job* j)
                  * both audio tasks run task 1's descriptor). */
                 if (j->taskset_ea) {
                     spurs_pm_build_context(ls, j->taskset_ea, j->taskid, 0, 0);
-                    fprintf(stderr, "[taskset] built SpursTasksetContext image=%d "
-                            "taskset=0x%08X task=%u\n", j->image_id,
-                            j->taskset_ea, j->taskid); fflush(stderr);
+                    /* Per task, so capped: tens of thousands a minute. */
+                    { static unsigned long _rl; if (++_rl <= 64 || _rl % 10000 == 0) {
+                        fprintf(stderr, "[taskset] built SpursTasksetContext image=%d "
+                                "taskset=0x%08X task=%u (#%lu)\n", j->image_id,
+                                j->taskset_ea, j->taskid, _rl); fflush(stderr); } }
                 }
             }
             /* ---- Bink-layer probe + real-policy A/B (image 3 = binkspu) ----
@@ -1032,8 +1034,9 @@ static void spu_async_run(spu_async_job* j)
                   FILE* f = fopen(path, "wb");
                   if (f) { fwrite(ls, 1, SPU_LS_SIZE, f); fclose(f);
                       fprintf(stderr, "[spu_workload] wrote local store -> %s\n", path); } } }
-            fprintf(stderr, "[spu_workload] async image=%d RETURNED rc=%d "
-                    "(job ran to completion, did not loop)\n", j->image_id, rc);
+            { static unsigned long _rl; if (++_rl <= 64 || _rl % 10000 == 0)
+                fprintf(stderr, "[spu_workload] async image=%d RETURNED rc=%d "
+                        "(job ran to completion, did not loop) (#%lu)\n", j->image_id, rc, _rl); }
             spu_serial_release();
             if (j->taskset_ea) spu_taskset_task_exited(j->taskset_ea, j->taskid);
             serial_ts_done_turn(j->taskset_ea, j->ticket);
@@ -1091,6 +1094,106 @@ static void* spu_async_thread(void* p)
       extern void spu_coh_forget_range(uintptr_t, uintptr_t);
       if (hi > lo) spu_coh_forget_range(lo, hi); }
     return NULL;
+}
+#endif
+
+#ifndef _WIN32
+/* SPU task threads are kept and reused. A thread per task -- a 256 MB stack
+ * reservation created and torn down each time -- cost the dispatching PPU
+ * thread well over 100 us, and Drakengard 3's PhysX dispatches 20-30 tasks a
+ * frame from the thread its game thread then waits on. The pool grows on
+ * demand: a task never waits for a free worker, since tasks may wait on one
+ * another. A reused thread starts each task with fresh per-task state
+ * (spu_task_begin) and drops its stack from the lock-line reserver set after
+ * it, as an exiting thread does. SPU_TASK_POOL=0: a thread per task. */
+typedef struct spu_pool_worker {
+    pthread_mutex_t mu;
+    pthread_cond_t  cv;
+    spu_async_job*  job;
+    struct spu_pool_worker* next;
+} spu_pool_worker;
+static pthread_mutex_t  s_pool_mu = PTHREAD_MUTEX_INITIALIZER;
+static spu_pool_worker* s_pool_idle;
+
+static int spu_task_pool_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("SPU_TASK_POOL"); on = !(e && e[0] == '0'); }
+    return on;
+}
+
+static void spu_forget_own_stack(void)
+{
+    uintptr_t lo = 0, hi = 0;
+#if defined(__APPLE__)
+    pthread_t self = pthread_self();
+    hi = (uintptr_t)pthread_get_stackaddr_np(self);
+    lo = hi - pthread_get_stacksize_np(self);
+#else
+    pthread_attr_t a; void* base; size_t size;
+    if (pthread_getattr_np(pthread_self(), &a) == 0) {
+        if (pthread_attr_getstack(&a, &base, &size) == 0) { lo = (uintptr_t)base; hi = lo + size; }
+        pthread_attr_destroy(&a);
+    }
+#endif
+    extern void spu_coh_forget_range(uintptr_t, uintptr_t);
+    if (hi > lo) spu_coh_forget_range(lo, hi);
+}
+
+static void* spu_pool_thread(void* p)
+{
+    spu_pool_worker* w = (spu_pool_worker*)p;
+    for (;;) {
+        pthread_mutex_lock(&w->mu);
+        while (!w->job) pthread_cond_wait(&w->cv, &w->mu);
+        spu_async_job* j = w->job;
+        w->job = NULL;
+        pthread_mutex_unlock(&w->mu);
+        extern void spu_task_begin(void);
+        spu_task_begin();
+        spu_async_run(j);
+        spu_forget_own_stack();
+        pthread_mutex_lock(&s_pool_mu);
+        w->next = s_pool_idle;
+        s_pool_idle = w;
+        pthread_mutex_unlock(&s_pool_mu);
+    }
+    return NULL;
+}
+
+/* Hand j to an idle worker, or start a new one. 0: no thread could be made. */
+static int spu_task_pool_submit(spu_async_job* j)
+{
+    pthread_mutex_lock(&s_pool_mu);
+    spu_pool_worker* w = s_pool_idle;
+    if (w) s_pool_idle = w->next;
+    pthread_mutex_unlock(&s_pool_mu);
+    if (w) {
+        pthread_mutex_lock(&w->mu);
+        w->job = j;
+        pthread_cond_signal(&w->cv);
+        pthread_mutex_unlock(&w->mu);
+        return 1;
+    }
+    w = (spu_pool_worker*)calloc(1, sizeof *w);
+    if (!w) return 0;
+    pthread_mutex_init(&w->mu, NULL);
+    pthread_cond_init(&w->cv, NULL);
+    w->job = j;
+    pthread_t th;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    int prc = EINVAL;
+    if (pthread_attr_setstacksize(&attr, 256u << 20) == 0)
+        prc = pthread_create(&th, &attr, spu_pool_thread, w);
+    pthread_attr_destroy(&attr);
+    if (prc != 0) prc = pthread_create(&th, NULL, spu_pool_thread, w);
+    if (prc != 0) {
+        pthread_cond_destroy(&w->cv); pthread_mutex_destroy(&w->mu); free(w);
+        return 0;
+    }
+    pthread_detach(th);
+    return 1;
 }
 #endif
 
@@ -1459,7 +1562,10 @@ int spu_workload_dispatch_task(const uint8_t* image, uint32_t image_size,
 {
     if (!image || image_size == 0) return 0;
 
-    uint64_t fp = spu_workload_fingerprint(image, image_size);
+    /* Cached, as the job path is: hashing the whole task image on every
+     * CreateTask was most of its cost -- Drakengard 3's PhysX creates 20-30
+     * tasks a frame. */
+    uint64_t fp = spu_workload_fingerprint_cached(image, image_size);
     spu_lifted_entry_fn fn = NULL;
     int image_id = 0;
     for (unsigned i = 0; i < s_registry_count; i++)
@@ -1518,9 +1624,10 @@ int spu_workload_dispatch_task(const uint8_t* image, uint32_t image_size,
         if ((j->r3[0] >> 16) == 0x40) j->have_r3 = 1;   /* valid marker */
     }
 
-    fprintf(stderr,
-        "[spu_workload] dispatch HIT (async) fp=0x%016llX args=0x%08X image=%d -> spawning thread\n",
-        (unsigned long long)fp, args_ea, image_id);
+    { static unsigned long _rl; if (++_rl <= 64 || _rl % 10000 == 0)
+        fprintf(stderr,
+            "[spu_workload] dispatch HIT (async) fp=0x%016llX args=0x%08X image=%d (#%lu)\n",
+            (unsigned long long)fp, args_ea, image_id, _rl); }
     if (args_ea) { extern uint8_t* vm_base; const uint8_t* c = vm_base + args_ea;
         static int _d=0; if (_d++ < 1) {
             /* Dump a larger window of the task context buffer + scan for any word
@@ -1561,6 +1668,7 @@ int spu_workload_dispatch_task(const uint8_t* image, uint32_t image_size,
      * mmap'd and committed on touch, so this reserves address space rather
      * than memory. The default is 512 KB on Darwin, half the 1 MB that blew
      * the guard page above. */
+    if (spu_task_pool_on() && spu_task_pool_submit(j)) return 1;
     pthread_t th;
     pthread_attr_t attr;
     pthread_attr_init(&attr);

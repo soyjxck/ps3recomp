@@ -167,8 +167,8 @@ int64_t sys_event_queue_create(ppu_context* ctx)
     q->tail     = 0;
     q->count    = 0;
     q->type     = SYS_PPU_QUEUE;
-    fprintf(stderr, "[evt] queue_create -> id=%d key=0x%llX size=%d\n",
-            slot + 1, (unsigned long long)key, size);
+    { static unsigned long _rl; if (++_rl <= 64 || _rl % 10000 == 0) fprintf(stderr, "[evt] queue_create -> id=%d key=0x%llX size=%d\n",
+            slot + 1, (unsigned long long)key, size); }
 
     if (attr_addr != 0) {
         uint8_t* attr_raw = (uint8_t*)vm_to_host(attr_addr);
@@ -789,8 +789,8 @@ int64_t sys_event_port_create(ppu_context* ctx)
     p->connected_queue = 0;
 
     uint32_t port_id = (uint32_t)(slot + 1);
-    fprintf(stderr, "[evt] port_create -> id=%u type=%d name=0x%llX\n",
-            port_id, (int)port_type, (unsigned long long)name);
+    { static unsigned long _rl; if (++_rl <= 64 || _rl % 10000 == 0) fprintf(stderr, "[evt] port_create -> id=%u type=%d name=0x%llX\n",
+            port_id, (int)port_type, (unsigned long long)name); }
     if (id_out_addr != 0) {
         write_be32(id_out_addr, port_id);
     }
@@ -828,7 +828,7 @@ int64_t sys_event_port_connect_local(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
     if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
-    fprintf(stderr, "[evt] port_connect(port=%u -> queue=%u)\n", port_id, queue_id);
+    { static unsigned long _rl; if (++_rl <= 64 || _rl % 10000 == 0) fprintf(stderr, "[evt] port_connect(port=%u -> queue=%u)\n", port_id, queue_id); }
 
     evt_table_lock();
 
@@ -855,7 +855,7 @@ int64_t sys_event_port_connect_local(ppu_context* ctx)
      * takes 1,901 receives and delivers zero events; knowing whether any port
      * points at it is the difference between "no sender ran" and "no sender
      * exists". */
-    fprintf(stderr, "[evt] port_connect_local(port=%u -> q=%u)\n", port_id, queue_id);
+    { static unsigned long _rl; if (++_rl <= 64 || _rl % 10000 == 0) fprintf(stderr, "[evt] port_connect_local(port=%u -> q=%u)\n", port_id, queue_id); }
     return CELL_OK;
 }
 

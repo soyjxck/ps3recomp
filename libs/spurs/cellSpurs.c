@@ -989,10 +989,11 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
             g_ydkj_real_taskset_ea = taskset_ea;
             g_ydkj_real_taskid     = i;
 
-            printf("[cellSpurs] CreateTask(id=%u, entry=%p, arg=%08X %08X %08X %08X"
-                   " ctx=0x%08X lsp=%08X %08X %08X %08X)\n",
-                   s_tasks[i].id, elf, task_arg[0], task_arg[1], task_arg[2], task_arg[3],
-                   context_ea, task_lsp[0], task_lsp[1], task_lsp[2], task_lsp[3]);
+            { static unsigned long _rl; if (++_rl <= 64 || _rl % 10000 == 0)
+              printf("[cellSpurs] CreateTask(id=%u, entry=%p, arg=%08X %08X %08X %08X"
+                     " ctx=0x%08X lsp=%08X %08X %08X %08X) (#%lu)\n",
+                     s_tasks[i].id, elf, task_arg[0], task_arg[1], task_arg[2], task_arg[3],
+                     context_ea, task_lsp[0], task_lsp[1], task_lsp[2], task_lsp[3], _rl); }
 
             /* One-shot: dump the memory the task argument points at, to find the
              * pointer that reads back 0 (the task GETs from EA 0 -> some field of
@@ -2209,7 +2210,8 @@ s32 _cellSpursEventFlagInitialize(void* spurs, void* taskset,
 s32 _cellSpursSendSignal(void* taskset, u32 taskId)
 {
     uint32_t taskset_ea = (uint32_t)(uintptr_t)taskset;
-    printf("[cellSpurs] _SendSignal(taskset=0x%08X id=%u)\n", taskset_ea, taskId);
+    { static unsigned long _rl; if (++_rl <= 64 || _rl % 10000 == 0)
+        printf("[cellSpurs] _SendSignal(taskset=0x%08X id=%u) (#%lu)\n", taskset_ea, taskId, _rl); }
     /* Real delivery now that SPU tasks execute (comment was stale). */
     if (taskset_ea) spu_taskset_signal_task(taskset_ea, taskId);
     return CELL_OK;
