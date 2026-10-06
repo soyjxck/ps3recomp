@@ -95,11 +95,54 @@ typedef struct {
     EngObjKind kind;
     u32 alias;                  /* OBJ_VIEW: the surface handle it views */
     DXGI_FORMAT fmt;
-    u32 w, h, mips, faces;
+    u32 w, h, mips, faces;      /* host pixels                           */
+    u32 gw, gh;                 /* guest pixels; w,h = gw,gh * the scale  */
     D3D12_RESOURCE_STATES state;
     int has_rtv, has_dsv;       /* RTV/DSV written at slot handle-1      */
     int retired;
 } EngObj;
+
+/* ---- internal resolution --------------------------------------------------
+ *
+ * RSX_SCALE=<factor> (1 = the title's own 1280x720; 2 = 2560x1440; 3 = 4K).
+ * Render targets, depth targets and their snapshots are created `factor`
+ * times the size the guest asked for; viewports, scissors and clear
+ * rectangles are scaled to match; everything a shader samples is addressed
+ * in normalised coordinates and needs nothing. What crosses back into the
+ * guest's world is scaled down: a readback is resampled to the guest size,
+ * an occlusion count is divided by factor^2, and a fragment program's WPOS
+ * is divided back to guest pixels (a title computes screen UVs from it).
+ * Guest textures (uploaded pixels) are never scaled.
+ *
+ * RSX_DISPLAY=windowed|borderless|fullscreen: a bordered window of
+ * RSX_WINDOW=<w>x<h> (default 1280x720); a borderless window the size of
+ * the primary display; or exclusive full screen, at the display's own mode
+ * or, with RSX_WINDOW, a mode switch to that size. (RSX_FULLSCREEN=1 is the
+ * old spelling of borderless.) The present blit resamples the surface to
+ * the window whatever the two sizes are. */
+static float s_scale = 1.0f;
+static u32 s_win_w, s_win_h;                 /* the window and swap chain */
+typedef enum { DISP_WINDOWED = 0, DISP_BORDERLESS, DISP_FULLSCREEN } EngDisplayMode;
+static EngDisplayMode s_display = DISP_WINDOWED;
+static u32 sc_dim(u32 v) { u32 r = (u32)((float)v * s_scale + 0.5f); return v && !r ? 1u : r; }
+static u32 sc_pos(u32 v) { return (u32)((float)v * s_scale + 0.5f); }
+/* [x, x+w) in guest pixels -> host pixels, as the two ends rounded, so
+ * neighbouring rectangles still meet. */
+static void sc_rect(u32* x, u32* y, u32* w, u32* h)
+{
+    const u32 x0 = sc_pos(*x), y0 = sc_pos(*y), x1 = sc_pos(*x + *w), y1 = sc_pos(*y + *h);
+    *x = x0; *y = y0; *w = x1 - x0; *h = y1 - y0;
+}
+static void eng_read_scale(void)
+{
+    const char* e = getenv("RSX_SCALE");
+    s_scale = 1.0f;
+    if (e && *e) {
+        const float f = (float)atof(e);
+        if (f >= 0.5f && f <= 8.0f) s_scale = f;
+        else fprintf(stderr, "[RSX d3d12] RSX_SCALE=%s ignored (0.5 to 8)\n", e);
+    }
+}
 
 typedef struct {
     ID3DBlob* vs; ID3DBlob* ps;
@@ -482,6 +525,7 @@ static u32 eng_obj_add(ID3D12Resource* res, EngObjKind kind, DXGI_FORMAT fmt, u3
     EngObj* o = &s_obj[slot];
     memset(o, 0, sizeof *o);
     o->res = res; o->kind = kind; o->fmt = fmt; o->w = w; o->h = h;
+    o->gw = w; o->gh = h;       /* a scaled object sets its guest size after */
     o->mips = mips ? mips : 1; o->faces = faces ? faces : 1; o->state = st;
     return slot + 1;
 }
@@ -695,9 +739,17 @@ static HWND eng_create_window(u32 width, u32 height, const char* title)
     wc.hIconSm = wc.hIcon;
     wc.lpszClassName = "ps3recomp_d3d12_engine";
     RegisterClassExA(&wc);
+    SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
+    if (s_display != DISP_WINDOWED) {
+        /* A popup over the display: for borderless that is the whole of it
+         * (no mode switch, so alt-tab and the flip model behave as in a
+         * window); for exclusive full screen DXGI takes it from here. */
+        return CreateWindowExA(0, "ps3recomp_d3d12_engine", title ? title : "ps3recomp (D3D12)",
+                               WS_POPUP | WS_VISIBLE, 0, 0, (int)width, (int)height,
+                               NULL, NULL, GetModuleHandle(NULL), NULL);
+    }
     RECT wr = {0, 0, (LONG)width, (LONG)height};
     AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
-    SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
     return CreateWindowExA(0, "ps3recomp_d3d12_engine", title ? title : "ps3recomp (D3D12)",
                            WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT,
                            wr.right - wr.left, wr.bottom - wr.top,
@@ -866,7 +918,27 @@ static int eng_init_device(u32 width, u32 height)
         sd.SampleDesc.Count = 1; sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
         sd.BufferCount = 3; sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         IDXGISwapChain1* sc1 = NULL;
-        hr = CALL(factory, CreateSwapChainForHwnd, (IUnknown*)s_queue, s_hwnd, &sd, NULL, NULL, &sc1);
+        DXGI_SWAP_CHAIN_FULLSCREEN_DESC fsd = {0};
+        fsd.Windowed = TRUE;
+        if (s_display == DISP_FULLSCREEN) {
+            /* Exclusive: the swap chain owns the output, at the mode its
+             * size names. ALLOW_MODE_SWITCH lets that be a different mode
+             * from the desktop's (RSX_WINDOW). */
+            sd.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
+            fsd.Windowed = FALSE;
+            fsd.RefreshRate.Numerator = 0; fsd.RefreshRate.Denominator = 0;
+            fsd.Scaling = DXGI_MODE_SCALING_UNSPECIFIED;
+            fsd.ScanlineOrdering = DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED;
+        }
+        hr = CALL(factory, CreateSwapChainForHwnd, (IUnknown*)s_queue, s_hwnd, &sd, &fsd, NULL, &sc1);
+        if (FAILED(hr) && s_display == DISP_FULLSCREEN) {
+            /* The output refused the mode: fall back to a borderless window
+             * of the same size rather than no window at all. */
+            fprintf(stderr, "[rsx engine/d3d12] exclusive full screen refused (0x%08lX); borderless instead\n", (long)hr);
+            s_display = DISP_BORDERLESS;
+            sd.Flags &= ~(UINT)DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
+            hr = CALL(factory, CreateSwapChainForHwnd, (IUnknown*)s_queue, s_hwnd, &sd, NULL, NULL, &sc1);
+        }
         if (FAILED(hr)) { fprintf(stderr, "[rsx engine/d3d12] swap chain failed: 0x%08lX\n", (long)hr); RELEASE(factory); return -1; }
         CALL(factory, MakeWindowAssociation, s_hwnd, DXGI_MWA_NO_ALT_ENTER);
         hr = CALL(sc1, QueryInterface, &IID_IDXGISwapChain3, (void**)&s_swap);
@@ -1032,16 +1104,35 @@ static u32 eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 h,
     (void)user;
     if (!s_dev || !w || !h) return 0;
     const DXGI_FORMAT df = eng_dxgi(fmt);
+    const u32 sw = sc_dim(w), sh = sc_dim(h);
     D3D12_CLEAR_VALUE cv = {0}; cv.Format = df;
-    ID3D12Resource* t = make_texture(df, w, h, 1, 1, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+    ID3D12Resource* t = make_texture(df, sw, sh, 1, 1, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
                                      D3D12_RESOURCE_STATE_RENDER_TARGET, &cv);
-    const u32 handle = eng_obj_add(t, OBJ_COLOR, df, w, h, 1, 1, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    const u32 handle = eng_obj_add(t, OBJ_COLOR, df, sw, sh, 1, 1, D3D12_RESOURCE_STATE_RENDER_TARGET);
     s_stat_rt++;
     if (!handle) return 0;
+    s_obj[handle - 1].gw = w; s_obj[handle - 1].gh = h;
     eng_write_srv(handle, t, df, 1, 1, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
     CALL(s_dev, CreateRenderTargetView, t, NULL, obj_rtv(handle));
     s_obj[handle - 1].has_rtv = 1;
-    if (seed && seed_row_bytes) eng_upload_rows(handle, 0, w, h, seed, seed_row_bytes, h);
+    if (seed && seed_row_bytes) {
+        if (sw == w && sh == h) eng_upload_rows(handle, 0, w, h, seed, seed_row_bytes, h);
+        else {
+            /* The guest's bytes, resampled (nearest) to the scaled target. */
+            const u32 bpp = eng_bpp(df);
+            u8* big = (u8*)malloc((size_t)sw * bpp * sh);
+            if (big) {
+                for (u32 y = 0; y < sh; y++) {
+                    const u8* srow = (const u8*)seed + (size_t)((u64)y * h / sh) * seed_row_bytes;
+                    u8* drow = big + (size_t)y * sw * bpp;
+                    for (u32 x = 0; x < sw; x++)
+                        memcpy(drow + (size_t)x * bpp, srow + (size_t)((u64)x * w / sw) * bpp, bpp);
+                }
+                eng_upload_rows(handle, 0, sw, sh, big, sw * bpp, sh);
+                free(big);
+            }
+        }
+    }
     return handle;
 }
 
@@ -1064,15 +1155,15 @@ static u32 eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_format)
     return handle;
 }
 
-static u32 eng_depth_target_create(void* user, u32 w, u32 h)
+static u32 eng_depth_target_create_host(u32 w, u32 h, u32 gw, u32 gh)
 {
-    (void)user;
     if (!s_dev || !w || !h) return 0;
     D3D12_CLEAR_VALUE cv = {0}; cv.Format = ENG_DEPTH_FMT; cv.DepthStencil.Depth = 1.0f;
     ID3D12Resource* t = make_texture(ENG_DEPTH_RES_FMT, w, h, 1, 1, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
                                      D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv);
     const u32 handle = eng_obj_add(t, OBJ_DEPTH, ENG_DEPTH_FMT, w, h, 1, 1, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     if (!handle) return 0;
+    s_obj[handle - 1].gw = gw; s_obj[handle - 1].gh = gh;
     D3D12_DEPTH_STENCIL_VIEW_DESC dd = {0};
     dd.Format = ENG_DEPTH_FMT; dd.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
     CALL(s_dev, CreateDepthStencilView, t, &dd, obj_dsv(handle));
@@ -1080,6 +1171,11 @@ static u32 eng_depth_target_create(void* user, u32 w, u32 h)
     /* Sampled by the resolve passes as its depth plane. */
     eng_write_srv(handle, t, ENG_DEPTH_SRV_FMT, 1, 1, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
     return handle;
+}
+static u32 eng_depth_target_create(void* user, u32 w, u32 h)
+{
+    (void)user;
+    return eng_depth_target_create_host(sc_dim(w), sc_dim(h), w, h);
 }
 
 /* A depth target for a draw pass whose guest never declared a zeta: every
@@ -1090,7 +1186,7 @@ static u32 eng_fallback_depth(u32 w, u32 h)
         EngObj* o = eng_obj(s_fallback_depth[i]);
         if (o && o->w == w && o->h == h) return s_fallback_depth[i];
     }
-    const u32 d = eng_depth_target_create(NULL, w, h);
+    const u32 d = eng_depth_target_create_host(w, h, w, h);   /* w, h are host pixels here */
     if (d && s_fallback_n < 8) s_fallback_depth[s_fallback_n++] = d;
     return d;
 }
@@ -1114,6 +1210,7 @@ static u32 eng_color_snapshot(void* user, u32 surface)
         ID3D12Resource* r = make_texture(t->fmt, t->w, t->h, 1, 1, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, NULL);
         dst = eng_obj_add(r, OBJ_SNAPSHOT, t->fmt, t->w, t->h, 1, 1, D3D12_RESOURCE_STATE_COPY_DEST);
         if (!dst) return 0;
+        s_obj[dst - 1].gw = t->gw; s_obj[dst - 1].gh = t->gh;
         eng_write_srv(dst, r, t->fmt, 1, 1, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
         if (slot == npool) { if (npool >= 32) return 0; npool++; }
         pool[slot].surface = surface; pool[slot].snap = dst;
@@ -1131,6 +1228,8 @@ static u32 eng_depth_snapshot_common(u32 depth, u32 w, u32 h, int packed)
     EngObj* z = eng_obj(depth);
     if (!z || !z->res || !(packed ? s_depth_pack_pso : s_depth_pso)) return 0;
     if (s_rec_count >= ENG_MAX_RECORDS) { s_dropped++; return 0; }
+    const u32 gw = w, gh = h;
+    w = sc_dim(w); h = sc_dim(h);
     const DXGI_FORMAT df = packed ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R32_FLOAT;
     ID3D12Resource* r = NULL;
     D3D12_RESOURCE_STATES st = D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -1150,6 +1249,7 @@ static u32 eng_depth_snapshot_common(u32 depth, u32 w, u32 h, int packed)
     }
     const u32 dst = eng_obj_add(r, OBJ_SNAPSHOT, df, w, h, 1, 1, st);
     if (!dst) return 0;
+    s_obj[dst - 1].gw = gw; s_obj[dst - 1].gh = gh;
     eng_write_srv(dst, r, df, 1, 1, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
     CALL(s_dev, CreateRenderTargetView, r, NULL, obj_rtv(dst));
     s_obj[dst - 1].has_rtv = 1;
@@ -1266,7 +1366,37 @@ static u32 eng_pipeline_create_locked(const char* vs_hlsl, const char* ps_hlsl,
     if (s_pipe_count >= ENG_MAX_PIPES) return 0;
     ID3DBlob* vs = eng_shader(vs_hlsl, 0, "vp");
     if (!vs) return 0;
-    ID3DBlob* ps = eng_shader(ps_hlsl, 1, "fp");
+    ID3DBlob* ps = NULL;
+    /* With the internal resolution raised, a fragment program's WPOS (the
+     * decompiler's `input.position`) arrives in host pixels; the title
+     * computes screen UVs and offsets from it in its own. Divide it back:
+     * every use of the input is wrapped, and the text is what the shader
+     * cache is keyed on, so the two builds never collide. */
+    const char* wp = (s_scale != 1.0f) ? strstr(ps_hlsl, "input.position") : NULL;
+    if (wp) {
+        const char* needle = "input.position";
+        const char* repl = "(input.position*RSX_WPOS)";
+        const size_t nl = strlen(needle), rl = strlen(repl), src_len = strlen(ps_hlsl);
+        size_t n = 0;
+        for (const char* q = wp; (q = strstr(q, needle)) != NULL; q += nl) n++;
+        char head[96];
+        snprintf(head, sizeof head, "static const float4 RSX_WPOS = float4(%.8f, %.8f, 1.0, 1.0);\n",
+                 1.0 / (double)s_scale, 1.0 / (double)s_scale);
+        char* text = (char*)malloc(src_len + n * (rl - nl) + strlen(head) + 1);
+        if (text) {
+            char* d = text + sprintf(text, "%s", head);
+            for (const char* q = ps_hlsl;;) {
+                const char* hit = strstr(q, needle);
+                if (!hit) { strcpy(d, q); break; }
+                memcpy(d, q, (size_t)(hit - q)); d += hit - q;
+                memcpy(d, repl, rl); d += rl;
+                q = hit + nl;
+            }
+            ps = eng_shader(text, 1, "fp");
+            free(text);
+        }
+    }
+    if (!ps) ps = eng_shader(ps_hlsl, 1, "fp");
     if (!ps) return 0;
 
     EngPipeline* p = &s_pipe[s_pipe_count];
@@ -1486,9 +1616,9 @@ static void eng_bind_vertex_textures(void* user, const u32* textures, const rsx_
     }
 }
 static void eng_set_viewport(void* user, float x, float y, float w, float h)
-{ (void)user; s_pending.vp[0] = x; s_pending.vp[1] = y; s_pending.vp[2] = w; s_pending.vp[3] = h; }
+{ (void)user; s_pending.vp[0] = x * s_scale; s_pending.vp[1] = y * s_scale; s_pending.vp[2] = w * s_scale; s_pending.vp[3] = h * s_scale; }
 static void eng_set_scissor(void* user, u32 x, u32 y, u32 w, u32 h)
-{ (void)user; s_pending.sc[0] = x; s_pending.sc[1] = y; s_pending.sc[2] = w; s_pending.sc[3] = h; }
+{ (void)user; if (w && h) sc_rect(&x, &y, &w, &h); s_pending.sc[0] = x; s_pending.sc[1] = y; s_pending.sc[2] = w; s_pending.sc[3] = h; }
 static void eng_set_stencil_ref(void* user, u32 ref) { (void)user; s_pending.stencil_ref = ref; }
 
 static void eng_draw(void* user, rsx_topology topology, const void* vertices, u32 vertex_count,
@@ -1547,6 +1677,7 @@ static void eng_clear_depth_stencil_rect(void* user, u32 depth, u32 flags, float
     (void)user;
     if (!w || !h) return;
     if (s_rec_count >= ENG_MAX_RECORDS) { s_dropped++; return; }
+    sc_rect(&x, &y, &w, &h);
     EngRecord* r = &s_rec[s_rec_count++];
     memset(r, 0, sizeof *r);
     r->kind = ENG_REC_CLEAR_DS_RECT; r->depth = depth; r->clear_flags = flags;
@@ -1932,8 +2063,11 @@ static void eng_poll_submits(void)
                 D3D12_RANGE wr = {0, 0}; CALL(s_qread, Unmap, 0, &wr);
             }
         }
-        for (u32 k = 0; k < s->n_reports; k++)
-            rsx_draw_engine_query_result(s->reports[k].index, s_vis_count[s->reports[k].slot]);
+        for (u32 k = 0; k < s->n_reports; k++) {
+            u64 c = s_vis_count[s->reports[k].slot];
+            if (s_scale != 1.0f) c = (u64)((double)c / ((double)s_scale * (double)s_scale) + 0.5);
+            rsx_draw_engine_query_result(s->reports[k].index, c);
+        }
         free(s->q_vis); free(s->reports);
         memset(s, 0, sizeof *s);
     }
@@ -1971,7 +2105,7 @@ static void eng_submit(u32 present_surface, int wait)
             res_transition(dst, &st, D3D12_RESOURCE_STATE_RENDER_TARGET);
             res_transition(src->res, &src->state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             bar_flush();
-            eng_fullscreen_pass(s_blit_pso, rtv, s_width, s_height, obj_srv(present_surface));
+            eng_fullscreen_pass(s_blit_pso, rtv, s_win_w, s_win_h, obj_srv(present_surface));
             if (windowed) res_transition(dst, &st, D3D12_RESOURCE_STATE_PRESENT);
             else s_offscreen_state = st;
             bar_flush();
@@ -2042,6 +2176,17 @@ static void eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h, vo
     (void)user;
     EngObj* o = eng_owner(surface);
     if (!o || !out || !out_pitch || !w || !h || !s_ready) return;
+    /* The caller's rectangle is in guest pixels; the texture may be larger.
+     * Read the matching host rectangle and resample it (nearest) on the way
+     * out, so the caller sees the surface at the size it asked for. */
+    const u32 gw = w, gh = h;
+    const int scaled = o->gw && o->gh && (o->gw != o->w || o->gh != o->h);
+    if (scaled) {
+        if (x + w > o->gw || y + h > o->gh) return;
+        const u32 x0 = (u32)((u64)x * o->w / o->gw), x1 = (u32)((u64)(x + w) * o->w / o->gw);
+        const u32 y0 = (u32)((u64)y * o->h / o->gh), y1 = (u32)((u64)(y + h) * o->h / o->gh);
+        x = x0; y = y0; w = x1 > x0 ? x1 - x0 : 1u; h = y1 > y0 ? y1 - y0 : 1u;
+    }
     if (x + w > o->w || y + h > o->h) return;
     const u32 bpp = eng_bpp(o->fmt);
     const u32 pitch = (w * bpp + 255u) & ~255u;
@@ -2075,7 +2220,16 @@ static void eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h, vo
     fence_wait(fence_signal());
     u8* p = NULL; D3D12_RANGE rg = { 0, need };
     if (SUCCEEDED(CALL(s_readback, Map, 0, &rg, (void**)&p))) {
-        for (u32 r = 0; r < h; r++) memcpy((u8*)out + (size_t)r * out_pitch, p + (size_t)r * pitch, (size_t)w * bpp);
+        if (!scaled) {
+            for (u32 r = 0; r < h; r++) memcpy((u8*)out + (size_t)r * out_pitch, p + (size_t)r * pitch, (size_t)w * bpp);
+        } else {
+            for (u32 r = 0; r < gh; r++) {
+                const u8* srow = p + (size_t)(((u64)r * h + h / 2) / gh) * pitch;
+                u8* drow = (u8*)out + (size_t)r * out_pitch;
+                for (u32 c = 0; c < gw; c++)
+                    memcpy(drow + (size_t)c * bpp, srow + (size_t)(((u64)c * w + w / 2) / gw) * bpp, bpp);
+            }
+        }
         D3D12_RANGE wr = {0, 0}; CALL(s_readback, Unmap, 0, &wr);
     }
 }
@@ -2120,7 +2274,7 @@ static void eng_dump_frame(u32 surface)
         path = dump;
         if (seq) { snprintf(seqpath, sizeof seqpath, "%s.%06u.ppm", dump, frame); path = seqpath; }
     }
-    const u32 w = o->w, h = o->h;
+    const u32 w = o->gw ? o->gw : o->w, h = o->gh ? o->gh : o->h;
     if (!w || !h || w > 16384 || h > 16384) return;
     u8* rgba = (u8*)malloc((size_t)w * h * 4);
     u8* rgb = (u8*)malloc((size_t)w * h * 3);
@@ -2198,6 +2352,7 @@ static const rsx_draw_backend s_engine_backend = {
 
 static void eng_release_device(void)
 {
+    if (s_swap && s_display == DISP_FULLSCREEN) CALL(s_swap, SetFullscreenState, FALSE, NULL);
     RELEASE(s_zero_cb); RELEASE(s_readback); s_readback_cap = 0; RELEASE(s_aux_alloc);
     RELEASE(s_null_tex); RELEASE(s_blit_pso); RELEASE(s_depth_pso); RELEASE(s_depth_pack_pso);
     RELEASE(s_rootsig); RELEASE(s_helper_rootsig);
@@ -2220,6 +2375,34 @@ int rsx_d3d12_engine_init(u32 width, u32 height, const char* title)
     s_headless = (hl && *hl && *hl != '0');
     s_width = width ? width : 1280; s_height = height ? height : 720;
     { const char* v = getenv("RSX_VSYNC"); if (v && *v) s_vsync = atoi(v) ? 1 : 0; }
+    eng_read_scale();
+    /* Per-monitor DPI awareness, before any window exists: without it a
+     * 4K display at 125% scaling reports 3072x1728, the borderless window
+     * covers that and Windows stretches it, and a 1280x720 window is drawn
+     * at 1600x900 through the desktop compositor's scaler. */
+    { HMODULE u32 = GetModuleHandleA("user32.dll");
+      typedef BOOL (WINAPI *SetCtxFn)(DPI_AWARENESS_CONTEXT);
+      SetCtxFn set_ctx = u32 ? (SetCtxFn)(void*)GetProcAddress(u32, "SetProcessDpiAwarenessContext") : NULL;
+      if (!set_ctx || !set_ctx(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)) SetProcessDPIAware(); }
+    s_win_w = s_width; s_win_h = s_height;
+    { const char* dm = getenv("RSX_DISPLAY");
+      const char* fs = getenv("RSX_FULLSCREEN");
+      s_display = DISP_WINDOWED;
+      if (dm && *dm) {
+          if (!_stricmp(dm, "borderless")) s_display = DISP_BORDERLESS;
+          else if (!_stricmp(dm, "fullscreen") || !_stricmp(dm, "exclusive")) s_display = DISP_FULLSCREEN;
+          else if (_stricmp(dm, "windowed") && _stricmp(dm, "window"))
+              fprintf(stderr, "[RSX d3d12] RSX_DISPLAY=%s ignored (windowed, borderless or fullscreen)\n", dm);
+      } else if (fs && *fs && *fs != '0') s_display = DISP_BORDERLESS;
+      const char* ws = getenv("RSX_WINDOW");
+      unsigned ww = 0, wh = 0;
+      const int have_ws = ws && *ws && sscanf(ws, "%ux%u", &ww, &wh) == 2 && ww >= 320 && wh >= 240 && ww <= 16384 && wh <= 16384;
+      if (ws && *ws && !have_ws) fprintf(stderr, "[RSX d3d12] RSX_WINDOW=%s ignored (want <w>x<h>)\n", ws);
+      if (s_display == DISP_WINDOWED) { if (have_ws) { s_win_w = ww; s_win_h = wh; } }
+      else {
+          s_win_w = (u32)GetSystemMetrics(SM_CXSCREEN); s_win_h = (u32)GetSystemMetrics(SM_CYSCREEN);
+          if (s_display == DISP_FULLSCREEN && have_ws) { s_win_w = ww; s_win_h = wh; }   /* a mode switch */
+      } }
 
     /* The engine is this backend's default; PS3RECOMP_RSX_ENGINE=vtable is
      * the way back to the rsx_state path. The query needs a registered
@@ -2229,10 +2412,10 @@ int rsx_d3d12_engine_init(u32 width, u32 height, const char* title)
     if (!rsx_draw_engine_enabled()) { rsx_draw_engine_set_backend(NULL); return -1; }
 
     if (!s_headless) {
-        s_hwnd = eng_create_window(s_width, s_height, title);
+        s_hwnd = eng_create_window(s_win_w, s_win_h, title);
         if (!s_hwnd) { fprintf(stderr, "[RSX d3d12] window creation failed\n"); rsx_draw_engine_set_backend(NULL); return -1; }
     }
-    if (eng_init_device(s_width, s_height) != 0) {
+    if (eng_init_device(s_win_w, s_win_h) != 0) {
         fprintf(stderr, "[RSX d3d12] device initialisation failed; falling back to the vtable path\n");
         eng_release_device();
         rsx_draw_engine_set_backend(NULL);
@@ -2248,8 +2431,9 @@ int rsx_d3d12_engine_init(u32 width, u32 height, const char* title)
         return -1;
     }
     s_active = 1;
-    fprintf(stderr, "[RSX d3d12] %s (%ux%u), register-file draw engine, vsync %d\n",
-            s_headless ? "headless" : "windowed", s_width, s_height, s_vsync);
+    fprintf(stderr, "[RSX d3d12] %s (%ux%u), register-file draw engine, vsync %d, internal resolution x%.2f (%ux%u)\n",
+            s_headless ? "headless" : s_display == DISP_FULLSCREEN ? "full screen" : s_display == DISP_BORDERLESS ? "borderless" : "windowed",
+            s_win_w, s_win_h, s_vsync, s_scale, sc_dim(s_width), sc_dim(s_height));
     return 0;
 }
 
