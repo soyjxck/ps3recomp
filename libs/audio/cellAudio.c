@@ -467,6 +467,18 @@ static void audio_mix_one_block(void)
                         p, (unsigned long long)port->read_index, block_idx, map);
             } } }
 
+        /* AUDIO_PORT_RAW=<file>: every block of every port with 8 channels
+         * except port 0, raw (host-endian f32, all channels), prefixed by a
+         * u32 port index and u32 block index -- the movie audio's layout. */
+        { static FILE* rf = (FILE*)-1;
+          if (rf == (FILE*)-1) { const char* e = getenv("AUDIO_PORT_RAW"); rf = e ? fopen(e, "wb") : NULL; }
+          if (rf && p != 0) {
+              u32 hdr[2] = { (u32)p, block_idx };
+              fwrite(hdr, 4, 2, rf);
+              for (u32 k = 0; k < CELL_AUDIO_BLOCK_SAMPLES * nch; k++) {
+                  float f = ld_be_f32(&src[k]); fwrite(&f, 4, 1, rf); }
+          } }
+
         for (u32 s = 0; s < CELL_AUDIO_BLOCK_SAMPLES; s++) {
             float left, right;
             if (nch >= 2) {
