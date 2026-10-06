@@ -487,19 +487,16 @@ static void audio_mix_one_block(void)
               }
           } }
         /* Read one block at the current read_index -- or AUDIO_LAG_BLOCKS
-         * behind it (default 2 on Windows, 0 elsewhere). The game writes
-         * relative to the read index we publish, so a lag of L means the
-         * block mixed now was due L block-times ago: a producer running up
-         * to L * 5.33 ms late is still heard, at L * 5.33 ms more latency.
-         * Drakengard 3's MultiStream task on Windows wrote 6-15% of its
-         * blocks late in battle with no lag (AUDIO_GAPS=1 counts them). */
+         * behind it (default 0). A lag gives a producer that writes just
+         * AHEAD of the published index more time, but it is wrong for one
+         * that fills the slots just BEHIND it: Drakengard 3's MultiStream
+         * writes at published-1 and published-2 (AUDIO_WRITEPOS=1: 12,144 of
+         * 13,000 writes), keeping six or seven blocks of lead, so a lag of 2
+         * read the very block being written and 2-5% of blocks played as
+         * silence; with no lag the same run had none. */
         static int lag = -1;
         if (lag < 0) { const char* e = getenv("AUDIO_LAG_BLOCKS");
-#ifdef _WIN32
-                       lag = e ? atoi(e) : 2;
-#else
                        lag = e ? atoi(e) : 0;
-#endif
                        if (lag < 0) lag = 0; }
         const u32 lag_b = (u32)lag < nblock - 1u ? (u32)lag : nblock - 2u;
         u32 block_idx = (u32)((port->read_index + nblock - lag_b) % nblock);
