@@ -1943,6 +1943,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                         u32 pea = gcm_io2ea(s_fifo_getoff);
                         armed_io = s_fifo_getoff; armed_word = w;
                         g_ww_dyn = pea; g_spu_watchea_dyn = pea; g_ww_lo = pea & ~15u; g_ww_hi = (pea & ~15u) + 16;
+                        { extern void ppu_vm_slow_any_update(void); ppu_vm_slow_any_update(); }
                         fprintf(stderr, "[park] parked at io=0x%08X ea=0x%08X word=%08X put=0x%08X -- watching writers\n",
                                 s_fifo_getoff, pea, w, put);
                     } }
@@ -1963,7 +1964,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
           extern uint32_t g_ww_dyn;
           if (pw2 && g_ww_dyn && gcm_io2ea(s_fifo_getoff) == g_ww_dyn) {
               fprintf(stderr, "[park] io=0x%08X patched -> %08X (walker moving on)\n", s_fifo_getoff, w);
-              g_ww_dyn = 0; } }
+              g_ww_dyn = 0;
+              { extern void ppu_vm_slow_any_update(void); ppu_vm_slow_any_update(); } } }
         if ((w & 3) == 2) {                    /* CALL: offset | 2 */
             { u32 tgt = w & 0x1FFFFFFCu;
               if (ring_watch && tgt >= ring_end) { static int n = 0; if (n++ < 24) {

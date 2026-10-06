@@ -43,6 +43,9 @@ extern uint32_t      g_null_sweep_hi;      /* null-store sweep in progress      
 extern int           g_ppu_vm_slow_reads;  /* a read diagnostic is armed        */
 extern int           g_ppu_vm_slow_stores; /* a store diagnostic is armed       */
 extern uint32_t      ppu_hle_inject_base;  /* GCM control block at +0x2000      */
+/* g_ppu_vm_slow_stores | g_ww_dyn | g_null_sweep_hi, kept by ppu_vm_slow_any_update:
+ * a store tests one word instead of three. */
+extern uint32_t      g_ppu_vm_slow_stores_any;
 
 uint8_t  vm_read8_slow (uint64_t addr);
 uint16_t vm_read16_slow(uint64_t addr);
@@ -64,7 +67,7 @@ static inline int ppu_vm_fast_ok(uint32_t a, uint32_t n)
 
 static inline int ppu_vm_store_fast_ok(uint32_t a, uint32_t n)
 {
-    if (g_ppu_vm_slow_stores || g_ww_dyn || g_null_sweep_hi || !ppu_vm_fast_ok(a, n)) return 0;
+    if (g_ppu_vm_slow_stores_any || !ppu_vm_fast_ok(a, n)) return 0;
     if (g_spu_coh_armed) {
         uint32_t line = a >> 7;
         if ((g_spu_coh_bitmap[line >> 3] >> (line & 7)) & 1u) return 0;
@@ -131,4 +134,17 @@ static inline void vm_fast_write64(uint64_t ea, uint64_t v)
     vm_write64_slow(ea, v);
 }
 
+/* Store-conditionals with the caller's own context (see ppu_stwcx32_ctx). The
+ * lifted code always has `ctx` in scope. */
+struct ppu_context;
+#ifdef __cplusplus
+extern "C" {
+#endif
+int ppu_stwcx32_ctx(struct ppu_context* self, uint64_t ea, uint32_t expected, uint32_t val);
+int ppu_stdcx64_ctx(struct ppu_context* self, uint64_t ea, uint64_t expected, uint64_t val);
+#ifdef __cplusplus
+}
+#endif
+#define ppu_stwcx32(ea, e, v) ppu_stwcx32_ctx(ctx, (ea), (e), (v))
+#define ppu_stdcx64(ea, e, v) ppu_stdcx64_ctx(ctx, (ea), (e), (v))
 #endif /* PS3RECOMP_PPU_VM_FAST_H */

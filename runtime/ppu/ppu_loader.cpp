@@ -923,14 +923,27 @@ extern "C" void ppu_ww_note_atomic(uint32_t ea, uint32_t val, int width, void* r
 extern "C" uint32_t g_ww_lo, g_ww_hi;
 extern "C" uint32_t g_ww_dyn;
 
+/* The lifted code calls the _ctx forms with its own context (ppu_vm_fast.h),
+ * which spares every indirect call a thread-local store of g_active_ctx --
+ * a call on macOS, ~3% of the game thread. The plain forms are for callers
+ * without one. */
+extern "C" int ppu_stwcx32_ctx(ppu_context* self, uint64_t ea, uint32_t expected, uint32_t val);
+extern "C" int ppu_stdcx64_ctx(ppu_context* self, uint64_t ea, uint64_t expected, uint64_t val);
 extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
+{
+    return ppu_stwcx32_ctx(g_active_ctx, ea, expected, val);
+}
+extern "C" int ppu_stdcx64(uint64_t ea, uint64_t expected, uint64_t val)
+{
+    return ppu_stdcx64_ctx(g_active_ctx, ea, expected, val);
+}
+extern "C" int ppu_stwcx32_ctx(ppu_context* self, uint64_t ea, uint32_t expected, uint32_t val)
 {
     uint32_t exp_raw = __builtin_bswap32(expected);
     uint32_t new_raw = __builtin_bswap32(val);
     if (resv_off())
         return __atomic_compare_exchange_n((uint32_t*)(vm_base + ea), &exp_raw, new_raw,
                                            0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
-    ppu_context* self = g_active_ctx;
     if (resv_diag() && self) resv_check_reg(self);
     volatile LONG* L = resv_slot(ea);
     resv_lock(L);
@@ -1008,14 +1021,13 @@ extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
         ppu_ww_note_atomic((uint32_t)ea, val, 4, __builtin_return_address(0));
     return ok;
 }
-extern "C" int ppu_stdcx64(uint64_t ea, uint64_t expected, uint64_t val)
+extern "C" int ppu_stdcx64_ctx(ppu_context* self, uint64_t ea, uint64_t expected, uint64_t val)
 {
     uint64_t exp_raw = __builtin_bswap64(expected);
     uint64_t new_raw = __builtin_bswap64(val);
     if (resv_off())
         return __atomic_compare_exchange_n((uint64_t*)(vm_base + ea), &exp_raw, new_raw,
                                            0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
-    ppu_context* self = g_active_ctx;
     if (resv_diag() && self) resv_check_reg(self);
     volatile LONG* L = resv_slot(ea);   /* ea and ea+4 share a 16-byte-block slot */
     resv_lock(L);
@@ -1286,6 +1298,15 @@ static inline int vm_oob(uint32_t a, uint32_t n)
 extern "C" PPU_THREAD_LOCAL ppu_context* g_active_ctx;
 extern "C" void ppu_dump_guest_stack(ppu_context*, const char*);
 extern "C" uint32_t g_null_sweep_hi = 0;   /* 0 = not sweeping */
+extern "C" uint32_t g_ww_dyn;
+extern "C" int g_ppu_vm_slow_stores;
+/* The inline store path's one test (ppu_vm_fast.h); recompute after changing
+ * any of the three. */
+extern "C" uint32_t g_ppu_vm_slow_stores_any = 1;   /* as g_ppu_vm_slow_stores starts */
+extern "C" void ppu_vm_slow_any_update(void)
+{
+    g_ppu_vm_slow_stores_any = (g_ppu_vm_slow_stores || g_ww_dyn || g_null_sweep_hi) ? 1u : 0u;
+}
 static uint32_t g_null_sweep_last = 0;
 static unsigned g_null_sweep_tid = 0;
 static int vm_null_store_report(uint32_t a, uint32_t v, int width, void* ra)
@@ -1296,7 +1317,7 @@ static int vm_null_store_report(uint32_t a, uint32_t v, int width, void* ra)
     if (!en) return 0;                                    /* let it land */
     { static int sweep = -1;
       if (sweep < 0) { const char* e = getenv("PS3_NULL_SWEEP"); sweep = e ? 1 : 0; }
-      if (sweep) { g_null_sweep_hi = 1; g_null_sweep_last = a;
+      if (sweep) { g_null_sweep_hi = 1; ppu_vm_slow_any_update(); g_null_sweep_last = a;
                    g_null_sweep_tid = g_active_ctx
                                     ? (unsigned)g_active_ctx->thread_id : 0u; } }
     { static long n = 0;
@@ -1358,6 +1379,7 @@ static int vm_null_sweep(uint32_t a)
         return 1;                       /* still the same sweep: drop */
     }
     g_null_sweep_hi = 0;                /* pattern broken: it is over */
+    ppu_vm_slow_any_update();
     { static int said = 0;
       if (!said) { said = 1;
           fprintf(stderr, "[null-write] sweep contained, ended at 0x%08X\n",
@@ -1388,6 +1410,7 @@ static void ppu_hotread_init(void)
 #ifdef _WIN32
     g_ppu_vm_slow_stores = 1;    /* the PT-restore record keeps its view of every store */
 #endif
+    ppu_vm_slow_any_update();
 }
 
 static inline int vm_null_store(uint32_t a, uint32_t v, int width, void* ra)
@@ -2449,7 +2472,9 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
 
 static void ps3_indirect_call_impl(ppu_context* ctx)
 {
-    g_active_ctx = ctx;
+    /* g_active_ctx is set where a context starts running on a host thread
+     * (thread entry, callbacks); the store-conditionals that needed it here
+     * get the context passed in now. */
     /* BCTRL_RING=1: keep the last N indirect-call targets per thread, and let
      * anything that can name a moment dump them. A render path built out of
      * function pointers and vtables -- a scene graph -- cannot be mapped from

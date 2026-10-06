@@ -41,6 +41,7 @@ uint8_t* vm_base = NULL;
 /* ppu_loader.cpp's dynamic store-watch address, referenced by the GCM layer's
  * park diagnostics; there is no PPU here. */
 uint32_t g_ww_dyn = 0;
+void ppu_vm_slow_any_update(void) {}   /* cellGcmSys.c's word watch, no PPU here */
 
 #define ARENA_BYTES 0x100000000ull
 #define NPAGES      (ARENA_BYTES / RSX_CAPTURE_PAGE)
