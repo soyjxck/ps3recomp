@@ -103,6 +103,8 @@ typedef struct {
     int snapshot_valid;
     u32 packed;            /* RGBA8 copy as the D24S8 bytes read as colour */
     int packed_valid;
+    u32 snap_w, snap_h;    /* the region each copy covers (see below)      */
+    u32 packed_w, packed_h;
 } eng_zdepth;
 
 typedef struct {
@@ -691,11 +693,25 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
  * a depth-WRITING draw: a write-enable bit alone does not prove the pass
  * produced a usable depth map, and a clear-only zeta falls through to guest
  * memory instead (rsx_live_draw.c:6016-6018, 6265-6269). */
-static u32 eng_zdepth_snapshot(u32 slot)
+/* A depth target is allocated at least as large as the screen
+ * (eng_zdepth_get), so a 512x512 shadow map lives in the top-left corner of a
+ * 1280x720 texture. A copy for sampling must be the size the title's texture
+ * unit declares -- the region it addresses with 0..1 coordinates -- or every
+ * lookup lands in the wrong texels: Drakengard 3's character shadow
+ * projection read its 512x512 map as if it were 1280x720 and found nothing,
+ * so no character cast a shadow. The copy is cropped texel for texel. */
+static void eng_zdepth_copy_size(const eng_zdepth* z, u32 tw, u32 th, u32* w, u32* h)
+{
+    *w = (tw && tw < z->w) ? tw : z->w;
+    *h = (th && th < z->h) ? th : z->h;
+}
+
+static u32 eng_zdepth_snapshot(u32 slot, u32 tw, u32 th)
 {
     eng_zdepth* z = &g.zdepths[slot];
     if (!z->handle || !z->had_write) return 0;
-    if (z->snapshot_valid && z->snapshot) return z->snapshot;
+    u32 cw, ch; eng_zdepth_copy_size(z, tw, th, &cw, &ch);
+    if (z->snapshot_valid && z->snapshot && z->snap_w == cw && z->snap_h == ch) return z->snapshot;
     if (!g.be->depth_snapshot) return 0;
     /* The previous image of this zeta is stale (a clear invalidated it), so
      * hand it back before resolving a new one. It never was: every shadow-map
@@ -709,25 +725,28 @@ static u32 eng_zdepth_snapshot(u32 slot)
      * after the frame is encoded. */
     if (z->snapshot && g.be->texture_release) g.be->texture_release(g.be->user, z->snapshot);
     z->snapshot = 0;
-    const u32 tex = g.be->depth_snapshot(g.be->user, z->handle, z->w, z->h);
+    const u32 tex = g.be->depth_snapshot(g.be->user, z->handle, cw, ch);
     if (!tex) return 0;
     z->snapshot = tex;
     z->snapshot_valid = 1;
+    z->snap_w = cw; z->snap_h = ch;
     return tex;
 }
 
-static u32 eng_zdepth_packed(u32 slot)
+static u32 eng_zdepth_packed(u32 slot, u32 tw, u32 th)
 {
     eng_zdepth* z = &g.zdepths[slot];
     if (!z->handle || !z->had_write) return 0;
-    if (z->packed_valid && z->packed) return z->packed;
+    u32 cw, ch; eng_zdepth_copy_size(z, tw, th, &cw, &ch);
+    if (z->packed_valid && z->packed && z->packed_w == cw && z->packed_h == ch) return z->packed;
     if (!g.be->depth_snapshot_rgba8) return 0;
     if (z->packed && g.be->texture_release) g.be->texture_release(g.be->user, z->packed);
     z->packed = 0;
-    const u32 tex = g.be->depth_snapshot_rgba8(g.be->user, z->handle, z->w, z->h);
+    const u32 tex = g.be->depth_snapshot_rgba8(g.be->user, z->handle, cw, ch);
     if (!tex) return 0;
     z->packed = tex;
     z->packed_valid = 1;
+    z->packed_w = cw; z->packed_h = ch;
     return tex;
 }
 
@@ -1622,11 +1641,17 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                     static u32 seen[16][2]; static u32 nseen = 0; int dup = 0;
                     for (u32 k = 0; k < nseen; k++) if (seen[k][0] == t.offset && seen[k][1] == t.format) dup = 1;
                     /* Bind the depth packed as those bytes, through the unit's
-                     * own remap, when it is A8R8G8B8 and not the zeta this draw
-                     * writes. RSX_NO_DEPTH_AS_COLOR=1 leaves the guest bytes. */
+                     * own remap, when it is A8R8G8B8. The packed image is a
+                     * copy, so this also works for the zeta the draw has bound:
+                     * UE3's shadow projection keeps the scene depth attached
+                     * for its stencil test while it reads that depth back,
+                     * and skipping the zeta-in-use case handed it the guest
+                     * bytes (all zero), so it rebuilt every receiver at the
+                     * near plane and no character cast a shadow.
+                     * RSX_NO_DEPTH_AS_COLOR=1 leaves the guest bytes. */
                     { static int off = -1; if (off < 0) off = getenv("RSX_NO_DEPTH_AS_COLOR") ? 1 : 0;
-                      if (!off && base_fmt == 0x85u && current_zslot != i) {
-                          const u32 pk = eng_zdepth_packed(i);
+                      if (!off && base_fmt == 0x85u) {
+                          const u32 pk = eng_zdepth_packed(i, t.width, t.height);
                           if (pk) {
                               const u32 view = g.be->surface_view
                                   ? g.be->surface_view(g.be->user, pk, t.remap & 0xFFFFu, t.format) : 0;
@@ -1647,7 +1672,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                 if (g.zdepths[i].location == t.location &&
                     g.zdepths[i].offset == t.offset && current_zslot != i) {
                     found = 1;
-                    const u32 snap = eng_zdepth_snapshot(i);
+                    const u32 snap = eng_zdepth_snapshot(i, t.width, t.height);
                     if (snap) textures[u] = snap;
                     else { static int n = 0; if (n++ < 6)
                         fprintf(stderr, "[rsx engine] depth texture unit %u (loc %u off 0x%08X %ux%u): tracked zeta %u has no snapshot (handle %u had_write %u)\n",
@@ -1833,7 +1858,7 @@ static void eng_draw_trace(const char* outcome, u32 prim, int indexed, u32 n_dra
     { int skinned = 0;
       for (u32 i = 0; i < 16 && !skinned; i++) { rsx_dsp_vertex_attr a; rsx_dsp_get_vertex_attr(&g.rsx, i, &a); if (a.type == 7) skinned = 1; }
       if (skinned) {
-          static const u32 slots[] = { 204, 207, 208, 209, 210, 211, 212, 462, 463, 464, 465, 466, 467 };
+          static const u32 slots[] = { 200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 429, 430, 431, 432, 462, 463, 464, 465, 466, 467 };
           { const u8* vu = NULL; const u8* fu = NULL; u32 vi2 = 0, fs2 = 0;
             u64 vf = 1469598103934665603ull;
             if (eng_guest_programs(&vu, &vi2, &fu, &fs2))
@@ -2138,8 +2163,17 @@ static void sink_end(void* user, const rsx_dispatch* r)
           }
       } }
 
-    if (zslot != ENG_INVALID && rs.depth_test && rs.depth_write)
+    if (zslot != ENG_INVALID && rs.depth_test && rs.depth_write) {
+        /* New depth: any snapshot taken before this draw is stale. Only a
+         * depth CLEAR used to invalidate them, so a title that never clears
+         * a depth buffer between reads (Drakengard 3's battle areas) read a
+         * snapshot from long before: the character shadow projection
+         * rebuilt every receiver at the near plane, landed outside its
+         * shadow map, and no character cast a shadow. */
         g.zdepths[zslot].had_write = 1;
+        g.zdepths[zslot].snapshot_valid = 0;
+        g.zdepths[zslot].packed_valid = 0;
+    }
 }
 
 static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
