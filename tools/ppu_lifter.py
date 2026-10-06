@@ -3050,44 +3050,51 @@ class PPULifter:
             return (f"{{ uint16_t* d=(uint16_t*)&ctx->vr[{vd}]; uint16_t* b=(uint16_t*)&ctx->vr[{vb}]; "
                     f"uint16_t v=b[{uimm}]; for(int i=0;i<8;i++) d[i]=v; }}")
 
-        # Pack signed halfword signed saturate
-        if mn == "vpkshss":
+        # The vector packs: narrow two source vectors (vA's elements first,
+        # then vB's) to half-width elements, saturating signed or unsigned, or
+        # keeping the low half (modulo). vr[] holds BIG-ENDIAN bytes, so every
+        # element is composed from and written back to its byte lanes
+        # explicitly. vpkswss used to have no lowering at all ("TODO", a
+        # no-op), and the others read vr[] through host int16_t*/uint32_t*
+        # pointers -- byte-reversed lanes on a little-endian host, so vpkuwum
+        # kept each word's HIGH half. Drakengard 3's movie-audio converter
+        # (func_015196F4) packs its 32-bit samples with vpkswss and interleaves
+        # L/R with vmrghh: with the pack missing, every other stereo frame
+        # carried the samples' sign halfwords -- zero-stuffed audio that
+        # crackled through every video.
+        PACKS = {
+            # mnemonic: (source element bytes, signed source, narrowing)
+            "vpkswss": (4, True, "ss"), "vpkswus": (4, True, "us"),
+            "vpkshss": (2, True, "ss"), "vpkshus": (2, True, "us"),
+            "vpkuwus": (4, False, "us"), "vpkuwum": (4, False, "um"),
+            "vpkuhus": (2, False, "us"), "vpkuhum": (2, False, "um"),
+        }
+        if mn in PACKS:
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ int8_t* d=(int8_t*)&ctx->vr[{vd}]; int16_t* a=(int16_t*)&ctx->vr[{va}]; "
-                    f"int16_t* b=(int16_t*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<8;i++){{int32_t v=a[i]; d[i]=(int8_t)(v>127?127:v<-128?-128:v);}} "
-                    f"for(int i=0;i<8;i++){{int32_t v=b[i]; d[8+i]=(int8_t)(v>127?127:v<-128?-128:v);}} }}")
-
-        # Pack unsigned halfword -> unsigned byte, saturating (vpkuhus).
-        # The saturating packs are the back half of a colour-conversion kernel:
-        # widen, do arithmetic at higher precision, then narrow with clamping so
-        # an overflow shows as white rather than wrapping to black. Emitting
-        # them as a TODO comment left the narrow step out entirely, so the
-        # destination register kept whatever it held.
-        if mn == "vpkuhus":
-            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ uint8_t* d=(uint8_t*)&ctx->vr[{vd}]; uint16_t* a=(uint16_t*)&ctx->vr[{va}]; "
-                    f"uint16_t* b=(uint16_t*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<8;i++){{uint32_t v=a[i]; d[i]=(uint8_t)(v>255u?255u:v);}} "
-                    f"for(int i=0;i<8;i++){{uint32_t v=b[i]; d[8+i]=(uint8_t)(v>255u?255u:v);}} }}")
-
-        # Pack unsigned word -> unsigned halfword, saturating (vpkuwus)
-        if mn == "vpkuwus":
-            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ uint16_t* d=(uint16_t*)&ctx->vr[{vd}]; uint32_t* a=(uint32_t*)&ctx->vr[{va}]; "
-                    f"uint32_t* b=(uint32_t*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<4;i++){{uint32_t v=a[i]; d[i]=(uint16_t)(v>65535u?65535u:v);}} "
-                    f"for(int i=0;i<4;i++){{uint32_t v=b[i]; d[4+i]=(uint16_t)(v>65535u?65535u:v);}} }}")
-
-        # Pack unsigned word -> unsigned halfword, modulo (vpkuwum): keep the
-        # low half of each word, no clamping. Same narrowing step as vpkuwus
-        # where the caller already knows the values fit.
-        if mn == "vpkuwum":
-            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ uint16_t* d=(uint16_t*)&ctx->vr[{vd}]; uint32_t* a=(uint32_t*)&ctx->vr[{va}]; "
-                    f"uint32_t* b=(uint32_t*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<4;i++) d[i]=(uint16_t)(a[i]&0xFFFFu); "
-                    f"for(int i=0;i<4;i++) d[4+i]=(uint16_t)(b[i]&0xFFFFu); }}")
+            sb, sgn, kind = PACKS[mn]
+            n = 16 // sb            # elements per source vector
+            db = sb // 2            # destination element bytes
+            if sb == 4:
+                comp = ("(int64_t)(int32_t)(((uint32_t)p[4*i]<<24)|((uint32_t)p[4*i+1]<<16)|((uint32_t)p[4*i+2]<<8)|p[4*i+3])"
+                        if sgn else
+                        "(int64_t)(((uint32_t)p[4*i]<<24)|((uint32_t)p[4*i+1]<<16)|((uint32_t)p[4*i+2]<<8)|p[4*i+3])")
+            else:
+                comp = ("(int64_t)(int16_t)(((uint16_t)p[2*i]<<8)|p[2*i+1])" if sgn else
+                        "(int64_t)(((uint16_t)p[2*i]<<8)|p[2*i+1])")
+            bits = 8 * db
+            if kind == "ss":
+                lo, hi = -(1 << (bits - 1)), (1 << (bits - 1)) - 1
+                narrow = f"if(v<{lo}LL)v={lo}LL; if(v>{hi}LL)v={hi}LL;"
+            elif kind == "us":
+                narrow = f"if(v<0)v=0; if(v>{(1 << bits) - 1}LL)v={(1 << bits) - 1}LL;"
+            else:
+                narrow = f"v&={(1 << bits) - 1}LL;"
+            store = ("o[(s*%d+i)*2]=(uint8_t)((uint64_t)v>>8); o[(s*%d+i)*2+1]=(uint8_t)v;" % (n, n)
+                     if db == 2 else "o[s*%d+i]=(uint8_t)v;" % n)
+            return (f"{{ const uint8_t* src[2]={{(const uint8_t*)&ctx->vr[{va}],(const uint8_t*)&ctx->vr[{vb}]}}; "
+                    f"uint8_t o[16]; for(int s=0;s<2;s++){{ const uint8_t* p=src[s]; "
+                    f"for(int i=0;i<{n};i++){{ int64_t v={comp}; {narrow} {store} }} }} "
+                    f"memcpy(&ctx->vr[{vd}], o, 16); }}")
 
         # vmsummbm (VA-form, 4 operands)
         if mn == "vmsummbm":

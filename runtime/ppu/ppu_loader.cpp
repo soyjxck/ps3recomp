@@ -1899,7 +1899,11 @@ static __attribute__((noinline, cold)) void barrier_watch_hit_slow(uint32_t a, u
               /* On the first write to the watched word, dump the guest caller
                * chain so the origin of a null field can be walked up-stack. */
               extern void ppu_dump_guest_stack(ppu_context*, const char*);
-              if (_i == 1 && g_active_ctx) ppu_dump_guest_stack(g_active_ctx, "ww");
+              /* PPU_WWATCH_NOSTACK=1 skips it: the dump chases pointers it finds
+               * on the stack and can fault on a bad one (a bus error watching
+               * Drakengard 3's audio ring). */
+              { static int nostack = -1; if (nostack < 0) nostack = getenv("PPU_WWATCH_NOSTACK") ? 1 : 0;
+                if (_i == 1 && g_active_ctx && !nostack) ppu_dump_guest_stack(g_active_ctx, "ww"); }
           } else if (_i == _cap + 1) {
               fprintf(stderr, "[ww] --- print cap %ld reached; further writes to "
                               "this window are NOT shown (raise PPU_WWATCH_MAX, "
