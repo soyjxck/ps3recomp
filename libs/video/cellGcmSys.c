@@ -2268,7 +2268,18 @@ static void gcm_rsx_process_fifo_unlocked(void)
                                 vm_write32(rea + 12, 0u);
                             } else { static int _n = 0; if (_n++ < 4)
                                 printf("[GET_REPORT] index %u beyond the 256 the label window holds\n", idx); }
-                            if (s_config.localAddress && off + 16u <= s_config.localSize) {
+                            /* GCM_REPORT_LOCAL_MIRROR=1 also writes the report at
+                             * local offset 0x0E000000 + offset. Off by default:
+                             * that range is the title's own VRAM -- the real local
+                             * report area is in the driver's reserved block (RPCS3
+                             * keeps it with the labels) -- and Drakengard 3 keeps
+                             * vertex streams there. Reports 0x7FC-0x7FF landed
+                             * in the middle of a mesh's per-vertex float stream
+                             * outside the village, and the timestamps read as
+                             * 1e18 lit the object up as a blinding white box. */
+                            static int local_mirror = -1;
+                            if (local_mirror < 0) { const char* e = getenv("GCM_REPORT_LOCAL_MIRROR"); local_mirror = e ? atoi(e) : 0; }
+                            if (local_mirror && s_config.localAddress && off + 16u <= s_config.localSize) {
                                 const u32 rea = s_config.localAddress + 0x0E000000u + off;
                                 vm_write32(rea + 0, (u32)(ts >> 32));
                                 vm_write32(rea + 4, (u32)ts);
