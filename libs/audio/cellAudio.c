@@ -467,6 +467,31 @@ static void audio_mix_one_block(void)
                         p, (unsigned long long)port->read_index, block_idx, map);
             } } }
 
+        /* AUDIO_GAPS=1: a block still cleared when it is read, in the middle
+         * of sound, is one the game did not write in time -- heard as a gap.
+         * Each run of them that ends within 40 blocks (213 ms) of sound is
+         * logged with the RSX frame it ended in, to line up with
+         * [stutter]/[frametime]; longer runs are taken to be real silence. */
+        { static int s_gaps = -1; if (s_gaps < 0) s_gaps = getenv("AUDIO_GAPS") ? 1 : 0;
+          if (s_gaps) {
+              static u32 run[CELL_AUDIO_PORT_MAX]; static u8 heard[CELL_AUDIO_PORT_MAX];
+              static unsigned logged;
+              extern uint32_t g_rsx_engine_frame;
+              const u32 n = CELL_AUDIO_BLOCK_SAMPLES * nch;
+              const u32* w = (const u32*)src;
+              u32 k = 0;
+              while (k < n && !w[k]) k++;
+              if (k == n) run[p]++;
+              else {
+                  if (run[p] && run[p] <= 40 && heard[p] && logged++ < 400)
+                      fprintf(stderr, "[audio-gap] port %d: %u block(s) (%.1f ms) not written in time, "
+                              "ending at frame %u\n", p, run[p],
+                              run[p] * CELL_AUDIO_BLOCK_SAMPLES * 1000.0 / CELL_AUDIO_SAMPLE_RATE,
+                              g_rsx_engine_frame);
+                  run[p] = 0; heard[p] = 1;
+              }
+          } }
+
         /* AUDIO_PORT_RAW=<file>: every block of every port with 8 channels
          * except port 0, raw (host-endian f32, all channels), prefixed by a
          * u32 port index and u32 block index -- the movie audio's layout. */

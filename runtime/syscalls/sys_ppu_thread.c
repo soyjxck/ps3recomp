@@ -3,6 +3,9 @@
  */
 
 #include <setjmp.h>
+#if defined(__APPLE__)
+#include <pthread/qos.h>
+#endif
 
 /* sys_ppu_thread_exit never returns on hardware. Returning CELL_OK to the
  * guest lets it run on past the call: Twisted Metal has a thread that exits
@@ -119,6 +122,28 @@ static void* ppu_host_thread_proc(void* param)
      * invalidation (ppu_loader.cpp) -- so a concurrent stwcx breaks this thread's
      * reservation and prevents ABA corruption of the guest's lock-free lists. */
     { extern void ppu_resv_register(ppu_context*); ppu_resv_register(&info->ctx); }
+
+#if defined(__APPLE__)
+    /* PPU_QOS_INTERACTIVE=<prefix>[,<prefix>...]: a guest thread whose name
+     * starts with one of them runs at user-interactive QoS. On the PS3 the
+     * guest's priorities are strict, so its audio loop runs the moment it
+     * wakes; here every guest thread is equal, and on Apple Silicon a busy
+     * moment can put the audio loop behind the game's heavy threads or on an
+     * efficiency core, where it writes its blocks late -- gaps in the sound
+     * exactly when the picture stutters. The title names its audio threads. */
+    { const char* list = getenv("PPU_QOS_INTERACTIVE");
+      while (list && *list) {
+          const char* end = strchr(list, ',');
+          const size_t n = end ? (size_t)(end - list) : strlen(list);
+          if (n && strncmp(info->name, list, n) == 0) {
+              pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+              fprintf(stderr, "[THREAD %llu] \"%s\" runs at user-interactive QoS\n",
+                      (unsigned long long)info->ctx.thread_id, info->name);
+              break;
+          }
+          list = end ? end + 1 : NULL;
+      } }
+#endif
 
     fprintf(stderr, "[THREAD %llu] host thread started, entry=0x%08llX hosttid=%lu\n",
             (unsigned long long)info->ctx.thread_id,

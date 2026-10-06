@@ -6,6 +6,9 @@
  * spu_workload_dispatch(); the registry is populated by the title's lifted set.
  */
 #include "spu_workload.h"
+#if defined(__APPLE__)
+#include <pthread/qos.h>
+#endif
 #include "spu_lifted_job.h"   /* spu_run_lifted_job */
 #include "../ps3_log.h"      /* ps3_log_verbose */
 #include <stdio.h>
@@ -1151,7 +1154,31 @@ static void* spu_pool_thread(void* p)
         pthread_mutex_unlock(&w->mu);
         extern void spu_task_begin(void);
         spu_task_begin();
+#if defined(__APPLE__)
+        /* SPU_QOS_INTERACTIVE=<image id>[,...]: those images' tasks run at
+         * user-interactive QoS -- an audio mixer, which must finish each block
+         * in time however busy the rest of the machine is (see
+         * PPU_QOS_INTERACTIVE in sys_ppu_thread.c). */
+        qos_class_t qos_was = QOS_CLASS_DEFAULT;
+        int qos_raised = 0;
+        { const char* list = getenv("SPU_QOS_INTERACTIVE");
+          while (list && *list) {
+              char* end;
+              const long id = strtol(list, &end, 0);
+              if (end == list) break;
+              if (id == j->image_id) {
+                  qos_was = qos_class_self();
+                  if (qos_was == QOS_CLASS_UNSPECIFIED) qos_was = QOS_CLASS_DEFAULT;
+                  qos_raised = pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) == 0;
+                  break;
+              }
+              list = *end == ',' ? end + 1 : NULL;
+          } }
+#endif
         spu_async_run(j);
+#if defined(__APPLE__)
+        if (qos_raised) pthread_set_qos_class_self_np(qos_was, 0);
+#endif
         spu_forget_own_stack();
         pthread_mutex_lock(&s_pool_mu);
         w->next = s_pool_idle;
