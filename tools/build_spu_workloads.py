@@ -97,6 +97,31 @@ def debase_includes(path):
     if new != txt:
         open(path, "w", encoding="utf-8", newline="\n").write(new)
 
+def apply_native_hooks(srcc, prefix, hooks):
+    """Make each hooked lifted function start with `if (FN(ctx)) return;`.
+
+    hooks: [(addr, fn)]. A hook is a title-supplied native implementation of
+    (part of) that function: it returns 1 when it has done the function's work
+    and set the pc and trampoline as the lifted code would, 0 to fall through
+    into the lifted body -- having fast-forwarded it, or not. Idempotent, so
+    it is applied to an existing lift as well as a fresh one."""
+    if not hooks:
+        return
+    src = open(srcc).read()
+    for addr, fn in hooks:
+        head = f"void {prefix}spu_func_{addr:08X}(spu_context* ctx) {{\n"
+        call = f"        if ({fn}(ctx)) return;   /* --native-hook */\n"
+        i = src.find(head)
+        if i < 0:
+            sys.exit(f"[build_spu_workloads] --native-hook: no lifted function at 0x{addr:X} in {srcc}")
+        if src.startswith(call, i + len(head)):
+            continue
+        proto = f"int {fn}(spu_context* ctx);\n"
+        src = src[:i] + proto + head + call + src[i + len(head):]
+        print(f"[build_spu_workloads] native hook {fn} at 0x{addr:X}")
+    open(srcc, "w").write(src)
+
+
 # ---- main --------------------------------------------------------------------
 
 def main():
@@ -118,6 +143,10 @@ def main():
                          "branch, so --auto-functions cannot see it, and dispatch "
                          "to it lands on address 0 at runtime. "
                          "e.g. --extra-funcs pm_wwsjob=0xA2C")
+    ap.add_argument("--native-hook", action="append", default=[],
+                    metavar="IMAGE=ADDR:FN",
+                    help="Call FN(ctx) first thing in the lifted function at ADDR of "
+                         "IMAGE (see apply_native_hooks). Repeatable.")
     ap.add_argument("--constructor", action="store_true",
                     help="also emit an __attribute__((constructor)) that calls the register fn at startup")
     ap.add_argument("--relift", action="store_true", help="re-lift even if a prior lift exists")
@@ -135,6 +164,15 @@ def main():
             sys.exit(f"[build_spu_workloads] --extra-funcs wants IMAGE=ADDR, got {spec!r}")
         k, v = spec.split("=", 1)
         extra_funcs[k.strip()] = v.strip()
+
+    native_hooks = {}
+    for spec in args.native_hook:
+        try:
+            k, rest = spec.split("=", 1)
+            a, fn = rest.split(":", 1)
+            native_hooks.setdefault(k.strip(), []).append((int(a, 0), fn.strip()))
+        except ValueError:
+            sys.exit(f"[build_spu_workloads] --native-hook wants IMAGE=ADDR:FN, got {spec!r}")
 
     imgs = []  # (img, prefix, fingerprint, e_entry)
     text_fps = {}  # img -> executable-segment fingerprint
@@ -162,6 +200,7 @@ def main():
         # Make the lifted headers/sources location-independent.
         debase_includes(os.path.join(outdir, "spu_recomp.h"))
         debase_includes(srcc)
+        apply_native_hooks(srcc, prefix, native_hooks.get(img, []))
 
         sz = img_size(b)
         e_entry = be32(b, 0x18)
