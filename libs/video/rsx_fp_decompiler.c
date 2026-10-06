@@ -1028,7 +1028,12 @@ static int rsx_fp_decompile_internal(
     /* Preamble: PSInput matches the backend's placeholder layout; temp/half
      * register files; texture+sampler banks for TEX. Built here, in front of
      * the body, now that the return type is known. */
-    char preamble[2048];
+    /* Static (the decompiler is not reentrant: its per-call unit state is
+     * static too) and roomy: per-unit helpers (shadow compare, texel ops) go
+     * in here, and a ten-texture terrain material with gamma on every unit
+     * overflowed the old 2 KB -- the program failed to translate and its
+     * draws were dropped, which drew Drakengard 3's cliffs and water black. */
+    static char preamble[64 * 1024];
     Out p = { preamble, sizeof(preamble), 0, 1 };
     preamble[0] = '\0';
     out_puts(&p,
