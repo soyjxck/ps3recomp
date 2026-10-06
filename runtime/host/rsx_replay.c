@@ -24,9 +24,26 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
-#include <sys/mman.h>
 #include <time.h>
 #include <zlib.h>
+#ifdef _WIN32
+/* Windows: the arenas are reserved address space committed a page at a time
+ * as the capture fills them; the backend is the D3D12 draw-engine one,
+ * headless; setenv and the clock come from the CRT and QPC. */
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include "../../libs/video/rsx_d3d12_engine.h"
+static int setenv(const char* k, const char* v, int overwrite)
+{
+    if (!overwrite && getenv(k)) return 0;
+    return _putenv_s(k, v) ? -1 : 0;
+}
+static int unsetenv(const char* k) { return _putenv_s(k, "") ? -1 : 0; }
+#else
+#include <sys/mman.h>
+#endif
 
 #include "ps3emu/ps3types.h"
 #include "../../libs/video/rsx_capture.h"
@@ -68,8 +85,15 @@ static int rd(void* p, unsigned n)
 
 static double now_s(void)
 {
+#ifdef _WIN32
+    static LARGE_INTEGER f; LARGE_INTEGER c;
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (double)c.QuadPart / (double)f.QuadPart;
+#else
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
     return t.tv_sec + t.tv_nsec * 1e-9;
+#endif
 }
 
 int main(int argc, char** argv)
@@ -116,6 +140,7 @@ int main(int argc, char** argv)
     /* The backend dumps every `every`-th present it is handed; presents
      * before `from` are skipped by turning the dump off until then. */
     setenv("PS3RECOMP_METAL_HEADLESS", "1", 1);
+    setenv("PS3RECOMP_D3D12_HEADLESS", "1", 1);
     if (surf) {   /* the engine counts presents from 0, as the loop below does */
         char v[32];
         setenv("RSX_SURF_DUMP_DIR", surf, 1);
@@ -129,15 +154,27 @@ int main(int argc, char** argv)
     if (!getenv("RSX_ASYNC_SHADERS")) setenv("RSX_ASYNC_SHADERS", "0", 1);
 
     for (int l = 0; l < 2; l++) {
+#ifdef _WIN32
+        s_arena[l] = (u8*)VirtualAlloc(NULL, ARENA_BYTES, MEM_RESERVE, PAGE_READWRITE);
+        s_have[l] = (u8*)calloc(NPAGES / 8, 1);
+        if (!s_arena[l] || !s_have[l]) { fprintf(stderr, "arena allocation failed\n"); return 1; }
+#else
         s_arena[l] = (u8*)mmap(NULL, ARENA_BYTES, PROT_READ | PROT_WRITE,
                                MAP_PRIVATE | MAP_ANON, -1, 0);
         s_have[l] = (u8*)calloc(NPAGES / 8, 1);
         if (s_arena[l] == MAP_FAILED || !s_have[l]) { fprintf(stderr, "arena allocation failed\n"); return 1; }
+#endif
     }
 
+#ifdef _WIN32
+    if (rsx_d3d12_engine_init(1280, 720, "rsx_replay") != 0) {
+        fprintf(stderr, "D3D12 engine backend init failed\n"); return 1;
+    }
+#else
     if (rsx_metal_backend_init(1280, 720, "rsx_replay") != 0) {
         fprintf(stderr, "Metal backend init failed\n"); return 1;
     }
+#endif
     rsx_draw_engine_set_guest_memory(replay_reader, NULL);
 
     s_gz = gzopen(cap, "rb");
@@ -169,6 +206,9 @@ int main(int argc, char** argv)
         } else if (kind == RSX_CAP_PAGE) {
             u8 loc; u32 off;
             if (!rd(&loc, 1) || !rd(&off, 4) || loc > 1) break;
+#ifdef _WIN32
+            if (!VirtualAlloc(s_arena[loc] + off, RSX_CAPTURE_PAGE, MEM_COMMIT, PAGE_READWRITE)) break;
+#endif
             if (!rd(s_arena[loc] + off, RSX_CAPTURE_PAGE)) break;
             const u64 pg = off / RSX_CAPTURE_PAGE;
             s_have[loc][pg >> 3] |= (u8)(1u << (pg & 7));
@@ -194,6 +234,9 @@ int main(int argc, char** argv)
         }
     }
     gzclose(s_gz);
+#ifdef _WIN32
+    rsx_d3d12_engine_shutdown();
+#endif
     const double dt = now_s() - t0;
     fprintf(stderr, "[replay] %ld presents, %llu methods, %llu pages in %.1f s (%.1f presents/s)\n",
             presents, methods, pages, dt, dt > 0 ? presents / dt : 0.0);

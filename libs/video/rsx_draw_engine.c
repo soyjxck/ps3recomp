@@ -1924,26 +1924,40 @@ static void eng_vc_store(u64 key, const EngVCFill* f, const u8* verts,
     u32 buf = 0, ib_off = 0;
     /* A large entry lives in a buffer of its own that the GPU reads in place,
      * where a small one is copied into the per-submit arena with the rest. */
-#ifndef _WIN32
     /* RSX_VCACHE_GPU_MIN=<bytes>: the smallest entry given a buffer of its own. */
     static size_t gpu_min = 0;
     if (!gpu_min) { const char* e = getenv("RSX_VCACHE_GPU_MIN");
                     gpu_min = e ? (size_t)strtoull(e, 0, 0) : ENG_VC_GPU_MIN; if (!gpu_min) gpu_min = 1; }
     if (vb + ib >= gpu_min && g.be->buffer_wrap && g.be->draw_buffer &&
         g.be->buffer_release) {
+        /* Page-aligned, a whole number of pages: what buffer_wrap takes. On
+         * Windows the memory comes from _aligned_malloc and the backend frees
+         * it with _aligned_free; elsewhere posix_memalign and free. */
+#ifdef _WIN32
+        const size_t page = 4096u;
+#else
         const size_t page = (size_t)getpagesize();
+#endif
         ib_off = (u32)((vb + 255u) & ~(size_t)255u);
         const size_t total = ((size_t)ib_off + ib + page - 1u) & ~(page - 1u);
         void* mem = NULL;
+#ifdef _WIN32
+        if (total <= 0xFFFFFFFFu) mem = _aligned_malloc(total, page);
+        if (mem) {
+#else
         if (total <= 0xFFFFFFFFu && posix_memalign(&mem, page, total) == 0) {
+#endif
             memcpy(mem, verts, vb);
             if (ib) memcpy((u8*)mem + ib_off, indices, ib);
             buf = g.be->buffer_wrap(g.be->user, mem, (u32)total);
             if (buf) { v = (u8*)mem; x = ib ? (u32*)((u8*)mem + ib_off) : NULL; }
+#ifdef _WIN32
+            else _aligned_free(mem);
+#else
             else free(mem);
+#endif
         }
     }
-#endif
     if (!buf) {
         ib_off = 0;
         v = (u8*)malloc(vb ? vb : 1);
@@ -2480,7 +2494,7 @@ static void eng_draw_trace(const char* outcome, u32 prim, int indexed, u32 n_dra
                     (unsigned long long)ph2); }
           fprintf(stderr, "[draw-trace]   constants:");
           for (u32 k = 0; k < sizeof slots / sizeof slots[0]; k++) {
-              const float* c = g.rsx.constants[slots[k]];
+              const float* c = (const float*)g.rsx.constants[slots[k]];
               fprintf(stderr, " c%u=(%.3g %.3g %.3g %.3g)", slots[k], c[0], c[1], c[2], c[3]); }
           fputc('\n', stderr); } }
 }

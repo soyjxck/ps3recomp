@@ -392,6 +392,21 @@ if(UNIX)
     endif()
 endif()
 
+# Frame replay on Windows: the same harness over the D3D12 draw-engine
+# backend, headless.
+if(WIN32)
+    add_executable(rsx_replay
+        runtime/host/rsx_replay.c
+        runtime/host/host_stubs.c
+    )
+    target_link_libraries(rsx_replay PRIVATE ps3recomp_runtime dbghelp user32 gdi32 winmm)
+    target_include_directories(rsx_replay PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    )
+    set_target_properties(rsx_replay PROPERTIES LINKER_LANGUAGE CXX)
+endif()
+
 # ---------------------------------------------------------------------------
 # PPU boot smoke title
 # ---------------------------------------------------------------------------

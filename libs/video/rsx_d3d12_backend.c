@@ -18,6 +18,8 @@
 
 #include <time.h>
 #include "rsx_d3d12_backend.h"
+#include "rsx_d3d12_engine.h"
+#include "rsx_draw_engine.h"
 #include "rsx_primitives.h"
 #include "rsx_vertex_fetch.h"
 #include "rsx_texture_layout.h"
@@ -45,6 +47,7 @@
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3dcompiler.lib")
+#pragma comment(lib, "dxguid.lib")
 
 /* ---------------------------------------------------------------------------
  * Constants
@@ -6582,6 +6585,11 @@ static rsx_backend s_d3d12_backend = {0};
 
 int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
 {
+    /* The register-file draw engine (rsx_d3d12_engine.c) is the default path,
+     * as it is on Metal: every title-specific rendering fix lives there.
+     * PS3RECOMP_RSX_ENGINE=vtable, or a device the engine cannot bring up,
+     * falls through to the rsx_state path below. */
+    if (rsx_d3d12_engine_init(width, height, title) == 0) return 0;
     memset(&s_d3d, 0, sizeof(s_d3d));
     s_d3d.width = width;
     s_d3d.height = height;
@@ -6650,6 +6658,7 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
 
 void rsx_d3d12_backend_shutdown(void)
 {
+    if (rsx_d3d12_engine_active()) { rsx_d3d12_engine_shutdown(); return; }
     if (!s_d3d.initialized) return;
 
     wait_for_gpu();
@@ -6687,6 +6696,7 @@ void rsx_d3d12_backend_shutdown(void)
 
 int rsx_d3d12_backend_pump_messages(void)
 {
+    if (rsx_d3d12_engine_active()) return rsx_d3d12_engine_pump_messages();
     MSG msg;
     while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
         if (msg.message == WM_QUIT) return -1;
@@ -6698,6 +6708,15 @@ int rsx_d3d12_backend_pump_messages(void)
 
 void rsx_d3d12_backend_present(void)
 {
+    /* Under the draw engine the frame belongs to it: a host that drives the
+     * flip itself calls here, and a title whose FIFO carries 0xE944 presents
+     * through the engine's own sink. Present the buffer cellGcmSys says the
+     * guest flipped to (see rsx_metal_backend_present). */
+    if (rsx_d3d12_engine_active()) {
+        extern u32 cellGcmGetCurrentDisplayBufferId(void);
+        rsx_draw_engine_present_buffer(cellGcmGetCurrentDisplayBufferId());
+        return;
+    }
     if (blink_dbg())
         printf("[PRESENT] draws=%u clears_since_last=%u clear_presents=%u\n",
                s_d3d.draw_count, s_dbg_clears_since_present, s_clear_presents);

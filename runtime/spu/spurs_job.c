@@ -174,6 +174,13 @@ static void spu_context_init_regs(spu_context* ctx)
 /* Monotonic nanoseconds for the job-shape histogram (spu_workload.c keeps
  * its own copy private). */
 #ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 static uint64_t sj_now_ns(void)
 {
     LARGE_INTEGER f, c; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&c);

@@ -124,3 +124,11 @@ uint32_t g_spu_image_span = 0;
 void ppu_dump_bctrl_ring(uint32_t a, const char* tag) { (void)a; (void)tag; }
 uint32_t ps3_spu_image_source_ea(uint32_t img_ea) { return img_ea; }
 
+#ifdef _WIN32
+/* lv2_register.c's SPU-import backtrace (Windows only) symbolises host
+ * addresses against the lifted function table. A host with no lifted title
+ * has an empty one. Matches func_entry in the generated ppu_recomp.h. */
+struct host_stub_fentry { uint64_t addr; void* func; const char* name; };
+const struct host_stub_fentry function_table[1] = { { 0, 0, 0 } };
+const uint64_t function_table_count = 0;
+#endif

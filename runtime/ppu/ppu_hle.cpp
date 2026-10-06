@@ -190,6 +190,8 @@ extern "C" uint32_t ppu_prof_resolve_host(void* ra);
 #include <chrono>
 #include <algorithm>
 #include <vector>
+
+extern "C" uint32_t g_sc_inflight[];   /* ppu_loader.cpp: syscall in flight per thread */
 namespace {
 struct WaitProfEntry { unsigned tid, site, sc; const char* name; uint64_t ns, n; };
 WaitProfEntry s_wp[4096];
@@ -253,7 +255,6 @@ static void stutter_report(const FrameSlot& fs)
           "sys_lwcond_queue_wait", "sys_ppu_thread_join", "sys_lwmutex_lock(sc)" };
       struct T { unsigned tid; double wait_ms; const FrameEnt* top; };
       std::vector<T> ts;
-      extern uint32_t g_sc_inflight[];
       for (int idx = 0; idx < 64; idx++) {
           unsigned tid = 0, cia = 0; const char* tn = nullptr;
           if (!ppu_prof_snapshot(idx, &tid, &cia, &tn)) continue;
