@@ -2039,14 +2039,16 @@ static void sink_end(void* user, const rsx_dispatch* r)
     /* RSX_SURF_DUMP_AT_FP=<hash>: the first time (from RSX_SURF_DUMP_FROM) a
      * draw with that fragment program is about to run, finish the GPU work
      * recorded so far and dump every surface -- what the draw will read. */
-    { static int armed = -1; static unsigned long long want = 0;
-      if (armed < 0) { const char* e = getenv("RSX_SURF_DUMP_AT_FP"); want = e ? strtoull(e, 0, 16) : 0; armed = want ? 1 : 0; }
-      if (armed == 1) {
+    /* RSX_SURF_DUMP_AT_FP_EVERY=1: once per frame instead of once per run. */
+    { static int armed = -1, every = 0; static unsigned long long want = 0; static u32 last_frame = ~0u;
+      if (armed < 0) { const char* e = getenv("RSX_SURF_DUMP_AT_FP"); want = e ? strtoull(e, 0, 16) : 0; armed = want ? 1 : 0;
+                       every = getenv("RSX_SURF_DUMP_AT_FP_EVERY") ? 1 : 0; }
+      if (armed == 1 && (!every || last_frame != g.frames)) {
           const char* e = getenv("RSX_SURF_DUMP_FROM"); const long from = e ? atol(e) : 0;
           u64 fh = 0;
           for (u32 i = 0; i < g.n_pipelines; i++) if (g.pipelines[i].handle == pipeline) { fh = g.pipelines[i].fp_hlsl; break; }
           if (fh == want && (long)g.frames >= from) {
-              armed = 0;
+              if (every) last_frame = g.frames; else armed = 0;
               if (g.be->submit_and_wait) g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
               fprintf(stderr, "[surf-dump] before the first draw with fp-hlsl %016llx in frame %u\n", want, g.frames);
               s_dump_tag = "_pre"; eng_surface_dump_now(); s_dump_tag = "";
@@ -2275,14 +2277,46 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
          * nv40 reset 0xFFFFFF00 seeded by rsx_dispatch_init, so a stream that
          * never writes it still clears to 1.0 / 0. */
         const u32 zs = rsx_dsp_reg(&g.rsx, M_ZSTENCIL_CLEAR);
-        g.be->clear_depth_stencil(g.be->user, g.zdepths[zslot].handle, flags,
-                                  zs ? (float)(zs >> 8) / 16777215.0f : 1.0f,
-                                  (u8)(zs & 0xFFu));
+        const float zval = zs ? (float)(zs >> 8) / 16777215.0f : 1.0f;
+        /* CLEAR_SURFACE honours the scissor. Drakengard 3 packs its shadow
+         * maps into one 512x512 depth target and clears each region just
+         * before drawing it; cleared whole, the last region's clear wiped the
+         * character shadows drawn earlier in the frame whenever the
+         * projections came after it, and they flickered in and out. The
+         * scissor is the draws' (guest scissor within the surface);
+         * RSX_CLEAR_NO_SCISSOR=1 clears the whole target as before. */
+        int partial = 0;
+        u32 cx = 0, cy = 0, cw = 0, ch = 0;
+        { static int off = -1; if (off < 0) off = getenv("RSX_CLEAR_NO_SCISSOR") ? 1 : 0;
+          const u32 h = rsx_dsp_reg(&g.rsx, M_SCISSOR_HORIZONTAL);
+          const u32 v = rsx_dsp_reg(&g.rsx, M_SCISSOR_VERTICAL);
+          const u32 gx = h & 0xFFFFu, gw = h >> 16, gy = v & 0xFFFFu, gh = v >> 16;
+          const u32 sw = sf.clip_w ? sf.clip_w : g.zdepths[zslot].w;
+          const u32 sh = sf.clip_h ? sf.clip_h : g.zdepths[zslot].h;
+          if (!off && gw > 0 && gh > 0 && g.be->clear_depth_stencil_rect) {
+              u32 right = sw, bottom = sh;
+              cx = gx; cy = gy;
+              if (gx + gw < right)  right = gx + gw;
+              if (gy + gh < bottom) bottom = gy + gh;
+              cw = right > cx ? right - cx : 0;
+              ch = bottom > cy ? bottom - cy : 0;
+              /* Whole-target clears keep the load-action path. */
+              partial = !(cx == 0 && cy == 0 && cw >= g.zdepths[zslot].w && ch >= g.zdepths[zslot].h);
+              if (partial && (!cw || !ch)) return;   /* scissored away entirely */
+          } }
+        if (partial)
+            g.be->clear_depth_stencil_rect(g.be->user, g.zdepths[zslot].handle, flags,
+                                           zval, (u8)(zs & 0xFFu), cx, cy, cw, ch);
+        else
+            g.be->clear_depth_stencil(g.be->user, g.zdepths[zslot].handle, flags,
+                                      zval, (u8)(zs & 0xFFu));
         g.zdepths[zslot].cleared = 1;
         if (mask & RSX_CLEAR_DEPTH) {
             /* A clear invalidates the older published depth image; the next
-             * texture consumer resolves the newly written pass exactly once. */
-            g.zdepths[zslot].had_write = 0;
+             * texture consumer resolves the newly written pass exactly once.
+             * A partial clear leaves the rest of the target's depth in place,
+             * so it still counts as written. */
+            if (!partial) g.zdepths[zslot].had_write = 0;
             g.zdepths[zslot].snapshot_valid = 0;
             g.zdepths[zslot].packed_valid = 0;
         }

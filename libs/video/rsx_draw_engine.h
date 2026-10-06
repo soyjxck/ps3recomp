@@ -218,6 +218,13 @@ typedef struct rsx_draw_backend {
     void (*clear_color)(void* user, u32 surface, const float rgba[4]);
     void (*clear_depth_stencil)(void* user, u32 depth, u32 flags,
                                 float depth_value, u8 stencil);
+    /* The same, limited to a rectangle in target pixels (top-left origin):
+     * the RSX's CLEAR_SURFACE honours the scissor, and a title that packs
+     * several shadow maps into one depth target clears each region on its
+     * own. Optional; without it the engine clears the whole target. */
+    void (*clear_depth_stencil_rect)(void* user, u32 depth, u32 flags,
+                                     float depth_value, u8 stencil,
+                                     u32 x, u32 y, u32 w, u32 h);
 
     /* Present the named surface, and read a rectangle of one back. The rows
      * come back in the format the target was created with, so R,G,B,A for an
