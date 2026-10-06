@@ -410,6 +410,61 @@ static u64 rsx_vertex_remap_hash(u64 value)
     return value;
 }
 
+/* The dense path: every reference shares one base index and the vertex ids
+ * span at most RSX_REMAP_DENSE_MAX, which is every indexed draw and every
+ * array draw in practice. vertex_id - lowest id indexes the table directly
+ * instead of hashing; the result -- first-use order, the occurrence map --
+ * is the hash path's exactly. Returns 0, having changed nothing, when the
+ * draw does not qualify. */
+#define RSX_REMAP_DENSE_MAX (1u << 20)
+static int rsx_vertex_remap_dense(
+    rsx_vertex_remap* remap, rsx_vertex_ref* refs, u32 count,
+    u32* unique_count)
+{
+    const u32 base = refs[0].base_index;
+    u32 lo = refs[0].vertex_id, hi = lo;
+    for (u32 i = 1; i < count; i++) {
+        if (refs[i].base_index != base) return 0;
+        const u32 v = refs[i].vertex_id;
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+    }
+    const u64 range = (u64)hi - lo + 1u;
+    if (range > RSX_REMAP_DENSE_MAX) return 0;
+    if (range > remap->dense_capacity) {
+        u32 cap = remap->dense_capacity ? remap->dense_capacity : 4096u;
+        while (cap < range) cap *= 2u;
+        u64* d = (u64*)realloc(remap->dense, (size_t)cap * sizeof(u64));
+        if (!d) return 0;
+        memset(d, 0, (size_t)cap * sizeof(u64));
+        remap->dense = d;
+        remap->dense_capacity = cap;
+        remap->dense_generation = 0;
+    }
+    if (!++remap->dense_generation) {
+        memset(remap->dense, 0, (size_t)remap->dense_capacity * sizeof(u64));
+        remap->dense_generation = 1u;
+    }
+    const u32 gen = remap->dense_generation;
+    const u64 tag = (u64)gen << 32;
+    u64* const dense = remap->dense;
+    u32* const occ_map = remap->occurrence_to_unique;
+    u32 unique = 0;
+    for (u32 occurrence = 0; occurrence < count; occurrence++) {
+        const rsx_vertex_ref ref = refs[occurrence];
+        u64* e = &dense[ref.vertex_id - lo];
+        if ((u32)(*e >> 32) != gen) {
+            *e = tag | unique;
+            refs[unique] = ref;
+            occ_map[occurrence] = unique++;
+        } else {
+            occ_map[occurrence] = (u32)*e;
+        }
+    }
+    *unique_count = unique;
+    return 1;
+}
+
 int rsx_vertex_remap_build(
     rsx_vertex_remap* remap, rsx_vertex_ref* refs, u32 count,
     u32* unique_count)
@@ -428,6 +483,12 @@ int rsx_vertex_remap_build(
         remap->occurrence_to_unique = occurrences;
         remap->occurrence_capacity = count;
     }
+
+    /* RSX_REMAP_HASH=1: always the hash path below. */
+    static int hash_only = -1;
+    if (hash_only < 0) hash_only = getenv("RSX_REMAP_HASH") ? 1 : 0;
+    if (!hash_only && rsx_vertex_remap_dense(remap, refs, count, unique_count))
+        return 1;
 
     if (count > UINT_MAX / 2u)
         return 0;
@@ -498,6 +559,7 @@ void rsx_vertex_remap_destroy(rsx_vertex_remap* remap)
         return;
     free(remap->occurrence_to_unique);
     free(remap->slots);
+    free(remap->dense);
     memset(remap, 0, sizeof(*remap));
 }
 

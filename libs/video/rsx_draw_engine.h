@@ -197,6 +197,10 @@ typedef struct rsx_draw_backend {
     void (*bind_targets)(void* user, const u32* surfaces, u32 count, u32 depth);
     void (*bind_pipeline)(void* user, u32 pipeline);
     void (*bind_vs_constants)(void* user, const void* data, u32 bytes);
+    /* Optional: bind the block the last bind_vs_constants staged, unchanged.
+     * Returns 0 when that block is gone (a submit retired it) -- the caller
+     * then binds the data again. */
+    int  (*reuse_vs_constants)(void* user);
     void (*bind_ps_constants)(void* user, const void* data, u32 bytes);
     void (*bind_textures)(void* user, const u32* textures,
                           const rsx_be_sampler_desc* samplers, u32 mask);
@@ -212,6 +216,17 @@ typedef struct rsx_draw_backend {
     void (*draw)(void* user, rsx_topology topology, const void* vertices,
                  u32 vertex_count, u32 stride, const u32* indices,
                  u32 index_count);
+    /* Optional: vertex and index data the engine keeps across frames.
+     * buffer_wrap takes ownership of `data` -- page-aligned, `bytes` a whole
+     * number of pages -- and frees it once the buffer has been released and
+     * the GPU is done with it; on failure (0) the caller still owns it.
+     * draw_buffer is draw() with the vertices, and the indices when
+     * index_count is nonzero, read from such a buffer at byte offsets. */
+    u32  (*buffer_wrap)(void* user, void* data, u32 bytes);
+    void (*buffer_release)(void* user, u32 buffer);
+    void (*draw_buffer)(void* user, rsx_topology topology, u32 buffer,
+                        u32 vb_off, u32 vertex_count, u32 stride,
+                        u32 ib_off, u32 index_count);
 
     /* Clears, which are ordered against draws rather than folded into a pass:
      * a title draws the world, clears depth, and draws the weapon over it. */

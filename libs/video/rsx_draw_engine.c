@@ -18,10 +18,14 @@
 #include "rsx_restart_cuts.h"
 #include "rsx_vertex_formats.h"
 #include <math.h>
+#include <time.h>
 #include "rsx_vp_decompiler.h"
 
 #include <stdio.h>
 #include <stdlib.h>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 #include <string.h>
 
 /* Guest memory and the RSX offset resolvers, declared the way every backend
@@ -157,6 +161,9 @@ static struct {
     u8* tex_staging;
     u32 tex_staging_cap;
     u8* vp_cb;
+    u32 vp_cb_gen;           /* rsx.const_gen vp_cb was filled at        */
+    int vp_cb_valid;
+    int vp_cb_bound;         /* the backend's last staged block is vp_cb */
     u8* fp_cb;
     u32 fp_cb_cap;
     u32* indices;
@@ -188,6 +195,7 @@ static struct {
     u8* verts;
     u64 verts_cap;
     u32 n_verts;
+    const u8* out_verts;     /* what the draw uploads: verts, or a cached copy */
 
     rsx_vertex_layout_plan layout;
     rsx_vertex_fetch_plan fetch_plan;
@@ -1124,6 +1132,28 @@ static u32 eng_cube_mask(void)
  * layout and by the pipeline, because they must not disagree: the built-in
  * program declares all sixteen inputs, so narrowing the layout for it would
  * leave the pipeline's vertex descriptor short of what the shader reads. */
+/* What every draw would otherwise work out again from the resident vertex
+ * program -- its size, the inputs it reads, its hash -- for as long as no
+ * program word is uploaded (rsx.vp_gen) and the start slot stays put.
+ * RSX_VP_INFO_NOCACHE=1 recomputes them on every draw. */
+static struct {
+    int valid;
+    u32 gen, start, instrs;
+    int mask_valid; u32 input_mask;
+    int hash_valid; u64 hash;
+} s_vpi;
+
+static int eng_vp_info_current(u32 start)
+{
+    static int off = -1;
+    if (off < 0) off = getenv("RSX_VP_INFO_NOCACHE") ? 1 : 0;
+    if (!off && s_vpi.valid && s_vpi.gen == g.rsx.vp_gen && s_vpi.start == start)
+        return 1;
+    s_vpi.valid = 0;
+    s_vpi.mask_valid = s_vpi.hash_valid = 0;
+    return 0;
+}
+
 static int eng_guest_programs(const u8** out_vp, u32* out_vp_instrs,
                               const u8** out_fp, u32* out_fp_size)
 {
@@ -1132,8 +1162,16 @@ static int eng_guest_programs(const u8** out_vp, u32* out_vp_instrs,
     const u32 start = rsx_dsp_vp_start(&g.rsx);
     if (start < RSX_DSP_VP_INSTR) {
         vp_uc = (const u8*)(g.rsx.vp + start * 4);
-        vp_instrs = rsx_vp_program_size_instrs(
-            vp_uc, (RSX_DSP_VP_INSTR - start) * 16u);
+        if (eng_vp_info_current(start)) {
+            vp_instrs = s_vpi.instrs;
+        } else {
+            vp_instrs = rsx_vp_program_size_instrs(
+                vp_uc, (RSX_DSP_VP_INSTR - start) * 16u);
+            s_vpi.valid = 1;
+            s_vpi.gen = g.rsx.vp_gen;
+            s_vpi.start = start;
+            s_vpi.instrs = vp_instrs;
+        }
     }
 
     /* A zero SET_SHADER_PROGRAM is "none", not "the program at offset 0": the
@@ -1165,10 +1203,15 @@ static void eng_vertex_layout(rsx_vertex_layout_plan* layout)
     const u8* uc = NULL;
     u32 instrs = 0;
     if (eng_guest_programs(&uc, &instrs, NULL, NULL)) {
-        rsx_vp_input_analysis analysis = { 0xFFFFu, 0 };
-        if (rsx_vp_analyze_inputs(uc, instrs * 16u, &analysis) == (int)instrs &&
-            analysis.exact && analysis.input_mask)
-            mask = analysis.input_mask;
+        if (s_vpi.valid && s_vpi.mask_valid) {
+            mask = s_vpi.input_mask;
+        } else {
+            rsx_vp_input_analysis analysis = { 0xFFFFu, 0 };
+            if (rsx_vp_analyze_inputs(uc, instrs * 16u, &analysis) == (int)instrs &&
+                analysis.exact && analysis.input_mask)
+                mask = analysis.input_mask;
+            if (s_vpi.valid) { s_vpi.input_mask = mask; s_vpi.mask_valid = 1; }
+        }
     }
     rsx_vertex_layout_plan_init(layout, mask);
 }
@@ -1284,7 +1327,12 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         static const u32 fixed_tag = 0x4E464958u;   /* "XIFN" */
         key = eng_fnv1a(&fixed_tag, sizeof fixed_tag, key);
     } else {
-        key = eng_fnv1a(vp_uc, vp_instrs * 16u, key);
+        if (s_vpi.valid && s_vpi.hash_valid) {
+            key = s_vpi.hash;
+        } else {
+            key = eng_fnv1a(vp_uc, vp_instrs * 16u, key);
+            if (s_vpi.valid) { s_vpi.hash = key; s_vpi.hash_valid = 1; }
+        }
         key = rsx_fp_structural_hash(fp_uc, fp_size, key);
         if (!key) return 0;
         const u32 fp_ctrl_key = fp_ctrl & 0x40u;
@@ -1322,6 +1370,8 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     u32 handle = 0;
     int vi = 1, fi = 1;
     u32 nconst = 0;
+    struct timespec t_create0, t_create1;
+    timespec_get(&t_create0, TIME_UTC);
     if (fixed) {
         snprintf(s_vs_hlsl, sizeof s_vs_hlsl, "%s", kEngFixedVS);
         snprintf(s_ps_hlsl, sizeof s_ps_hlsl, "%s", kEngFixedPS);
@@ -1354,6 +1404,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     if (vi > 0 && fi > 0)
         handle = g.be->pipeline_create(g.be->user, s_vs_hlsl, s_ps_hlsl, rs,
                                        layout, layout->stride, rt_fmt, rt_count);
+    timespec_get(&t_create1, TIME_UTC);
     /* RSX_PIPE_LOG=1 lifts the cap: the draw trace names pipelines by handle,
      * and the fragment program's FNV hash is what the shader dump files carry. */
     { static u32 logs = 0; static int uncapped = -1;
@@ -1395,6 +1446,16 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
       u64 fh2 = 1469598103934665603ull;
       for (const char* c = s_ps_hlsl; *c; c++) fh2 = (fh2 ^ (unsigned char)*c) * 1099511628211ull;
       g.pipelines[g.n_pipelines].fp_hlsl = fixed ? 0 : fh2; }
+    /* A pipeline built mid-game stalls the FIFO walker for as long as it
+     * takes (decompile, translate, Metal compile): name every slow one. */
+    { static double total_ms = 0;
+      const double ms = (double)(t_create1.tv_sec - t_create0.tv_sec) * 1e3 +
+                        (double)(t_create1.tv_nsec - t_create0.tv_nsec) / 1e6;
+      total_ms += ms;
+      if (ms >= 20.0)
+          fprintf(stderr, "[pipe-slow] frame %u: new pipeline took %.1f ms (vp-hlsl %016llx fp-hlsl %016llx); %u built, %.0f ms in all\n",
+                  g.frames, ms, (unsigned long long)g.pipelines[g.n_pipelines].vp_hlsl,
+                  (unsigned long long)g.pipelines[g.n_pipelines].fp_hlsl, g.n_pipelines + 1, total_ms); }
     g.n_pipelines++;
     *out_fixed = fixed;
     return handle;
@@ -1406,6 +1467,7 @@ static void dc_reset(void)
 {
     dc.n_arr = dc.n_idx = dc.n_packets = 0;
     dc.n_refs = dc.n_source_refs = dc.n_verts = dc.n_cuts = 0;
+    dc.out_verts = NULL;
     dc.refs_remapped = 0;
     dc.fetch_ok = 1;
     dc.inl = NULL;
@@ -1465,8 +1527,332 @@ static void eng_vfetch_check_summary(void)
                 *s_vfc_draws, *s_vfc_bad, *s_vfc_bytes);
 }
 
-static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
+/* ---- vertex cache -------------------------------------------------------- *
+ *
+ * Most of what a frame draws is the same static meshes from the same guest
+ * vertex and index buffers, frame after frame, and converting them again was
+ * most of the draw engine's time: a Drakengard 3 battle frame decodes ~280k
+ * vertices (19 MB) from ~560k index references. A draw is keyed on everything
+ * that decides its conversion other than memory -- the vertex layout, every
+ * fetched attribute's descriptor and default, the index array and the batch
+ * ranges -- and an entry is reused only when a hash of the bytes it read (the
+ * index ranges, then each attribute's vertex span) still matches. The hash is
+ * taken BEFORE the conversion reads memory, so a guest write racing it can
+ * only cause a miss later, never a stale hit. RSX_VCACHE=0 turns it off;
+ * RSX_VCACHE_CHECK=1 converts every hit again and compares. */
+typedef struct { u32 location, start, len; } EngVCSpan;
+typedef struct {
+    u64 key, content;                       /* key 0: empty slot            */
+    u32 last_frame;
+    u32 n_verts, stride, n_source_refs, n_draw;
+    int indexed;
+    u32 n_spans;
+    EngVCSpan span[RSX_DSP_NUM_VERTEX_ATTR];
+    u8* verts;
+    u32* indices;
+    size_t bytes;
+    u32 buf;                                /* backend buffer, or 0          */
+    u32 ib_off;                             /* the indices' offset in it     */
+} EngVCEntry;
+typedef struct {
+    int ok;
+    u64 content;
+    u32 n_spans;
+    EngVCSpan span[RSX_DSP_NUM_VERTEX_ATTR];
+} EngVCFill;
+#define ENG_VC_SLOTS  8192u                 /* power of two                 */
+#define ENG_VC_BUDGET ((size_t)384 << 20)
+#define ENG_VC_GPU_MIN ((size_t)64 << 10)    /* entries this big get a buffer */
+static EngVCEntry* s_vc;
+static u32 s_vc_count;
+static size_t s_vc_bytes;
+static struct { unsigned long long hit, miss, stored, uncacheable, check_bad, stale; } s_vcstat;
+
+static inline u64 eng_vc_mum(u64 a, u64 b)
 {
+    const __uint128_t r = (__uint128_t)a * b;
+    return (u64)r ^ (u64)(r >> 64);
+}
+
+/* Four independent 128-bit-multiply lanes over 64-byte blocks; every byte
+ * reaches every bit of the result, unlike the texture mutation hash. */
+static u64 eng_vc_hash(const u8* p, size_t n, u64 seed)
+{
+    const u64 s0 = 0xa0761d6478bd642full, s1 = 0xe7037ed1a0b428dbull,
+              s2 = 0x8ebc6af09c88c6e3ull, s3 = 0x589965cc75374cc3ull;
+    u64 a = seed ^ s0, b = seed ^ s1, c = seed ^ s2, d = seed ^ s3;
+    size_t i = 0;
+    for (; i + 64 <= n; i += 64) {
+        u64 w[8];
+        memcpy(w, p + i, sizeof w);
+        a = eng_vc_mum(w[0] ^ s0, w[1] ^ a);
+        b = eng_vc_mum(w[2] ^ s1, w[3] ^ b);
+        c = eng_vc_mum(w[4] ^ s2, w[5] ^ c);
+        d = eng_vc_mum(w[6] ^ s3, w[7] ^ d);
+    }
+    for (; i + 8 <= n; i += 8) {
+        u64 w; memcpy(&w, p + i, 8);
+        a = eng_vc_mum(w ^ s1, a ^ s2);
+    }
+    if (i < n) {
+        u64 w = 0; memcpy(&w, p + i, n - i);
+        b = eng_vc_mum(w ^ s3, b ^ s0);
+    }
+    const u64 h = eng_vc_mum(a ^ s1, b ^ s2) ^ eng_vc_mum(c ^ s3, d ^ s0);
+    return eng_vc_mum(h ^ (u64)n, s1 ^ seed);
+}
+
+static int eng_vc_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("RSX_VCACHE"); on = !(e && e[0] == '0'); }
+    return on;
+}
+static unsigned long long s_vc_checked, s_vc_check_bad_total;
+static void eng_vc_check_summary(void)
+{
+    fprintf(stderr, "[vcache-check] %llu hits converted again, %llu mismatched\n",
+            s_vc_checked, s_vc_check_bad_total);
+}
+static int eng_vc_checking(void)
+{
+    static int on = -1;
+    if (on < 0) { on = getenv("RSX_VCACHE_CHECK") ? 1 : 0; if (on) atexit(eng_vc_check_summary); }
+    return on;
+}
+
+/* Everything other than memory that decides the draw's conversion; 0 for a
+ * draw the cache does not take (an inline stream, or no batches). */
+static u64 eng_vc_key(const rsx_vertex_layout_plan* layout, u32 prim, int rebuild)
+{
+    if (!eng_vc_enabled() || dc.inl || dc.inl_bytes) return 0;
+    if (!dc.n_arr && !dc.n_idx) return 0;
+    rsx_vertex_fetch_plan plan;
+    rsx_vertex_fetch_plan_init(&plan, &g.rsx, layout, eng_guest_ptr, NULL);
+    u32 m[8 + RSX_DSP_NUM_VERTEX_ATTR * 13 + 2 * ENG_MAX_BATCHES * 2 + 16];
+    u32 n = 0;
+    m[n++] = prim; m[n++] = (u32)rebuild;
+    m[n++] = layout->mask; m[n++] = layout->stride; m[n++] = layout->count;
+    m[n++] = plan.base_offset; m[n++] = plan.divider_mask;
+    for (u32 slot = 0; slot < layout->count; slot++) {
+        const u32 attr = layout->attrs[slot];
+        const rsx_vertex_fetch_attr* f = &plan.attr[attr];
+        m[n++] = attr;
+        m[n++] = f->desc.type; m[n++] = f->desc.size; m[n++] = f->desc.stride;
+        m[n++] = f->desc.frequency; m[n++] = f->desc.offset; m[n++] = f->desc.location;
+        m[n++] = f->elem_size; m[n++] = f->stride;
+        memcpy(&m[n], f->default_value, 16); n += 4;
+    }
+    m[n++] = dc.n_arr;
+    for (u32 b = 0; b < dc.n_arr; b++) { m[n++] = dc.arr[b].first; m[n++] = dc.arr[b].count; }
+    m[n++] = dc.n_idx;
+    for (u32 b = 0; b < dc.n_idx; b++) { m[n++] = dc.idx[b].first; m[n++] = dc.idx[b].count; }
+    if (dc.n_idx) {
+        rsx_dsp_index_array ia;
+        rsx_dsp_get_index_array(&g.rsx, &ia);
+        m[n++] = ia.offset; m[n++] = ia.location; m[n++] = ia.is_u32;
+        m[n++] = rsx_dsp_vertex_data_base_index(&g.rsx);
+        m[n++] = (u32)rsx_dsp_restart_index_enabled(&g.rsx, ia.is_u32);
+        m[n++] = rsx_dsp_restart_index(&g.rsx);
+    }
+    const u64 k = eng_vc_hash((const u8*)m, (size_t)n * 4u, 0x5643414348450001ull);
+    return k ? k : 1;
+}
+
+/* The index bytes the draw reads, batch by batch; 0 when a batch is not one
+ * contiguous guest range. */
+static int eng_vc_hash_indices(u64* h)
+{
+    if (!dc.n_idx) return 1;
+    rsx_dsp_index_array ia;
+    rsx_dsp_get_index_array(&g.rsx, &ia);
+    const u32 esz = ia.is_u32 ? 4u : 2u;
+    const u32 ia_loc = ia.location ? RSX_LOCATION_MAIN : RSX_LOCATION_LOCAL;
+    for (u32 b = 0; b < dc.n_idx; b++) {
+        const u64 start = (u64)ia.offset + (u64)dc.idx[b].first * esz;
+        const u64 bytes = (u64)dc.idx[b].count * esz;
+        if (!bytes) continue;
+        if (start + bytes > 0x100000000ull) return 0;
+        const u8* p = eng_guest_ptr(NULL, ia_loc, (u32)start, (u32)bytes);
+        if (!p) return 0;
+        *h = eng_vc_hash(p, (size_t)bytes, *h);
+    }
+    return 1;
+}
+
+static int eng_vc_hash_spans(const EngVCSpan* sp, u32 n, u64* h)
+{
+    for (u32 i = 0; i < n; i++) {
+        const u8* p = eng_guest_ptr(NULL, sp[i].location, sp[i].start, sp[i].len);
+        if (!p) return 0;
+        *h = eng_vc_hash(p, sp[i].len, *h);
+    }
+    return 1;
+}
+
+static EngVCEntry* eng_vc_slot(u64 key)
+{
+    if (!s_vc) {
+        s_vc = (EngVCEntry*)calloc(ENG_VC_SLOTS, sizeof *s_vc);
+        if (!s_vc) return NULL;
+    }
+    u32 i = (u32)key & (ENG_VC_SLOTS - 1u);
+    for (u32 probe = 0; probe < ENG_VC_SLOTS; probe++) {
+        EngVCEntry* e = &s_vc[i];
+        if (!e->key || e->key == key) return e;
+        i = (i + 1u) & (ENG_VC_SLOTS - 1u);
+    }
+    return NULL;
+}
+
+/* A valid entry for the key: present, and the bytes it read unchanged. */
+static EngVCEntry* eng_vc_lookup(u64 key)
+{
+    EngVCEntry* e = eng_vc_slot(key);
+    if (!e || e->key != key) return NULL;
+    u64 h = key;
+    if (!eng_vc_hash_indices(&h) || !eng_vc_hash_spans(e->span, e->n_spans, &h) ||
+        h != e->content) {
+        s_vcstat.stale++;
+        return NULL;
+    }
+    e->last_frame = g.frames;
+    return e;
+}
+
+static void eng_vc_free(EngVCEntry* e)
+{
+    if (e->buf) g.be->buffer_release(g.be->user, e->buf);   /* frees later */
+    else { free(e->verts); free(e->indices); }
+    s_vc_bytes -= e->bytes;
+    memset(e, 0, sizeof *e);
+}
+
+/* Over budget, or the table filling up: keep what the last two frames drew,
+ * re-inserted so the probe chains stay intact, and drop the rest -- or
+ * everything, when even the recent draws would leave it nearly full again. */
+static void eng_vc_evict(void)
+{
+    size_t recent = 0;
+    u32 n_recent = 0;
+    for (u32 i = 0; i < ENG_VC_SLOTS; i++)
+        if (s_vc[i].key && s_vc[i].last_frame + 1u >= g.frames) { recent += s_vc[i].bytes; n_recent++; }
+    const int keep_none = recent > ENG_VC_BUDGET / 2u || n_recent > ENG_VC_SLOTS / 2u;
+    EngVCEntry* old = s_vc;
+    s_vc = (EngVCEntry*)calloc(ENG_VC_SLOTS, sizeof *s_vc);
+    if (!s_vc) { s_vc = old; return; }
+    s_vc_count = 0;
+    for (u32 i = 0; i < ENG_VC_SLOTS; i++) {
+        EngVCEntry* e = &old[i];
+        if (!e->key) continue;
+        if (keep_none || e->last_frame + 1u < g.frames) { eng_vc_free(e); continue; }
+        EngVCEntry* d = eng_vc_slot(e->key);
+        if (!d) { eng_vc_free(e); continue; }
+        *d = *e;
+        s_vc_count++;
+    }
+    free(old);
+}
+
+static void eng_vc_store(u64 key, const EngVCFill* f, const u8* verts,
+                         u32 n_verts, u32 stride, u32 n_source_refs,
+                         int indexed, const u32* indices, u32 n_draw)
+{
+    if (s_vc_bytes > ENG_VC_BUDGET || s_vc_count >= ENG_VC_SLOTS * 3u / 4u)
+        eng_vc_evict();
+    EngVCEntry* e = eng_vc_slot(key);
+    if (!e) return;
+    if (e->key) { eng_vc_free(e); s_vc_count--; }
+    const size_t vb = (size_t)n_verts * stride;
+    const size_t ib = indexed ? (size_t)n_draw * sizeof(u32) : 0;
+    u8* v = NULL;
+    u32* x = NULL;
+    u32 buf = 0, ib_off = 0;
+    /* A large entry lives in a buffer of its own that the GPU reads in place,
+     * where a small one is copied into the per-submit arena with the rest. */
+#ifndef _WIN32
+    if (vb + ib >= ENG_VC_GPU_MIN && g.be->buffer_wrap && g.be->draw_buffer &&
+        g.be->buffer_release) {
+        const size_t page = (size_t)getpagesize();
+        ib_off = (u32)((vb + 255u) & ~(size_t)255u);
+        const size_t total = ((size_t)ib_off + ib + page - 1u) & ~(page - 1u);
+        void* mem = NULL;
+        if (total <= 0xFFFFFFFFu && posix_memalign(&mem, page, total) == 0) {
+            memcpy(mem, verts, vb);
+            if (ib) memcpy((u8*)mem + ib_off, indices, ib);
+            buf = g.be->buffer_wrap(g.be->user, mem, (u32)total);
+            if (buf) { v = (u8*)mem; x = ib ? (u32*)((u8*)mem + ib_off) : NULL; }
+            else free(mem);
+        }
+    }
+#endif
+    if (!buf) {
+        ib_off = 0;
+        v = (u8*)malloc(vb ? vb : 1);
+        x = ib ? (u32*)malloc(ib) : NULL;
+        if (!v || (ib && !x)) { free(v); free(x); return; }
+        memcpy(v, verts, vb);
+        if (ib) memcpy(x, indices, ib);
+    }
+    e->key = key;
+    e->content = f->content;
+    e->last_frame = g.frames;
+    e->n_verts = n_verts; e->stride = stride;
+    e->n_source_refs = n_source_refs;
+    e->indexed = indexed; e->n_draw = n_draw;
+    e->n_spans = f->n_spans;
+    memcpy(e->span, f->span, sizeof e->span);
+    e->verts = v; e->indices = x;
+    e->buf = buf; e->ib_off = ib_off;
+    e->bytes = vb + ib;
+    s_vc_bytes += e->bytes;
+    s_vc_count++;
+    s_vcstat.stored++;
+}
+
+/* The prepared plan's vertex spans, merged where interleaved attributes
+ * overlap, hashed into the fill. 0 when an attribute has no single span. */
+static int eng_vc_fill_spans(EngVCFill* f, const rsx_vertex_fetch_plan* plan)
+{
+    EngVCSpan sp[RSX_DSP_NUM_VERTEX_ATTR];
+    u32 n = 0;
+    for (u32 slot = 0; slot < plan->layout.count; slot++) {
+        const rsx_vertex_fetch_attr* a = &plan->attr[plan->layout.attrs[slot]];
+        if (!a->desc.type || !a->desc.size) continue;
+        if (!a->stable_base || !a->elem_size) return 0;
+        const u64 prefix = (u64)plan->base_offset + a->desc.offset;
+        const u64 start = prefix + (u64)a->stable_first * a->stride;
+        const u64 end = prefix + (u64)a->stable_last * a->stride + a->elem_size;
+        if (end <= start || end > 0x100000000ull) return 0;
+        EngVCSpan s = { a->desc.location, (u32)start, (u32)(end - start) };
+        u32 k = n;
+        while (k > 0 && (sp[k - 1].location > s.location ||
+                         (sp[k - 1].location == s.location && sp[k - 1].start > s.start))) {
+            sp[k] = sp[k - 1]; k--;
+        }
+        sp[k] = s; n++;
+    }
+    f->n_spans = 0;
+    for (u32 i = 0; i < n; i++) {
+        EngVCSpan* last = f->n_spans ? &f->span[f->n_spans - 1] : NULL;
+        if (last && last->location == sp[i].location &&
+            sp[i].start <= last->start + last->len) {
+            const u32 end = sp[i].start + sp[i].len;
+            if (end > last->start + last->len) last->len = end - last->start;
+        } else {
+            f->span[f->n_spans++] = sp[i];
+        }
+    }
+    return eng_vc_hash_spans(f->span, f->n_spans, &f->content);
+}
+
+static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap,
+                     EngVCFill* vc_fill)
+{
+    /* The index bytes are hashed before they are read; see the cache note. */
+    if (vc_fill && vc_fill->ok && !eng_vc_hash_indices(&vc_fill->content))
+        vc_fill->ok = 0;
+
     for (u32 b = 0; b < dc.n_arr && dc.fetch_ok; b++)
         for (u32 i = 0; i < dc.arr[b].count && dc.fetch_ok; i++)
             if (!dc_push_ref(dc.arr[b].first + i, 0)) dc.fetch_ok = 0;
@@ -1525,6 +1911,8 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
     rsx_vertex_fetch_plan_init(&dc.fetch_plan, &g.rsx, layout, eng_guest_ptr, NULL);
     rsx_vertex_fetch_plan_set_inline(&dc.fetch_plan, &g.rsx, dc.inl, dc.inl_bytes);
     rsx_vertex_fetch_plan_prepare(&dc.fetch_plan, dc.refs, dc.n_refs);
+    if (vc_fill && vc_fill->ok && !eng_vc_fill_spans(vc_fill, &dc.fetch_plan))
+        vc_fill->ok = 0;
     if (!dc_reserve_verts((u64)dc.n_refs * layout->stride)) {
         dc.fetch_ok = 0;
         return;
@@ -1776,7 +2164,8 @@ static u32 sink_bind_vertex_textures(
  * RSX_DRAW_TRACE_FRAME=<n>: every draw of frame n in full -- primitive,
  * counts, the enabled vertex attributes (type/size/stride/location/offset),
  * the index array, textures and the outcome. */
-static struct { unsigned long issued, drop_topo, drop_fetch, drop_targets, drop_pipeline, drop_empty; } s_dstat;
+static struct { unsigned long issued, drop_topo, drop_fetch, drop_targets, drop_pipeline, drop_empty;
+                unsigned long long refs, verts, vbytes; } s_dstat;
 static unsigned s_surf_draws[ENG_MAX_SURFACES];   /* draws per surface since the last present */
 /* GPU-skinned colour draws since the last present (bone indices in attribute
  * 7 as unnormalised bytes, colour writes on) and their vertex total: whether a
@@ -1792,9 +2181,13 @@ uint32_t g_rsx_engine_frame = 0;   /* the present count, for frame-gated logs el
 static void eng_draw_stats_report(void)
 {
     if (s_dstat_on != 1 || (g.frames % 120u) != 0u) return;
-    fprintf(stderr, "[draw-stats] frame %u: issued %lu, dropped topo=%lu fetch=%lu targets=%lu pipeline=%lu empty=%lu\n",
+    fprintf(stderr, "[draw-stats] frame %u: issued %lu, dropped topo=%lu fetch=%lu targets=%lu pipeline=%lu empty=%lu; "
+            "refs %llu, vertices %llu (%llu KB); vcache hit %llu miss %llu uncacheable %llu stored %llu (stale %llu), %u entries %zu MB, check mismatches %llu\n",
             g.frames, s_dstat.issued, s_dstat.drop_topo, s_dstat.drop_fetch, s_dstat.drop_targets,
-            s_dstat.drop_pipeline, s_dstat.drop_empty);
+            s_dstat.drop_pipeline, s_dstat.drop_empty, s_dstat.refs, s_dstat.verts, s_dstat.vbytes >> 10,
+            s_vcstat.hit, s_vcstat.miss, s_vcstat.uncacheable, s_vcstat.stored, s_vcstat.stale, s_vc_count, s_vc_bytes >> 20,
+            s_vcstat.check_bad);
+    memset(&s_vcstat, 0, sizeof s_vcstat);
     memset(&s_dstat, 0, sizeof s_dstat);
 }
 /* Retroactive trace: with RSX_TRACE_ON_WHITE set, every draw and clear is
@@ -1831,8 +2224,8 @@ static void eng_ring_draw(const char* outcome, u32 prim, int indexed, u32 n_draw
         tn ? (int)tt[0] : -1, tn ? (u32)g.surfaces[tt[0]].fmt : 0, tsf.zeta_offset, tsf.clip_w, tsf.clip_h,
         trs.blend_enable, trs.sf_rgb, trs.df_rgb, trs.alpha_test_enable, trs.alpha_func, trs.alpha_ref_raw, trs.alpha_ref_format, (double)rsx_fp_alpha_ref(trs.alpha_ref_raw, trs.alpha_ref_format), trs.depth_test, trs.depth_write, trs.depth_func,
         trs.cull_enable, trs.color_mask);
-    if (dc.n_verts && dc.n_verts <= 4 && dc.verts && dc.layout.stride && o > 0 && o < (int)sizeof line - 40) {
-        const float* v = (const float*)dc.verts;
+    if (dc.n_verts && dc.n_verts <= 4 && dc.out_verts && dc.layout.stride && o > 0 && o < (int)sizeof line - 40) {
+        const float* v = (const float*)dc.out_verts;
         for (u32 k = 0; k < 8 && k < dc.layout.stride / 4 && o < (int)sizeof line - 12; k++)
             o += snprintf(line + o, sizeof line - o, "%s%.3g", k ? " " : " v0=", v[k]);
     }
@@ -1870,11 +2263,11 @@ static void eng_draw_trace(const char* outcome, u32 prim, int indexed, u32 n_dra
             trs.cull_enable, trs.color_mask);
     /* The first decoded vertex of a small draw: a full-screen quad's position
      * and its vertex colour are what decide whether it covers the frame. */
-    if (dc.n_verts && dc.n_verts <= 8 && dc.verts && dc.layout.stride) {
+    if (dc.n_verts && dc.n_verts <= 8 && dc.out_verts && dc.layout.stride) {
         /* Every vertex of a small draw, first 8 floats each: a quad's four
          * corners and colours say whether it covers the frame and with what. */
         for (u32 n = 0; n < dc.n_verts; n++) {
-            const float* v = (const float*)(dc.verts + (size_t)n * dc.layout.stride);
+            const float* v = (const float*)(dc.out_verts + (size_t)n * dc.layout.stride);
             fprintf(stderr, " v%u=[", n);
             for (u32 k = 0; k < dc.layout.stride / 4 && k < 8; k++) fprintf(stderr, "%s%.3g", k ? " " : "", v[k]);
             fprintf(stderr, "]");
@@ -1958,17 +2351,66 @@ static void sink_end(void* user, const rsx_dispatch* r)
 
     rsx_vertex_layout_plan layout;
     eng_vertex_layout(&layout);
-    dc_fetch(&layout, rebuild);
+
+    /* A cache hit supplies the converted vertices and the rebuilt index list;
+     * a miss converts and, once the indices are written, stores both. Under
+     * RSX_VCACHE_CHECK a hit is converted anyway and compared at that point. */
+    const u64 vc_key = eng_vc_key(&layout, prim, rebuild);
+    EngVCEntry* vce = vc_key ? eng_vc_lookup(vc_key) : NULL;
+    EngVCEntry* vc_check = NULL;
+    if (vce && eng_vc_checking()) { vc_check = vce; vce = NULL; }
+    EngVCFill vcf;
+    vcf.ok = vc_key != 0;
+    vcf.content = vc_key;
+    vcf.n_spans = 0;
+    const u8* draw_verts = NULL;
+    const u32* draw_indices = NULL;
+    int indexed = 0;
+    u32 n_draw = 0;
+    if (vce) {
+        s_vcstat.hit++;
+        dc.fetch_ok = 1;
+        dc.n_verts = vce->n_verts;
+        dc.n_source_refs = vce->n_source_refs;
+        indexed = vce->indexed;
+        n_draw = vce->n_draw;
+        draw_verts = vce->verts;
+        draw_indices = vce->indices;
+        dc.out_verts = draw_verts;
+        dc.layout = layout;
+    } else {
+        if (vc_key) s_vcstat.miss++; else s_vcstat.uncacheable++;
+        /* RSX_VCACHE_LOG_MISS=<frame>: every miss of that frame. */
+        { static long lf = -2; if (lf == -2) { const char* e = getenv("RSX_VCACHE_LOG_MISS"); lf = e ? atol(e) : -1; }
+          if (lf >= 0 && (long)g.frames == lf) {
+              rsx_dsp_index_array ia; rsx_dsp_get_index_array(&g.rsx, &ia);
+              char buf[512]; int o = snprintf(buf, sizeof buf, "[vc-miss] prim %u arr %u idx %u", prim, dc.n_arr, dc.n_idx);
+              if (dc.n_idx) o += snprintf(buf + o, sizeof buf - o, " ia %u:%08X first %u count %u base %u", ia.location, ia.offset, dc.idx[0].first, dc.idx[0].count, rsx_dsp_vertex_data_base_index(&g.rsx));
+              if (dc.n_arr) o += snprintf(buf + o, sizeof buf - o, " arr first %u count %u", dc.arr[0].first, dc.arr[0].count);
+              o += snprintf(buf + o, sizeof buf - o, " mask %04X baseoff %08X", layout.mask, rsx_dsp_vertex_data_base_offset(&g.rsx));
+              for (u32 a = 0; a < 16 && o < (int)sizeof buf - 40; a++) if ((layout.mask >> a) & 1u) {
+                  rsx_dsp_vertex_attr va; rsx_dsp_get_vertex_attr(&g.rsx, a, &va);
+                  o += snprintf(buf + o, sizeof buf - o, " a%u=%u:%08X/%u/t%u", a, va.location, va.offset, va.stride, va.type); }
+              fprintf(stderr, "%s\n", buf); } }
+        dc_fetch(&layout, rebuild, vc_key ? &vcf : NULL);
+        draw_verts = dc.verts;
+        dc.out_verts = draw_verts;
+    }
+    if (s_dstat_on == 1 && dc.fetch_ok) {
+        s_dstat.refs += dc.n_source_refs; s_dstat.verts += dc.n_verts;
+        s_dstat.vbytes += (unsigned long long)dc.n_verts * layout.stride;
+    }
     if (!dc.n_verts || !dc.fetch_ok) { s_dstat.drop_fetch++; eng_draw_trace(dc.fetch_ok ? "DROP-noverts" : "DROP-fetch", prim, 0, 0, 0, 0); return; }
 
-    int indexed = 0;
-    u32 n_draw = dc.n_source_refs;
-    if (rebuild) {
-        if (!eng_topology_rebuild(prim, dc.refs_remapped, &indexed)) { s_dstat.drop_topo++; eng_draw_trace("DROP-rebuild", prim, 0, 0, 0, 0); return; }
-        n_draw = indexed
-            ? rsx_draw_engine_topology_index_count(prim, dc.n_source_refs,
-                                                   dc.cuts, dc.n_cuts)
-            : dc.n_source_refs - dc.n_source_refs % 3u;
+    if (!vce) {
+        n_draw = dc.n_source_refs;
+        if (rebuild) {
+            if (!eng_topology_rebuild(prim, dc.refs_remapped, &indexed)) { s_dstat.drop_topo++; eng_draw_trace("DROP-rebuild", prim, 0, 0, 0, 0); return; }
+            n_draw = indexed
+                ? rsx_draw_engine_topology_index_count(prim, dc.n_source_refs,
+                                                       dc.cuts, dc.n_cuts)
+                : dc.n_source_refs - dc.n_source_refs % 3u;
+        }
     }
     if (!n_draw) { s_dstat.drop_empty++; eng_draw_trace("DROP-empty", prim, indexed, 0, 0, 0); return; }
     if (g.q_cur) g.q_attempts++;
@@ -2063,12 +2505,28 @@ static void sink_end(void* user, const rsx_dispatch* r)
           for (u32 i = 0; i < g.n_pipelines; i++) if (g.pipelines[i].handle == pipeline) { fh = g.pipelines[i].fp_hlsl; break; }
           for (int k = 0; k < n; k++) if (fh && fh == want[k]) return; } }
 
-    if (indexed) {
+    if (indexed && !vce) {
         if (!dc_reserve_indices(n_draw)) return;
         rsx_draw_engine_write_topology_indices(
             prim, dc.n_source_refs, dc.cuts, dc.n_cuts,
             dc.refs_remapped ? dc.ref_remap.occurrence_to_unique : NULL,
             g.indices);
+        draw_indices = g.indices;
+    }
+    if (vc_check) {
+        const int same = vc_check->n_verts == dc.n_verts && vc_check->stride == layout.stride &&
+            vc_check->indexed == indexed && vc_check->n_draw == n_draw &&
+            !memcmp(vc_check->verts, dc.verts, (size_t)dc.n_verts * layout.stride) &&
+            (!indexed || !memcmp(vc_check->indices, g.indices, (size_t)n_draw * sizeof(u32)));
+        s_vc_checked++;
+        if (!same) s_vc_check_bad_total++;
+        if (!same && ++s_vcstat.check_bad <= 8)
+            fprintf(stderr, "[vcache-check] f%u MISMATCH: cached %u verts/%u draw (indexed %d), converted %u/%u (%d)\n",
+                    g.frames, vc_check->n_verts, vc_check->n_draw, vc_check->indexed,
+                    dc.n_verts, n_draw, indexed);
+    } else if (!vce && vcf.ok && dc.fetch_ok) {
+        eng_vc_store(vc_key, &vcf, dc.verts, dc.n_verts, layout.stride,
+                     dc.n_source_refs, indexed, g.indices, n_draw);
     }
 
     /* The transform constant block, then the viewport epilogue the vertex
@@ -2085,8 +2543,21 @@ static void sink_end(void* user, const rsx_dispatch* r)
         xf[5] = -((vp.translate[1] - H * 0.5f) / (H * 0.5f));
         xf[6] = vp.translate[2];
     }
-    memcpy(g.vp_cb, g.rsx.constants, RSX_DSP_NUM_CONSTANTS * 16u);
-    memcpy(g.vp_cb + RSX_DSP_NUM_CONSTANTS * 16u, xf, sizeof xf);
+    /* The 8 KB block is copied and staged again only when a constant or the
+     * viewport changed since the last draw; otherwise the backend rebinds
+     * what it already staged. RSX_VS_CB_ALWAYS=1 stages it every draw. */
+    static int vs_cb_always = -1;
+    if (vs_cb_always < 0) vs_cb_always = getenv("RSX_VS_CB_ALWAYS") ? 1 : 0;
+    const int vs_cb_same = !vs_cb_always && g.vp_cb_valid &&
+        g.vp_cb_gen == g.rsx.const_gen &&
+        !memcmp(g.vp_cb + RSX_DSP_NUM_CONSTANTS * 16u, xf, sizeof xf);
+    if (!vs_cb_same) {
+        memcpy(g.vp_cb, g.rsx.constants, RSX_DSP_NUM_CONSTANTS * 16u);
+        memcpy(g.vp_cb + RSX_DSP_NUM_CONSTANTS * 16u, xf, sizeof xf);
+        g.vp_cb_gen = g.rsx.const_gen;
+        g.vp_cb_valid = 1;
+        g.vp_cb_bound = 0;
+    }
 
     /* The buffered fragment constants, then fp_alpha: the layout
      * rsx_fp_decompile_buffered_ex compiled the shader against. */
@@ -2140,7 +2611,10 @@ static void sink_end(void* user, const rsx_dispatch* r)
     for (u32 i = 0; i < n_targets; i++) handles[i] = g.surfaces[targets[i]].handle;
     g.be->bind_targets(g.be->user, handles, n_targets, depth_handle);
     g.be->bind_pipeline(g.be->user, pipeline);
-    g.be->bind_vs_constants(g.be->user, g.vp_cb, ENG_VP_CB_BYTES);
+    if (vs_cb_always || !g.vp_cb_bound || !g.be->reuse_vs_constants ||
+        !g.be->reuse_vs_constants(g.be->user))
+        g.be->bind_vs_constants(g.be->user, g.vp_cb, ENG_VP_CB_BYTES);
+    g.vp_cb_bound = 1;
     g.be->bind_ps_constants(g.be->user, g.fp_cb, fp_bytes);
     g.be->bind_textures(g.be->user, textures, samplers, tex_mask);
     g.be->bind_vertex_textures(g.be->user, vtextures, vsamplers, vtex_mask);
@@ -2174,8 +2648,12 @@ static void sink_end(void* user, const rsx_dispatch* r)
 
     const u32 uploaded = indexed ? dc.n_verts : n_draw;
     if (g.q_cur && g.be->query_set) { g.be->query_set(g.be->user, g.q_cur); g.q_draws++; }
-    g.be->draw(g.be->user, topology, dc.verts, uploaded, layout.stride,
-               indexed ? g.indices : NULL, indexed ? n_draw : 0);
+    if (vce && vce->buf)
+        g.be->draw_buffer(g.be->user, topology, vce->buf, 0, uploaded,
+                          layout.stride, vce->ib_off, indexed ? n_draw : 0);
+    else
+        g.be->draw(g.be->user, topology, draw_verts, uploaded, layout.stride,
+                   indexed ? draw_indices : NULL, indexed ? n_draw : 0);
     /* Counted only when the draw ran the guest's OWN programs, which is what
      * the test hook means: a draw through the built-in pair is a draw, not
      * evidence that the decompile-translate-compile path worked. */
@@ -2634,6 +3112,8 @@ int rsx_draw_engine_init(u32 width, u32 height)
     g.height = height ? height : 720;
     g.vp_cb = (u8*)calloc(1, ENG_VP_CB_BYTES);
     if (!g.vp_cb) return -1;
+    g.vp_cb_valid = 0;
+    g.vp_cb_bound = 0;
     if (g.be->init && g.be->init(g.be->user, g.width, g.height) != 0) {
         free(g.vp_cb); g.vp_cb = NULL;
         return -1;
@@ -2667,6 +3147,10 @@ void rsx_draw_engine_shutdown(void)
         if (g.surfaces[i].handle) g.be->color_target_release(g.be->user, g.surfaces[i].handle);
     for (u32 i = 0; i < g.n_zdepths; i++)
         if (g.zdepths[i].handle) g.be->depth_target_release(g.be->user, g.zdepths[i].handle);
+    if (s_vc) {
+        for (u32 i = 0; i < ENG_VC_SLOTS; i++) if (s_vc[i].key) eng_vc_free(&s_vc[i]);
+        free(s_vc); s_vc = NULL; s_vc_count = 0; s_vc_bytes = 0;
+    }
     if (g.ready && g.be->shutdown) g.be->shutdown(g.be->user);
 
     rsx_draw_engine_set_guest_memory(NULL, NULL);

@@ -48,6 +48,7 @@
  */
 #import <Metal/Metal.h>
 #include <sys/stat.h>
+#include <os/lock.h>
 #import <QuartzCore/CAMetalLayer.h>
 #if !TARGET_OS_IPHONE
 #  import <AppKit/AppKit.h>
@@ -2160,6 +2161,8 @@ typedef struct {
     u32   resolve_dst;          /* ENG_REC_DEPTH_RESOLVE target texture */
     u32   resolve_packed;       /* ...into RGBA8 as the D24S8 bytes (eng_depth_pack_fs) */
     u32   vis;                  /* ENG_REC_DRAW: occlusion counter + 1, or 0 */
+    u32   vbuf;                 /* ENG_REC_DRAW: a wrapped buffer holding the
+                                 * vertices (and indices), or 0: the stage   */
     u32   clear_rect[4];        /* ENG_REC_CLEAR_DS_RECT: x, y, w, h        */
 } EngRecord;
 
@@ -2179,8 +2182,21 @@ static u32 s_vis_npending;
 static u32 s_eng_rec_count;
 static u32 s_eng_dropped;
 
+/* The staging arena IS a shared MTLBuffer: draws write vertices, indices and
+ * constants straight into memory the GPU reads, where a submit used to copy
+ * the whole arena into a fresh buffer. A committed arena returns to the pool
+ * once its command buffer completes; the next submit takes one from there. */
+#define ENG_STAGE_POOL 6
+static id<MTLBuffer> s_eng_stage_buf;
 static u8* s_eng_stage;
 static u32 s_eng_stage_used, s_eng_stage_cap;
+static u32 s_eng_stage_want = 4u << 20;     /* the largest arena a submit grew to */
+static id<MTLBuffer> s_eng_stage_pool[ENG_STAGE_POOL];
+static u32 s_eng_stage_npool;
+static os_unfair_lock s_eng_stage_lock = OS_UNFAIR_LOCK_INIT;
+/* Submits so far, and the submit/offset of the last VS constant block. */
+static u32 s_eng_submit_seq;
+static u32 s_eng_vs_cb_seq = ~0u, s_eng_vs_cb_off, s_eng_vs_cb_bytes;
 
 /* What the bind_* calls have accumulated for the next draw. */
 static EngRecord s_eng_pending;
@@ -2273,6 +2289,56 @@ static void eng_collect_retired_objects(void)
     }
 }
 
+/* Buffers the engine keeps across frames (buffer_wrap), by handle, recycled
+ * like objects: a released slot is reused only once encoding has resolved
+ * every record that names it. The memory is the engine's, handed over. */
+#define ENG_MAX_BUFS 16384
+static id<MTLBuffer> s_eng_buf[ENG_MAX_BUFS];
+static u32 s_eng_buf_count, s_eng_buf_free[ENG_MAX_BUFS], s_eng_buf_free_count;
+static u8 s_eng_buf_retired[ENG_MAX_BUFS];
+
+static id<MTLBuffer> eng_buf(u32 h)
+{
+    return (h && h <= s_eng_buf_count) ? s_eng_buf[h - 1] : nil;
+}
+
+static void eng_collect_retired_buffers(void)
+{
+    if (s_eng_rec_count) return;
+    for (u32 i = 0; i < s_eng_buf_count; ++i) {
+        if (!s_eng_buf_retired[i]) continue;
+        s_eng_buf_retired[i] = 0;
+        s_eng_buf[i] = nil;          /* the deallocator frees the memory once
+                                      * the last command buffer lets go */
+        s_eng_buf_free[s_eng_buf_free_count++] = i;
+    }
+}
+
+static u32 eng_buffer_wrap(void* user, void* data, u32 bytes)
+{
+    (void)user;
+    if (!s_dev || !data || !bytes) return 0;
+    u32 slot;
+    if (s_eng_buf_free_count) slot = s_eng_buf_free[s_eng_buf_free_count - 1];
+    else if (s_eng_buf_count < ENG_MAX_BUFS) slot = s_eng_buf_count;
+    else return 0;
+    id<MTLBuffer> b = [s_dev newBufferWithBytesNoCopy:data length:bytes
+                                              options:MTLResourceStorageModeShared
+                                          deallocator:^(void* p, NSUInteger n) { (void)n; free(p); }];
+    if (!b) return 0;
+    if (s_eng_buf_free_count) s_eng_buf_free_count--; else s_eng_buf_count++;
+    s_eng_buf[slot] = b;
+    return slot + 1;
+}
+
+static void eng_buffer_release(void* user, u32 h)
+{
+    (void)user;
+    if (!h || h > s_eng_buf_count || !s_eng_buf[h - 1] || s_eng_buf_retired[h - 1]) return;
+    s_eng_buf_retired[h - 1] = 1;
+    eng_collect_retired_buffers();
+}
+
 static void eng_obj_release(void* user, u32 handle)
 {
     (void)user;
@@ -2312,6 +2378,14 @@ static MTLPixelFormat eng_pixel_format(rsx_be_format f)
 
 static void eng_encode_and_commit(id<MTLTexture> present_dst);
 
+/* A committed arena, back from the GPU. */
+static void eng_stage_release(id<MTLBuffer> b)
+{
+    os_unfair_lock_lock(&s_eng_stage_lock);
+    if (s_eng_stage_npool < ENG_STAGE_POOL) s_eng_stage_pool[s_eng_stage_npool++] = b;
+    os_unfair_lock_unlock(&s_eng_stage_lock);
+}
+
 static int eng_stage_reserve(u32 bytes, u32* out_off)
 {
     const u32 start = (s_eng_stage_used + ENG_ALIGN - 1u) & ~(ENG_ALIGN - 1u);
@@ -2321,13 +2395,36 @@ static int eng_stage_reserve(u32 bytes, u32* out_off)
         eng_encode_and_commit(nil);
         return eng_stage_reserve(bytes, out_off);
     }
+    if (!s_eng_stage_buf) {
+        /* A fresh submit: a pooled arena, when one is free and big enough. */
+        id<MTLBuffer> b = nil;
+        os_unfair_lock_lock(&s_eng_stage_lock);
+        while (s_eng_stage_npool && !b) {
+            b = s_eng_stage_pool[--s_eng_stage_npool];
+            s_eng_stage_pool[s_eng_stage_npool] = nil;
+            if ([b length] < s_eng_stage_want) b = nil;
+        }
+        os_unfair_lock_unlock(&s_eng_stage_lock);
+        if (!b) b = [s_dev newBufferWithLength:s_eng_stage_want
+                                       options:MTLResourceStorageModeShared];
+        if (!b) return 0;
+        s_eng_stage_buf = b;
+        s_eng_stage = (u8*)[b contents];
+        s_eng_stage_cap = (u32)[b length];
+    }
     if (start + bytes > s_eng_stage_cap) {
+        /* Grow: nothing has been committed from this arena yet, so the
+         * bytes staged so far move over and the old buffer is simply let go. */
         u32 cap = s_eng_stage_cap ? s_eng_stage_cap : (4u << 20);
         while (start + bytes > cap) cap *= 2u;
-        u8* n = (u8*)realloc(s_eng_stage, cap);
+        id<MTLBuffer> n = [s_dev newBufferWithLength:cap
+                                             options:MTLResourceStorageModeShared];
         if (!n) return 0;
-        s_eng_stage = n;
+        if (s_eng_stage_used) memcpy([n contents], s_eng_stage, s_eng_stage_used);
+        s_eng_stage_buf = n;
+        s_eng_stage = (u8*)[n contents];
         s_eng_stage_cap = cap;
+        if (cap > s_eng_stage_want) s_eng_stage_want = cap;
     }
     *out_off = start;
     s_eng_stage_used = start + bytes;
@@ -2400,8 +2497,16 @@ static void eng_shutdown(void* user)
     memset(s_eng_obj_retired, 0, sizeof s_eng_obj_retired);
     s_eng_pipe_count = s_eng_func_count = s_eng_samp_count = s_eng_view_count = 0;
     s_eng_rec_count = 0;
-    free(s_eng_stage); s_eng_stage = NULL;
+    for (u32 i = 0; i < s_eng_buf_count; i++) s_eng_buf[i] = nil;
+    memset(s_eng_buf_retired, 0, sizeof s_eng_buf_retired);
+    s_eng_buf_count = s_eng_buf_free_count = 0;
+    s_eng_stage_buf = nil; s_eng_stage = NULL;
     s_eng_stage_used = s_eng_stage_cap = 0;
+    os_unfair_lock_lock(&s_eng_stage_lock);
+    for (u32 k = 0; k < s_eng_stage_npool; k++) s_eng_stage_pool[k] = nil;
+    s_eng_stage_npool = 0;
+    os_unfair_lock_unlock(&s_eng_stage_lock);
+    s_eng_vs_cb_seq = ~0u;
     s_eng_helper_lib = nil;
     s_eng_blit_pso = nil;
     s_eng_depth_pso = nil;
@@ -2895,6 +3000,19 @@ static void eng_bind_vs_constants(void* user, const void* data, u32 bytes)
     (void)user;
     if (!eng_stage_copy(data, bytes, &s_eng_pending.vs_cb_off)) bytes = 0;
     s_eng_pending.vs_cb_bytes = bytes;
+    /* The copy may have submitted (a full arena), so read the count after. */
+    s_eng_vs_cb_seq = s_eng_submit_seq;
+    s_eng_vs_cb_off = s_eng_pending.vs_cb_off;
+    s_eng_vs_cb_bytes = bytes;
+}
+
+static int eng_reuse_vs_constants(void* user)
+{
+    (void)user;
+    if (s_eng_vs_cb_seq != s_eng_submit_seq || !s_eng_vs_cb_bytes) return 0;
+    s_eng_pending.vs_cb_off = s_eng_vs_cb_off;
+    s_eng_pending.vs_cb_bytes = s_eng_vs_cb_bytes;
+    return 1;
 }
 
 static void eng_bind_ps_constants(void* user, const void* data, u32 bytes)
@@ -2958,11 +3076,32 @@ static void eng_draw(void* user, rsx_topology topology, const void* vertices,
     *r = s_eng_pending;
     r->kind         = ENG_REC_DRAW;
     r->topology     = topo_to_metal(topology);
+    r->vbuf         = 0;
     r->vb_off       = vb_off;
     r->stride       = stride;
     r->vertex_count = vertex_count;
     r->ib_off       = ib_off;
     r->index_count  = indices ? index_count : 0;
+    r->vis          = s_vis_cur;
+}
+
+static void eng_draw_buffer(void* user, rsx_topology topology, u32 buffer,
+                            u32 vb_off, u32 vertex_count, u32 stride,
+                            u32 ib_off, u32 index_count)
+{
+    (void)user;
+    if (!vertex_count || !stride || !eng_buf(buffer)) return;
+    if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return; }
+    EngRecord* r = &s_eng_rec[s_eng_rec_count++];
+    *r = s_eng_pending;
+    r->kind         = ENG_REC_DRAW;
+    r->topology     = topo_to_metal(topology);
+    r->vbuf         = buffer;
+    r->vb_off       = vb_off;
+    r->stride       = stride;
+    r->vertex_count = vertex_count;
+    r->ib_off       = ib_off;
+    r->index_count  = index_count;
     r->vis          = s_vis_cur;
 }
 
@@ -3099,7 +3238,9 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
     [enc setViewport:vp];
     if (r->sc[2] && r->sc[3])
         [enc setScissorRect:(MTLScissorRect){ r->sc[0], r->sc[1], r->sc[2], r->sc[3] }];
-    [enc setVertexBuffer:stage offset:r->vb_off atIndex:MTL_VB_INDEX];
+    id<MTLBuffer> vbuf = r->vbuf ? eng_buf(r->vbuf) : stage;
+    if (!vbuf) return;
+    [enc setVertexBuffer:vbuf offset:r->vb_off atIndex:MTL_VB_INDEX];
     if (r->vs_cb_bytes) [enc setVertexBuffer:stage offset:r->vs_cb_off atIndex:0];
     if (r->ps_cb_bytes) [enc setFragmentBuffer:stage offset:r->ps_cb_off atIndex:1];
     for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
@@ -3124,7 +3265,7 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
         [enc drawIndexedPrimitives:r->topology
                         indexCount:r->index_count
                          indexType:MTLIndexTypeUInt32
-                       indexBuffer:stage
+                       indexBuffer:vbuf
                  indexBufferOffset:r->ib_off];
     else
         [enc drawPrimitives:r->topology
@@ -3395,11 +3536,35 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
             }
         }
 
+        /* The arena goes with the command buffer and comes back to the pool
+         * when it completes; the next draw takes another. */
         id<MTLBuffer> stage = nil;
-        if (s_eng_stage_used)
-            stage = [s_dev newBufferWithBytes:s_eng_stage length:s_eng_stage_used
-                                      options:MTLResourceStorageModeShared];
+        if (s_eng_stage_used) {
+            stage = s_eng_stage_buf;
+            s_eng_stage_buf = nil;
+            s_eng_stage = NULL;
+            s_eng_stage_cap = 0;
+        }
+        s_eng_submit_seq++;
         id<MTLCommandBuffer> cb = [s_queue commandBuffer];
+        /* RSX_GPU_TIME=1: the GPU time of the engine's command buffers, and
+         * how many there were, summed over every 60 presents. */
+        { static int on = -1; if (on < 0) on = getenv("RSX_GPU_TIME") ? 1 : 0;
+          if (on) {
+              static double acc; static unsigned ncb, npres;
+              static os_unfair_lock lk = OS_UNFAIR_LOCK_INIT;
+              const int pres = present_dst != nil;
+              [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
+                  os_unfair_lock_lock(&lk);
+                  acc += [c GPUEndTime] - [c GPUStartTime]; ncb++;
+                  if (pres && ++npres % 60 == 0) {
+                      fprintf(stderr, "[gpu-time] %u presents: %.2f ms GPU per present, %.1f command buffers per present\n",
+                              npres, acc * 1000.0 / 60.0, ncb / 60.0);
+                      acc = 0; ncb = 0;
+                  }
+                  os_unfair_lock_unlock(&lk);
+              }];
+          } }
         eng_encode_records(cb, stage);
         /* Occlusion reports: a windowed present delivers them from the
          * completion handler; a synchronous submit (no present, or headless)
@@ -3432,12 +3597,14 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
             dispatch_semaphore_t sem = s_inflight;
             [cb addCompletedHandler:^(id<MTLCommandBuffer> _unused) {
                 (void)_unused;
+                if (stage) eng_stage_release(stage);
                 dispatch_semaphore_signal(sem);
             }];
             [cb commit];
         } else {
             [cb commit];
             [cb waitUntilCompleted];
+            if (stage) eng_stage_release(stage);
             if (sync_reps) {
                 const u64* c = (const u64*)[s_vis_buf contents];
                 for (u32 k = 0; k < sync_n; k++)
@@ -3454,6 +3621,7 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
         s_eng_rec_count  = 0;
         s_eng_stage_used = 0;
         eng_collect_retired_objects();
+        eng_collect_retired_buffers();
     }
 }
 
@@ -3564,6 +3732,10 @@ static const rsx_draw_backend s_engine_backend = {
     .bind_targets         = eng_bind_targets,
     .bind_pipeline        = eng_bind_pipeline,
     .bind_vs_constants    = eng_bind_vs_constants,
+    .reuse_vs_constants   = eng_reuse_vs_constants,
+    .buffer_wrap          = eng_buffer_wrap,
+    .buffer_release       = eng_buffer_release,
+    .draw_buffer          = eng_draw_buffer,
     .bind_ps_constants    = eng_bind_ps_constants,
     .bind_textures        = eng_bind_textures,
     .bind_vertex_textures = eng_bind_vertex_textures,

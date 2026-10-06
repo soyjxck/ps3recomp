@@ -242,6 +242,7 @@ void rsx_dispatch_seed_transform_program(rsx_dispatch* rsx, const u32* words, u3
     if (count > RSX_DSP_VP_WORDS)
         count = RSX_DSP_VP_WORDS;
     memcpy(rsx->vp, words, count * sizeof(u32));
+    rsx->vp_gen++;
 }
 
 void rsx_dispatch_seed_transform_constants(rsx_dispatch* rsx, const u32* words, u32 count)
@@ -250,6 +251,7 @@ void rsx_dispatch_seed_transform_constants(rsx_dispatch* rsx, const u32* words, 
     if (count > max_words)
         count = max_words;
     memcpy(rsx->constants, words, count * sizeof(u32));
+    rsx->const_gen++;
 }
 
 /* Every NV4097_SET_VERTEX_DATA* variant writes the same constant ("current")
@@ -329,8 +331,10 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
         const u32 lane = ((method - M_VP_UPLOAD_INST) >> 2) & 3;
         u32* load = &rsx->regs[M_VP_UPLOAD_FROM_ID >> 2];
         const u32 pos = *load * 4 + lane;
-        if (pos < RSX_DSP_VP_WORDS)
+        if (pos < RSX_DSP_VP_WORDS) {
             rsx->vp[pos] = arg;
+            rsx->vp_gen++;
+        }
         if (lane == 3)
             (*load)++;
         return;
@@ -342,8 +346,10 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
     if (method >= M_VP_UPLOAD_CONST && method < M_VP_UPLOAD_CONST + 32 * 4) {
         const u32 word = (method - M_VP_UPLOAD_CONST) >> 2;
         const u32 slot = rsx->regs[M_VP_UPLOAD_CONST_ID >> 2] + (word >> 2);
-        if (slot < RSX_DSP_NUM_CONSTANTS)
+        if (slot < RSX_DSP_NUM_CONSTANTS) {
             rsx->constants[slot][word & 3] = arg;
+            rsx->const_gen++;
+        }
         /* RSX_CONST_LOG=<lo>,<hi>: every transform-constant upload into that
          * slot range (first 400) -- what a shader's constants really were. */
         /* RSX_CONST_LOG_FRAME=<n>: only while the draw engine's frame counter

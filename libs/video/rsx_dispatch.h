@@ -118,6 +118,8 @@ struct rsx_dispatch {
 
     int in_begin_end;                 /* between BEGIN_END(prim) and (0)    */
     u32 current_primitive;
+    u32 const_gen;                    /* bumped on every constants[] write  */
+    u32 vp_gen;                       /* bumped on every vp[] write         */
 
     u32 inline_len;                   /* bytes accumulated this primitive   */
     u32 inline_dropped;               /* streams lost to the cap            */

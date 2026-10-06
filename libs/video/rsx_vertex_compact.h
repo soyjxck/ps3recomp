@@ -44,6 +44,11 @@ typedef struct rsx_vertex_remap {
     rsx_vertex_remap_slot* slots;
     u32 slot_capacity;
     u32 generation;
+    /* Direct-indexed table for the common case (see rsx_vertex_remap_build):
+     * generation << 32 | unique index, at vertex_id - the draw's lowest id. */
+    u64* dense;
+    u32 dense_capacity;
+    u32 dense_generation;
 } rsx_vertex_remap;
 
 typedef struct rsx_vertex_fetch_attr {
