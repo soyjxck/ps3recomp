@@ -148,6 +148,7 @@ static struct {
     u32 last_flip_buffer;
     u32 q_cur;               /* open occlusion query (backend counter), or 0 */
     u32 q_attempts, q_draws; /* draws the game issued / the backend counted */
+    u32 q_unflushed;         /* reports handed to the backend since its last submit */
     u32 sink_flips;          /* flips decoded from the FIFO (0xE944), in draw order */
 
     /* staging: decoded texture levels, the constant blocks, the index list */
@@ -2304,6 +2305,7 @@ static void eng_present(u32 buffer_id)
     }
     g.last_present_surface = target;
     g.be->present(g.be->user, g.surfaces[target].handle);
+    g.q_unflushed = 0;   /* the present's command buffer carries them */
     eng_surface_dump_frame();
     /* RSX_PRESENT_LOG=<from frame>: one line per present from that frame on:
      * the guest's buffer id, the surface it resolved to, the draws each
@@ -2540,10 +2542,22 @@ void rsx_draw_engine_method(u32 method, u32 arg)
         g.q_attempts = g.q_draws = 0;
     } else if (m == 0x1800u && (arg >> 24) == 1u && g.q_cur) {
         const u32 index = (arg & 0xFFFFFFu) / 16u;
-        if (g.q_draws && g.q_draws >= g.q_attempts) g.be->query_report(g.be->user, g.q_cur, index);
+        if (g.q_draws && g.q_draws >= g.q_attempts) { g.be->query_report(g.be->user, g.q_cur, index); g.q_unflushed++; }
         else rsx_draw_engine_query_result(index, 0xFFFFu);
         g.q_cur = 0;
         if (g.be->query_set) g.be->query_set(g.be->user, 0);
+    } else if (m == 0x1D70u && g.q_unflushed && g.be->submit_and_wait) {
+        /* BACK_END_WRITE_SEMAPHORE_RELEASE after occlusion queries: the title
+         * reads a fence the GPU writes once it is past the query block, then
+         * trusts the report values. The walker writes the fence as soon as it
+         * reaches it, long before the counts come back, so Drakengard 3 read
+         * last frame's values -- another object's, since report indices are a
+         * per-frame pool -- and culled whatever drew a 0: characters and props
+         * flickered out for single frames. Finish the GPU work up to here and
+         * deliver the counts before the fence lands. RSX_QUERY_NOSYNC=1 off. */
+        static int nosync = -1; if (nosync < 0) nosync = getenv("RSX_QUERY_NOSYNC") ? 1 : 0;
+        if (!nosync) g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_QUERY_FENCE);
+        g.q_unflushed = 0;
     }
     if ((m == 0x17C8u || m == 0x1800u || m == 0x1D84u) && s_dtrace_frame >= 0 &&
         (long)g.frames >= s_dtrace_frame && (long)g.frames < s_dtrace_frame + 4)
@@ -2557,7 +2571,7 @@ void cellGcm_set_report_value(u32 index, u32 value);   /* cellGcmSys.c */
 void rsx_draw_engine_query_result(u32 report_index, u64 count)
 {
     static int log = -1; if (log < 0) log = getenv("RSX_QUERY_LOG") ? 1 : 0;
-    if (log) fprintf(stderr, "[query] report %u = %llu\n", report_index, (unsigned long long)count);
+    if (log) fprintf(stderr, "[query] f%u report %u = %llu\n", g.frames, report_index, (unsigned long long)count);
     cellGcm_set_report_value(report_index, count > 0xFFFFFFFFull ? 0xFFFFFFFFu : (u32)count);
 }
 
@@ -2573,6 +2587,13 @@ void rsx_draw_engine_set_display_buffer(u32 buffer_id, u32 location, u32 offset,
     d->width = width;
     d->height = height;
     d->valid = width && height;
+}
+
+void rsx_draw_engine_sync_queries(void)
+{
+    if (!g.ready || !g.q_unflushed || !g.be->submit_and_wait) return;
+    g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_QUERY_FENCE);
+    g.q_unflushed = 0;
 }
 
 void rsx_draw_engine_flush(void)

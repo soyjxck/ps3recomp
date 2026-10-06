@@ -3299,19 +3299,28 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
                                       options:MTLResourceStorageModeShared];
         id<MTLCommandBuffer> cb = [s_queue commandBuffer];
         eng_encode_records(cb, stage);
+        /* Occlusion reports: a windowed present delivers them from the
+         * completion handler; a synchronous submit (no present, or headless)
+         * delivers them on this thread after the wait, so the caller -- the
+         * query fence in rsx_draw_engine_method -- sees them written. */
+        EngVisReport* sync_reps = NULL; u32 sync_n = 0;
         if (s_vis_npending && s_vis_buf) {
             const u32 n = s_vis_npending;
             EngVisReport* reps = (EngVisReport*)malloc(n * sizeof *reps);
             if (reps) {
                 memcpy(reps, s_vis_pending, n * sizeof *reps);
-                id<MTLBuffer> vb = s_vis_buf;
-                [cb addCompletedHandler:^(id<MTLCommandBuffer> _unused) {
-                    (void)_unused;
-                    const u64* c = (const u64*)[vb contents];
-                    for (u32 k = 0; k < n; k++)
-                        rsx_draw_engine_query_result(reps[k].index, c[reps[k].slot]);
-                    free(reps);
-                }];
+                if (windowed_present) {
+                    id<MTLBuffer> vb = s_vis_buf;
+                    [cb addCompletedHandler:^(id<MTLCommandBuffer> _unused) {
+                        (void)_unused;
+                        const u64* c = (const u64*)[vb contents];
+                        for (u32 k = 0; k < n; k++)
+                            rsx_draw_engine_query_result(reps[k].index, c[reps[k].slot]);
+                        free(reps);
+                    }];
+                } else {
+                    sync_reps = reps; sync_n = n;
+                }
             }
             s_vis_npending = 0;
         }
@@ -3327,6 +3336,12 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
         } else {
             [cb commit];
             [cb waitUntilCompleted];
+            if (sync_reps) {
+                const u64* c = (const u64*)[s_vis_buf contents];
+                for (u32 k = 0; k < sync_n; k++)
+                    rsx_draw_engine_query_result(sync_reps[k].index, c[sync_reps[k].slot]);
+                free(sync_reps);
+            }
         }
 
         if (s_eng_dropped) {

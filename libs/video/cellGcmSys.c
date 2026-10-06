@@ -1105,6 +1105,34 @@ static void nv0039_report_bytes(u32 report_off, u8* out)
     *out = rec[rem];
 }
 
+/* Copies out of the report area wait here until the counts they read exist.
+ * Drakengard 3 copies every occlusion report into main memory with NV0039
+ * right after its GET_REPORT, and the CPU reads that copy once the fence
+ * after the query block has passed. The walker reaches the copy before the
+ * GPU has run the query, so done at once it copied the slot's previous value
+ * -- last frame's, for a different object, since report indices are a
+ * per-frame pool -- and objects that were in plain view were culled for a
+ * frame. Queued copies run, after rsx_draw_engine_sync_queries, at the next
+ * fence or label write and at a flip. GCM_REPORT_COPY_NOW=1 restores the
+ * immediate copy. */
+typedef struct { u32 src, dst, len, lines, in_pitch, out_pitch; } gcm_report_copy;
+static gcm_report_copy s_rcopy[1024];
+static u32 s_rcopy_n;
+static void nv0039_report_bytes(u32 report_off, u8* out);
+static void gcm_report_copies_flush(void)
+{
+    if (!s_rcopy_n) return;
+    rsx_draw_engine_sync_queries();
+    for (u32 k = 0; k < s_rcopy_n; k++) {
+        const gcm_report_copy* c = &s_rcopy[k];
+        for (u32 l = 0; l < c->lines; l++) {
+            const u32 s0 = c->src + l * c->in_pitch, d0 = c->dst + l * c->out_pitch;
+            for (u32 i = 0; i < c->len; i++) { u8 b; nv0039_report_bytes(s0 + i, &b); vm_write8(d0 + i, b); }
+        }
+    }
+    s_rcopy_n = 0;
+}
+
 static void nv0039_copy(void)
 {
     const u32 len = s_nv0039.len, lines = s_nv0039.lines ? s_nv0039.lines : 1u;
@@ -1156,6 +1184,14 @@ static void nv0039_copy(void)
             printf("[NV0039] copy dropped: unresolved %s (in dma 0x%08X off 0x%08X, out dma 0x%08X off 0x%08X)\n",
                    dst ? "source" : "destination", s_nv0039.dma_in, s_nv0039.off_in, s_nv0039.dma_out, s_nv0039.off_out);
         return;
+    }
+    if (from_report && rsx_draw_engine_enabled()) {
+        static int now = -1; if (now < 0) now = getenv("GCM_REPORT_COPY_NOW") ? 1 : 0;
+        if (!now) {
+            if (s_rcopy_n >= sizeof s_rcopy / sizeof s_rcopy[0]) gcm_report_copies_flush();
+            s_rcopy[s_rcopy_n++] = (gcm_report_copy){ src, dst, len, lines, in_pitch, out_pitch };
+            return;
+        }
     }
     for (u32 l = 0; l < lines; l++) {
         const u32 s0 = src + l * in_pitch, d0 = dst + l * out_pitch;
@@ -1863,6 +1899,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
              * up. The ticker's present comes later, and by then this drain
              * may have run through several more frames (the catch-up below),
              * so the buffer it names already holds a later frame's clear. */
+            gcm_report_copies_flush();
             rsx_draw_engine_fifo_flip(s_current_display_buffer_id);
             /* ...unless the FIFO is badly backlogged. One flip per drain is
              * right while `get` is keeping up with `put`; when it is megabytes
@@ -1988,7 +2025,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     { static int sn = 0; if (getenv("GCM_RECDBG") && sn++ < 12)
                         fprintf(stderr, "[SEMA] m=0x%02X v=0x%08X off=0x%X\n", m, v, s_sema_offset); }
                     if (m == 0x64u)      s_sema_offset = v;
-                    else if (m == 0x6Cu) vm_write32(la, v);
+                    else if (m == 0x6Cu) { gcm_report_copies_flush(); vm_write32(la, v); }
                     else if (m == 0x68u && vm_read32(la) != v) {
             /* GCM_SEMA_ACQUIRE=1 makes ACQUIRE actually block, which is what
              * the hardware does. Off by default: a title whose label nothing
@@ -2171,6 +2208,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 } else if (mfull == 0xE920u || mfull == 0xE924u) {
                     cellGcmSetFlipCommand(vm_read32(dea) & 7u);
                 } else if (subch == 0 || (subch == 1 && !s1_2d)) {
+                    if (m == 0x1D70u || m == 0x1D74u) gcm_report_copies_flush();
                     rsx_process_method(&s_state, m, vm_read32(dea));
                     /* NV406E_SET_REFERENCE: queue the fence value for PACED
                      * publication (gcm_ref_publish below) instead of letting a

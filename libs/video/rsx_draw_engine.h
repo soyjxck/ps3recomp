@@ -89,6 +89,7 @@ typedef struct rsx_be_render_state {
 #define RSX_BE_FLUSH_VERTEX_RING     0
 #define RSX_BE_FLUSH_GUEST_REFERENCE 1
 #define RSX_BE_FLUSH_SHUTDOWN        2
+#define RSX_BE_FLUSH_QUERY_FENCE     3   /* a fence follows occlusion queries */
 
 /* clear_depth_stencil flags */
 #define RSX_BE_CLEAR_DEPTH   0x1u
@@ -267,6 +268,9 @@ void rsx_draw_engine_set_display_buffer(u32 buffer_id, u32 location, u32 offset,
 /* The guest's SET_REFERENCE sync point: submit and wait, so a title spinning
  * on its fence sees the GPU catch up. */
 void rsx_draw_engine_flush(void);
+/* Finish the GPU work behind any occlusion reports handed to the backend and
+ * write their counts into the report area now (no-op when none are out). */
+void rsx_draw_engine_sync_queries(void);
 
 /* Present whatever the frame has recorded, for a host that drives the flip
  * itself rather than through the FIFO's 0xE944. */
