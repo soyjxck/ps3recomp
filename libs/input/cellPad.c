@@ -420,9 +420,13 @@ static void pad_poll_keyboard(void)
 
     /* macOS virtual keycodes (kVK_* in HIToolbox/Events.h): physical keys,
      * independent of the keyboard layout. */
+    /* The arrows are the left stick alone: a title that gives the D-pad its
+     * own job (Drakengard 3's item menu is D-pad up) must not see it pressed
+     * whenever the player walks. The D-pad is T F G H, the right stick (the
+     * camera, usually) I J K L. */
     static const struct { unsigned kc; u16 btn; } map[] = {
-        { 0x7E, CELL_PAD_CTRL_UP },     { 0x7D, CELL_PAD_CTRL_DOWN },
-        { 0x7B, CELL_PAD_CTRL_LEFT },   { 0x7C, CELL_PAD_CTRL_RIGHT },
+        { 0x11, CELL_PAD_CTRL_UP },     { 0x05, CELL_PAD_CTRL_DOWN },     /* T, G     */
+        { 0x03, CELL_PAD_CTRL_LEFT },   { 0x04, CELL_PAD_CTRL_RIGHT },    /* F, H     */
         { 0x06, CELL_PAD_CTRL_CROSS },  { 0x31, CELL_PAD_CTRL_CROSS },    /* Z, Space */
         { 0x07, CELL_PAD_CTRL_CIRCLE },                                   /* X        */
         { 0x00, CELL_PAD_CTRL_SQUARE }, { 0x01, CELL_PAD_CTRL_TRIANGLE }, /* A, S     */
@@ -437,16 +441,19 @@ static void pad_poll_keyboard(void)
 
     hs->buttons   = btns;
     hs->connected = 1;
-    hs->analog_lx = (u8)((btns & CELL_PAD_CTRL_LEFT) ? 0 :
-                         (btns & CELL_PAD_CTRL_RIGHT) ? 255 : 128);
-    hs->analog_ly = (u8)((btns & CELL_PAD_CTRL_UP) ? 0 :
-                         (btns & CELL_PAD_CTRL_DOWN) ? 255 : 128);
-    hs->analog_rx = hs->analog_ry = 128;
+    #define PAD_KEY(kc) (rsx_metal_backend_key_down(kc) != 0)
+    hs->analog_lx = (u8)(PAD_KEY(0x7B) ? 0 : PAD_KEY(0x7C) ? 255 : 128);   /* Left, Right */
+    hs->analog_ly = (u8)(PAD_KEY(0x7E) ? 0 : PAD_KEY(0x7D) ? 255 : 128);   /* Up, Down    */
+    hs->analog_rx = (u8)(PAD_KEY(0x26) ? 0 : PAD_KEY(0x25) ? 255 : 128);   /* J, L        */
+    hs->analog_ry = (u8)(PAD_KEY(0x22) ? 0 : PAD_KEY(0x28) ? 255 : 128);   /* I, K        */
+    #undef PAD_KEY
+    const int sticks = hs->analog_lx != 128 || hs->analog_ly != 128 ||
+                       hs->analog_rx != 128 || hs->analog_ry != 128;
     hs->trigger_l2 = (u8)((btns & CELL_PAD_CTRL_L2) ? 255 : 0);
     hs->trigger_r2 = (u8)((btns & CELL_PAD_CTRL_R2) ? 255 : 0);
 
     { static int said = 0;
-      if (!said && btns) { said = 1;
+      if (!said && (btns || sticks)) { said = 1;
           printf("[cellPad] keyboard fallback active on port 0 (no SDL2 pad)\n");
           fflush(stdout); } }
 }
