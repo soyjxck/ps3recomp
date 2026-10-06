@@ -196,12 +196,112 @@ WaitProfEntry s_wp[4096];
 std::mutex    s_wp_mu;
 thread_local const char* tl_wp_name = nullptr;
 }
+/* DOD3_STUTTER_MS=<n> (or PPU_STUTTER_MS): any frame longer than n ms gets a
+ * report of where every guest thread spent it -- the calls it waited in, by
+ * site -- so a hitch while playing names its cause. Turns the timing on. */
+static int s_stutter_ms = -1;
+static int stutter_ms(void)
+{
+    if (s_stutter_ms < 0) {
+        const char* e = getenv("DOD3_STUTTER_MS");
+        if (!e) e = getenv("PPU_STUTTER_MS");
+        s_stutter_ms = e ? atoi(e) : 0;
+    }
+    return s_stutter_ms;
+}
 extern "C" int ppu_waitprof_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = (getenv("PPU_WAITPROF") || stutter_ms() > 0) ? 1 : 0;
+    return on;
+}
+static int waitprof_report_on(void)
 {
     static int on = -1;
     if (on < 0) on = getenv("PPU_WAITPROF") ? 1 : 0;
     return on;
 }
+
+/* The last few frames, for the stutter report. A call is recorded when it
+ * returns, often after the frame it stalled has been presented, so each call's
+ * time is split over every frame it overlapped, and a frame is reported two
+ * frames late, once the calls that held it up have come back. */
+namespace {
+struct FrameEnt { unsigned tid, site, sc; const char* name; uint64_t ns; uint32_t n; };
+enum { FR_SLOTS = 4, FR_ENTS = 512 };
+struct FrameSlot { uint32_t frame; uint64_t t0, t1; int used; FrameEnt e[FR_ENTS]; };
+FrameSlot s_frs[FR_SLOTS];
+unsigned  s_fr_cur = 0;
+}
+extern "C" uint32_t g_rsx_engine_frame;
+extern "C" int ppu_prof_snapshot(int idx, unsigned* tid, unsigned* cia, const char** name);
+static const char* wp_syscall_name(unsigned sc);
+static void stutter_report(const FrameSlot& fs)
+{
+    const uint32_t frame = fs.frame;
+    const double ms = (double)(fs.t1 - fs.t0) / 1e6;
+    std::vector<FrameEnt> v;
+    for (auto& e : fs.e) if (e.n) v.push_back(e);
+    std::sort(v.begin(), v.end(), [](const FrameEnt& a, const FrameEnt& b) { return a.ns > b.ns; });
+    fprintf(stderr, "[stutter] frame %u took %.0f ms; where the guest threads were:\n", frame, ms);
+    /* Per thread: time inside blocking calls vs the rest (running guest code,
+     * or a call that does work). The busiest threads first -- an idle worker
+     * waiting out the frame is not news. */
+    { static const char* const waits[] = { "sys_cond_wait", "sys_event_queue_receive", "sys_timer_usleep",
+          "sys_lwcond_wait", "sys_lwmutex_lock", "cellSpursEventFlagWait", "cellSpursQueuePopBody",
+          "sys_event_flag_wait", "sys_semaphore_wait", "sys_mutex_lock", "sys_timer_sleep",
+          "sys_lwcond_queue_wait", "sys_ppu_thread_join", "sys_lwmutex_lock(sc)" };
+      struct T { unsigned tid; double wait_ms; const FrameEnt* top; };
+      std::vector<T> ts;
+      extern uint32_t g_sc_inflight[];
+      for (int idx = 0; idx < 64; idx++) {
+          unsigned tid = 0, cia = 0; const char* tn = nullptr;
+          if (!ppu_prof_snapshot(idx, &tid, &cia, &tn)) continue;
+          /* Still inside a blocking call that has not come back: waiting,
+           * not busy, whatever this frame's table says. */
+          { const char* in = tid < PS3_HLE_INFLIGHT_MAX ? g_hle_inflight[tid] : nullptr;
+            const char* sc = tid < 64 && g_sc_inflight[tid] ? wp_syscall_name(g_sc_inflight[tid]) : nullptr;
+            bool parked = false;
+            for (const char* x : waits) if ((in && !strcmp(in, x)) || (sc && !strcmp(sc, x))) parked = true;
+            if (parked) continue; }
+          T t{ tid, 0.0, nullptr };
+          for (auto& e : v) {
+              if (e.tid != tid) continue;
+              const char* call = e.name ? e.name : wp_syscall_name(e.sc);
+              bool w = false;
+              for (const char* x : waits) if (call && !strcmp(call, x)) w = true;
+              if (w) t.wait_ms += (double)e.ns / 1e6;
+              if (!t.top) t.top = &e;
+          }
+          ts.push_back(t);
+      }
+      std::sort(ts.begin(), ts.end(), [](const T& a, const T& b) { return a.wait_ms < b.wait_ms; });
+      for (size_t i = 0; i < ts.size() && i < 6; i++) {
+          unsigned t2 = 0, cia = 0; const char* tn = "?";
+          ppu_prof_snapshot((int)ts[i].tid - 1, &t2, &cia, &tn);
+          const double busy = ms - ts[i].wait_ms;
+          char top[96] = "";
+          if (ts[i].top) {
+              const char* call = ts[i].top->name ? ts[i].top->name : wp_syscall_name(ts[i].top->sc);
+              snprintf(top, sizeof top, "; most time in %s at %08X (%.0f ms)", call ? call : "syscall",
+                       ts[i].top->site, (double)ts[i].top->ns / 1e6);
+          }
+          fprintf(stderr, "[stutter]   busy %5.0f ms  tid %2u %-24.24s%s\n",
+                  busy < 0 ? 0.0 : busy, ts[i].tid, tn ? tn : "?", top);
+      } }
+    fprintf(stderr, "[stutter]   longest calls:\n");
+    for (size_t i = 0; i < v.size() && i < 8; i++) {
+        const FrameEnt& e = v[i];
+        if (e.ns < 2000000ull) break;   /* under 2 ms */
+        unsigned t2 = 0, cia = 0; const char* tn = "?";
+        if (e.tid >= 1) ppu_prof_snapshot((int)e.tid - 1, &t2, &cia, &tn);
+        char sc[48]; const char* call = e.name;
+        if (!call) { const char* n = wp_syscall_name(e.sc); if (n) call = n; else { snprintf(sc, sizeof sc, "syscall %u", e.sc); call = sc; } }
+        fprintf(stderr, "[stutter]   tid %2u %-22.22s %-26.26s site %08X %7.1f ms (%u calls)\n",
+                e.tid, tn ? tn : "?", call, e.site, (double)e.ns / 1e6, e.n);
+    }
+}
+
 extern "C" uint64_t ppu_waitprof_now(void)
 {
     return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -214,6 +314,39 @@ extern "C" void ppu_waitprof_add(unsigned tid, unsigned site, unsigned sc,
                  ((uint64_t)sc << 17) ^ (uint64_t)(uintptr_t)name;
     h ^= h >> 29;
     std::lock_guard<std::mutex> lk(s_wp_mu);
+    if (stutter_ms() > 0) {
+        const uint64_t now = ppu_waitprof_now(), t0 = now - ns;
+        const uint32_t f = g_rsx_engine_frame;
+        FrameSlot* cur = &s_frs[s_fr_cur];
+        if (!cur->used || f != cur->frame) {
+            /* A new frame: close this one, report the one two frames back if
+             * it ran long, and start the next slot. */
+            if (cur->used) cur->t1 = now;
+            const unsigned back = (s_fr_cur + FR_SLOTS - 1) % FR_SLOTS;
+            FrameSlot* old = &s_frs[back];
+            if (old->used && old->t1 && old->t1 - old->t0 > (uint64_t)stutter_ms() * 1000000ull)
+                stutter_report(*old);
+            s_fr_cur = (s_fr_cur + 1) % FR_SLOTS;
+            cur = &s_frs[s_fr_cur];
+            memset(cur->e, 0, sizeof cur->e);
+            cur->frame = f; cur->t0 = now; cur->t1 = 0; cur->used = 1;
+        }
+        for (unsigned k = 0; k < FR_SLOTS; k++) {
+            FrameSlot* fs = &s_frs[k];
+            if (!fs->used) continue;
+            const uint64_t end = fs->t1 ? fs->t1 : now;
+            const uint64_t a = t0 > fs->t0 ? t0 : fs->t0, b = now < end ? now : end;
+            if (b <= a) continue;
+            for (unsigned probe = 0; probe < FR_ENTS; probe++) {
+                FrameEnt& e = fs->e[(h + probe) % FR_ENTS];
+                if (!e.n) { e.tid = tid; e.site = site; e.sc = sc; e.name = name; }
+                else if (e.tid != tid || e.site != site || e.sc != sc || e.name != name) continue;
+                e.ns += b - a; e.n++;
+                break;
+            }
+        }
+        if (!waitprof_report_on()) return;
+    }
     for (unsigned probe = 0; probe < 4096; probe++) {
         WaitProfEntry& e = s_wp[(h + probe) & 4095];
         if (!e.n) { e.tid = tid; e.site = site; e.sc = sc; e.name = name; }

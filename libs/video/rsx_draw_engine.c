@@ -119,7 +119,9 @@ typedef struct {
     u64 last_use_serial;
 } eng_texture;
 
-typedef struct { u64 key; u32 handle; u8 fixed; u64 vp_fnv; u64 vp_hlsl; u64 fp_hlsl; } eng_pipeline;
+struct eng_pipe_job;
+typedef struct { u64 key; u32 handle; u8 fixed; u64 vp_fnv; u64 vp_hlsl; u64 fp_hlsl;
+                 u8 pending; struct eng_pipe_job* job; } eng_pipeline;
 
 typedef struct { u32 first, count; } eng_batch;
 
@@ -830,6 +832,10 @@ static int eng_staging_reserve(u32 bytes)
 
 /* Decode a guest texture out of guest memory and hand every face and level to
  * the backend. Returns the backend handle, or 0. */
+/* What the walker did in the current frame, for the stutter line in
+ * eng_present (DOD3_STUTTER_MS). */
+static struct { u32 tex; u64 tex_bytes; u32 vc_store; u64 vc_bytes; u32 pipes; double pipe_ms; } s_fstat;
+
 static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                               u32 levels, u32 pitch, int cube, u32 remap)
 {
@@ -842,6 +848,7 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     const u32 span = eng_texture_span(fmt, w, h, levels, pitch, cube);
     const u8* src = eng_guest_ptr(NULL, location, offset, span);
     if (!src) return 0;
+    s_fstat.tex++; s_fstat.tex_bytes += span;
 
     /* TEX_DUMP_DIR=<dir>: log every upload, and write each 8-bit (B8) upload at
      * least 256 wide -- a Bink video plane -- as a PPM, so "is the decoder
@@ -1278,6 +1285,137 @@ static const char* const kEngFixedPS =
 /* The pipeline for this draw, built once per distinct key. A negative result
  * is cached too (handle 0), so a program pair that will not translate is not
  * retried on every draw of every frame. */
+/* ---- asynchronous pipeline builds ------------------------------------------
+ *
+ * A pipeline the cache has not seen means translating its programs (HLSL ->
+ * SPIR-V -> MSL) and compiling them, and the first time on a machine that is
+ * 200-450 ms a pipeline: Drakengard 3 froze for 0.7 s entering an area with a
+ * handful of new effects. The walker now hands the build to a worker and
+ * waits for it out of a budget of RSX_ASYNC_WAIT_MS a frame (default 8) -- a
+ * cached shader is ready well inside that, so nothing changes for it -- and
+ * a slow one is skipped until it is ready: the effect appears a few frames
+ * late, the first time, instead of the game stopping. RSX_ASYNC_SHADERS=0 builds on the walker as
+ * before. Metal only: the backend's pipeline_create is made thread-safe there. */
+#if defined(__APPLE__)
+#include <pthread.h>
+typedef struct eng_pipe_job {
+    char* vs; char* ps;
+    rsx_be_render_state rs;
+    rsx_vertex_layout_plan layout;
+    u32 stride; rsx_be_format rt_fmt; u32 rt_count;
+    u32 handle; int done;
+    u32 frame;
+    struct eng_pipe_job* next;
+} eng_pipe_job;
+static pthread_mutex_t s_pj_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  s_pj_work = PTHREAD_COND_INITIALIZER, s_pj_done = PTHREAD_COND_INITIALIZER;
+static eng_pipe_job *s_pj_head, *s_pj_tail;
+static int s_pj_started, s_pj_quit;
+static pthread_t s_pj_thread;
+
+static int eng_async_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("RSX_ASYNC_SHADERS"); on = !(e && e[0] == '0'); }
+    return on;
+}
+static void* eng_pipe_worker(void* arg)
+{
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&s_pj_mu);
+        while (!s_pj_head && !s_pj_quit) pthread_cond_wait(&s_pj_work, &s_pj_mu);
+        if (!s_pj_head) { pthread_mutex_unlock(&s_pj_mu); return NULL; }
+        eng_pipe_job* j = s_pj_head;
+        s_pj_head = j->next;
+        if (!s_pj_head) s_pj_tail = NULL;
+        pthread_mutex_unlock(&s_pj_mu);
+        struct timespec t0, t1;
+        timespec_get(&t0, TIME_UTC);
+        const u32 h = g.be->pipeline_create(g.be->user, j->vs, j->ps, &j->rs,
+                                            &j->layout, j->stride, j->rt_fmt, j->rt_count);
+        timespec_get(&t1, TIME_UTC);
+        const double ms = (double)(t1.tv_sec - t0.tv_sec) * 1e3 + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
+        if (ms >= 20.0)
+            fprintf(stderr, "[pipe-slow] async build took %.1f ms (asked for in frame %u, ready in frame %u)%s\n",
+                    ms, j->frame, g.frames, h ? "" : " -- FAILED");
+        free(j->vs); free(j->ps); j->vs = j->ps = NULL;
+        pthread_mutex_lock(&s_pj_mu);
+        j->handle = h;
+        __atomic_store_n(&j->done, 1, __ATOMIC_RELEASE);
+        pthread_cond_broadcast(&s_pj_done);
+        pthread_mutex_unlock(&s_pj_mu);
+    }
+}
+/* Queue a build and wait for it a little; the job is the entry's until done. */
+static eng_pipe_job* eng_pipe_submit(const char* vs, const char* ps, const rsx_be_render_state* rs,
+                                     const rsx_vertex_layout_plan* layout, u32 stride,
+                                     rsx_be_format rt_fmt, u32 rt_count)
+{
+    eng_pipe_job* j = (eng_pipe_job*)calloc(1, sizeof *j);
+    if (!j) return NULL;
+    j->vs = strdup(vs); j->ps = strdup(ps);
+    if (!j->vs || !j->ps) { free(j->vs); free(j->ps); free(j); return NULL; }
+    j->rs = *rs; j->layout = *layout; j->stride = stride; j->rt_fmt = rt_fmt; j->rt_count = rt_count;
+    j->frame = g.frames;
+    pthread_mutex_lock(&s_pj_mu);
+    if (!s_pj_started) {
+        s_pj_started = 1; s_pj_quit = 0;
+        pthread_attr_t at; pthread_attr_init(&at);
+        pthread_attr_setstacksize(&at, 64u << 20);   /* glslang and spirv-opt recurse deeply */
+        if (pthread_create(&s_pj_thread, &at, eng_pipe_worker, NULL) != 0) s_pj_started = -1;
+        pthread_attr_destroy(&at);
+    }
+    if (s_pj_started < 0) { pthread_mutex_unlock(&s_pj_mu); free(j->vs); free(j->ps); free(j); return NULL; }
+    if (s_pj_tail) s_pj_tail->next = j; else s_pj_head = j;
+    s_pj_tail = j;
+    pthread_cond_signal(&s_pj_work);
+    /* The wait is a budget for the frame, not for each build: 38 new
+     * effects at once had waited 8 ms apiece, 300 ms in one frame. */
+    static long wait_ms = -1;
+    static u32 budget_frame;
+    static long left_us;
+    if (wait_ms < 0) { const char* e = getenv("RSX_ASYNC_WAIT_MS"); wait_ms = e ? atol(e) : 8; }
+    if (budget_frame != g.frames) { budget_frame = g.frames; left_us = wait_ms * 1000L; }
+    if (left_us > 0) {
+        struct timespec t0, dl; timespec_get(&t0, TIME_UTC);
+        dl = t0;
+        dl.tv_nsec += (left_us % 1000000L) * 1000L; dl.tv_sec += left_us / 1000000L + dl.tv_nsec / 1000000000L;
+        dl.tv_nsec %= 1000000000L;
+        while (!j->done) if (pthread_cond_timedwait(&s_pj_done, &s_pj_mu, &dl) != 0) break;
+        struct timespec t1; timespec_get(&t1, TIME_UTC);
+        left_us -= (long)((t1.tv_sec - t0.tv_sec) * 1000000L + (t1.tv_nsec - t0.tv_nsec) / 1000L);
+    }
+    pthread_mutex_unlock(&s_pj_mu);
+    return j;
+}
+static void eng_pipe_stop(void)
+{
+    pthread_mutex_lock(&s_pj_mu);
+    const int started = s_pj_started > 0;
+    s_pj_quit = 1;
+    pthread_cond_broadcast(&s_pj_work);
+    pthread_mutex_unlock(&s_pj_mu);
+    if (started) pthread_join(s_pj_thread, NULL);
+    s_pj_started = 0;
+}
+/* An entry whose build is in flight: its handle once done (and the job
+ * freed), else 0. */
+static u32 eng_pipe_poll(eng_pipeline* p)
+{
+    if (!p->pending) return p->handle;
+    if (!__atomic_load_n(&p->job->done, __ATOMIC_ACQUIRE)) return 0;
+    p->handle = p->job->handle;
+    p->pending = 0;
+    free(p->job); p->job = NULL;
+    return p->handle;
+}
+#else
+static int eng_async_on(void) { return 0; }
+static void eng_pipe_stop(void) {}
+static u32 eng_pipe_poll(eng_pipeline* p) { return p->handle; }
+#endif
+
 static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                             const rsx_be_render_state* rs,
                             rsx_be_format rt_fmt, u32 rt_count, int* out_fixed)
@@ -1363,7 +1501,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     for (u32 i = 0; i < g.n_pipelines; i++)
         if (g.pipelines[i].key == key) {
             *out_fixed = g.pipelines[i].fixed;
-            return g.pipelines[i].handle;
+            return eng_pipe_poll(&g.pipelines[i]);
         }
     if (g.n_pipelines >= ENG_MAX_PIPELINES) return 0;
 
@@ -1401,6 +1539,18 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                                              rs->alpha_func) < 0)
             fi = -1;
     }
+    struct eng_pipe_job* job = NULL;
+#if defined(__APPLE__)
+    if (vi > 0 && fi > 0 && !fixed && eng_async_on()) {
+        job = eng_pipe_submit(s_vs_hlsl, s_ps_hlsl, rs, layout, layout->stride, rt_fmt, rt_count);
+        if (job && __atomic_load_n(&job->done, __ATOMIC_ACQUIRE)) {
+            handle = job->handle; free(job); job = NULL;
+        } else if (job) {
+            handle = 0;                          /* not ready: this draw is skipped */
+        }
+    }
+    if (!job && handle == 0)
+#endif
     if (vi > 0 && fi > 0)
         handle = g.be->pipeline_create(g.be->user, s_vs_hlsl, s_ps_hlsl, rs,
                                        layout, layout->stride, rt_fmt, rt_count);
@@ -1438,6 +1588,8 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     g.pipelines[g.n_pipelines].key = key;
     g.pipelines[g.n_pipelines].handle = handle;
     g.pipelines[g.n_pipelines].fixed = (u8)fixed;
+    g.pipelines[g.n_pipelines].pending = job ? 1 : 0;
+    g.pipelines[g.n_pipelines].job = job;
     { u64 vf = 1469598103934665603ull, vh2 = 1469598103934665603ull;
       for (u32 i = 0; vp_uc && i < vp_instrs * 16u; i++) vf = (vf ^ vp_uc[i]) * 1099511628211ull;
       for (const char* c = s_vs_hlsl; *c; c++) vh2 = (vh2 ^ (unsigned char)*c) * 1099511628211ull;
@@ -1452,6 +1604,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
       const double ms = (double)(t_create1.tv_sec - t_create0.tv_sec) * 1e3 +
                         (double)(t_create1.tv_nsec - t_create0.tv_nsec) / 1e6;
       total_ms += ms;
+      s_fstat.pipes++; s_fstat.pipe_ms += ms;
       if (ms >= 20.0)
           fprintf(stderr, "[pipe-slow] frame %u: new pipeline took %.1f ms (vp-hlsl %016llx fp-hlsl %016llx); %u built, %.0f ms in all\n",
                   g.frames, ms, (unsigned long long)g.pipelines[g.n_pipelines].vp_hlsl,
@@ -1812,6 +1965,7 @@ static void eng_vc_store(u64 key, const EngVCFill* f, const u8* verts,
     s_vc_bytes += e->bytes;
     s_vc_count++;
     s_vcstat.stored++;
+    s_fstat.vc_store++; s_fstat.vc_bytes += vb + ib;
 }
 
 /* The prepared plan's vertex spans, merged where interleaved attributes
@@ -2951,6 +3105,23 @@ static void eng_present(u32 buffer_id)
     }
     g.last_present_surface = target;
     g.be->present(g.be->user, g.surfaces[target].handle);
+    /* DOD3_STUTTER_MS=<n>: a frame longer than n ms says what the walker did
+     * in it -- texture uploads, vertex conversions stored, pipelines built --
+     * beside the guest threads' report ([stutter], ppu_hle.cpp). */
+    { static int thr = -1; static double last;
+      if (thr < 0) { const char* e = getenv("DOD3_STUTTER_MS"); thr = e ? atoi(e) : 0; }
+      if (thr > 0) {
+          struct timespec ts; timespec_get(&ts, TIME_UTC);
+          const double now = (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec / 1e6;
+          if (last > 0 && now - last > thr)
+              fprintf(stderr, "[stutter-rsx] frame %u took %.0f ms: %u textures uploaded (%llu KB), "
+                      "%u vertex conversions stored (%llu KB), %u pipelines built (%.0f ms)\n",
+                      g.frames, now - last, s_fstat.tex, (unsigned long long)(s_fstat.tex_bytes >> 10),
+                      s_fstat.vc_store, (unsigned long long)(s_fstat.vc_bytes >> 10),
+                      s_fstat.pipes, s_fstat.pipe_ms);
+          last = now;
+          memset(&s_fstat, 0, sizeof s_fstat);
+      } }
     /* Every 5 s: presents per second and frame times, worst included -- the
      * numbers a player feels. RSX_FRAMETIME=0 turns the line off. */
     { static int on = -1; static double win_start, last, worst, first; static u32 n, slow;
@@ -3164,6 +3335,9 @@ int rsx_draw_engine_init(u32 width, u32 height)
 void rsx_draw_engine_shutdown(void)
 {
     if (!g.be) return;
+    eng_pipe_stop();
+    for (u32 i = 0; i < g.n_pipelines; i++)
+        if (g.pipelines[i].pending) eng_pipe_poll(&g.pipelines[i]);
     if (g.ready && g.be->submit_and_wait)
         g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_SHUTDOWN);
     for (u32 i = 0; i < g.n_textures; i++)

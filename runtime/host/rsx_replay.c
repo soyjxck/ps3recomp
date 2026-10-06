@@ -125,6 +125,8 @@ int main(int argc, char** argv)
     }
     if (!getenv("PS3RECOMP_MSL_CACHE")) setenv("PS3RECOMP_MSL_CACHE", "cache/msl", 1);
     if (!getenv("PS3RECOMP_RSX_ENGINE")) setenv("PS3RECOMP_RSX_ENGINE", "dispatch", 1);
+    /* Frames are compared byte for byte, so every draw waits for its pipeline. */
+    if (!getenv("RSX_ASYNC_SHADERS")) setenv("RSX_ASYNC_SHADERS", "0", 1);
 
     for (int l = 0; l < 2; l++) {
         s_arena[l] = (u8*)mmap(NULL, ARENA_BYTES, PROT_READ | PROT_WRITE,

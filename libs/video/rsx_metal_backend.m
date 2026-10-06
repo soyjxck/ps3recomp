@@ -50,6 +50,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <os/lock.h>
+#include <pthread.h>
 #import <QuartzCore/CAMetalLayer.h>
 #if !TARGET_OS_IPHONE
 #  import <AppKit/AppKit.h>
@@ -2819,11 +2820,35 @@ static id<MTLFunction> eng_function(const char* hlsl, int stage,
     return fn;
 }
 
+static u32 eng_pipeline_create_locked(void* user, const char* vs_hlsl, const char* ps_hlsl,
+                                      const rsx_be_render_state* rs,
+                                      const rsx_vertex_layout_plan* layout,
+                                      u32 vertex_stride, rsx_be_format rt_fmt,
+                                      u32 rt_count);
+/* The engine builds pipelines on a worker thread (rsx_draw_engine.c, async
+ * builds) as well as on the walker: one at a time, since the translation
+ * buffers and the function cache are shared. Encoding reads only entries
+ * whose handle it was given, which were complete before it got it. */
+static pthread_mutex_t s_eng_pipe_mu = PTHREAD_MUTEX_INITIALIZER;
 static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_hlsl,
                                const rsx_be_render_state* rs,
                                const rsx_vertex_layout_plan* layout,
                                u32 vertex_stride, rsx_be_format rt_fmt,
                                u32 rt_count)
+{
+    pthread_mutex_lock(&s_eng_pipe_mu);
+    u32 h;
+    @autoreleasepool {
+        h = eng_pipeline_create_locked(user, vs_hlsl, ps_hlsl, rs, layout, vertex_stride, rt_fmt, rt_count);
+    }
+    pthread_mutex_unlock(&s_eng_pipe_mu);
+    return h;
+}
+static u32 eng_pipeline_create_locked(void* user, const char* vs_hlsl, const char* ps_hlsl,
+                                      const rsx_be_render_state* rs,
+                                      const rsx_vertex_layout_plan* layout,
+                                      u32 vertex_stride, rsx_be_format rt_fmt,
+                                      u32 rt_count)
 {
     (void)user;
     if (!s_dev || !s_guest_shaders || !vertex_stride) return 0;
@@ -2943,11 +2968,13 @@ static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
 
 static void eng_pipeline_release(void* user, u32 pipeline)
 {
+    pthread_mutex_lock(&s_eng_pipe_mu);
     (void)user;
     if (pipeline && pipeline <= s_eng_pipe_count) {
         s_eng_pipe[pipeline - 1].pso = nil;
         s_eng_pipe[pipeline - 1].ds  = nil;
     }
+    pthread_mutex_unlock(&s_eng_pipe_mu);
 }
 
 /* ---- per-draw binding ---------------------------------------------------- */
