@@ -127,8 +127,13 @@ void rsx_vertex_fetch_plan_init(
         rsx_dsp_get_vertex_attr(rsx, attr, &fetch->desc);
         fetch->elem_size =
             rsx_vertex_attrib_size(fetch->desc.type, fetch->desc.size);
-        fetch->stride =
-            fetch->desc.stride ? fetch->desc.stride : fetch->elem_size;
+        /* A zero stride is a constant attribute: every vertex reads the one
+         * element at the offset (RPCS3 treats it the same way). Reading it as
+         * tightly packed handed vertex N the N-th element past it -- for
+         * Unreal Engine 3's shared white vertex-colour stream, white for the
+         * first vertex and the zeros that follow for the rest, so every mesh
+         * without its own vertex colours rendered black. */
+        fetch->stride = fetch->desc.stride;
         rsx_dsp_vertex_default(rsx, attr, fetch->default_value);
         if (attr == 3 &&
             fetch->default_value[0] == 0.0f &&
@@ -195,8 +200,8 @@ void rsx_vertex_fetch_plan_prepare(
          * describes -- so it needs no resolver and no bounds fallback, only
          * the right base. */
         if (plan->inline_data) {
-            const u32 stride =
-                plan->inline_stride ? plan->inline_stride : fetch->stride;
+            const u32 stride = plan->inline_stride ? plan->inline_stride
+                             : fetch->stride ? fetch->stride : fetch->elem_size;
             const u32 off = plan->inline_off[attr];
             if (!stride || off + fetch->elem_size > stride)
                 continue;

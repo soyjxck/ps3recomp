@@ -643,6 +643,11 @@ static void* audio_mix_thread_func(void* arg)
         }
         blocks++;
         audio_mix_one_block();
+        /* AUDIO_WAV=<file>: the final mix as raw f32le stereo 48 kHz
+         * (ffmpeg -f f32le -ar 48000 -ac 2 -i <file>). */
+        { static FILE* wf = (FILE*)-1;
+          if (wf == (FILE*)-1) { const char* e = getenv("AUDIO_WAV"); wf = e ? fopen(e, "wb") : NULL; }
+          if (wf) fwrite(s_mix_buffer, sizeof(float), CELL_AUDIO_BLOCK_SAMPLES * 2, wf); }
         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
         audio_notify_event_queues();
         if (rate_on) {

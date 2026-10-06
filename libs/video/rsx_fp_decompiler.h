@@ -110,7 +110,17 @@ float rsx_fp_alpha_ref(u32 raw, u32 surface_color_format);
  * 1 LESS .. 7 ALWAYS, from TEXTURE_ADDRESS bits 28-31). The caller sets it
  * from the textures bound at draw time, keys its pipeline on it, and resets
  * it to 0 afterwards. */
+/* What the last decompile saw: instructions by OPDEST precision field
+ * (bits 22-23: 1 half, 2 fixed12, 3 fixed9) and with the texture-expand
+ * bit (21) set. */
+typedef struct { u32 instrs, prec[4], exp_tex; } rsx_fp_decompile_stats;
+extern rsx_fp_decompile_stats g_rsx_fp_stats;
 void rsx_fp_set_shadow_units(u32 mask, const u8* funcs);
+/* Unnormalised units for the NEXT decompile call: bit u of mask means unit u's
+ * texture carries RSX_TEX_FMT_UNNORM (addressed in texels) and dim[u] is its
+ * size, so every sample of it scales the coordinate by 1/size. Set from the
+ * textures bound at draw time, key the pipeline on it, reset to 0 after. */
+void rsx_fp_set_unnorm_units(u32 mask, const u32 dim[][2]);
 int rsx_fp_decompile_ex(const u8* ucode, u32 max_bytes, u32 ctrl,
                         u32 tex_cube_mask, char* out, u32 out_size);
 

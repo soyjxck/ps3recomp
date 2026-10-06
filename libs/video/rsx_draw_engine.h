@@ -147,6 +147,10 @@ typedef struct rsx_draw_backend {
     /* Resolve a depth target into a sampleable texture and return it; 0 when
      * the backend cannot. The engine only asks after a depth-writing draw. */
     u32  (*depth_snapshot)(void* user, u32 depth, u32 w, u32 h);
+    /* The depth target packed into RGBA8 as its D24S8 bytes read through an
+     * A8R8G8B8 texture (R = depth[15:8], G = depth[7:0], B = stencil,
+     * A = depth[23:16]); 0 when unsupported. */
+    u32  (*depth_snapshot_rgba8)(void* user, u32 depth, u32 w, u32 h);
     /* A copy of a colour target as it stands at this point of the stream,
      * for a draw that samples the target it writes (a title's in-place
      * post-process, legal on the RSX and undefined on every host API); 0
@@ -230,6 +234,9 @@ void rsx_draw_engine_set_default(int on);
 /* A runner with its own RSX IO map supplies its address resolver before init.
  * NULL restores the toolkit's cellGcm mapping. */
 void rsx_draw_engine_set_guest_memory(rsx_vertex_guest_ptr_fn reader, void* user);
+/* Seed the dispatcher from captured state (tools/rsx_replay). Word counts. */
+void rsx_draw_engine_seed_state(const u32* regs, u32 nregs, const u32* vp, u32 nvp,
+                                const u32* constants, u32 nconst_words);
 
 int  rsx_draw_engine_init(u32 width, u32 height);
 void rsx_draw_engine_shutdown(void);

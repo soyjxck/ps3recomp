@@ -341,7 +341,9 @@ static const char* input_expr(u32 input_src)
     case 0x3: return "input.fog";      /* FOGC */
     default:
         if (input_src >= 0x4 && input_src <= 0xB) return tc[input_src - 0x4]; /* TC0..7 */
-        return "float4(0,0,0,0)";      /* TC8/TC9/FACING not plumbed */
+        if (input_src == 0xC) return "input.tc8";
+        if (input_src == 0xD) return "input.tc9";
+        return "float4(0,0,0,0)";      /* FACING not plumbed */
     }
 }
 
@@ -415,10 +417,40 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, u32 ctrl, char* out, u32 ou
     return rsx_fp_decompile_ex(ucode, max_bytes, ctrl, 0u, out, out_size);
 }
 
+rsx_fp_decompile_stats g_rsx_fp_stats;
+
 /* Depth-compare (shadow map) units for the next decompile; see
  * rsx_fp_set_shadow_units in the header. */
 static u32 s_shadow_mask;
 static u8  s_shadow_func[16];
+
+/* Unnormalised (texel-addressed) units for the next decompile; see
+ * rsx_fp_set_unnorm_units in the header. */
+static u32   s_unnorm_mask;
+static float s_unnorm_scale[16][2];
+
+void rsx_fp_set_unnorm_units(u32 mask, const u32 dim[][2])
+{
+    s_unnorm_mask = 0;
+    for (u32 u = 0; u < 16; u++) {
+        s_unnorm_scale[u][0] = s_unnorm_scale[u][1] = 1.0f;
+        if (!((mask >> u) & 1u) || !dim || !dim[u][0] || !dim[u][1]) continue;
+        s_unnorm_mask |= 1u << u;
+        s_unnorm_scale[u][0] = 1.0f / (float)dim[u][0];
+        s_unnorm_scale[u][1] = 1.0f / (float)dim[u][1];
+    }
+}
+
+/* The 2D coordinate expression a sample of unit u takes: `xy` as written,
+ * or scaled from texels to 0..1 when the unit is unnormalised. */
+static void fp_coord2(u32 u, const char* xy, char* out, u32 out_size)
+{
+    if ((s_unnorm_mask >> u) & 1u)
+        snprintf(out, out_size, "((%s) * float2(%.9g, %.9g))", xy,
+                 (double)s_unnorm_scale[u][0], (double)s_unnorm_scale[u][1]);
+    else
+        snprintf(out, out_size, "%s", xy);
+}
 
 void rsx_fp_set_shadow_units(u32 mask, const u8* funcs)
 {
@@ -439,6 +471,7 @@ static int rsx_fp_decompile_internal(
     int buffered, char* out, u32 out_size, u32* out_constant_count)
 {
     if (!ucode || !out || out_size == 0) return -1;
+    memset(&g_rsx_fp_stats, 0, sizeof g_rsx_fp_stats);
 
     u32 buffered_constant_count = 0;
     if (buffered) {
@@ -505,6 +538,16 @@ static int rsx_fp_decompile_internal(
 
         u32 opcode    = (w0 & FP_OPCODE_MASK) >> FP_OPCODE_SHIFT;
         u32 input_src = (w0 & FP_INPUT_SRC_MASK) >> FP_INPUT_SRC_SHIFT;
+        /* RSX_FP_HEX=1: every instruction's four words as decoded. */
+        { static int hx = -1; if (hx < 0) hx = getenv("RSX_FP_HEX") ? 1 : 0;
+          if (hx) fprintf(stderr, "[fp-hex] %3u: %08X %08X %08X %08X op=%s sat=%u prec=%u dst=%s%u mask=%c%c%c%c\n", count - 1, w0, w1, w2, w3,
+                          rsx_fp_opcode_name(opcode), (w0 >> 31) & 1u, (w0 >> 22) & 3u, (w0 & FP_OUT_HALF) ? "h" : "r",
+                          (w0 & FP_OUT_REG_MASK) >> FP_OUT_REG_SHIFT,
+                          (w0 >> 9) & 1 ? 'x' : '-', (w0 >> 10) & 1 ? 'y' : '-', (w0 >> 11) & 1 ? 'z' : '-', (w0 >> 12) & 1 ? 'w' : '-'); }
+        { const u32 prec = (w0 >> 22) & 3u;
+          if (prec) g_rsx_fp_stats.prec[prec]++;
+          if (w0 & (1u << 21)) g_rsx_fp_stats.exp_tex++;
+          g_rsx_fp_stats.instrs++; }
         u32 tex_unit  = (w0 & FP_TEX_UNIT_MASK) >> FP_TEX_UNIT_SHIFT;
         int is_branch = (w2 & FP_BRANCH) ? 1 : 0;
 
@@ -690,23 +733,30 @@ static int rsx_fp_decompile_internal(
         case OP_SGT: snprintf(rhs, sizeof(rhs), "(float4)((%s) >  (%s))", a, b); break;
         case OP_SNE: snprintf(rhs, sizeof(rhs), "(float4)((%s) != (%s))", a, b); break;
         case OP_SEQ: snprintf(rhs, sizeof(rhs), "(float4)((%s) == (%s))", a, b); break;
-        case OP_TEX:
+        case OP_TEX: {
+            char xy[160], c2[256];
+            snprintf(xy, sizeof xy, "(%s).xy", a);
+            fp_coord2(tex_unit, xy, c2, sizeof c2);
             if ((s_shadow_mask >> tex_unit) & 1u)
-                snprintf(rhs, sizeof(rhs), "rsx_shadow%u((%s).xyz)", tex_unit, a);
+                snprintf(rhs, sizeof(rhs), "rsx_shadow%u(float3(%s, (%s).z))", tex_unit, c2, a);
             else if ((tex_cube_mask >> tex_unit) & 1u)
                 /* Cubemap: sample with the full 3-component direction vector. */
                 snprintf(rhs, sizeof(rhs),
                          "rsx_tex%u.Sample(rsx_samp[%u], (%s).xyz)", tex_unit, tex_unit, a);
             else if (tex_cube_mask)
                 snprintf(rhs, sizeof(rhs),
-                         "rsx_tex%u.Sample(rsx_samp[%u], (%s).xy)", tex_unit, tex_unit, a);
+                         "rsx_tex%u.Sample(rsx_samp[%u], %s)", tex_unit, tex_unit, c2);
             else
                 snprintf(rhs, sizeof(rhs),
-                         "rsx_tex[%u].Sample(rsx_samp[%u], (%s).xy)", tex_unit, tex_unit, a);
+                         "rsx_tex[%u].Sample(rsx_samp[%u], %s)", tex_unit, tex_unit, c2);
             break;
-        case OP_TXP:
+        }
+        case OP_TXP: {
+            char xy[200], c2[300];
+            snprintf(xy, sizeof xy, "(%s).xy / (%s).w", a, a);
+            fp_coord2(tex_unit, xy, c2, sizeof c2);
             if ((s_shadow_mask >> tex_unit) & 1u)
-                snprintf(rhs, sizeof(rhs), "rsx_shadow%u((%s).xyz / (%s).w)", tex_unit, a, a);
+                snprintf(rhs, sizeof(rhs), "rsx_shadow%u(float3(%s, (%s).z / (%s).w))", tex_unit, c2, a, a);
             else if ((tex_cube_mask >> tex_unit) & 1u)
                 /* Projective divide is meaningless for a cube lookup; sample
                  * the direction directly. */
@@ -714,16 +764,27 @@ static int rsx_fp_decompile_internal(
                          "rsx_tex%u.Sample(rsx_samp[%u], (%s).xyz)", tex_unit, tex_unit, a);
             else if (tex_cube_mask)
                 snprintf(rhs, sizeof(rhs),
-                         "rsx_tex%u.Sample(rsx_samp[%u], (%s).xy / (%s).w)",
-                         tex_unit, tex_unit, a, a);
+                         "rsx_tex%u.Sample(rsx_samp[%u], %s)", tex_unit, tex_unit, c2);
             else
                 snprintf(rhs, sizeof(rhs),
-                         "rsx_tex[%u].Sample(rsx_samp[%u], (%s).xy / (%s).w)",
-                         tex_unit, tex_unit, a, a);
+                         "rsx_tex[%u].Sample(rsx_samp[%u], %s)", tex_unit, tex_unit, c2);
             break;
+        }
         case OP_TXB: case OP_TXL:
             if ((s_shadow_mask >> tex_unit) & 1u) {
-                snprintf(rhs, sizeof(rhs), "rsx_shadow%u((%s).xyz)", tex_unit, a);
+                char xy[160], c2[256];
+                snprintf(xy, sizeof xy, "(%s).xy", a);
+                fp_coord2(tex_unit, xy, c2, sizeof c2);
+                snprintf(rhs, sizeof(rhs), "rsx_shadow%u(float3(%s, (%s).z))", tex_unit, c2, a);
+                break;
+            }
+            if (((s_unnorm_mask >> tex_unit) & 1u) && !((tex_cube_mask >> tex_unit) & 1u)) {
+                char xy[160], c2[256], tn[32];
+                snprintf(xy, sizeof xy, "(%s).xy", a);
+                fp_coord2(tex_unit, xy, c2, sizeof c2);
+                snprintf(tn, sizeof(tn), tex_cube_mask ? "rsx_tex%u" : "rsx_tex[%u]", tex_unit);
+                snprintf(rhs, sizeof(rhs), "%s.%s(rsx_samp[%u], %s, (%s).x)", tn,
+                         opcode == OP_TXB ? "SampleBias" : "SampleLevel", tex_unit, c2, b);
                 break;
             }
         {
@@ -775,6 +836,38 @@ static int rsx_fp_decompile_internal(
             dest_mask(w0, m);
 
             const char* sat = (w0 & FP_OUT_SAT) ? " _v = saturate(_v);" : "";
+            /* The OPDEST precision field (bits 22-23) clamps the result the
+             * way the RSX's narrower ALU formats do: fixed12 to [-2, 2],
+             * fixed9 to [-1, 1], half to the FP16 range when the destination
+             * is a half register. Applied when SAT is not, with RPCS3's
+             * exemptions (FragmentProgramDecompiler::SetDst): opcodes whose
+             * results are already in range, a half-to-half temp MOV, and the
+             * half flag on a full-precision register. It was never decoded:
+             * Drakengard 3's light-shaft composite computes its blend alpha
+             * with fixed12 instructions, and unclamped that alpha went as low
+             * as -26 -- ONE_MINUS_SRC_ALPHA then multiplied the scene by 27
+             * and the interior washed out to white. RSX_NO_FP_PREC=1 off. */
+            static int no_prec = -1;
+            if (no_prec < 0) no_prec = getenv("RSX_NO_FP_PREC") ? 1 : 0;
+            if (!(w0 & FP_OUT_SAT) && !no_prec) {
+                const u32 prec = (w0 >> 22) & 3u;
+                int exempt = 0;
+                switch (opcode) {
+                case OP_NRM: case OP_MAX: case OP_MIN: case OP_COS: case OP_SIN:
+                case OP_RFL: case OP_EX2: case OP_FRC: case OP_LIT: case OP_LIF:
+                case OP_LG2:
+                    exempt = 1; break;
+                case OP_MOV:
+                    if (dst_half && s0.half && s0.type == FP_REG_TYPE_TEMP) exempt = 1;
+                    break;
+                default: break;
+                }
+                if (!exempt) {
+                    if (prec == 2) sat = " _v = clamp(_v, -2.0, 2.0);";
+                    else if (prec == 3) sat = " _v = clamp(_v, -1.0, 1.0);";
+                    else if (prec == 1 && dst_half) sat = " _v = clamp(_v, -65504.0, 65504.0);";
+                }
+            }
             /* NV40 per-instruction result-scale modifier (SRC1 word bits
              * 28-30): 1/2/3 = *2/*4/*8, 5/6/7 = /2//4//8; applied to the
              * result BEFORE saturate (RPCS3 FragmentProgramDecompiler.cpp
@@ -914,6 +1007,7 @@ static int rsx_fp_decompile_internal(
         "    float4 fog : FOG;\n"
         "    float4 tc0:TEXCOORD0; float4 tc1:TEXCOORD1; float4 tc2:TEXCOORD2; float4 tc3:TEXCOORD3;\n"
         "    float4 tc4:TEXCOORD4; float4 tc5:TEXCOORD5; float4 tc6:TEXCOORD6; float4 tc7:TEXCOORD7;\n"
+        "    float4 tc8:TEXCOORD8; float4 tc9:TEXCOORD9;\n"
         "};\n");
     /* Texture bank. With no cube units (the default) emit the exact legacy
      * array declaration so 2D-only programs are byte-identical. When any unit

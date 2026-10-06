@@ -2157,6 +2157,7 @@ typedef struct {
     float clear_depth;
     u8    clear_stencil;
     u32   resolve_dst;          /* ENG_REC_DEPTH_RESOLVE target texture */
+    u32   resolve_packed;       /* ...into RGBA8 as the D24S8 bytes (eng_depth_pack_fs) */
 } EngRecord;
 
 static EngRecord s_eng_rec[ENG_MAX_RECORDS];
@@ -2174,6 +2175,7 @@ static id<MTLLibrary>             s_eng_helper_lib;
 static id<MTLRenderPipelineState> s_eng_blit_pso;
 static MTLPixelFormat             s_eng_blit_pso_fmt;
 static id<MTLRenderPipelineState> s_eng_depth_pso;
+static id<MTLRenderPipelineState> s_eng_depth_pack_pso;
 static id<MTLSamplerState>        s_eng_point_sampler;
 
 static NSString* const kEngHelperMSL = @
@@ -2195,6 +2197,14 @@ static NSString* const kEngHelperMSL = @
 "                            depth2d<float> src [[texture(0)]],\n"
 "                            sampler s [[sampler(0)]]) {\n"
 "    return src.sample(s, i.uv);\n"
+"}\n"
+"/* The depth as the RSX's D24S8 word reads through an A8R8G8B8 texture:\n"
+" * A = depth[23:16], R = depth[15:8], G = depth[7:0], B = stencil (0). */\n"
+"fragment float4 eng_depth_pack_fs(BOut i [[stage_in]],\n"
+"                                 depth2d<float> src [[texture(0)]],\n"
+"                                 sampler s [[sampler(0)]]) {\n"
+"    uint v = uint(clamp(src.sample(s, i.uv), 0.0, 1.0) * 16777215.0 + 0.5);\n"
+"    return float4(float((v >> 8) & 255u), float(v & 255u), 0.0, float((v >> 16) & 255u)) / 255.0;\n"
 "}\n";
 
 static u32 eng_obj_add(id<MTLTexture> t)
@@ -2349,6 +2359,7 @@ static void eng_shutdown(void* user)
     s_eng_helper_lib = nil;
     s_eng_blit_pso = nil;
     s_eng_depth_pso = nil;
+    s_eng_depth_pack_pso = nil;
     s_eng_point_sampler = nil;
     s_eng_active = 0;
 }
@@ -2537,6 +2548,44 @@ static u32 eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
     return dst;
 }
 
+/* The depth target packed into RGBA8 the way its D24S8 bytes read through an
+ * A8R8G8B8 texture unit: for a title that samples its depth buffer as colour
+ * and decodes the 24-bit depth with a dot product (Drakengard 3's shadow
+ * projections and soft particles). */
+static u32 eng_depth_snapshot_rgba8(void* user, u32 depth, u32 w, u32 h)
+{
+    (void)user;
+    if (!eng_obj(depth) || !s_eng_helper_lib) return 0;
+    if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return 0; }
+    if (!s_eng_depth_pack_pso) {
+        MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
+        pd.vertexFunction   = [s_eng_helper_lib newFunctionWithName:@"eng_fullscreen_vs"];
+        pd.fragmentFunction = [s_eng_helper_lib newFunctionWithName:@"eng_depth_pack_fs"];
+        pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+        NSError* err = nil;
+        s_eng_depth_pack_pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+        if (!s_eng_depth_pack_pso) {
+            fprintf(stderr, "[rsx engine/metal] depth pack pipeline failed: %s\n",
+                    [[err localizedDescription] UTF8String]);
+            return 0;
+        }
+    }
+    MTLTextureDescriptor* td =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                           width:w height:h
+                                                       mipmapped:NO];
+    td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    const u32 dst = eng_obj_add([s_dev newTextureWithDescriptor:td]);
+    if (!dst) return 0;
+    EngRecord* r = &s_eng_rec[s_eng_rec_count++];
+    memset(r, 0, sizeof *r);
+    r->kind = ENG_REC_DEPTH_RESOLVE;
+    r->depth = depth;
+    r->resolve_dst = dst;
+    r->resolve_packed = 1;
+    return dst;
+}
+
 /* ---- pipelines ----------------------------------------------------------- */
 
 static id<MTLFunction> eng_function(const char* hlsl, int stage,
@@ -2565,7 +2614,25 @@ static id<MTLFunction> eng_function(const char* hlsl, int stage,
     }
     char cpath[1024] = "";
     int cached = 0;
-    if (cache_dir) {
+    /* RSX_MSL_OVERRIDE=<dir>: use <dir>/<what>_<hlsl hash>.msl instead of the
+     * translation when it exists -- a hand-edited shader for an experiment
+     * (the hash is the one RSX_PIPE_LOG and the shader dump print). */
+    { static const char* od = (const char*)1;
+      if (od == (const char*)1) od = getenv("RSX_MSL_OVERRIDE");
+      if (od && *od) {
+          char opath[1024];
+          snprintf(opath, sizeof opath, "%s/%s_%016llx.msl", od, what, (unsigned long long)hash);
+          FILE* of = fopen(opath, "rb");
+          if (of) {
+              const size_t n = fread(s_msl, 1, sizeof s_msl - 1, of);
+              fclose(of);
+              if (n > 0 && n < sizeof s_msl - 1) {
+                  s_msl[n] = 0; cached = 1;
+                  fprintf(stderr, "[rsx engine/metal] %s %016llx: using override %s\n", what, (unsigned long long)hash, opath);
+                  cache_dir = cache_dir ? cache_dir : NULL;
+              }
+          } } }
+    if (!cached && cache_dir) {
         const u64 key = fnv1a64("msl-v1", 6, hash ^ (u64)(stage + 1) * 0x9E3779B97F4A7C15ull);
         snprintf(cpath, sizeof cpath, "%s/%s_%016llx.msl", cache_dir, what, (unsigned long long)key);
         FILE* cf = fopen(cpath, "rb");
@@ -2962,14 +3029,15 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
             const EngRecord* r = &s_eng_rec[i++];
             id<MTLTexture> src = eng_obj(r->depth);
             id<MTLTexture> dst = eng_obj(r->resolve_dst);
-            if (!src || !dst || !s_eng_depth_pso) continue;
+            id<MTLRenderPipelineState> pso = r->resolve_packed ? s_eng_depth_pack_pso : s_eng_depth_pso;
+            if (!src || !dst || !pso) continue;
             MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
             rp.colorAttachments[0].texture     = dst;
             rp.colorAttachments[0].loadAction  = MTLLoadActionDontCare;
             rp.colorAttachments[0].storeAction = MTLStoreActionStore;
             id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
             if (!e) continue;
-            [e setRenderPipelineState:s_eng_depth_pso];
+            [e setRenderPipelineState:pso];
             [e setFragmentTexture:src atIndex:0];
             [e setFragmentSamplerState:s_eng_point_sampler atIndex:0];
             [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
@@ -3211,18 +3279,23 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
  * Headless submits have completed; windowed captures fence the same queue. */
 static void eng_dump_frame(id<MTLTexture> src)
 {
-    const char* path = getenv("PS3RECOMP_METAL_FRAME_DUMP");
-    if (!path || !*path) return;
-    static unsigned frame;
-    /* PS3RECOMP_METAL_FRAME_EVERY=<n> frames (default 120);
-     * PS3RECOMP_METAL_FRAME_SEQ=1 keeps every capture as <path>.<frame>.ppm
-     * instead of overwriting one file, so a run can be read back as a strip. */
-    static unsigned every = 0; static int seq = -1;
-    if (!every) { const char* e = getenv("PS3RECOMP_METAL_FRAME_EVERY"); every = e ? (unsigned)atoi(e) : 120u; if (!every) every = 120u; }
-    if (seq < 0) seq = getenv("PS3RECOMP_METAL_FRAME_SEQ") ? 1 : 0;
-    if ((++frame % every) != 0) return;
+    /* RSX_REPLAY_DUMP_PATH: tools/rsx_replay names the file for this present
+     * itself, and unsets it for the presents it does not want. */
+    const char* path = getenv("RSX_REPLAY_DUMP_PATH");
     char seqpath[1024];
-    if (seq) { snprintf(seqpath, sizeof seqpath, "%s.%06u.ppm", path, frame); path = seqpath; }
+    if (!path || !*path) {
+        path = getenv("PS3RECOMP_METAL_FRAME_DUMP");
+        if (!path || !*path) return;
+        static unsigned frame;
+        /* PS3RECOMP_METAL_FRAME_EVERY=<n> frames (default 120);
+         * PS3RECOMP_METAL_FRAME_SEQ=1 keeps every capture as <path>.<frame>.ppm
+         * instead of overwriting one file, so a run can be read back as a strip. */
+        static unsigned every = 0; static int seq = -1;
+        if (!every) { const char* e = getenv("PS3RECOMP_METAL_FRAME_EVERY"); every = e ? (unsigned)atoi(e) : 120u; if (!every) every = 120u; }
+        if (seq < 0) seq = getenv("PS3RECOMP_METAL_FRAME_SEQ") ? 1 : 0;
+        if ((++frame % every) != 0) return;
+        if (seq) { snprintf(seqpath, sizeof seqpath, "%s.%06u.ppm", path, frame); path = seqpath; }
+    }
     if ([src pixelFormat] != MTLPixelFormatRGBA8Unorm &&
         [src pixelFormat] != MTLPixelFormatBGRA8Unorm) return;
     size_t w = [src width], h = [src height];
@@ -3246,7 +3319,7 @@ static void eng_dump_frame(id<MTLTexture> src)
             fwrite(rgb, 1, 3, f);
         }
         fclose(f);
-        fprintf(stderr, "[rsx engine/metal] captured frame %u to %s\n", frame, path);
+        fprintf(stderr, "[rsx engine/metal] captured frame to %s\n", path);
     }
     free(rgba);
 }
@@ -3274,6 +3347,13 @@ static void eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
     id<MTLTexture> t = eng_obj(surface);
     if (!t || !out || !out_pitch || !w || !h) return;
     if (x + w > [t width] || y + h > [t height]) return;
+    /* Diagnostics only (present log, trace triggers, surface dumps): wait for
+     * the GPU so the bytes are the frame just submitted, not a stale one. */
+    if (s_queue) {
+        id<MTLCommandBuffer> fence = [s_queue commandBuffer];
+        [fence commit];
+        [fence waitUntilCompleted];
+    }
     [t getBytes:out bytesPerRow:out_pitch
      fromRegion:MTLRegionMake2D(x, y, w, h) mipmapLevel:0];
 }
@@ -3292,6 +3372,7 @@ static const rsx_draw_backend s_engine_backend = {
     .depth_target_create  = eng_depth_target_create,
     .depth_target_release = eng_obj_release,
     .depth_snapshot       = eng_depth_snapshot,
+    .depth_snapshot_rgba8 = eng_depth_snapshot_rgba8,
     .color_snapshot       = eng_color_snapshot,
     .pipeline_create      = eng_pipeline_create,
     .pipeline_release     = eng_pipeline_release,

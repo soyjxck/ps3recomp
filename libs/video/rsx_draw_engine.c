@@ -11,6 +11,7 @@
  * probe, and every YZ_PERF_PROFILE block.
  */
 #include "rsx_draw_engine.h"
+#include "rsx_capture.h"
 
 #include "rsx_fp_decompiler.h"
 #include "rsx_primitives.h"
@@ -100,6 +101,8 @@ typedef struct {
     int cleared;
     int had_write;
     int snapshot_valid;
+    u32 packed;            /* RGBA8 copy as the D24S8 bytes read as colour */
+    int packed_valid;
 } eng_zdepth;
 
 typedef struct {
@@ -110,7 +113,7 @@ typedef struct {
     u64 last_use_serial;
 } eng_texture;
 
-typedef struct { u64 key; u32 handle; u8 fixed; u64 vp_fnv; u64 vp_hlsl; } eng_pipeline;
+typedef struct { u64 key; u32 handle; u8 fixed; u64 vp_fnv; u64 vp_hlsl; u64 fp_hlsl; } eng_pipeline;
 
 typedef struct { u32 first, count; } eng_batch;
 
@@ -215,7 +218,18 @@ static const u8* eng_guest_ptr(void* user, u32 location, u32 offset,
     const u32 ea = cellGcmResolveLocated(location == RSX_LOCATION_LOCAL, offset);
     if (!ea) return NULL;
     if (ppu_vm_size && (u64)ea + min_bytes > ppu_vm_size) return NULL;
+    if (g_rsx_capture_on) rsx_capture_read(location, offset, min_bytes);
     return vm_base + ea;
+}
+
+/* tools/rsx_replay: start from a captured register file, transform program
+ * and constants, as rsx_dispatch_seed_* lay them in. */
+void rsx_draw_engine_seed_state(const u32* regs, u32 nregs, const u32* vp, u32 nvp,
+                                const u32* constants, u32 nconst_words)
+{
+    if (regs) rsx_dispatch_seed_registers(&g.rsx, regs, nregs);
+    if (vp) rsx_dispatch_seed_transform_program(&g.rsx, vp, nvp);
+    if (constants) rsx_dispatch_seed_transform_constants(&g.rsx, constants, nconst_words);
 }
 
 static u64 eng_fnv1a(const void* data, u32 n, u64 hash)
@@ -657,6 +671,8 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
     eng_zdepth* z = &g.zdepths[slot];
     if (z->handle) g.be->depth_target_release(g.be->user, z->handle);
     if (z->snapshot && g.be->texture_release) g.be->texture_release(g.be->user, z->snapshot);
+    if (z->packed && g.be->texture_release) g.be->texture_release(g.be->user, z->packed);
+    z->packed = 0; z->packed_valid = 0;
     z->location = location; z->offset = offset;
     z->w = want_w; z->h = want_h;
     z->handle = handle;
@@ -694,6 +710,21 @@ static u32 eng_zdepth_snapshot(u32 slot)
     if (!tex) return 0;
     z->snapshot = tex;
     z->snapshot_valid = 1;
+    return tex;
+}
+
+static u32 eng_zdepth_packed(u32 slot)
+{
+    eng_zdepth* z = &g.zdepths[slot];
+    if (!z->handle || !z->had_write) return 0;
+    if (z->packed_valid && z->packed) return z->packed;
+    if (!g.be->depth_snapshot_rgba8) return 0;
+    if (z->packed && g.be->texture_release) g.be->texture_release(g.be->user, z->packed);
+    z->packed = 0;
+    const u32 tex = g.be->depth_snapshot_rgba8(g.be->user, z->handle, z->w, z->h);
+    if (!tex) return 0;
+    z->packed = tex;
+    z->packed_valid = 1;
     return tex;
 }
 
@@ -1061,6 +1092,7 @@ static const char* const kEngFixedVS =
 "    float4 fog:FOG;\n"
 "    float4 t0:TEXCOORD0; float4 t1:TEXCOORD1; float4 t2:TEXCOORD2; float4 t3:TEXCOORD3;\n"
 "    float4 t4:TEXCOORD4; float4 t5:TEXCOORD5; float4 t6:TEXCOORD6; float4 t7:TEXCOORD7;\n"
+"    float4 t8:TEXCOORD8; float4 t9:TEXCOORD9;\n"
 "};\n"
 "cbuffer VPConst : register(b0) {\n"
 "    float4 vp_c[512];\n"
@@ -1078,6 +1110,7 @@ static const char* const kEngFixedVS =
 "    Out.col0 = input.a3; Out.col1 = float4(0,0,0,1); Out.fog = (float4)0;\n"
 "    Out.t0 = input.a8; Out.t1 = (float4)0; Out.t2 = (float4)0; Out.t3 = (float4)0;\n"
 "    Out.t4 = (float4)0; Out.t5 = (float4)0; Out.t6 = (float4)0; Out.t7 = (float4)0;\n"
+"    Out.t8 = (float4)0; Out.t9 = (float4)0;\n"
 "    return Out;\n"
 "}\n";
 
@@ -1087,6 +1120,7 @@ static const char* const kEngFixedPS =
 "    float4 fog : FOG;\n"
 "    float4 tc0:TEXCOORD0; float4 tc1:TEXCOORD1; float4 tc2:TEXCOORD2; float4 tc3:TEXCOORD3;\n"
 "    float4 tc4:TEXCOORD4; float4 tc5:TEXCOORD5; float4 tc6:TEXCOORD6; float4 tc7:TEXCOORD7;\n"
+"    float4 tc8:TEXCOORD8; float4 tc9:TEXCOORD9;\n"
 "};\n"
 "float4 main(PSInput input) : SV_TARGET { return input.col0; }\n";
 
@@ -1109,6 +1143,22 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     const u32 vtex_mask = eng_vtex_mask();
     u8 shadow_funcs[16];
     const u32 shadow_mask = eng_shadow_units(shadow_funcs);
+    /* Texel-addressed units (RSX_TEX_FMT_UNNORM): the decompiler scales their
+     * coordinates by 1/size. The D3D12 path patched this in; this engine never
+     * did, so every post-process pass that samples a render target in texels
+     * -- downsampling, blur, bloom, the luminance chain -- read coordinates
+     * hundreds of times out of range and got one clamped edge texel. The
+     * near-black luminance then drove Drakengard 3's exposure up until the
+     * village interior washed out to white. RSX_NO_UNNORM=1 turns it off. */
+    u32 unnorm_mask = 0, unnorm_dim[16][2];
+    memset(unnorm_dim, 0, sizeof unnorm_dim);
+    { static int off = -1; if (off < 0) off = getenv("RSX_NO_UNNORM") ? 1 : 0;
+      for (u32 u = 0; !off && u < RSX_DSP_NUM_TEXTURES && u < 16; u++) {
+          rsx_dsp_texture t; rsx_dsp_get_texture(&g.rsx, u, &t);
+          if (!t.enabled || !(t.format & RSX_TEX_FMT_UNNORM) || ((cube_mask >> u) & 1u)) continue;
+          if (!t.width || !t.height) continue;
+          unnorm_mask |= 1u << u; unnorm_dim[u][0] = t.width; unnorm_dim[u][1] = t.height;
+      } }
 
     memset(&g.fp_constants, 0, sizeof g.fp_constants);
     if (!fixed && rsx_fp_collect_constants(fp_uc, fp_size, &g.fp_constants) < 0)
@@ -1134,6 +1184,10 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         if (shadow_mask) {
             key = eng_fnv1a(&shadow_mask, sizeof shadow_mask, key);
             key = eng_fnv1a(shadow_funcs, sizeof shadow_funcs, key);
+        }
+        if (unnorm_mask) {
+            key = eng_fnv1a(&unnorm_mask, sizeof unnorm_mask, key);
+            key = eng_fnv1a(unnorm_dim, sizeof unnorm_dim, key);
         }
     }
     key = eng_fnv1a(&layout->mask, sizeof layout->mask, key);
@@ -1162,9 +1216,14 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                                          layout->mask, s_vs_hlsl,
                                          sizeof s_vs_hlsl);
         rsx_fp_set_shadow_units(shadow_mask, shadow_funcs);
+        rsx_fp_set_unnorm_units(unnorm_mask, unnorm_dim);
         fi = rsx_fp_decompile_buffered_ex(fp_uc, fp_size, fp_ctrl, cube_mask,
                                           s_ps_hlsl, sizeof s_ps_hlsl, &nconst);
         rsx_fp_set_shadow_units(0, NULL);
+        rsx_fp_set_unnorm_units(0, NULL);
+        if (unnorm_mask) { static int n = 0; if (n++ < 6)
+            fprintf(stderr, "[rsx engine] unnormalised units 0x%X (unit %u %ux%u)\n", unnorm_mask,
+                    __builtin_ctz(unnorm_mask), unnorm_dim[__builtin_ctz(unnorm_mask)][0], unnorm_dim[__builtin_ctz(unnorm_mask)][1]); }
         if (shadow_mask) { static int n = 0; if (n++ < 6)
             fprintf(stderr, "[rsx engine] shadow-compare units 0x%X (func of first: %u)\n",
                     shadow_mask, shadow_funcs[__builtin_ctz(shadow_mask)]); }
@@ -1190,10 +1249,12 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         for (const char* c = s_vs_hlsl; *c; c++) vh = (vh ^ (unsigned char)*c) * 1099511628211ull;
         for (const char* c = s_ps_hlsl; *c; c++) ph = (ph ^ (unsigned char)*c) * 1099511628211ull;
         fprintf(stderr, "[rsx engine] pipeline %016llx: %s vp %d, fp %d,"
-                        " %u constants -> %s handle=%u fp-hash=%016llx fp-size=%u blend=%u(%X/%X) vp-hlsl=%016llx fp-hlsl=%016llx vp-start=%u vp-instrs=%u\n",
+                        " %u constants -> %s handle=%u fp-hash=%016llx fp-size=%u blend=%u(%X/%X) vp-hlsl=%016llx fp-hlsl=%016llx vp-start=%u vp-instrs=%u"
+                        " prec(h/x12/x9)=%u/%u/%u exptex=%u\n",
                 (unsigned long long)key, fixed ? "built-in" : "guest",
                 vi, fi, nconst, handle ? "ok" : "FAILED (draw dropped)", handle, fh, fp_size,
-                rs->blend_enable, rs->sf_rgb, rs->df_rgb, vh, ph, rsx_dsp_vp_start(&g.rsx), vp_instrs);
+                rs->blend_enable, rs->sf_rgb, rs->df_rgb, vh, ph, rsx_dsp_vp_start(&g.rsx), vp_instrs,
+                g_rsx_fp_stats.prec[1], g_rsx_fp_stats.prec[2], g_rsx_fp_stats.prec[3], g_rsx_fp_stats.exp_tex);
         /* RSX_VP_HEX=<vp-hlsl hash>: that program's microcode, four words per
          * instruction, for decoding a field by hand against the decompiler. */
         { static unsigned long long want = 0; static int got = -1;
@@ -1211,7 +1272,10 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
       for (u32 i = 0; vp_uc && i < vp_instrs * 16u; i++) vf = (vf ^ vp_uc[i]) * 1099511628211ull;
       for (const char* c = s_vs_hlsl; *c; c++) vh2 = (vh2 ^ (unsigned char)*c) * 1099511628211ull;
       g.pipelines[g.n_pipelines].vp_fnv = vf;
-      g.pipelines[g.n_pipelines].vp_hlsl = fixed ? 0 : vh2; }
+      g.pipelines[g.n_pipelines].vp_hlsl = fixed ? 0 : vh2;
+      u64 fh2 = 1469598103934665603ull;
+      for (const char* c = s_ps_hlsl; *c; c++) fh2 = (fh2 ^ (unsigned char)*c) * 1099511628211ull;
+      g.pipelines[g.n_pipelines].fp_hlsl = fixed ? 0 : fh2; }
     g.n_pipelines++;
     *out_fixed = fixed;
     return handle;
@@ -1399,6 +1463,9 @@ static void sink_draw_index(void* user, const rsx_dispatch* r, u32 first, u32 co
  * render-to-texture read back through a texture unit), a unit naming a
  * tracked zeta in DEPTH24_D8 samples its snapshot, and everything else is a
  * guest upload (rsx_live_draw.c:5986-6062). */
+static int s_zeta_alias_log;   /* print the next pipeline's fragment constants */
+static void eng_surface_dump_now(void);   /* every registered surface, now */
+static const char* s_dump_tag = "";        /* file-name suffix for the dumps above */
 static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                               u32 current_zslot,
                               u32 textures[RSX_BE_MAX_TEXTURES],
@@ -1452,6 +1519,34 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             continue;
         }
         const u32 base_fmt = t.format & RSX_TEX_FMT_BASE_MASK & ~(u32)RSX_TEX_FMT_UNNORM;
+        /* A non-depth format over a tracked zeta: the title reads its depth
+         * buffer's bytes as colour (UE3 decodes D24 from A8R8G8B8 with a dot
+         * product). Report each (offset, format) once. */
+        if (base_fmt != RSX_TEX_FMT_DEPTH24_D8 && base_fmt != 0x92u) {
+            for (u32 i = 0; i < g.n_zdepths; i++)
+                if (g.zdepths[i].location == t.location && g.zdepths[i].offset == t.offset) {
+                    static u32 seen[16][2]; static u32 nseen = 0; int dup = 0;
+                    for (u32 k = 0; k < nseen; k++) if (seen[k][0] == t.offset && seen[k][1] == t.format) dup = 1;
+                    /* Bind the depth packed as those bytes, through the unit's
+                     * own remap, when it is A8R8G8B8 and not the zeta this draw
+                     * writes. RSX_NO_DEPTH_AS_COLOR=1 leaves the guest bytes. */
+                    { static int off = -1; if (off < 0) off = getenv("RSX_NO_DEPTH_AS_COLOR") ? 1 : 0;
+                      if (!off && base_fmt == 0x85u && current_zslot != i) {
+                          const u32 pk = eng_zdepth_packed(i);
+                          if (pk) {
+                              const u32 view = g.be->surface_view
+                                  ? g.be->surface_view(g.be->user, pk, t.remap & 0xFFFFu, t.format) : 0;
+                              textures[u] = view ? view : pk;
+                          }
+                      } }
+                    if (!dup && nseen < 16) { seen[nseen][0] = t.offset; seen[nseen][1] = t.format; nseen++;
+                        fprintf(stderr, "[rsx engine] unit %u reads zeta %u (loc %u off 0x%08X %ux%u) as format 0x%02X %ux%u remap 0x%04X -- depth as colour\n",
+                                u, i, t.location, t.offset, g.zdepths[i].w, g.zdepths[i].h, t.format, t.width, t.height, t.remap & 0xFFFFu);
+                        s_zeta_alias_log = 1; }
+                    break;
+                }
+        }
+        if (textures[u]) continue;
         if (base_fmt == RSX_TEX_FMT_DEPTH24_D8) {
             int found = 0;
             for (u32 i = 0; i < g.n_zdepths; i++)
@@ -1617,7 +1712,8 @@ static void eng_draw_trace(const char* outcome, u32 prim, int indexed, u32 n_dra
     /* For a quad-sized draw (a movie, a post-process or UI pass), each bound
      * texture: location, offset, format, size, and the mean of its first
      * row -- whether the planes a video quad samples hold any picture. */
-    if (dc.n_verts && dc.n_verts <= 8) {
+    static int tex_all = -1; if (tex_all < 0) tex_all = getenv("RSX_TRACE_TEXUNITS") ? 1 : 0;
+    if (dc.n_verts && (dc.n_verts <= 8 || tex_all)) {
         fprintf(stderr, " texunits:");
         for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
             if (!(tex_mask & (1u << u))) continue;
@@ -1625,7 +1721,12 @@ static void eng_draw_trace(const char* outcome, u32 prim, int indexed, u32 n_dra
             const u32 row = t.pitch ? t.pitch : t.width;
             const u8* p = (t.width && row) ? eng_guest_ptr(NULL, t.location, t.offset, row) : NULL;
             unsigned long sum = 0; for (u32 k = 0; p && k < row && k < 4096; k++) sum += p[k];
-            fprintf(stderr, " %u:L%u/0x%08X/f%02X/%ux%u/p%u/ea%08X/m%lu", u, t.location, t.offset, t.format, t.width, t.height, t.pitch,
+            int surf = -1, zeta = -1;
+            for (u32 k = 0; k < g.n_surfaces; k++) if (g.surfaces[k].handle && g.surfaces[k].location == t.location && g.surfaces[k].offset == t.offset) surf = (int)k;
+            for (u32 k = 0; k < g.n_zdepths; k++) if (g.zdepths[k].handle && g.zdepths[k].location == t.location && g.zdepths[k].offset == t.offset) zeta = (int)k;
+            if (surf >= 0) fprintf(stderr, " [surface s%d fmt%u]", surf, (u32)g.surfaces[surf].fmt);
+            if (zeta >= 0) fprintf(stderr, " [zeta z%d]", zeta);
+            fprintf(stderr, " %u:L%u/0x%08X/f%02X/%ux%u/p%u/mips%u/filt%08X/ctl%08X/remap%04X/ea%08X/m%lu", u, t.location, t.offset, t.format, t.width, t.height, t.pitch, t.mipmaps, t.filter, t.control0, t.remap & 0xFFFFu,
                     cellGcmResolveLocated(t.location == RSX_LOCATION_LOCAL, t.offset),
                     p ? sum / (row < 4096 ? row : 4096) : 9999ul);
         }
@@ -1757,6 +1858,30 @@ static void sink_end(void* user, const rsx_dispatch* r)
     const u32 pipeline = eng_pipeline_get(&layout, &rs, rt_fmt,
                                           n_targets, &pipeline_is_fixed);
     if (!pipeline) { s_dstat.drop_pipeline++; eng_draw_trace("DROP-pipeline", prim, indexed, n_draw, 0, tex_mask); return; }
+    /* RSX_SURF_DUMP_AT_FP=<hash>: the first time (from RSX_SURF_DUMP_FROM) a
+     * draw with that fragment program is about to run, finish the GPU work
+     * recorded so far and dump every surface -- what the draw will read. */
+    { static int armed = -1; static unsigned long long want = 0;
+      if (armed < 0) { const char* e = getenv("RSX_SURF_DUMP_AT_FP"); want = e ? strtoull(e, 0, 16) : 0; armed = want ? 1 : 0; }
+      if (armed == 1) {
+          const char* e = getenv("RSX_SURF_DUMP_FROM"); const long from = e ? atol(e) : 0;
+          u64 fh = 0;
+          for (u32 i = 0; i < g.n_pipelines; i++) if (g.pipelines[i].handle == pipeline) { fh = g.pipelines[i].fp_hlsl; break; }
+          if (fh == want && (long)g.frames >= from) {
+              armed = 0;
+              if (g.be->submit_and_wait) g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+              fprintf(stderr, "[surf-dump] before the first draw with fp-hlsl %016llx in frame %u\n", want, g.frames);
+              s_dump_tag = "_pre"; eng_surface_dump_now(); s_dump_tag = "";
+          } } }
+    /* RSX_SKIP_FP=<hash>[,<hash>...]: drop every draw whose fragment program
+     * translates to that HLSL hash (the fp-hlsl the pipeline log prints) --
+     * to find which pass produces an artefact. */
+    { static int n = -1; static unsigned long long want[16];
+      if (n < 0) { n = 0; const char* e = getenv("RSX_SKIP_FP");
+          while (e && *e && n < 16) { char* d; want[n++] = strtoull(e, &d, 16); e = (*d == ',') ? d + 1 : NULL; } }
+      if (n) { u64 fh = 0;
+          for (u32 i = 0; i < g.n_pipelines; i++) if (g.pipelines[i].handle == pipeline) { fh = g.pipelines[i].fp_hlsl; break; }
+          for (int k = 0; k < n; k++) if (fh && fh == want[k]) return; } }
 
     if (indexed) {
         if (!dc_reserve_indices(n_draw)) return;
@@ -1796,6 +1921,26 @@ static void sink_end(void* user, const rsx_dispatch* r)
     memset(g.fp_cb, 0, fp_bytes);
     if (g.fp_constants.count)
         memcpy(g.fp_cb, g.fp_constants.values, g.fp_constants.count * 16u);
+    /* RSX_FPCONST_AT_FP=<hash>: the fragment constants of the first 3 draws
+     * (from RSX_SURF_DUMP_FROM) whose program translates to that hash. */
+    { static int left = -1; static unsigned long long want = 0;
+      if (left < 0) { const char* e = getenv("RSX_FPCONST_AT_FP"); want = e ? strtoull(e, 0, 16) : 0; left = want ? 3 : 0; }
+      if (left > 0) {
+          const char* e = getenv("RSX_SURF_DUMP_FROM"); const long from = e ? atol(e) : 0;
+          u64 fh = 0;
+          for (u32 i = 0; i < g.n_pipelines; i++) if (g.pipelines[i].handle == pipeline) { fh = g.pipelines[i].fp_hlsl; break; }
+          if (fh == want && (long)g.frames >= from) { left--;
+              fprintf(stderr, "[fpconst] f%u fp %016llx:", g.frames, want);
+              for (u32 k = 0; k < g.fp_constants.count; k++) {
+                  const float* c = (const float*)g.fp_constants.values[k];
+                  fprintf(stderr, " c%u=(%.6g %.6g %.6g %.6g)", k, c[0], c[1], c[2], c[3]); }
+              fputc('\n', stderr); } } }
+    if (s_zeta_alias_log) { s_zeta_alias_log = 0;
+        fprintf(stderr, "[rsx engine]   its fragment constants:");
+        for (u32 k = 0; k < g.fp_constants.count && k < 6; k++) {
+            const float* c = (const float*)g.fp_constants.values[k];
+            fprintf(stderr, " c%u=(%.6g %.6g %.6g %.6g)", k, c[0], c[1], c[2], c[3]); }
+        fputc('\n', stderr); }
     { float* alpha = (float*)(g.fp_cb + nslots * 16u);
       alpha[0] = rsx_fp_alpha_ref(rs.alpha_ref_raw, rs.alpha_ref_format);
       alpha[1] = alpha[2] = alpha[3] = 0.0f; }
@@ -1859,6 +2004,43 @@ static void sink_end(void* user, const rsx_dispatch* r)
     if (rs.color_mask) { rsx_dsp_vertex_attr a7; rsx_dsp_get_vertex_attr(&g.rsx, 7, &a7);
         if (a7.type == 7) { s_skin_draws++; s_skin_verts += dc.n_verts; } }
     eng_draw_trace(pipeline_is_fixed ? "OK-fixed" : "OK", prim, indexed, n_draw, pipeline, tex_mask);
+    /* RSX_PICK=<x>,<y>,<frame>: after every draw of that frame into a
+     * full-size target, finish the GPU work and read pixel (x, y) of the
+     * draw's first target back -- which draws touch a pixel, and what each
+     * one leaves there. Slow (a GPU sync per draw); for tools/rsx_replay. */
+    { static int px = -2, py = 0; static long pf = -1; static u32 last[4]; static u32 last_surf = ENG_INVALID; static u32 idx;
+      if (px == -2) { const char* e = getenv("RSX_PICK"); px = -1;
+          if (e && sscanf(e, "%d,%d,%ld", &px, &py, &pf) != 3) px = -1; }
+      if (px >= 0 && (long)g.frames == pf && target < g.n_surfaces) {
+          const eng_surface* ts = &g.surfaces[target];
+          idx++;
+          /* A smaller target (a downsample) is read at the same place in
+           * the picture: the pick scaled to its size. */
+          const u32 qx = ts->w >= 1280 ? (u32)px : (u32)((u64)px * ts->w / 1280u);
+          const u32 qy = ts->h >= 720 ? (u32)py : (u32)((u64)py * ts->h / 720u);
+          if (qx < ts->w && qy < ts->h) {
+              if (g.be->submit_and_wait) g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+              u8 b[16]; memset(b, 0, sizeof b);
+              const u32 bpp = ts->fmt == RSX_BE_FMT_R16G16B16A16F ? 8u : 4u;
+              g.be->readback(g.be->user, ts->handle, qx, qy, 1, 1, b, bpp);
+              u32 cur[4] = {0, 0, 0, 0}; memcpy(cur, b, bpp);
+              if (target != last_surf || memcmp(cur, last, sizeof cur)) {
+                  float c[4] = {0, 0, 0, 0};
+                  if (bpp == 8) for (int k = 0; k < 4; k++) {
+                      const u16 v = ((const u16*)b)[k]; const u32 ex = (v >> 10) & 0x1F, mant = v & 0x3FF;
+                      float o = ex == 0 ? mant / 1024.0f / 16384.0f : ex == 31 ? 65504.0f : (1.0f + mant / 1024.0f) * (float)pow(2.0, (int)ex - 15);
+                      c[k] = (v & 0x8000) ? -o : o; }
+                  else for (int k = 0; k < 4; k++) c[k] = b[k] / 255.0f;
+                  u64 fh = 0;
+                  for (u32 i = 0; i < g.n_pipelines; i++) if (g.pipelines[i].handle == pipeline) { fh = g.pipelines[i].fp_hlsl; break; }
+                  rsx_dsp_surface psf; rsx_dsp_get_surface(&g.rsx, &psf);
+                  fprintf(stderr, "[pick] f%u draw %u pipe %u fp %016llx -> s%u(rsxfmt 0x%X engfmt %u) = (%.4g %.4g %.4g %.4g) blend=%u(%X/%X) depth=%u/%u/%X mask=0x%X tex=0x%X verts=%u\n",
+                          g.frames, idx, pipeline, (unsigned long long)fh, target, psf.color_format, (u32)ts->fmt, c[0], c[1], c[2], c[3],
+                          rs.blend_enable, rs.sf_rgb, rs.df_rgb, rs.depth_test, rs.depth_write, rs.depth_func, rs.color_mask, tex_mask, dc.n_verts);
+                  memcpy(last, cur, sizeof cur); last_surf = target;
+              }
+          }
+      } }
 
     if (zslot != ENG_INVALID && rs.depth_test && rs.depth_write)
         g.zdepths[zslot].had_write = 1;
@@ -1914,6 +2096,7 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
              * texture consumer resolves the newly written pass exactly once. */
             g.zdepths[zslot].had_write = 0;
             g.zdepths[zslot].snapshot_valid = 0;
+            g.zdepths[zslot].packed_valid = 0;
         }
     }
 }
@@ -1949,8 +2132,36 @@ static void eng_surface_dump_frame(void)
         every = (e = getenv("RSX_SURF_DUMP_EVERY")) ? atol(e) : 240; if (every <= 0) every = 240;
         count = (e = getenv("RSX_SURF_DUMP_COUNT")) ? atol(e) : 8;
     }
-    if (!dir || !*dir || done >= count || (long)g.frames < from || ((long)g.frames - from) % every) return;
+    /* RSX_SURF_DUMP_BRIGHT=<mean>: instead of a frame schedule, dump when the
+     * presented frame's mean brightness (0-255) is at least <mean>, from
+     * RSX_SURF_DUMP_FROM on, at least RSX_SURF_DUMP_EVERY frames apart -- the
+     * scene you are after, wherever the run's timing put it. */
+    static long bright = -2, last_dump = -1000000;
+    if (bright == -2) { const char* e = getenv("RSX_SURF_DUMP_BRIGHT"); bright = e ? atol(e) : -1; }
+    if (!dir || !*dir || done >= count || (long)g.frames < from) return;
+    if (bright >= 0) {
+        if ((long)g.frames - last_dump < every) return;
+        const eng_surface* ps = &g.surfaces[g.last_present_surface];
+        if (ps->fmt != RSX_BE_FMT_R8G8B8A8 || !ps->w || !ps->h) return;
+        u8* buf = (u8*)malloc((size_t)ps->w * ps->h * 4);
+        if (!buf) return;
+        g.be->readback(g.be->user, ps->handle, 0, 0, ps->w, ps->h, buf, ps->w * 4);
+        unsigned long long sum = 0; u32 n = 0;
+        for (u32 q = 0; q < ps->w * ps->h; q += 61) { sum += buf[q * 4] + buf[q * 4 + 1] + buf[q * 4 + 2]; n += 3; }
+        free(buf);
+        if (!n || (long)(sum / n) < bright) return;
+        last_dump = (long)g.frames;
+        fprintf(stderr, "[surf-dump] frame %u presented mean %llu >= %ld: dumping\n", g.frames, sum / n, bright);
+    } else if (((long)g.frames - from) % every) return;
     done++;
+    eng_surface_dump_now();
+}
+
+static void eng_surface_dump_now(void)
+{
+    static const char* dir = (const char*)1;
+    if (dir == (const char*)1) dir = getenv("RSX_SURF_DUMP_DIR");
+    if (!dir || !*dir) return;
     for (u32 i = 0; i < g.n_surfaces; i++) {
         const eng_surface* sf = &g.surfaces[i];
         if (!sf->handle || !sf->w || !sf->h) continue;
@@ -1963,8 +2174,9 @@ static void eng_surface_dump_frame(void)
         memset(buf, 0, (size_t)sf->w * sf->h * bpp);
         g.be->readback(g.be->user, sf->handle, 0, 0, sf->w, sf->h, buf, sf->w * bpp);
         double sum[3] = {0, 0, 0}, mx[3] = {0, 0, 0}; unsigned long nan = 0;
+        double asum = 0, amin = 1e30, amax = -1e30;
         char path[1024];
-        snprintf(path, sizeof path, "%s/f%06u_s%02u_%ux%u_%s.ppm", dir, g.frames, i, sf->w, sf->h,
+        snprintf(path, sizeof path, "%s/f%06u%s_s%02u_%ux%u_%s.ppm", dir, g.frames, s_dump_tag, i, sf->w, sf->h,
                  fp16 ? "fp16" : f32 ? "r32f" : "rgba8");
         FILE* f = fopen(path, "wb");
         if (f) fprintf(f, "P6\n%u %u\n255\n", sf->w, sf->h);
@@ -1972,13 +2184,16 @@ static void eng_surface_dump_frame(void)
             float c[3];
             if (fp16) {
                 const u16* h = (const u16*)(buf + (size_t)p * 8);
-                for (int k = 0; k < 3; k++) {
+                float a4[4];
+                for (int k = 0; k < 4; k++) {
                     u16 v = h[k]; u32 sgn = (v >> 15) & 1, ex = (v >> 10) & 0x1F, mant = v & 0x3FF; float out;
                     if (ex == 0) out = (float)mant / 1024.0f / 16384.0f;
                     else if (ex == 31) { out = mant ? 0.0f : 1e30f; if (mant) nan++; }
                     else out = (1.0f + mant / 1024.0f) * (float)pow(2.0, (int)ex - 15);
-                    c[k] = sgn ? -out : out;
+                    a4[k] = sgn ? -out : out;
                 }
+                c[0] = a4[0]; c[1] = a4[1]; c[2] = a4[2];
+                asum += a4[3]; if (a4[3] < amin) amin = a4[3]; if (a4[3] > amax) amax = a4[3];
             } else if (f32) {
                 float v; memcpy(&v, buf + (size_t)p * 4, 4); c[0] = c[1] = c[2] = v;
             } else {
@@ -1993,9 +2208,25 @@ static void eng_surface_dump_frame(void)
         }
         if (f) fclose(f);
         const double n = (double)sf->w * sf->h;
-        fprintf(stderr, "[surf-dump] f%u s%u %ux%u %s off=0x%08X mean=(%.3f %.3f %.3f) max=(%.2f %.2f %.2f) nan=%lu -> %s\n",
+        fprintf(stderr, "[surf-dump] f%u s%u %ux%u %s off=0x%08X mean=(%.3f %.3f %.3f) max=(%.2f %.2f %.2f) nan=%lu",
                 g.frames, i, sf->w, sf->h, fp16 ? "fp16" : f32 ? "r32f" : "rgba8", sf->offset,
-                sum[0] / n, sum[1] / n, sum[2] / n, mx[0], mx[1], mx[2], nan, path);
+                sum[0] / n, sum[1] / n, sum[2] / n, mx[0], mx[1], mx[2], nan);
+        if (fp16) fprintf(stderr, " alpha mean=%.4g min=%.4g max=%.4g", asum / n, amin, amax);
+        fprintf(stderr, " -> %s\n", path);
+        /* An FP16 target's alpha as its own image, scaled to its maximum:
+         * UE3 on PS3 keeps scene depth there. */
+        if (fp16 && amax > 0) {
+            char apath[1100]; snprintf(apath, sizeof apath, "%s.alpha.ppm", path);
+            FILE* af = fopen(apath, "wb");
+            if (af) { fprintf(af, "P6\n%u %u\n255\n", sf->w, sf->h);
+                for (u32 p = 0; p < sf->w * sf->h; p++) {
+                    const u16 v = ((const u16*)(buf + (size_t)p * 8))[3];
+                    u32 ex = (v >> 10) & 0x1F, mant = v & 0x3FF; float out;
+                    if (ex == 0) out = (float)mant / 1024.0f / 16384.0f; else if (ex == 31) out = 0; else out = (1.0f + mant / 1024.0f) * (float)pow(2.0, (int)ex - 15);
+                    if (v & 0x8000) out = -out;
+                    float t = out / (float)amax; t = t < 0 ? 0 : t > 1 ? 1 : t; u8 g8 = (u8)(t * 255.0f + 0.5f); u8 px3[3] = { g8, g8, g8 };
+                    fwrite(px3, 1, 3, af); }
+                fclose(af); } }
         free(buf);
     }
 }
@@ -2090,6 +2321,23 @@ static void eng_present(u32 buffer_id)
           done = 1; s_dtrace_frame = (long)g.frames + 1;
           fprintf(stderr, "[draw-trace] frame %u issued %u draws: tracing frames %ld..%ld\n",
                   g.frames, g.guest_draws, s_dtrace_frame, s_dtrace_frame + 3); } }
+    /* Frame capture (rsx_capture.h): starts, counts and ends at presents. */
+    { double cmean = -1.0;
+      if (rsx_capture_wants_mean(g.frames)) {
+          const eng_surface* ps = &g.surfaces[target];
+          if (ps->fmt == RSX_BE_FMT_R8G8B8A8 && ps->w && ps->h) {
+              u8* buf = (u8*)malloc((size_t)ps->w * ps->h * 4);
+              if (buf) { g.be->readback(g.be->user, ps->handle, 0, 0, ps->w, ps->h, buf, ps->w * 4);
+                  unsigned long long sum = 0; u32 n = 0;
+                  for (u32 p = 0; p < ps->w * ps->h; p += 61) { sum += buf[p * 4] + buf[p * 4 + 1] + buf[p * 4 + 2]; n += 3; }
+                  cmean = n ? (double)sum / n : 0.0; free(buf); } } }
+      u32 db[8][6];
+      for (u32 i = 0; i < 8; i++) {
+          const eng_display_buffer* d = &g.display_buffers[i];
+          db[i][0] = (u32)d->valid; db[i][1] = d->location; db[i][2] = d->offset;
+          db[i][3] = d->pitch; db[i][4] = d->width; db[i][5] = d->height; }
+      rsx_capture_present(g.frames, cmean, g.rsx.regs, RSX_DSP_NUM_REGS, g.rsx.vp, RSX_DSP_VP_WORDS,
+                          &g.rsx.constants[0][0], RSX_DSP_NUM_CONSTANTS * 4u, &db[0][0], 8); }
     g.frames++;
     g_rsx_engine_frame = g.frames;
     eng_draw_stats_report();
@@ -2218,13 +2466,24 @@ void rsx_draw_engine_method(u32 method, u32 arg)
      * (0xE9xx, 0xEBxx) encode the subchannel bits as part of the address;
      * preserve them with the wider mask. */
     u32 m = (method >= 0xE000u) ? (method & 0xFFFCu) : (method & 0x1FFCu);
+    /* Recorded after the dispatch, behind the pages it read (rsx_capture.c),
+     * and only when the capture was already running when it began. */
+    const int cap = g_rsx_capture_on;
+    /* Occlusion-query methods in the draw trace: CLEAR_REPORT_VALUE (0x17C8),
+     * GET_REPORT (0x1800), SET_ZPASS_PIXEL_COUNT_ENABLE (0x1D84). */
+    if ((m == 0x17C8u || m == 0x1800u || m == 0x1D84u) && s_dtrace_frame >= 0 &&
+        (long)g.frames >= s_dtrace_frame && (long)g.frames < s_dtrace_frame + 4)
+        fprintf(stderr, "[draw-trace] f%u QUERY %s 0x%08X\n", g.frames,
+                m == 0x17C8u ? "CLEAR_REPORT_VALUE" : m == 0x1800u ? "GET_REPORT" : "ZPASS_ENABLE", arg);
     rsx_dispatch_method(&g.rsx, m, arg);
+    if (cap) rsx_capture_method(method, arg);
 }
 
 void rsx_draw_engine_set_display_buffer(u32 buffer_id, u32 location, u32 offset,
                                         u32 pitch, u32 width, u32 height)
 {
     if (buffer_id >= 8) return;
+    rsx_capture_display_buffer(buffer_id, location, offset, pitch, width, height);
     eng_display_buffer* d = &g.display_buffers[buffer_id];
     d->location = location;
     d->offset = offset;
@@ -2264,6 +2523,7 @@ int rsx_draw_engine_fifo_flip(u32 buffer_id)
     if (!g.ready) return 0;
     g.last_flip_buffer = buffer_id & 7u;
     g.sink_flips++;
+    rsx_capture_flip(buffer_id);
     s_present_src = "fifo";
     eng_present(g.last_flip_buffer);
     s_present_src = "host";

@@ -154,6 +154,10 @@ else()
     target_link_libraries(ps3recomp_runtime PRIVATE Threads::Threads)
 endif()
 
+# Frame capture (libs/video/rsx_capture.c) writes gzip.
+find_package(ZLIB REQUIRED)
+target_link_libraries(ps3recomp_runtime PUBLIC ZLIB::ZLIB)
+
 if(APPLE)
     target_link_libraries(ps3recomp_runtime PUBLIC
         "-framework Metal"
@@ -355,6 +359,21 @@ if(UNIX)
     # The runtime carries C++ (and, with translation on, spirv-cross), so the
     # C++ driver must do the final link or the standard library goes missing.
     set_target_properties(ps3recomp_host PROPERTIES LINKER_LANGUAGE CXX)
+
+    # Frame replay: a capture (RSX_CAPTURE=...) played back through the draw
+    # engine and the headless Metal backend with no game -- see rsx_replay.c.
+    if(APPLE)
+        add_executable(rsx_replay
+            runtime/host/rsx_replay.c
+            runtime/host/host_stubs.c
+        )
+        target_link_libraries(rsx_replay PRIVATE ps3recomp_runtime)
+        target_include_directories(rsx_replay PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        )
+        set_target_properties(rsx_replay PROPERTIES LINKER_LANGUAGE CXX)
+    endif()
 
     # Guest shader translation, decompilers -> HLSL -> MSL, with no GPU: the
     # regression net for the Metal backend's shader path on every platform.

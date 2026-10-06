@@ -590,6 +590,7 @@ static int rsx_vp_decompile_impl(
         "    float4 fog:FOG;\n"
         "    float4 t0:TEXCOORD0; float4 t1:TEXCOORD1; float4 t2:TEXCOORD2; float4 t3:TEXCOORD3;\n"
         "    float4 t4:TEXCOORD4; float4 t5:TEXCOORD5; float4 t6:TEXCOORD6; float4 t7:TEXCOORD7;\n"
+        "    float4 t8:TEXCOORD8; float4 t9:TEXCOORD9;\n"
         "};\n"
         /* b0: 512 vec4 transform constants + the RSX viewport transform,
          * pre-mapped by the harness to D3D clip space:
@@ -663,6 +664,12 @@ static int rsx_vp_decompile_impl(
         "    Out.col0 = o[1]; Out.col1 = o[2]; Out.fog = o[5].xxxx;\n"
         "    Out.t0=o[7];  Out.t1=o[8];  Out.t2=o[9];  Out.t3=o[10];\n"
         "    Out.t4=o[11]; Out.t5=o[12]; Out.t6=o[13]; Out.t7=o[14];\n"
+        /* TEX8 is output register 15 and TEX9 register 6 (which it shares
+         * with the point size in .x) -- RPCS3 VertexProgramDecompiler's
+         * reg_table. Unrouted, every fragment program reading TEX8/9 got
+         * zero: Unreal Engine 3 carries its light vectors there, so lit
+         * furniture and props rendered black. */
+        "    Out.t8=o[15]; Out.t9=o[6];\n"
         "    return Out;\n"
         "}\n");
 
