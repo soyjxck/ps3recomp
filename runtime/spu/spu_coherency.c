@@ -72,8 +72,15 @@ void spu_lockline_unlock(void) { atomic_flag_clear_explicit(&g_lockline, memory_
 #define SPU_COH_LINES       (1u << (32 - SPU_COH_LINE_SHIFT))   /* 2^25 lines */
 #define SPU_COH_BITMAP_SZ   (SPU_COH_LINES / 8)                 /* 4 MiB */
 
-unsigned char g_spu_coh_bitmap[SPU_COH_BITMAP_SZ];   /* read inline by ppu_vm_fast.h */
+unsigned char g_spu_coh_bitmap[SPU_COH_BITMAP_SZ];
 #define s_coh_bitmap g_spu_coh_bitmap
+
+/* The lifted code's one-test page table (runtime/ppu/ppu_vm_fast.h): a page
+ * with a reserved line in it gets its COH bit (4), and stores into the page
+ * then go through vm_write*_slow, which tests the line. Sticky, as the bitmap
+ * is. It lives here because this file is the one every user of the bitmap
+ * links; the other two bits belong to ppu_loader.cpp. */
+unsigned char g_ppu_vm_page[65536];
 
 /* Zero until the first GETLLAR anywhere. Keeps the PPU fast path off the
  * bitmap entirely for a title that runs no SPU code, and keeps every existing
@@ -94,6 +101,9 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
 {
     uint32_t line = ea >> SPU_COH_LINE_SHIFT;
     s_coh_bitmap[line >> 3] |= (unsigned char)(1u << (line & 7));
+    /* Atomic: ppu_vm_slow_any_update rewrites the page's other bits from
+     * another thread, without the lock-line lock. */
+    __atomic_fetch_or(&g_ppu_vm_page[ea >> 16], (unsigned char)4, __ATOMIC_SEQ_CST);
     s_coh_armed = 1;
 
     if (!ctx) return;

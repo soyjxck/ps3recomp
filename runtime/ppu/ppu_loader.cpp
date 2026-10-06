@@ -1300,12 +1300,30 @@ extern "C" void ppu_dump_guest_stack(ppu_context*, const char*);
 extern "C" uint32_t g_null_sweep_hi = 0;   /* 0 = not sweeping */
 extern "C" uint32_t g_ww_dyn;
 extern "C" int g_ppu_vm_slow_stores;
-/* The inline store path's one test (ppu_vm_fast.h); recompute after changing
- * any of the three. */
+extern "C" int g_ppu_vm_slow_reads;
+extern "C" unsigned char g_ppu_vm_page[65536];      /* spu_coherency.c */
+extern "C" uint32_t ppu_hle_inject_base;
+/* The inline paths' one test (ppu_vm_fast.h): which 64 KiB pages a lifted
+ * load or store may touch without calling vm_read*_slow / vm_write*_slow.
+ * Recompute after changing anything this reads. Bit 4 (a reserved SPU line
+ * in the page) is spu_coherency.c's and is left alone; a page is slow for a
+ * moment while its bits are rewritten, which is always safe. */
 extern "C" uint32_t g_ppu_vm_slow_stores_any = 1;   /* as g_ppu_vm_slow_stores starts */
 extern "C" void ppu_vm_slow_any_update(void)
 {
     g_ppu_vm_slow_stores_any = (g_ppu_vm_slow_stores || g_ww_dyn || g_null_sweep_hi) ? 1u : 0u;
+    const unsigned char all = (unsigned char)((g_ppu_vm_slow_reads ? 0u : 1u) |
+                                              (g_ppu_vm_slow_stores_any ? 0u : 2u));
+    const uint32_t gcm_page = (ppu_hle_inject_base + 0x2008u) >> 16;
+    for (uint32_t p = 0; p < 65536u; p++) {
+        unsigned char f = all;
+        if (p == 0 || (p >> 8) == 0xE0u) f = 0;      /* null page; raw SPU registers */
+        /* Out of the guest VM, or an access that could run off its end. */
+        if (ppu_vm_size && (((uint64_t)p + 1) << 16) >= ppu_vm_size) f = 0;
+        if (p == gcm_page) f &= (unsigned char)~1u;  /* the ref register's loads */
+        __atomic_fetch_and(&g_ppu_vm_page[p], (unsigned char)4, __ATOMIC_SEQ_CST);
+        if (f) __atomic_fetch_or(&g_ppu_vm_page[p], f, __ATOMIC_SEQ_CST);
+    }
 }
 static uint32_t g_null_sweep_last = 0;
 static unsigned g_null_sweep_tid = 0;
@@ -1407,17 +1425,13 @@ static void ppu_hotread_init(void)
                             getenv("PPU_FORCE_READ_ADDR")) ? 1 : 0;
     g_ppu_vm_slow_stores = (getenv("GCM_PARK_WRITE_LOG") || getenv("PPU_WVAL") || getenv("PPU_WWATCH") ||
                             getenv("PPU_WW_GUARD")) ? 1 : 0;
-#ifdef _WIN32
-    /* Every store through the slow function on Windows, as before, unless
-     * PPU_FAST_STORES=1. The inline fast path removed vm_write*_slow from the
-     * profile (10-12% of Drakengard 3's main and render threads) and yet three
-     * battle runs with it measured 40-43 fps against 72 fps without, with the
-     * same CPU use: a timing interaction nobody has explained yet (the slow
-     * path's only extra work is the raw-SPU register check, the null-page
-     * trap and the PT-restore record, PT=<hex>). Measured, not understood;
-     * the fast path stays opt-in until it is. */
-    if (!(getenv("PPU_FAST_STORES") && getenv("PPU_FAST_STORES")[0] == '1')) g_ppu_vm_slow_stores = 1;
-#endif
+    /* PPU_SLOW_STORES=1 sends every store through the function (PT=<hex>,
+     * the truncation hunt, needs it too). Windows did that by default while
+     * the inline path was five tests long: it measured slower than the call
+     * there, 9-11% more CPU a frame on Drakengard 3's game and render
+     * threads. As one page-table test (ppu_vm_fast.h) it is the faster of the
+     * two by a wide margin -- 81.5 fps against 64.6 in the same battle, the
+     * game thread at 9.9 ms of CPU a frame against 13.6. */
     if (getenv("PT") || getenv("PPU_SLOW_STORES")) g_ppu_vm_slow_stores = 1;
     ppu_vm_slow_any_update();
 }
@@ -2070,6 +2084,20 @@ static uint32_t g_addr[PPU_HASH_SIZE];
 static ppu_fn   g_fn[PPU_HASH_SIZE];
 static uint32_t g_fn_count = 0;
 
+/* A small front for the registry, for ps3_indirect_call. The registry is 3 MB
+ * of tables, so a lookup is two cache misses; the targets a title actually
+ * calls through a pointer in a frame number in the hundreds. Each entry is
+ * one word, read and written whole, so two threads filling a slot cannot
+ * pair one address with the other's function: the guest address above, the
+ * host function as a 32-bit distance from ps3_indirect_call below. Zero is
+ * empty (address 0 is never a function). */
+#define PPU_ICALL_CACHE_BITS 12
+static uint64_t g_icall_cache[1u << PPU_ICALL_CACHE_BITS];
+static inline uint32_t icall_cache_slot(uint32_t a)
+{
+    return (a * 2654435761u) >> (32 - PPU_ICALL_CACHE_BITS);
+}
+
 extern "C" void ppu_register_function(uint64_t addr, ppu_fn fn)
 {
     uint32_t a = (uint32_t)addr;
@@ -2078,7 +2106,11 @@ extern "C" void ppu_register_function(uint64_t addr, ppu_fn fn)
      * count >= PPU_HASH_SIZE) would otherwise spin forever here at startup. */
     for (uint32_t probes = 0; probes < PPU_HASH_SIZE; probes++) {
         if (g_fn[i] == nullptr) { g_addr[i] = a; g_fn[i] = fn; g_fn_count++; return; }
-        if (g_addr[i] == a) { g_fn[i] = fn; return; }   /* overwrite */
+        if (g_addr[i] == a) {                           /* overwrite */
+            g_fn[i] = fn;
+            __atomic_store_n(&g_icall_cache[icall_cache_slot(a)], (uint64_t)0, __ATOMIC_RELAXED);
+            return;
+        }
         i = (i + 1) & PPU_HASH_MASK;
     }
     static int warned = 0;
@@ -2402,6 +2434,28 @@ extern "C" void ppu_dump_bctrl_ring(uint32_t thread_id, const char* tag)
  * the caller trusts, and the damage surfaces far away as a "vtable used as an
  * object" or a double-allocated heap block. Reports the target once each. */
 static void ps3_indirect_call_impl(ppu_context* ctx);
+/* Indirect-call nesting on this thread: the recursion guard of both the fast
+ * path and the full one. */
+static thread_local int s_icall_depth = 0;
+/* -1 undecided, 0 the fast path may be used, 1 always the full path. */
+extern "C" int g_ppu_icall_full = -1;
+/* Is any of the diagnostics that live in the indirect-call path armed? They
+ * are all switched by the environment, read once each where they are used --
+ * some fifteen tests a call. With none armed ps3_indirect_call skips the lot.
+ * The store watches are in the list so that a run hunting a bad write goes
+ * through the full path, call-target stack included. */
+static int icall_diag_armed(void)
+{
+    static const char* const names[] = {
+        "PPU_CSCHECK", "PS3_ICALL_GATE", "BCTRL_RING", "PS3_BREADCRUMB", "PPU_TOCWATCH",
+        "PS3_CALLTRACE", "FLOW_FORCE_RTCFG", "SPURS_TRACE", "PS3_PRX_CALLTRACE", "PPU_TOCFIX",
+        "PPU_RETWATCH", "PPU_ICALL_SLOW",
+        "GCM_PARK_WRITE_LOG", "GCM_PARK_WATCH", "PPU_WVAL", "PPU_WWATCH", "PPU_WW_GUARD", "PT",
+    };
+    for (size_t i = 0; i < sizeof names / sizeof names[0]; i++)
+        if (getenv(names[i])) return 1;
+    return 0;
+}
 /* The impl declares these at block scope; outside an extern "C" function that
  * would give them C++ linkage, so pin it here. */
 extern "C" uint32_t ps3_hle_count(void);
@@ -2454,6 +2508,27 @@ static void icall_hist(ppu_context* ctx, uint32_t tgt, int phase)
 
 extern "C" void ps3_indirect_call(ppu_context* ctx)
 {
+    /* The ordinary call: no diagnostic armed, and a target this path has
+     * resolved before. Everything else -- the first call of a target, a null
+     * or unregistered one, the OPD fixups -- is the full path's.
+     * PPU_ICALL_SLOW=1 takes the full path always. */
+    { if (__builtin_expect(g_ppu_icall_full < 0, 0)) g_ppu_icall_full = icall_diag_armed();
+      if (__builtin_expect(!g_ppu_icall_full, 1)) {
+          const uint32_t addr = (uint32_t)ctx->ctr;
+          const uint64_t e = __atomic_load_n(&g_icall_cache[icall_cache_slot(addr)], __ATOMIC_RELAXED);
+          if (__builtin_expect((uint32_t)(e >> 32) == addr && e != 0 && s_icall_depth <= 4000, 1)) {
+              const ppu_fn fn = (ppu_fn)((intptr_t)(void*)&ps3_indirect_call + (int32_t)(uint32_t)e);
+              s_icall_depth++;
+              fn(ctx);
+              while (g_trampoline_fn) {
+                  void (*tf)(void*) = g_trampoline_fn;
+                  g_trampoline_fn = 0;
+                  tf(ctx);
+              }
+              s_icall_depth--;
+              return;
+          }
+      } }
     static int on = -1;
     if (on < 0) on = getenv("PPU_CSCHECK") ? 1 : 0;
     { static int hg = -1; if (hg < 0) hg = getenv("PS3_ICALL_GATE") ? 1 : 0;
@@ -2734,6 +2809,14 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
     }
 
     ppu_fn fn = ppu_lookup(addr);
+    if (fn) {
+        /* Remember it for ps3_indirect_call's fast path (when the function is
+         * within reach of a 32-bit distance, which in one image it is). */
+        const intptr_t d = (intptr_t)(void*)fn - (intptr_t)(void*)&ps3_indirect_call;
+        if (d == (intptr_t)(int32_t)d && d != 0)
+            __atomic_store_n(&g_icall_cache[icall_cache_slot(addr)],
+                             ((uint64_t)addr << 32) | (uint32_t)(int32_t)d, __ATOMIC_RELAXED);
+    }
     if (!fn) {
         /* OPD-swap clobber fixup: a malformed memcpy (game func_0036FA74) writes
          * some handler/vtable OPDs as {TOC, func} (code & toc SWAPPED), so lifted
@@ -2755,14 +2838,13 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
         /* Recursion-depth guard: a malformed/cyclic jump table (or a tail-call
          * chain that never converges) can dispatch recursively without bound
          * and blow the host stack. Cap the depth, log once, then unwind. */
-        static thread_local int s_depth = 0;
-        if (s_depth > 4000) {
+        if (s_icall_depth > 4000) {
             static int warned = 0;
             if (warned++ < 8)
-                fprintf(stderr, "[ppu] recursion cap @0x%08X depth=%d -- skipping\n", addr, s_depth);
+                fprintf(stderr, "[ppu] recursion cap @0x%08X depth=%d -- skipping\n", addr, s_icall_depth);
             return;
         }
-        s_depth++;
+        s_icall_depth++;
         /* PPU_TOCFIX: the dispatched function's TOC (r2) is the OPD toc we were
          * called with. Tail-call trampoline links (`b target`) are intra-module, so
          * they must all run with THIS same r2. A link that does a cross-module call
@@ -2796,7 +2878,7 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
             fprintf(stderr,"%s\n",ln);
 #endif
           } } }
-        s_depth--;
+        s_icall_depth--;
         return;
     }
     /* Garbage virtual-call guard: a call target that resolves to no registered

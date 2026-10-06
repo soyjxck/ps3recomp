@@ -8,17 +8,28 @@
  * render thread spent ~60% of its time inside those functions.
  *
  * With PPU_INLINE_VM defined for the lifted translation units, ppu_recomp.h
- * maps the accessor names onto these: an ordinary in-range access is one
- * bounds test and a byte-swapped load or store, and anything the slow path
- * exists for still takes it:
+ * maps the accessor names onto these: an ordinary access is one lookup in a
+ * table of 64 KiB pages, one branch, and a byte-swapped load or store.
+ * Anything the slow path exists for clears the page's bit, so it still takes
+ * the function:
  *   - below 0x10000 (null page reports / null-store sweep)
  *   - out of the guest VM (vm_oob)
  *   - the raw SPU window at 0xE0000000 (register side effects)
- *   - a line an SPU holds a reservation on (store side)
+ *   - the page of the GCM ref register (load side; see vm_fast_read32)
+ *   - a page with a line an SPU holds a reservation on (store side; the
+ *     function then tests the line itself)
  *   - any env-armed read or store diagnostic (g_ppu_vm_slow_*), or the
- *     run-time word watch g_ww_dyn
+ *     run-time word watch g_ww_dyn: every page
  * The slow functions keep their full behaviour, so a run with PPU_WWATCH etc.
  * sees exactly what it always did.
+ *
+ * One branch, and not the four or five separate tests this used to be,
+ * because the tests are repeated at every load and store in the lifted code
+ * -- hundreds of thousands of sites -- and each conditional branch at each
+ * site wants its own predictor entry. Measured on Drakengard 3 (x86-64, a
+ * switch flipped every few seconds inside one run): taking the five-test
+ * inline store path instead of calling the function cost the game and render
+ * threads 9-11% MORE CPU per frame, although it executes fewer instructions.
  *
  * The accesses are volatile: guest memory changes under other PPU threads
  * and the SPUs, and a lifted spin on a flag has no call between two loads
@@ -35,17 +46,15 @@
 extern "C" {
 #endif
 extern uint8_t*      vm_base;
-extern uint32_t      ppu_vm_size;          /* 0 = unchecked, as vm_oob treats it */
-extern int           g_spu_coh_armed;      /* an SPU has reserved a line        */
-extern unsigned char g_spu_coh_bitmap[];   /* one bit per 128-byte line         */
-extern uint32_t      g_ww_dyn;             /* word watch armed at run time      */
-extern uint32_t      g_null_sweep_hi;      /* null-store sweep in progress      */
-extern int           g_ppu_vm_slow_reads;  /* a read diagnostic is armed        */
-extern int           g_ppu_vm_slow_stores; /* a store diagnostic is armed       */
-extern uint32_t      ppu_hle_inject_base;  /* GCM control block at +0x2000      */
-/* g_ppu_vm_slow_stores | g_ww_dyn | g_null_sweep_hi, kept by ppu_vm_slow_any_update:
- * a store tests one word instead of three. */
-extern uint32_t      g_ppu_vm_slow_stores_any;
+/* One byte per 64 KiB guest page (defined in spu_coherency.c, which sets the
+ * COH bit; ppu_vm_slow_any_update in ppu_loader.cpp keeps the other two and
+ * has to run after anything they are computed from changes: ppu_vm_size,
+ * ppu_hle_inject_base, g_ppu_vm_slow_reads/_stores, g_ww_dyn, the null-store
+ * sweep). All zero, so every access is slow, until it has run once. */
+extern unsigned char g_ppu_vm_page[65536];
+#define PPU_VM_PAGE_RD   1u   /* loads take the inline path                    */
+#define PPU_VM_PAGE_WR   2u   /* stores do too, unless ...                     */
+#define PPU_VM_PAGE_COH  4u   /* ... an SPU has reserved a line in the page    */
 
 uint8_t  vm_read8_slow (uint64_t addr);
 uint16_t vm_read16_slow(uint64_t addr);
@@ -59,32 +68,26 @@ void     vm_write64_slow(uint64_t addr, uint64_t val);
 }
 #endif
 
-static inline int ppu_vm_fast_ok(uint32_t a, uint32_t n)
+static inline int ppu_vm_load_fast_ok(uint32_t a)
 {
-    if (a < 0x10000u || (a >> 24) == 0xE0u) return 0;
-    return ppu_vm_size == 0 || (uint64_t)a + n <= ppu_vm_size;
+    return g_ppu_vm_page[a >> 16] & PPU_VM_PAGE_RD;
 }
 
-static inline int ppu_vm_store_fast_ok(uint32_t a, uint32_t n)
+static inline int ppu_vm_store_fast_ok(uint32_t a)
 {
-    if (g_ppu_vm_slow_stores_any || !ppu_vm_fast_ok(a, n)) return 0;
-    if (g_spu_coh_armed) {
-        uint32_t line = a >> 7;
-        if ((g_spu_coh_bitmap[line >> 3] >> (line & 7)) & 1u) return 0;
-    }
-    return 1;
+    return (g_ppu_vm_page[a >> 16] & (PPU_VM_PAGE_WR | PPU_VM_PAGE_COH)) == PPU_VM_PAGE_WR;
 }
 
 static inline uint8_t vm_fast_read8(uint64_t ea)
 {
     uint32_t a = (uint32_t)ea;
-    if (__builtin_expect(!g_ppu_vm_slow_reads && ppu_vm_fast_ok(a, 1), 1)) return *(volatile uint8_t*)(vm_base + a);
+    if (__builtin_expect(ppu_vm_load_fast_ok(a), 1)) return *(volatile uint8_t*)(vm_base + a);
     return vm_read8_slow(ea);
 }
 static inline uint16_t vm_fast_read16(uint64_t ea)
 {
     uint32_t a = (uint32_t)ea;
-    if (__builtin_expect(!g_ppu_vm_slow_reads && ppu_vm_fast_ok(a, 2), 1)) {
+    if (__builtin_expect(ppu_vm_load_fast_ok(a), 1)) {
         uint16_t v = *(volatile uint16_t*)(vm_base + a); return __builtin_bswap16(v);
     }
     return vm_read16_slow(ea);
@@ -94,9 +97,9 @@ static inline uint32_t vm_fast_read32(uint64_t ea)
     uint32_t a = (uint32_t)ea;
     /* A read of the GCM ref register is not a plain load: the slow path
      * publishes the next queued RSX fence on it (GCM_REFPOLL), and a title
-     * spinning on it in cellGcmFinish waits forever without that. */
-    if (__builtin_expect(!g_ppu_vm_slow_reads && ppu_vm_fast_ok(a, 4) &&
-                         a != ppu_hle_inject_base + 0x2008u, 1)) {
+     * spinning on it in cellGcmFinish waits forever without that. Its page
+     * has no RD bit. */
+    if (__builtin_expect(ppu_vm_load_fast_ok(a), 1)) {
         uint32_t v = *(volatile uint32_t*)(vm_base + a); return __builtin_bswap32(v);
     }
     return vm_read32_slow(ea);
@@ -104,7 +107,7 @@ static inline uint32_t vm_fast_read32(uint64_t ea)
 static inline uint64_t vm_fast_read64(uint64_t ea)
 {
     uint32_t a = (uint32_t)ea;
-    if (__builtin_expect(!g_ppu_vm_slow_reads && ppu_vm_fast_ok(a, 8), 1)) {
+    if (__builtin_expect(ppu_vm_load_fast_ok(a), 1)) {
         uint64_t v = *(volatile uint64_t*)(vm_base + a); return __builtin_bswap64(v);
     }
     return vm_read64_slow(ea);
@@ -112,25 +115,25 @@ static inline uint64_t vm_fast_read64(uint64_t ea)
 static inline void vm_fast_write8(uint64_t ea, uint8_t v)
 {
     uint32_t a = (uint32_t)ea;
-    if (__builtin_expect(ppu_vm_store_fast_ok(a, 1), 1)) { *(volatile uint8_t*)(vm_base + a) = v; return; }
+    if (__builtin_expect(ppu_vm_store_fast_ok(a), 1)) { *(volatile uint8_t*)(vm_base + a) = v; return; }
     vm_write8_slow(ea, v);
 }
 static inline void vm_fast_write16(uint64_t ea, uint16_t v)
 {
     uint32_t a = (uint32_t)ea;
-    if (__builtin_expect(ppu_vm_store_fast_ok(a, 2), 1)) { *(volatile uint16_t*)(vm_base + a) = __builtin_bswap16(v); return; }
+    if (__builtin_expect(ppu_vm_store_fast_ok(a), 1)) { *(volatile uint16_t*)(vm_base + a) = __builtin_bswap16(v); return; }
     vm_write16_slow(ea, v);
 }
 static inline void vm_fast_write32(uint64_t ea, uint32_t v)
 {
     uint32_t a = (uint32_t)ea;
-    if (__builtin_expect(ppu_vm_store_fast_ok(a, 4), 1)) { *(volatile uint32_t*)(vm_base + a) = __builtin_bswap32(v); return; }
+    if (__builtin_expect(ppu_vm_store_fast_ok(a), 1)) { *(volatile uint32_t*)(vm_base + a) = __builtin_bswap32(v); return; }
     vm_write32_slow(ea, v);
 }
 static inline void vm_fast_write64(uint64_t ea, uint64_t v)
 {
     uint32_t a = (uint32_t)ea;
-    if (__builtin_expect(ppu_vm_store_fast_ok(a, 8), 1)) { *(volatile uint64_t*)(vm_base + a) = __builtin_bswap64(v); return; }
+    if (__builtin_expect(ppu_vm_store_fast_ok(a), 1)) { *(volatile uint64_t*)(vm_base + a) = __builtin_bswap64(v); return; }
     vm_write64_slow(ea, v);
 }
 
