@@ -224,6 +224,15 @@ static u32 s_q_vis[ENG_QUERIES_PER_SLOT];     /* vis counter per query of the li
 static u32 s_clear_argb;
 static u32 s_fallback_depth[8]; static u32 s_fallback_n;
 static u32 s_present_center;                  /* last presented centre pixel, headless */
+static u32 s_stat_tex, s_stat_snap, s_stat_snap_reused, s_stat_buf, s_stat_rt;   /* created since the last RSX_OBJ_STATS line */
+
+/* Released depth-snapshot textures, kept for the next request of the same
+ * size and format: a committed D3D12 resource costs the walker a kernel
+ * round trip to create and another to free, and this title asks for a few
+ * snapshots a frame. */
+#define ENG_SNAP_POOL 64
+static struct { ID3D12Resource* res; DXGI_FORMAT fmt; u32 w, h; u64 fence; D3D12_RESOURCE_STATES state; } s_snap_pool[ENG_SNAP_POOL];
+static u32 s_snap_pool_n;
 
 /* ---- small helpers -------------------------------------------------------- */
 
@@ -490,6 +499,14 @@ static void eng_collect_retired(void)
         const u32 h = s_retired[i];
         if (s_rec_count || !fence_done(s_retired_fence[i])) { s_retired[k] = h; s_retired_fence[k] = s_retired_fence[i]; k++; continue; }
         EngObj* o = &s_obj[h - 1];
+        if (o->kind == OBJ_SNAPSHOT && o->has_rtv && s_snap_pool_n < ENG_SNAP_POOL) {
+            s_snap_pool[s_snap_pool_n].res = o->res; s_snap_pool[s_snap_pool_n].fmt = o->fmt;
+            s_snap_pool[s_snap_pool_n].w = o->w; s_snap_pool[s_snap_pool_n].h = o->h;
+            s_snap_pool[s_snap_pool_n].fence = s_retired_fence[i];
+            s_snap_pool[s_snap_pool_n].state = o->state;
+            s_snap_pool_n++;
+            o->res = NULL;
+        }
         RELEASE(o->res);
         memset(o, 0, sizeof *o);
         s_obj_free[s_obj_free_count++] = h - 1;
@@ -625,6 +642,7 @@ static u32 eng_buffer_wrap(void* user, void* data, u32 bytes)
     memcpy(m, data, bytes);
     CALL(b, Unmap, 0, NULL);
     _aligned_free(data);
+    s_stat_buf++;
     if (s_buf_free_count) s_buf_free_count--; else s_buf_count++;
     s_buf[slot] = b; s_buf_bytes[slot] = bytes; s_buf_retired[slot] = 0;
     return slot + 1;
@@ -671,6 +689,10 @@ static HWND eng_create_window(u32 width, u32 height, const char* title)
     wc.lpfnWndProc = eng_wndproc;
     wc.hInstance = GetModuleHandle(NULL);
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    /* The executable's icon resource (id 101 in the port's app.rc), when it
+     * has one; the default application icon otherwise. */
+    wc.hIcon = LoadIconA(GetModuleHandle(NULL), MAKEINTRESOURCEA(101));
+    wc.hIconSm = wc.hIcon;
     wc.lpszClassName = "ps3recomp_d3d12_engine";
     RegisterClassExA(&wc);
     RECT wr = {0, 0, (LONG)width, (LONG)height};
@@ -957,6 +979,8 @@ static void eng_shutdown(void* user)
     s_stage_cur = -1; s_stage_used = 0;
     for (int i = 0; i < ENG_MAX_SUBMITS; i++) { free(s_sub[i].q_vis); free(s_sub[i].reports); memset(&s_sub[i], 0, sizeof s_sub[i]); }
     s_vs_cb_seq = ~0u; s_vis_npending = 0; s_fallback_n = 0;
+    for (u32 i = 0; i < s_snap_pool_n; i++) RELEASE(s_snap_pool[i].res);
+    s_snap_pool_n = 0;
     s_active = 0;
 }
 
@@ -969,6 +993,7 @@ static u32 eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
     if (!s_dev || !w || !h) return 0;
     const DXGI_FORMAT df = eng_dxgi(fmt);
     ID3D12Resource* t = make_texture(df, w, h, mips, faces, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, NULL);
+    s_stat_tex++;
     const u32 handle = eng_obj_add(t, OBJ_TEXTURE, df, w, h, mips, faces, D3D12_RESOURCE_STATE_COPY_DEST);
     if (handle) eng_write_srv(handle, t, df, mips ? mips : 1, faces, eng_mapping(remap, rsx_fmt));
     return handle;
@@ -1011,6 +1036,7 @@ static u32 eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 h,
     ID3D12Resource* t = make_texture(df, w, h, 1, 1, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
                                      D3D12_RESOURCE_STATE_RENDER_TARGET, &cv);
     const u32 handle = eng_obj_add(t, OBJ_COLOR, df, w, h, 1, 1, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    s_stat_rt++;
     if (!handle) return 0;
     eng_write_srv(handle, t, df, 1, 1, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
     CALL(s_dev, CreateRenderTargetView, t, NULL, obj_rtv(handle));
@@ -1106,10 +1132,23 @@ static u32 eng_depth_snapshot_common(u32 depth, u32 w, u32 h, int packed)
     if (!z || !z->res || !(packed ? s_depth_pack_pso : s_depth_pso)) return 0;
     if (s_rec_count >= ENG_MAX_RECORDS) { s_dropped++; return 0; }
     const DXGI_FORMAT df = packed ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R32_FLOAT;
-    D3D12_CLEAR_VALUE cv = {0}; cv.Format = df;
-    ID3D12Resource* r = make_texture(df, w, h, 1, 1, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
-                                     D3D12_RESOURCE_STATE_RENDER_TARGET, &cv);
-    const u32 dst = eng_obj_add(r, OBJ_SNAPSHOT, df, w, h, 1, 1, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    ID3D12Resource* r = NULL;
+    D3D12_RESOURCE_STATES st = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    for (u32 i = 0; i < s_snap_pool_n; i++) {
+        if (s_snap_pool[i].fmt != df || s_snap_pool[i].w != w || s_snap_pool[i].h != h) continue;
+        r = s_snap_pool[i].res;
+        st = s_snap_pool[i].state;
+        s_snap_pool[i] = s_snap_pool[--s_snap_pool_n];
+        s_stat_snap_reused++;
+        break;
+    }
+    if (!r) {
+        D3D12_CLEAR_VALUE cv = {0}; cv.Format = df;
+        r = make_texture(df, w, h, 1, 1, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                         D3D12_RESOURCE_STATE_RENDER_TARGET, &cv);
+        s_stat_snap++;
+    }
+    const u32 dst = eng_obj_add(r, OBJ_SNAPSHOT, df, w, h, 1, 1, st);
     if (!dst) return 0;
     eng_write_srv(dst, r, df, 1, 1, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
     CALL(s_dev, CreateRenderTargetView, r, NULL, obj_rtv(dst));
@@ -2104,9 +2143,10 @@ static void eng_present(void* user, u32 surface)
     (void)user;
     { static int on = -1; static unsigned n = 0;
       if (on < 0) on = getenv("RSX_OBJ_STATS") ? 1 : 0;
-      if (on && (++n % 600) == 0)
-          fprintf(stderr, "[rsx engine/d3d12] objects: %u slots used, %u free (present %u)\n",
-                  s_obj_count, s_obj_free_count, n); }
+      if (on && (++n % 600) == 0) {
+          fprintf(stderr, "[rsx engine/d3d12] objects: %u slots used, %u free (present %u); per 600 presents: %u textures, %u targets, %u snapshots (+%u reused, pool %u), %u vertex buffers created\n",
+                  s_obj_count, s_obj_free_count, n, s_stat_tex, s_stat_rt, s_stat_snap, s_stat_snap_reused, s_snap_pool_n, s_stat_buf);
+          s_stat_tex = s_stat_rt = s_stat_snap = s_stat_snap_reused = s_stat_buf = 0; } }
     if (!eng_owner(surface)) { eng_submit(0, 0); return; }
     eng_submit(surface, 0);
     eng_dump_frame(surface);

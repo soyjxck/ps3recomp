@@ -52,6 +52,8 @@ extern uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size);
   #include <windows.h>
   #include <mmdeviceapi.h>
   #include <audioclient.h>
+#include <avrt.h>
+#pragma comment(lib, "avrt.lib")
 #ifndef AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
 #define AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM      0x80000000
 #endif
@@ -161,6 +163,7 @@ static mutex_t       s_audio_mutex;
 
 /* Output mix buffer (stereo, one block worth) */
 static float s_mix_buffer[CELL_AUDIO_BLOCK_SAMPLES * 2];
+static unsigned long long g_audio_gaps, g_audio_gap_blocks;   /* AUDIO_GAPS totals */
 
 /* ---------------------------------------------------------------------------
  * Host audio output backend
@@ -284,8 +287,14 @@ static int audio_backend_init(void)
     wfx.nAvgBytesPerSec = wfx.nSamplesPerSec * wfx.nBlockAlign;
     wfx.cbSize          = 0;
 
-    /* Request event-driven mode with a ~20ms buffer */
-    REFERENCE_TIME buf_duration = 200000; /* 20ms in 100ns units */
+    /* Event-driven mode, with an AUDIO_BUF_MS buffer (default 40 ms). The
+     * mixer below keeps it nearly full, so this is how long a scheduling
+     * hiccup -- the mixer or the guest's audio thread held off the CPU --
+     * can last before the device runs dry. 20 ms stuttered on Drakengard 3
+     * under load; the PS3's own output path is several 5.33 ms blocks deep. */
+    long buf_ms = 40;
+    { const char* e = getenv("AUDIO_BUF_MS"); if (e && atol(e) > 0) buf_ms = atol(e); }
+    REFERENCE_TIME buf_duration = (REFERENCE_TIME)buf_ms * 10000; /* 100 ns units */
     s_wasapi_event = CreateEventW(NULL, FALSE, FALSE, NULL);
 
     /* AUTOCONVERTPCM | SRC_DEFAULT_QUALITY: let the shared-mode mixer convert
@@ -455,8 +464,45 @@ static void audio_mix_one_block(void)
         if (level <= 0.0f) level = 1.0f;
         if (level > 1.0f) level = 1.0f;
 
-        /* Read one block at the current read_index */
-        u32 block_idx = (u32)(port->read_index % nblock);
+        /* AUDIO_WRITEPOS=1: where the game writes relative to the index we
+         * publish. Each mix, the blocks that went from cleared to written since
+         * the last mix are counted by (block - published) mod nblock; the
+         * histogram is printed every 1000 writes. This is the game's write
+         * policy, measured, where the gap maps only showed snapshots. */
+        { static int wp = -1; if (wp < 0) wp = getenv("AUDIO_WRITEPOS") ? 1 : 0;
+          if (wp) {
+              static u8 was[CELL_AUDIO_PORT_MAX][32]; static u32 hist[CELL_AUDIO_PORT_MAX][32]; static u32 total[CELL_AUDIO_PORT_MAX];
+              const u32 pub = (u32)(port->read_index % nblock);
+              for (u32 b = 0; b < nblock && b < 32; b++) {
+                  const float* bp = port->buffer + b * CELL_AUDIO_BLOCK_SAMPLES * nch;
+                  int nz = 0;
+                  for (u32 s2 = 0; s2 < CELL_AUDIO_BLOCK_SAMPLES * nch; s2 += 16) if (bp[s2] != 0.0f) { nz = 1; break; }
+                  if (nz && !was[p][b]) { hist[p][(b + nblock - pub) % nblock]++; total[p]++; }
+                  was[p][b] = (u8)nz;
+              }
+              if (total[p] && (total[p] % 1000) == 0) {
+                  fprintf(stderr, "[audio-writepos] port %d (%u blocks): writes land at published+", p, nblock);
+                  for (u32 k = 0; k < nblock && k < 32; k++) if (hist[p][k]) fprintf(stderr, " %u:%u", k, hist[p][k]);
+                  fprintf(stderr, "  (of %u)%c", total[p], 10);
+              }
+          } }
+        /* Read one block at the current read_index -- or AUDIO_LAG_BLOCKS
+         * behind it (default 2 on Windows, 0 elsewhere). The game writes
+         * relative to the read index we publish, so a lag of L means the
+         * block mixed now was due L block-times ago: a producer running up
+         * to L * 5.33 ms late is still heard, at L * 5.33 ms more latency.
+         * Drakengard 3's MultiStream task on Windows wrote 6-15% of its
+         * blocks late in battle with no lag (AUDIO_GAPS=1 counts them). */
+        static int lag = -1;
+        if (lag < 0) { const char* e = getenv("AUDIO_LAG_BLOCKS");
+#ifdef _WIN32
+                       lag = e ? atoi(e) : 2;
+#else
+                       lag = e ? atoi(e) : 0;
+#endif
+                       if (lag < 0) lag = 0; }
+        const u32 lag_b = (u32)lag < nblock - 1u ? (u32)lag : nblock - 2u;
+        u32 block_idx = (u32)((port->read_index + nblock - lag_b) % nblock);
         u32 block_offset = block_idx * CELL_AUDIO_BLOCK_SAMPLES * nch;
         float* src = port->buffer + block_offset;
 
@@ -488,6 +534,9 @@ static void audio_mix_one_block(void)
           if (s_gaps) {
               static u32 run[CELL_AUDIO_PORT_MAX]; static u8 heard[CELL_AUDIO_PORT_MAX];
               static unsigned logged;
+              /* AUDIO_GAPS=<n>: how many gaps to log one by one (default 400);
+               * the totals below keep counting past it. */
+              static unsigned cap = 0; if (!cap) { const char* e = getenv("AUDIO_GAPS"); cap = (e && atoi(e) > 1) ? (unsigned)atoi(e) : 400u; }
               extern uint32_t g_rsx_engine_frame;
               const u32 n = CELL_AUDIO_BLOCK_SAMPLES * nch;
               const u32* w = (const u32*)src;
@@ -495,11 +544,24 @@ static void audio_mix_one_block(void)
               while (k < n && !w[k]) k++;
               if (k == n) run[p]++;
               else {
-                  if (run[p] && run[p] <= 40 && heard[p] && logged++ < 400)
-                      fprintf(stderr, "[audio-gap] port %d: %u block(s) (%.1f ms) not written in time, "
-                              "ending at frame %u\n", p, run[p],
-                              run[p] * CELL_AUDIO_BLOCK_SAMPLES * 1000.0 / CELL_AUDIO_SAMPLE_RATE,
-                              g_rsx_engine_frame);
+                  if (run[p] && run[p] <= 40 && heard[p]) {
+                      g_audio_gaps++; g_audio_gap_blocks += run[p];
+                      if (logged++ < cap) {
+                          /* The ring now: '#' a block with data, '.' cleared, 'R' the one just read. */
+                          char map[40]; u32 b;
+                          for (b = 0; b < nblock && b < 32; b++) {
+                              const float* bp = port->buffer + b * CELL_AUDIO_BLOCK_SAMPLES * nch;
+                              int nz = 0;
+                              for (u32 s2 = 0; s2 < CELL_AUDIO_BLOCK_SAMPLES * nch; s2 += 16) if (bp[s2] != 0.0f) { nz = 1; break; }
+                              map[b] = b == block_idx ? 'R' : (nz ? '#' : '.');
+                          }
+                          map[b] = 0;
+                          fprintf(stderr, "[audio-gap] port %d: %u block(s) (%.1f ms) not written in time, "
+                                  "ending at frame %u; ring [%s] published %u\n", p, run[p],
+                                  run[p] * CELL_AUDIO_BLOCK_SAMPLES * 1000.0 / CELL_AUDIO_SAMPLE_RATE,
+                                  g_rsx_engine_frame, map, (unsigned)(port->read_index % nblock));
+                      }
+                  }
                   run[p] = 0; heard[p] = 1;
               }
           } }
@@ -587,7 +649,17 @@ static void audio_notify_event_queues(void)
 static unsigned __stdcall audio_mix_thread_func(void* arg)
 {
     (void)arg;
-    printf("[cellAudio] Mixing thread started\n");
+    /* The mixer is what keeps the device fed: MMCSS "Pro Audio" puts it in
+     * the scheduler class Windows reserves for audio engines, ahead of every
+     * normal and high-priority thread of the game. AUDIO_MMCSS=0 turns it
+     * off; without avrt (or if it refuses) the thread is TIME_CRITICAL. */
+    { const char* e = getenv("AUDIO_MMCSS");
+      DWORD task_index = 0;
+      HANDLE mm = (e && e[0] == '0') ? NULL : AvSetMmThreadCharacteristicsW(L"Pro Audio", &task_index);
+      if (mm) AvSetMmThreadPriority(mm, AVRT_PRIORITY_HIGH);
+      else SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+      SetThreadDescription(GetCurrentThread(), L"cellAudio mixer");
+      printf("[cellAudio] Mixing thread started (%s)\n", mm ? "MMCSS Pro Audio" : "TIME_CRITICAL"); }
 
     /* Pace to the device clock. The PS3 consumes one block every 5.33 ms;
      * the old Sleep(2)/Sleep(5) loop keyed on a queue depth the 1056-frame
@@ -595,22 +667,44 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
      * dropped the surplus: 20% of the audio thrown away, and a guest mixer
      * (GH3's FMOD) that could not keep ahead of the read index played gaps.
      * With no device, pace on the performance counter instead. */
+    /* One block every 5.33 ms by the clock, as the hardware delivers them.
+     *
+     * Pacing on device room alone mixed in BURSTS: WASAPI drains its buffer
+     * a 10 ms period at a time, so two blocks' worth of room opened at once
+     * and two blocks went out back to back, each with a notify. The title's
+     * notify queue is one event deep (it expects one interrupt per block),
+     * the second event was lost, it wrote one block for the two consumed,
+     * and one block in every seven or eight played as silence: 13% of
+     * Drakengard 3's battle audio missing, a regular crackle, while the Mac
+     * (SDL, one block per callback) was clean. The device buffer is now only
+     * a safety valve: full means our clock runs ahead of the DAC's, so the
+     * schedule slips a block; nearly empty means it runs behind, so the
+     * schedule gains one. */
     LARGE_INTEGER qf, q0; QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&q0);
     unsigned long long blocks = 0;
+    const long long period = (long long)CELL_AUDIO_BLOCK_SAMPLES * qf.QuadPart / CELL_AUDIO_SAMPLE_RATE;
+    HANDLE pace_timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
     while (s_mix_thread_running) {
-        const int room = audio_backend_room();
-        if (room >= 0 && room < CELL_AUDIO_BLOCK_SAMPLES) { audio_backend_wait(); continue; }
-        if (room < 0) {
-            LARGE_INTEGER now; QueryPerformanceCounter(&now);
-            const long long due = q0.QuadPart +
-                (long long)(blocks * CELL_AUDIO_BLOCK_SAMPLES * qf.QuadPart / CELL_AUDIO_SAMPLE_RATE);
-            if (now.QuadPart < due) { Sleep(1); continue; }
-            /* More than 50 ms behind (device just went away, a debugger
-             * stop): drop the backlog instead of mixing it in a burst. */
-            if (now.QuadPart - due > qf.QuadPart / 20)
-                q0.QuadPart = now.QuadPart -
-                    (long long)(blocks * CELL_AUDIO_BLOCK_SAMPLES * qf.QuadPart / CELL_AUDIO_SAMPLE_RATE);
+        LARGE_INTEGER now; QueryPerformanceCounter(&now);
+        const long long due = q0.QuadPart + (long long)blocks * period;
+        if (now.QuadPart < due) {
+            const long long wait_us = (due - now.QuadPart) * 1000000LL / qf.QuadPart;
+            if (wait_us > 1200 && pace_timer) {
+                LARGE_INTEGER rel; rel.QuadPart = -(wait_us - 400) * 10;   /* leave the tail to the spin */
+                SetWaitableTimer(pace_timer, &rel, 0, NULL, NULL, FALSE);
+                WaitForSingleObject(pace_timer, 5);
+            } else {
+                SwitchToThread();
+            }
+            continue;
         }
+        /* More than 50 ms behind (a debugger stop, the device going away):
+         * drop the backlog instead of mixing it in a burst. */
+        if (now.QuadPart - due > qf.QuadPart / 20) q0.QuadPart = now.QuadPart - (long long)blocks * period;
+        const int room = audio_backend_room();
+        if (room >= 0 && room < CELL_AUDIO_BLOCK_SAMPLES) { q0.QuadPart += period; continue; }   /* DAC slower: slip */
+        if (room >= 0 && (UINT32)room >= s_wasapi_buf_frames - CELL_AUDIO_BLOCK_SAMPLES && blocks > 8)
+            q0.QuadPart -= period;                                                                /* DAC faster: gain */
         blocks++;
         /* Mix and submit one block */
         audio_mix_one_block();
@@ -635,7 +729,11 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
             { int nz = 0; for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) if (s_mix_buffer[i] != 0.0f) { nz = 1; break; }
               if (!nz) z++; }
             if (now - t0 >= 5000) {
-                fprintf(stderr, "[audio-rate] %.1f blocks/s (real time 187.5), silent %.1f%%, dropped %.0f frames/s, device buf %u%c",
+                static unsigned long long g0, gb0;
+                fprintf(stderr, "[audio-rate] gaps %llu (%llu blocks, %.1f%% of the window); ",
+                        g_audio_gaps - g0, g_audio_gap_blocks - gb0, n ? 100.0 * (g_audio_gap_blocks - gb0) / n : 0.0);
+                g0 = g_audio_gaps; gb0 = g_audio_gap_blocks;
+                fprintf(stderr, "%.1f blocks/s (real time 187.5), silent %.1f%%, dropped %.0f frames/s, device buf %u%c",
                         n * 1000.0 / (now - t0), n ? 100.0 * z / n : 0.0, (g_audio_dropped - d0) * 1000.0 / (now - t0),
                 #if AUDIO_BACKEND_WASAPI
                         (unsigned)s_wasapi_buf_frames, 10);

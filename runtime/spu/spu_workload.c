@@ -1071,6 +1071,7 @@ static DWORD WINAPI spu_async_thread(LPVOID p) {
      * sys_ppu_thread.c). The thread is this task's alone, so nothing to
      * restore. */
     { const spu_async_job* j = (const spu_async_job*)p;
+      { wchar_t nm[32]; swprintf(nm, 32, L"spu img %d", j->image_id); SetThreadDescription(GetCurrentThread(), nm); }
       const char* list = getenv("SPU_QOS_INTERACTIVE");
       while (list && *list) {
           char* end;
@@ -1520,7 +1521,9 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
      * forever. A task ENTERING WAIT_SIGNAL has by definition drained all work
      * dispatched to it, so advancing the active lanes to the published ticket
      * here is semantically the PM's bookkeeping, batched. Validation gate. */
-    if (getenv("LBP_SYNC_ACK")) {
+    static int s_sync_ack = -1;
+    if (s_sync_ack < 0) s_sync_ack = getenv("LBP_SYNC_ACK") ? 1 : 0;
+    if (s_sync_ack) {
         extern uint32_t g_barrier_sync_watch;
         uint32_t b = g_barrier_sync_watch;
         if (b) {
@@ -1550,7 +1553,9 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
      * kernel resumed the task with "no pending work" -- lets it run its post-wait
      * path (complete its loop / set completion flags) instead of hanging. 0/unset
      * keeps the block-forever behaviour. Reversible, opt-in. */
-    unsigned drain = 0; { const char* e = getenv("LBP_WS_DRAIN"); if (e) { drain = (unsigned)atoi(e); if (!drain) drain = 1; } }
+    static int s_drain = -1;
+    if (s_drain < 0) { const char* e = getenv("LBP_WS_DRAIN"); s_drain = e ? (atoi(e) > 0 ? atoi(e) : 1) : 0; }
+    unsigned drain = (unsigned)s_drain;
     int drained = 0;
     /* Release the global SPU-serial lock while parked so another SPU task can
      * run (and possibly signal us); re-acquired before returning to resume. */

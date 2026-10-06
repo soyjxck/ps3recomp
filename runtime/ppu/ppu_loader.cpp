@@ -1408,8 +1408,17 @@ static void ppu_hotread_init(void)
     g_ppu_vm_slow_stores = (getenv("GCM_PARK_WRITE_LOG") || getenv("PPU_WVAL") || getenv("PPU_WWATCH") ||
                             getenv("PPU_WW_GUARD")) ? 1 : 0;
 #ifdef _WIN32
-    g_ppu_vm_slow_stores = 1;    /* the PT-restore record keeps its view of every store */
+    /* Every store through the slow function on Windows, as before, unless
+     * PPU_FAST_STORES=1. The inline fast path removed vm_write*_slow from the
+     * profile (10-12% of Drakengard 3's main and render threads) and yet three
+     * battle runs with it measured 40-43 fps against 72 fps without, with the
+     * same CPU use: a timing interaction nobody has explained yet (the slow
+     * path's only extra work is the raw-SPU register check, the null-page
+     * trap and the PT-restore record, PT=<hex>). Measured, not understood;
+     * the fast path stays opt-in until it is. */
+    if (!(getenv("PPU_FAST_STORES") && getenv("PPU_FAST_STORES")[0] == '1')) g_ppu_vm_slow_stores = 1;
 #endif
+    if (getenv("PT") || getenv("PPU_SLOW_STORES")) g_ppu_vm_slow_stores = 1;
     ppu_vm_slow_any_update();
 }
 

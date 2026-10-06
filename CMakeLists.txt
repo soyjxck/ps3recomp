@@ -158,6 +158,19 @@ endif()
 find_package(ZLIB REQUIRED)
 target_link_libraries(ps3recomp_runtime PUBLIC ZLIB::ZLIB)
 
+# PS3RECOMP_DEBUG_INFO: debug records in the runtime's objects (clang-cl /Z7,
+# -g elsewhere) so a host profiler or crash handler can name its functions.
+# Codegen is unchanged; only the objects and the final PDB grow.
+option(PS3RECOMP_DEBUG_INFO "Compile the runtime with debug info" OFF)
+if(PS3RECOMP_DEBUG_INFO)
+    if(MSVC)
+        target_compile_options(ps3recomp_runtime PRIVATE /Z7)
+    else()
+        target_compile_options(ps3recomp_runtime PRIVATE -g)
+    endif()
+    message(STATUS "  Debug info:   on")
+endif()
+
 if(APPLE)
     target_link_libraries(ps3recomp_runtime PUBLIC
         "-framework Metal"

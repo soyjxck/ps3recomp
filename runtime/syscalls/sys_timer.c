@@ -240,15 +240,28 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         ppu_log_host_chain("usleep1ms"); } }
 
 #ifdef _WIN32
-    /* Use high-resolution sleep via waitable timer for better precision */
+    /* A high-resolution waitable timer, one per thread and kept: a plain
+     * waitable timer rounds to the scheduler's clock interval (1 ms with
+     * timeBeginPeriod(1), 15.6 ms otherwise, and since Windows 10 2004 the
+     * 1 ms is per process and not always honoured), so a guest audio or
+     * render loop's usleep(1000) could take 2-16 ms. The HIGH_RESOLUTION
+     * flag (Windows 10 1803+) fires within ~0.5 ms regardless; where the
+     * flag is unknown the plain timer is the fallback. Creating and closing
+     * a kernel object per call was also measurable at this title's rate. */
     if (usec >= 1000) {
-        HANDLE timer = CreateWaitableTimerW(NULL, TRUE, NULL);
+        static __declspec(thread) HANDLE timer = NULL;
+        if (!timer) {
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+            timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+            if (!timer) timer = CreateWaitableTimerW(NULL, TRUE, NULL);
+        }
         if (timer) {
             LARGE_INTEGER due;
             due.QuadPart = -((LONGLONG)usec * 10); /* 100ns units, negative = relative */
             SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE);
             WaitForSingleObject(timer, INFINITE);
-            CloseHandle(timer);
         } else {
             Sleep((DWORD)(usec / 1000));
         }
