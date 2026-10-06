@@ -311,6 +311,22 @@ static CellGcmZcullInfo s_zcull[CELL_GCM_MAX_ZCULL_COUNT];
 
 /* Report data area (256 slots, each 16 bytes) */
 static CellGcmReportData s_report_data[CELL_GCM_MAX_REPORT_COUNT];
+/* Occlusion queries the draw engine measures: CLEAR_REPORT_VALUE(ZPASS)
+ * seen since the last GET_REPORT, and which report indices have had a real
+ * count delivered (cellGcm_set_report_value). A measured index keeps its last
+ * count until the next one arrives -- the GPU answers a frame or so later,
+ * the latency a title's occlusion code is built for; one never measured reads
+ * "visible". */
+static volatile int s_zpass_query_open;
+static volatile u8  s_report_measured[CELL_GCM_MAX_REPORT_COUNT];
+
+void cellGcm_set_report_value(u32 index, u32 value)
+{
+    if (index >= CELL_GCM_MAX_REPORT_COUNT) return;
+    s_report_data[index].value = value;
+    s_report_data[index].timestamp = get_timestamp_ns();
+    s_report_measured[index] = 1;
+}
 
 /* Label area (256 labels, each u32). Labels live in GUEST memory so the
  * recompiled game can poll them via vm_read32; cellGcmGetLabelAddress returns a
@@ -2164,16 +2180,23 @@ static void gcm_rsx_process_fifo_unlocked(void)
                      * area. Sample counts are not measured, so a ZPASS query
                      * reports "visible" -- the conservative answer; reading 0
                      * tells the title every queried object is occluded. */
+                    /* NV4097_CLEAR_REPORT_VALUE(ZPASS): the draw engine counts
+                     * the samples of the draws up to the next GET_REPORT. */
+                    if (m == 0x17C8 && vm_read32(dea) == 1u) s_zpass_query_open = 1;
                     if (m == 0x1800) {
                         const u32 v = vm_read32(dea), idx = (v & 0xFFFFFFu) / 16u;
                         /* GCM_REPORT_LOG=1: every report command, uncapped (how
                          * many queries a frame issues, and of which type). */
                         { static int rn = 0, all = -1; if (all < 0) all = getenv("GCM_REPORT_LOG") ? 1 : 0;
                           if (all || rn++ < 6) printf("[GET_REPORT] type=%u idx=%u%c", v >> 24, idx, 10); }
-                        if (idx < CELL_GCM_MAX_REPORT_COUNT) {
+                        const int measured_query = (v >> 24) == 1u && s_zpass_query_open &&
+                                                   rsx_draw_engine_enabled() && !getenv("RSX_NO_QUERIES");
+                        s_zpass_query_open = 0;
+                        if (idx < CELL_GCM_MAX_REPORT_COUNT && !(measured_query && s_report_measured[idx])) {
                             s_report_data[idx].timestamp = get_timestamp_ns();
                             /* GCM_ZPASS_VALUE=<n>: the sample count a ZPASS
-                             * report carries (default 0xFFFF, "visible"). */
+                             * report carries when it is not measured (default
+                             * 0xFFFF, "visible"). */
                             { static long zp = -2; if (zp == -2) { const char* e = getenv("GCM_ZPASS_VALUE"); zp = e ? strtol(e, 0, 0) : 0xFFFF; }
                               s_report_data[idx].value = (v >> 24) == 1u ? (u32)zp : 0u; }
                         }

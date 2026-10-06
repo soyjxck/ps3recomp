@@ -121,6 +121,12 @@ void rsx_fp_set_shadow_units(u32 mask, const u8* funcs);
  * size, so every sample of it scales the coordinate by 1/size. Set from the
  * textures bound at draw time, key the pipeline on it, reset to 0 after. */
 void rsx_fp_set_unnorm_units(u32 mask, const u32 dim[][2]);
+/* Texel conversions for the NEXT decompile call, one word per unit: bits 0-3
+ * convert the R, G, B, A of every sample from sRGB to linear (TEXTURE_ADDRESS
+ * gamma), bits 4-7 expand them from biased unsigned to signed (UNSIGNED_REMAP
+ * BIASED), bit 8 says the format's channels are 16-bit. NULL clears. Set from
+ * the textures bound at draw time, key the pipeline on it, reset after. */
+void rsx_fp_set_texel_ops(const u32* ops);
 int rsx_fp_decompile_ex(const u8* ucode, u32 max_bytes, u32 ctrl,
                         u32 tex_cube_mask, char* out, u32 out_size);
 

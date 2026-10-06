@@ -146,6 +146,8 @@ static struct {
     u32 last_guest_draws;
     u32 last_present_surface;
     u32 last_flip_buffer;
+    u32 q_cur;               /* open occlusion query (backend counter), or 0 */
+    u32 q_attempts, q_draws; /* draws the game issued / the backend counted */
     u32 sink_flips;          /* flips decoded from the FIFO (0xE944), in draw order */
 
     /* staging: decoded texture levels, the constant blocks, the index list */
@@ -959,6 +961,51 @@ static void eng_decode_sampler(u32 filter, u32 wrap, u32 control0,
     if (out->max_lod < out->min_lod) out->max_lod = out->min_lod;
 }
 
+/* Texel conversions per unit for rsx_fp_set_texel_ops: TEXTURE_ADDRESS gamma
+ * (bits 20-23, R G B A) and UNSIGNED_REMAP_BIASED expansion (bits 12-15 == 1),
+ * on the formats the RSX applies them to (RPCS3 get_format_features: gamma
+ * and expansion on the 8-bit and compressed colour formats, expansion alone
+ * on depth, X16, Y16_X16 and HILO8, neither on float formats). Expansion
+ * skips channels the remap fills with a constant and channels gamma already
+ * converts. RSX_NO_TEXEL_OPS=1 turns both off, RSX_NO_TEX_GAMMA=1 gamma only. */
+static u32 eng_texel_ops(u32 ops[16])
+{
+    static int off = -1, no_gamma = -1;
+    if (off < 0) { off = getenv("RSX_NO_TEXEL_OPS") ? 1 : 0; no_gamma = getenv("RSX_NO_TEX_GAMMA") ? 1 : 0; }
+    u32 mask = 0;
+    memset(ops, 0, 16 * sizeof ops[0]);
+    if (off) return 0;
+    for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES && u < 16; u++) {
+        rsx_dsp_texture t;
+        rsx_dsp_get_texture(&g.rsx, u, &t);
+        if (!t.enabled) continue;
+        const u32 base = t.format & RSX_TEX_FMT_BASE_MASK & ~(u32)RSX_TEX_FMT_UNNORM;
+        int can_gamma = 0, can_expand = 0, wide = 0;
+        switch (base) {
+        case 0x81: case 0x82: case 0x83: case 0x84: case 0x85: case 0x86: case 0x87:
+        case 0x88: case 0x8B: case 0x8D: case 0x8E: case 0x8F: case 0x97: case 0x9D: case 0x9E:
+            can_gamma = can_expand = 1; break;
+        case 0x90: case 0x91: case 0x92: case 0x93: case 0x98:
+            can_expand = 1; break;
+        case 0x94: case 0x95:
+            can_expand = 1; wide = 1; break;
+        default: break;
+        }
+        u32 gamma = can_gamma && !no_gamma ? (t.wrap >> 20) & 0xFu : 0u;
+        u32 expand = 0;
+        if (can_expand && ((t.wrap >> 12) & 0xFu) == 1u) {
+            const u32 r = t.remap & 0xFFFFu;
+            const u32 op_r = (r >> 10) & 3u, op_g = (r >> 12) & 3u, op_b = (r >> 14) & 3u, op_a = (r >> 8) & 3u;
+            expand = (op_r == 2u ? 1u : 0u) | (op_g == 2u ? 2u : 0u) | (op_b == 2u ? 4u : 0u) | (op_a == 2u ? 8u : 0u);
+            expand &= ~gamma;
+        }
+        if (!gamma && !expand) continue;
+        ops[u] = gamma | (expand << 4) | (wide ? 0x100u : 0u);
+        mask |= 1u << u;
+    }
+    return mask;
+}
+
 /* ---- pipelines ----------------------------------------------------------- */
 
 static u32 eng_vtex_mask(void)
@@ -1143,6 +1190,8 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     const u32 vtex_mask = eng_vtex_mask();
     u8 shadow_funcs[16];
     const u32 shadow_mask = eng_shadow_units(shadow_funcs);
+    u32 texel_ops[16];
+    const u32 texop_mask = eng_texel_ops(texel_ops);
     /* Texel-addressed units (RSX_TEX_FMT_UNNORM): the decompiler scales their
      * coordinates by 1/size. The D3D12 path patched this in; this engine never
      * did, so every post-process pass that samples a render target in texels
@@ -1189,6 +1238,10 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
             key = eng_fnv1a(&unnorm_mask, sizeof unnorm_mask, key);
             key = eng_fnv1a(unnorm_dim, sizeof unnorm_dim, key);
         }
+        if (texop_mask) {
+            key = eng_fnv1a(&texop_mask, sizeof texop_mask, key);
+            key = eng_fnv1a(texel_ops, sizeof texel_ops, key);
+        }
     }
     key = eng_fnv1a(&layout->mask, sizeof layout->mask, key);
     key = eng_fnv1a(&layout->stride, sizeof layout->stride, key);
@@ -1217,10 +1270,12 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                                          sizeof s_vs_hlsl);
         rsx_fp_set_shadow_units(shadow_mask, shadow_funcs);
         rsx_fp_set_unnorm_units(unnorm_mask, unnorm_dim);
+        rsx_fp_set_texel_ops(texop_mask ? texel_ops : NULL);
         fi = rsx_fp_decompile_buffered_ex(fp_uc, fp_size, fp_ctrl, cube_mask,
                                           s_ps_hlsl, sizeof s_ps_hlsl, &nconst);
         rsx_fp_set_shadow_units(0, NULL);
         rsx_fp_set_unnorm_units(0, NULL);
+        rsx_fp_set_texel_ops(NULL);
         if (unnorm_mask) { static int n = 0; if (n++ < 6)
             fprintf(stderr, "[rsx engine] unnormalised units 0x%X (unit %u %ux%u)\n", unnorm_mask,
                     __builtin_ctz(unnorm_mask), unnorm_dim[__builtin_ctz(unnorm_mask)][0], unnorm_dim[__builtin_ctz(unnorm_mask)][1]); }
@@ -1726,7 +1781,7 @@ static void eng_draw_trace(const char* outcome, u32 prim, int indexed, u32 n_dra
             for (u32 k = 0; k < g.n_zdepths; k++) if (g.zdepths[k].handle && g.zdepths[k].location == t.location && g.zdepths[k].offset == t.offset) zeta = (int)k;
             if (surf >= 0) fprintf(stderr, " [surface s%d fmt%u]", surf, (u32)g.surfaces[surf].fmt);
             if (zeta >= 0) fprintf(stderr, " [zeta z%d]", zeta);
-            fprintf(stderr, " %u:L%u/0x%08X/f%02X/%ux%u/p%u/mips%u/filt%08X/ctl%08X/remap%04X/ea%08X/m%lu", u, t.location, t.offset, t.format, t.width, t.height, t.pitch, t.mipmaps, t.filter, t.control0, t.remap & 0xFFFFu,
+            fprintf(stderr, " %u:L%u/0x%08X/f%02X/%ux%u/p%u/mips%u/filt%08X/ctl%08X/remap%04X/addr%08X/ea%08X/m%lu", u, t.location, t.offset, t.format, t.width, t.height, t.pitch, t.mipmaps, t.filter, t.control0, t.remap & 0xFFFFu, t.wrap,
                     cellGcmResolveLocated(t.location == RSX_LOCATION_LOCAL, t.offset),
                     p ? sum / (row < 4096 ? row : 4096) : 9999ul);
         }
@@ -1794,6 +1849,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
             : dc.n_source_refs - dc.n_source_refs % 3u;
     }
     if (!n_draw) { s_dstat.drop_empty++; eng_draw_trace("DROP-empty", prim, indexed, 0, 0, 0); return; }
+    if (g.q_cur) g.q_attempts++;
 
     rsx_be_render_state rs;
     rsx_draw_engine_decode_render_state(&g.rsx, &rs);
@@ -1993,6 +2049,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
                           rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC_REF) & 0xFFu);
 
     const u32 uploaded = indexed ? dc.n_verts : n_draw;
+    if (g.q_cur && g.be->query_set) { g.be->query_set(g.be->user, g.q_cur); g.q_draws++; }
     g.be->draw(g.be->user, topology, dc.verts, uploaded, layout.stride,
                indexed ? g.indices : NULL, indexed ? n_draw : 0);
     /* Counted only when the draw ran the guest's OWN programs, which is what
@@ -2471,12 +2528,37 @@ void rsx_draw_engine_method(u32 method, u32 arg)
     const int cap = g_rsx_capture_on;
     /* Occlusion-query methods in the draw trace: CLEAR_REPORT_VALUE (0x17C8),
      * GET_REPORT (0x1800), SET_ZPASS_PIXEL_COUNT_ENABLE (0x1D84). */
+    /* Occlusion queries: CLEAR_REPORT_VALUE(ZPASS) opens a counter for the
+     * draws that follow, GET_REPORT(ZPASS) closes it and asks the backend for
+     * its total under that report index (rsx_draw_engine_query_result). The
+     * title never sets ZPASS_PIXEL_COUNT_ENABLE and still expects counts, so
+     * an open query counts regardless. A query whose draws never reached the
+     * backend -- dropped, not drawn -- reports "visible": a bug of ours must
+     * not hide the object. */
+    if (m == 0x17C8u && arg == 1u && g.be->query_begin) {
+        g.q_cur = g.be->query_begin(g.be->user);
+        g.q_attempts = g.q_draws = 0;
+    } else if (m == 0x1800u && (arg >> 24) == 1u && g.q_cur) {
+        const u32 index = (arg & 0xFFFFFFu) / 16u;
+        if (g.q_draws && g.q_draws >= g.q_attempts) g.be->query_report(g.be->user, g.q_cur, index);
+        else rsx_draw_engine_query_result(index, 0xFFFFu);
+        g.q_cur = 0;
+        if (g.be->query_set) g.be->query_set(g.be->user, 0);
+    }
     if ((m == 0x17C8u || m == 0x1800u || m == 0x1D84u) && s_dtrace_frame >= 0 &&
         (long)g.frames >= s_dtrace_frame && (long)g.frames < s_dtrace_frame + 4)
         fprintf(stderr, "[draw-trace] f%u QUERY %s 0x%08X\n", g.frames,
                 m == 0x17C8u ? "CLEAR_REPORT_VALUE" : m == 0x1800u ? "GET_REPORT" : "ZPASS_ENABLE", arg);
     rsx_dispatch_method(&g.rsx, m, arg);
     if (cap) rsx_capture_method(method, arg);
+}
+
+void cellGcm_set_report_value(u32 index, u32 value);   /* cellGcmSys.c */
+void rsx_draw_engine_query_result(u32 report_index, u64 count)
+{
+    static int log = -1; if (log < 0) log = getenv("RSX_QUERY_LOG") ? 1 : 0;
+    if (log) fprintf(stderr, "[query] report %u = %llu\n", report_index, (unsigned long long)count);
+    cellGcm_set_report_value(report_index, count > 0xFFFFFFFFull ? 0xFFFFFFFFu : (u32)count);
 }
 
 void rsx_draw_engine_set_display_buffer(u32 buffer_id, u32 location, u32 offset,

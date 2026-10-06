@@ -2158,9 +2158,22 @@ typedef struct {
     u8    clear_stencil;
     u32   resolve_dst;          /* ENG_REC_DEPTH_RESOLVE target texture */
     u32   resolve_packed;       /* ...into RGBA8 as the D24S8 bytes (eng_depth_pack_fs) */
+    u32   vis;                  /* ENG_REC_DRAW: occlusion counter + 1, or 0 */
 } EngRecord;
 
 static EngRecord s_eng_rec[ENG_MAX_RECORDS];
+
+/* Occlusion queries: one u64 sample counter per query in a shared buffer
+ * that every draw pass names as its visibility result buffer. Counters are
+ * handed out round-robin, far more than a frame uses, so one is never
+ * reused while the GPU may still be writing it; reports wait for their
+ * command buffer and are delivered from its completion handler. */
+#define ENG_VIS_SLOTS 16384u
+static id<MTLBuffer> s_vis_buf;
+static u32 s_vis_next, s_vis_cur;
+typedef struct { u32 slot, index; } EngVisReport;
+static EngVisReport s_vis_pending[4096];
+static u32 s_vis_npending;
 static u32 s_eng_rec_count;
 static u32 s_eng_dropped;
 
@@ -2337,7 +2350,29 @@ static int eng_init(void* user, u32 width, u32 height)
     sd.sAddressMode = MTLSamplerAddressModeClampToEdge;
     sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
     s_eng_point_sampler = [s_dev newSamplerStateWithDescriptor:sd];
+    { static int off = -1; if (off < 0) off = getenv("RSX_NO_QUERIES") ? 1 : 0;
+      if (!off) s_vis_buf = [s_dev newBufferWithLength:ENG_VIS_SLOTS * 8u
+                                               options:MTLResourceStorageModeShared]; }
     return s_eng_point_sampler ? 0 : -1;
+}
+
+static u32 eng_query_begin(void* user)
+{
+    (void)user;
+    if (!s_vis_buf) return 0;
+    const u32 slot = s_vis_next++ % ENG_VIS_SLOTS;
+    ((u64*)[s_vis_buf contents])[slot] = 0;
+    return slot + 1;
+}
+static void eng_query_set(void* user, u32 query) { (void)user; s_vis_cur = query; }
+static void eng_query_report(void* user, u32 query, u32 report_index)
+{
+    (void)user;
+    if (!query || !s_vis_buf) return;
+    if (s_vis_npending >= sizeof s_vis_pending / sizeof s_vis_pending[0]) return;
+    s_vis_pending[s_vis_npending].slot = query - 1;
+    s_vis_pending[s_vis_npending].index = report_index;
+    s_vis_npending++;
 }
 
 static void eng_shutdown(void* user)
@@ -2915,6 +2950,7 @@ static void eng_draw(void* user, rsx_topology topology, const void* vertices,
     r->vertex_count = vertex_count;
     r->ib_off       = ib_off;
     r->index_count  = indices ? index_count : 0;
+    r->vis          = s_vis_cur;
 }
 
 static void eng_clear_color(void* user, u32 surface, const float rgba[4])
@@ -3125,6 +3161,10 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
         if (attach && !zbuf) zbuf = s_depth;
 
         MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        if (s_vis_buf) {
+            rp.visibilityResultBuffer = s_vis_buf;
+            if (@available(macOS 14.0, *)) rp.visibilityResultType = MTLVisibilityResultTypeAccumulate;
+        }
         for (u32 k = 0; k < attach; k++) {
             rp.colorAttachments[k].texture     = tex[k];
             rp.colorAttachments[k].storeAction = MTLStoreActionStore;
@@ -3160,6 +3200,7 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
         }
 
         id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+        u32 cur_vis = 0;
         /* A draw's pipeline declares as many colour attachments as its record
          * named, so a pass that could not bind them all takes its clears and
          * skips those draws rather than encoding a mismatch. */
@@ -3173,6 +3214,14 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
                eng_record_targets_are(&s_eng_rec[i], rt, nrt) &&
                (s_eng_rec[i].depth == depth ||
                 (!s_eng_rec[i].depth && zbuf == s_depth))) {
+            if (s_vis_buf && s_eng_rec[i].vis != cur_vis) {
+                cur_vis = s_eng_rec[i].vis;
+                if (cur_vis)
+                    [enc setVisibilityResultMode:MTLVisibilityResultModeCounting
+                                          offset:(NSUInteger)(cur_vis - 1) * 8u];
+                else
+                    [enc setVisibilityResultMode:MTLVisibilityResultModeDisabled offset:0];
+            }
             eng_encode_draw(enc, &s_eng_rec[i], stage);
             i++;
         }
@@ -3250,6 +3299,22 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
                                       options:MTLResourceStorageModeShared];
         id<MTLCommandBuffer> cb = [s_queue commandBuffer];
         eng_encode_records(cb, stage);
+        if (s_vis_npending && s_vis_buf) {
+            const u32 n = s_vis_npending;
+            EngVisReport* reps = (EngVisReport*)malloc(n * sizeof *reps);
+            if (reps) {
+                memcpy(reps, s_vis_pending, n * sizeof *reps);
+                id<MTLBuffer> vb = s_vis_buf;
+                [cb addCompletedHandler:^(id<MTLCommandBuffer> _unused) {
+                    (void)_unused;
+                    const u64* c = (const u64*)[vb contents];
+                    for (u32 k = 0; k < n; k++)
+                        rsx_draw_engine_query_result(reps[k].index, c[reps[k].slot]);
+                    free(reps);
+                }];
+            }
+            s_vis_npending = 0;
+        }
         if (present_dst && dst) eng_blit_to_display(cb, present_dst, dst);
         if (drawable) [cb presentDrawable:drawable];
         if (windowed_present) {
@@ -3374,6 +3439,9 @@ static const rsx_draw_backend s_engine_backend = {
     .depth_snapshot       = eng_depth_snapshot,
     .depth_snapshot_rgba8 = eng_depth_snapshot_rgba8,
     .color_snapshot       = eng_color_snapshot,
+    .query_begin          = eng_query_begin,
+    .query_set            = eng_query_set,
+    .query_report         = eng_query_report,
     .pipeline_create      = eng_pipeline_create,
     .pipeline_release     = eng_pipeline_release,
     .bind_targets         = eng_bind_targets,

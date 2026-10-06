@@ -157,6 +157,15 @@ typedef struct rsx_draw_backend {
      * when the backend cannot. The engine binds the copy, with the unit's
      * crossbar, in place of the live target. */
     u32  (*color_snapshot)(void* user, u32 surface);
+    /* Occlusion queries (NV4097 ZPASS reports). query_begin returns a fresh
+     * zeroed sample counter (0 when the backend has none); query_set routes
+     * the samples that pass the depth/stencil tests in the following draws
+     * into it (0 stops counting); query_report asks for its total to be
+     * delivered, once the GPU has run those draws, through
+     * rsx_draw_engine_query_result(report_index, count). */
+    u32  (*query_begin)(void* user);
+    void (*query_set)(void* user, u32 query);
+    void (*query_report)(void* user, u32 query, u32 report_index);
 
     /* Pipelines, from the decompilers' HLSL plus the state that selects a
      * variant. This is the one call that hides D3DCompile against glslang
@@ -234,6 +243,9 @@ void rsx_draw_engine_set_default(int on);
 /* A runner with its own RSX IO map supplies its address resolver before init.
  * NULL restores the toolkit's cellGcm mapping. */
 void rsx_draw_engine_set_guest_memory(rsx_vertex_guest_ptr_fn reader, void* user);
+/* A backend's occlusion-query result: the samples that passed for the query
+ * that GET_REPORT named report_index. Forwarded to the GCM report table. */
+void rsx_draw_engine_query_result(u32 report_index, u64 count);
 /* Seed the dispatcher from captured state (tools/rsx_replay). Word counts. */
 void rsx_draw_engine_seed_state(const u32* regs, u32 nregs, const u32* vp, u32 nvp,
                                 const u32* constants, u32 nconst_words);

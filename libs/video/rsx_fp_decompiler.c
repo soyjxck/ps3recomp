@@ -452,6 +452,20 @@ static void fp_coord2(u32 u, const char* xy, char* out, u32 out_size)
         snprintf(out, out_size, "%s", xy);
 }
 
+/* Per-unit texel conversions for the next decompile; see
+ * rsx_fp_set_texel_ops in the header. */
+static u32 s_texop_mask;
+static u32 s_texop[16];
+
+void rsx_fp_set_texel_ops(const u32* ops)
+{
+    s_texop_mask = 0;
+    for (u32 u = 0; u < 16; u++) {
+        s_texop[u] = ops ? ops[u] : 0;
+        if (s_texop[u] & 0xFFu) s_texop_mask |= 1u << u;
+    }
+}
+
 void rsx_fp_set_shadow_units(u32 mask, const u8* funcs)
 {
     s_shadow_mask = mask & 0xFFFFu;
@@ -827,6 +841,15 @@ static int rsx_fp_decompile_internal(
             break;
         }
 
+        /* A unit with texel conversions returns its sample through
+         * rsx_texop<u> (gamma / biased expansion, emitted in the prologue). */
+        if (handled && rhs[0] && ((s_texop_mask >> tex_unit) & 1u) && !((s_shadow_mask >> tex_unit) & 1u) &&
+            (opcode == OP_TEX || opcode == OP_TXP || opcode == OP_TXB || opcode == OP_TXL)) {
+            char wrapped[sizeof rhs];
+            if (snprintf(wrapped, sizeof wrapped, "rsx_texop%u(%s)", tex_unit, rhs) < (int)sizeof wrapped)
+                memcpy(rhs, wrapped, sizeof rhs);
+        }
+
         int has_dest = !(w0 & FP_OUT_NONE);
         if (handled && (has_dest || set_cond)) {
             u32 dst_idx = (w0 & FP_OUT_REG_MASK) >> FP_OUT_REG_SHIFT;
@@ -1075,6 +1098,40 @@ static int rsx_fp_decompile_internal(
                 "    float v = lerp(lerp(p.x, p.y, f.x), lerp(p.z, p.w, f.x), f.y);\n"
                 "    return (float4)v;\n"
                 "}\n", u, tn, tn, tn, tn, tn, op, op, op, op);
+        out_puts(&p, fn);
+    }
+    /* Texel conversions the RSX applies to a sample after the channel remap
+     * (RPCS3 fragment_texture::get_format_ex / _process_texel):
+     *   gamma    TEXTURE_ADDRESS bits 20-23 (R, G, B, A): the channel is
+     *            sRGB-encoded and is read back linear. Unreal Engine 3 sets it
+     *            on its colour textures; sampled raw, every lit surface came
+     *            out too bright and the bloom and light shafts washed the
+     *            picture out to white (RPCS3 fixed the same in March 2018).
+     *   expand   TEXTURE_ADDRESS bits 12-15 == 1 (UNSIGNED_REMAP_BIASED): the
+     *            channel is a biased signed value, (x*255 - 128) / 127 --
+     *            UE3's compressed normal maps rely on it.
+     * s_texop[u]: bits 0-3 gamma (R G B A), 4-7 expand (R G B A), 8 the
+     * format has 16-bit channels. */
+    for (u32 u = 0; u < 16; u++) {
+        if (!((s_texop_mask >> u) & 1u)) continue;
+        const u32 o = s_texop[u];
+        char fn[900]; int n = 0;
+        n += snprintf(fn + n, sizeof fn - n, "float4 rsx_texop%u(float4 v) {\n", u);
+        if (o & 0xFu)
+            n += snprintf(fn + n, sizeof fn - n,
+                "    float4 lin = lerp(v / 12.92, pow(max((v + 0.055) / 1.055, 0.0), 2.4), step(0.04045, v));\n"
+                "    v = lerp(v, lin, float4(%u.0, %u.0, %u.0, %u.0));\n",
+                o & 1u, (o >> 1) & 1u, (o >> 2) & 1u, (o >> 3) & 1u);
+        if (o & 0xF0u)
+            n += snprintf(fn + n, sizeof fn - n,
+                (o & 0x100u)
+                ? "    float4 ex = (floor(v * 65535.0 + 0.5) - 32768.0) / 32767.0;\n"
+                : "    float4 ex = (floor(v * 255.0 + 0.5) - 128.0) / 127.0;\n");
+        if (o & 0xF0u)
+            n += snprintf(fn + n, sizeof fn - n,
+                "    v = lerp(v, ex, float4(%u.0, %u.0, %u.0, %u.0));\n",
+                (o >> 4) & 1u, (o >> 5) & 1u, (o >> 6) & 1u, (o >> 7) & 1u);
+        snprintf(fn + n, sizeof fn - n, "    return v;\n}\n");
         out_puts(&p, fn);
     }
     if (buffered) {
