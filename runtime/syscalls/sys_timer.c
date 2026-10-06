@@ -104,9 +104,19 @@ static void write_be64(uint32_t addr, uint64_t val)
  *
  * r3 = microseconds
  * -----------------------------------------------------------------------*/
+/* Called on every guest usleep before it sleeps, when set, with the guest
+ * return address and the requested time. A guest thread polling with usleep
+ * is usually waiting on something another host thread must produce -- the
+ * port's FIFO walker writing a fence label -- so the hook can wake that
+ * thread, and for a poll it recognises it may do the waiting itself (until
+ * whatever it waits on has had a chance to change, at most `usec`): it then
+ * returns nonzero and the full sleep is skipped. */
+int (*g_lv2_usleep_hook)(uint32_t lr, uint64_t usec) = 0;
+
 int64_t sys_timer_usleep(ppu_context* ctx)
 {
     uint64_t usec = LV2_ARG_U64(ctx, 0);
+    if (g_lv2_usleep_hook && g_lv2_usleep_hook((uint32_t)ctx->lr, usec)) return CELL_OK;
     /* A single sleep longer than a second is almost always a computed delay
      * gone wrong (a negative interval, a timebase in the wrong units) -- and a
      * thread asleep for an hour looks exactly like a hang. Say so. */
@@ -208,6 +218,17 @@ int64_t sys_timer_usleep(ppu_context* ctx)
               fprintf(stderr, "]");
             }
           }
+          /* The label a GPU fence wait polls usually sits behind a pointer
+           * in the object (DoD3's func_008B0C70: *(r30+0x50)). */
+          { const uint32_t o = (uint32_t)ctx->gpr[30];
+            if (vm_base && o >= 0x10000u) {
+              const uint8_t* q = vm_base + o + 0x50u;
+              const uint32_t pa = ((uint32_t)q[0] << 24) | ((uint32_t)q[1] << 16) | ((uint32_t)q[2] << 8) | q[3];
+              uint32_t lab = 0;
+              if (pa >= 0x10000u) { const uint8_t* l = vm_base + pa;
+                  lab = ((uint32_t)l[0] << 24) | ((uint32_t)l[1] << 16) | ((uint32_t)l[2] << 8) | l[3]; }
+              fprintf(stderr, "  *(r30+0x50)=0x%08X -> 0x%08X (r29 target=0x%08X)", pa, lab, (uint32_t)ctx->gpr[29]);
+            } }
           fprintf(stderr, "\n"); fflush(stderr);
         } } }
 

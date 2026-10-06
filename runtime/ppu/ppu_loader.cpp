@@ -3029,6 +3029,10 @@ extern "C" int lv2_try_syscall(ppu_context* ctx);
  * rest are dispatched to the real lv2 table, and only genuinely-unregistered
  * numbers fall through to the return-CELL_OK stub. */
 extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
+extern "C" int ppu_waitprof_on(void);
+extern "C" uint64_t ppu_waitprof_now(void);
+extern "C" void ppu_waitprof_add(unsigned tid, unsigned site, unsigned sc,
+                                 const char* name, uint64_t ns);
 /* In-flight lv2 syscall per guest thread; 0 = not in a syscall. See the guard
  * in lv2_syscall() below. */
 #define PS3_SC_INFLIGHT_MAX 64
@@ -3064,7 +3068,13 @@ extern "C" void lv2_syscall(ppu_context* ctx)
     /* Guest-PC breadcrumb for the sampling profiler: record the syscall
      * callsite (lr) in the runtime-side thread info. cia itself is the thread
      * entry OPD (load-bearing for the entry trampoline) -- do not touch it. */
-    ppu_prof_stamp(ctx, ppu_prof_resolve_host(__builtin_return_address(0)));
+    const unsigned _site = ppu_prof_resolve_host(__builtin_return_address(0));
+    ppu_prof_stamp(ctx, _site);
+    /* PPU_WAITPROF (ppu_hle.cpp): time inside this syscall, by call site. */
+    struct _WpGuard { unsigned tid, site, sc; uint64_t t0;
+        ~_WpGuard() { if (t0) ppu_waitprof_add(tid, site, sc, nullptr, ppu_waitprof_now() - t0); }
+    } _wg{ (unsigned)ctx->thread_id, _site ? _site : (unsigned)ctx->lr, (unsigned)num,
+           ppu_waitprof_on() ? ppu_waitprof_now() : 0 };
     /* PS3_SCTRACE_TID: trace every lv2 syscall made by the loader/worker thread
      * (tid=1) so we can see what it does AFTER receiving its q=1 event and why
      * it never registers handlers / loads assets. */

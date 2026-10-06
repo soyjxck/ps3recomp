@@ -179,6 +179,92 @@ static void ps3_hle_unresolved(uint32_t nid, ppu_context* ctx)
 
 extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
+
+/* ---- wait profiler -------------------------------------------------------
+ * PPU_WAITPROF=1: the time guest threads spend inside lv2 syscalls and HLE
+ * calls, by thread, call and guest call site, printed every 5 s by the frame
+ * clock (ppu_waitprof_report). A frame rate that no thread is busy enough to
+ * explain is a chain of waits; this names its links. Nested calls (an HLE
+ * call that runs a guest callback that makes another) count in both. */
+#include <mutex>
+#include <chrono>
+#include <algorithm>
+#include <vector>
+namespace {
+struct WaitProfEntry { unsigned tid, site, sc; const char* name; uint64_t ns, n; };
+WaitProfEntry s_wp[4096];
+std::mutex    s_wp_mu;
+thread_local const char* tl_wp_name = nullptr;
+}
+extern "C" int ppu_waitprof_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("PPU_WAITPROF") ? 1 : 0;
+    return on;
+}
+extern "C" uint64_t ppu_waitprof_now(void)
+{
+    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+extern "C" void ppu_waitprof_add(unsigned tid, unsigned site, unsigned sc,
+                                 const char* name, uint64_t ns)
+{
+    uint64_t h = ((uint64_t)tid * 0x9E3779B97F4A7C15ull) ^ ((uint64_t)site * 0xC2B2AE3D27D4EB4Full) ^
+                 ((uint64_t)sc << 17) ^ (uint64_t)(uintptr_t)name;
+    h ^= h >> 29;
+    std::lock_guard<std::mutex> lk(s_wp_mu);
+    for (unsigned probe = 0; probe < 4096; probe++) {
+        WaitProfEntry& e = s_wp[(h + probe) & 4095];
+        if (!e.n) { e.tid = tid; e.site = site; e.sc = sc; e.name = name; }
+        else if (e.tid != tid || e.site != site || e.sc != sc || e.name != name) continue;
+        e.ns += ns; e.n++;
+        return;
+    }
+}
+extern "C" int ppu_prof_snapshot(int idx, unsigned* tid, unsigned* cia, const char** name);
+static const char* wp_syscall_name(unsigned sc)
+{
+    switch (sc) {
+    case 82: return "sys_event_flag_wait"; case 95: return "sys_lwmutex_lock(sc)";
+    case 100: return "sys_mutex_lock"; case 107: return "sys_cond_wait";
+    case 113: return "sys_lwcond_queue_wait"; case 114: return "sys_semaphore_wait";
+    case 130: return "sys_event_queue_receive"; case 141: return "sys_timer_usleep";
+    case 142: return "sys_timer_sleep"; case 120: return "sys_rwlock_rlock";
+    case 122: return "sys_rwlock_wlock"; case 44: return "sys_ppu_thread_join";
+    default: return nullptr;
+    }
+}
+extern "C" void ppu_waitprof_report(double window_s)
+{
+    std::vector<WaitProfEntry> v;
+    {
+        std::lock_guard<std::mutex> lk(s_wp_mu);
+        for (auto& e : s_wp) if (e.n) { v.push_back(e); e = WaitProfEntry{}; }
+    }
+    std::sort(v.begin(), v.end(), [](const WaitProfEntry& a, const WaitProfEntry& b) { return a.ns > b.ns; });
+    fprintf(stderr, "[waitprof] ---- %.1f s: time inside syscalls/HLE by thread, call, guest site ----\n", window_s);
+    { uint64_t per[64] = {0};
+      for (auto& e : v) if (e.tid < 64) per[e.tid] += e.ns;
+      char line[1024]; int o = snprintf(line, sizeof line, "[waitprof] per thread (ms/s):");
+      for (unsigned t = 1; t < 64 && o < (int)sizeof line - 40; t++)
+          if (per[t]) o += snprintf(line + o, sizeof line - o, " %u=%.0f", t, (double)per[t] / 1e6 / window_s);
+      fprintf(stderr, "%s\n", line); }
+    for (size_t i = 0; i < v.size() && i < 30; i++) {
+        const WaitProfEntry& e = v[i];
+        const double ms_per_s = (double)e.ns / 1e6 / window_s;
+        if (ms_per_s < 5.0) break;
+        unsigned t2 = 0, cia = 0; const char* tn = "?";
+        if (e.tid >= 1) ppu_prof_snapshot((int)e.tid - 1, &t2, &cia, &tn);
+        char sc[48];
+        const char* call = e.name;
+        if (!call) { const char* n = wp_syscall_name(e.sc); if (n) call = n; else { snprintf(sc, sizeof sc, "syscall %u", e.sc); call = sc; } }
+        fprintf(stderr, "[waitprof] tid %2u %-24.24s %-28.28s site %08X  %6.1f ms/s  %7llu calls  %8.1f us avg\n",
+                e.tid, tn ? tn : "?", call, e.site, ms_per_s, (unsigned long long)e.n,
+                (double)e.ns / 1e3 / (double)e.n);
+    }
+}
+
 extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 {
     /* HLE_BT_EVERY=<n>: dump the calling thread's guest stack every nth HLE
@@ -240,7 +326,19 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
         return;
     }
     /* Guest-PC breadcrumb for the sampling profiler (see lv2_syscall). */
-    ppu_prof_stamp(ctx, ppu_prof_resolve_host(__builtin_return_address(0)));
+    const unsigned _site = ppu_prof_resolve_host(__builtin_return_address(0));
+    ppu_prof_stamp(ctx, _site);
+    /* PPU_WAITPROF: nothing below touches the thread-local name when it is off
+     * -- on macOS every thread-local access is a call, on every HLE call. */
+    const int _wp_on = ppu_waitprof_on();
+    struct _WpGuard { unsigned tid, site; uint64_t t0; const char* prev; int on;
+        ~_WpGuard() { if (!on) return;
+                      ppu_waitprof_add(tid, site, 0, tl_wp_name ? tl_wp_name : "(hle)",
+                                       ppu_waitprof_now() - t0);
+                      tl_wp_name = prev; }
+    } _wg{ (unsigned)ctx->thread_id, _site, _wp_on ? ppu_waitprof_now() : 0,
+           _wp_on ? tl_wp_name : nullptr, _wp_on };
+    if (_wp_on) tl_wp_name = nullptr;
     g_last_hle_nid = nid;
     /* Stamp the NAME here too, not only where a handler is found below.
      *
@@ -634,7 +732,9 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
             g_last_hle_name = g_ctx[i].name;
             { unsigned t = (unsigned)ctx->thread_id;
               if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = g_ctx[i].name; }
+            const char* _call_name = g_ctx[i].name;
             g_ctx[i].fn(ctx);
+            if (_wp_on) tl_wp_name = _call_name;   /* after: nested HLE resets it */
             { unsigned t = (unsigned)ctx->thread_id;
               if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = nullptr; }
             return;
@@ -710,6 +810,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
         return;
     }
     g_last_hle_name = e->name;
+    if (_wp_on) tl_wp_name = e->name;
     ps3_msf("hle:%s", e->name);
     { unsigned t = (unsigned)ctx->thread_id;
       if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = e->name; }
