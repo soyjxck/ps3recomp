@@ -48,6 +48,7 @@
  */
 #import <Metal/Metal.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <os/lock.h>
 #import <QuartzCore/CAMetalLayer.h>
 #if !TARGET_OS_IPHONE
@@ -3706,6 +3707,22 @@ static void eng_dump_frame(id<MTLTexture> src)
      * itself, and unsets it for the presents it does not want. */
     const char* path = getenv("RSX_REPLAY_DUMP_PATH");
     char seqpath[1024];
+    /* PS3RECOMP_METAL_FRAME_GRAB=<prefix>: a screenshot on request -- when
+     * <prefix>.req exists, the next present is written to <prefix>.ppm (via a
+     * rename, so a reader never sees half a file) and the request removed.
+     * tools/autoplay.sh asks for one to see whether the battle HUD is up. */
+    static const char* grab = (const char*)1;
+    if (grab == (const char*)1) { grab = getenv("PS3RECOMP_METAL_FRAME_GRAB"); if (grab && !*grab) grab = NULL; }
+    char grab_req[1024], grab_tmp[1024], grab_out[1024];
+    int grabbing = 0;
+    if ((!path || !*path) && grab) {
+        snprintf(grab_req, sizeof grab_req, "%s.req", grab);
+        if (access(grab_req, F_OK) == 0) {
+            snprintf(grab_tmp, sizeof grab_tmp, "%s.ppm.tmp", grab);
+            snprintf(grab_out, sizeof grab_out, "%s.ppm", grab);
+            path = grab_tmp; grabbing = 1;
+        }
+    }
     if (!path || !*path) {
         path = getenv("PS3RECOMP_METAL_FRAME_DUMP");
         if (!path || !*path) return;
@@ -3735,14 +3752,25 @@ static void eng_dump_frame(id<MTLTexture> src)
     FILE* f = fopen(path, "wb");
     if (f) {
         fprintf(f, "P6\n%zu %zu\n255\n", w, h);
-        int bgra = [src pixelFormat] == MTLPixelFormatBGRA8Unorm;
-        for (size_t p = 0; p < w * h; ++p) {
-            unsigned char rgb[3] = {rgba[p*4 + (bgra ? 2 : 0)], rgba[p*4+1],
-                                    rgba[p*4 + (bgra ? 0 : 2)]};
-            fwrite(rgb, 1, 3, f);
+        const int bgra = [src pixelFormat] == MTLPixelFormatBGRA8Unorm;
+        /* One write: a byte triple per fwrite call took tens of ms a frame. */
+        unsigned char* rgb = (unsigned char*)malloc(w * h * 3);
+        if (rgb) {
+            for (size_t p = 0; p < w * h; ++p) {
+                rgb[p*3 + 0] = rgba[p*4 + (bgra ? 2 : 0)];
+                rgb[p*3 + 1] = rgba[p*4 + 1];
+                rgb[p*3 + 2] = rgba[p*4 + (bgra ? 0 : 2)];
+            }
+            fwrite(rgb, 1, w * h * 3, f);
+            free(rgb);
         }
         fclose(f);
-        fprintf(stderr, "[rsx engine/metal] captured frame to %s\n", path);
+        if (grabbing) {
+            rename(grab_tmp, grab_out);
+            unlink(grab_req);
+        } else {
+            fprintf(stderr, "[rsx engine/metal] captured frame to %s\n", path);
+        }
     }
     free(rgba);
 }

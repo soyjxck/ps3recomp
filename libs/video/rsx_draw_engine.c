@@ -1771,7 +1771,11 @@ static void eng_vc_store(u64 key, const EngVCFill* f, const u8* verts,
     /* A large entry lives in a buffer of its own that the GPU reads in place,
      * where a small one is copied into the per-submit arena with the rest. */
 #ifndef _WIN32
-    if (vb + ib >= ENG_VC_GPU_MIN && g.be->buffer_wrap && g.be->draw_buffer &&
+    /* RSX_VCACHE_GPU_MIN=<bytes>: the smallest entry given a buffer of its own. */
+    static size_t gpu_min = 0;
+    if (!gpu_min) { const char* e = getenv("RSX_VCACHE_GPU_MIN");
+                    gpu_min = e ? (size_t)strtoull(e, 0, 0) : ENG_VC_GPU_MIN; if (!gpu_min) gpu_min = 1; }
+    if (vb + ib >= gpu_min && g.be->buffer_wrap && g.be->draw_buffer &&
         g.be->buffer_release) {
         const size_t page = (size_t)getpagesize();
         ib_off = (u32)((vb + 255u) & ~(size_t)255u);
