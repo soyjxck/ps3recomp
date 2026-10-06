@@ -2947,6 +2947,29 @@ static void eng_present(u32 buffer_id)
     }
     g.last_present_surface = target;
     g.be->present(g.be->user, g.surfaces[target].handle);
+    /* Every 5 s: presents per second and frame times, worst included -- the
+     * numbers a player feels. RSX_FRAMETIME=0 turns the line off. */
+    { static int on = -1; static double win_start, last, worst, first; static u32 n, slow;
+      if (on < 0) { const char* e = getenv("RSX_FRAMETIME"); on = !(e && e[0] == '0'); }
+      if (on) {
+          struct timespec ts; timespec_get(&ts, TIME_UTC);
+          const double now = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+          if (last > 0.0) {
+              const double ft = (now - last) * 1000.0;
+              if (ft > worst) worst = ft;
+              if (ft > 34.0) slow++;
+              n++;
+          } else {
+              win_start = first = now;
+          }
+          last = now;
+          if (now - win_start >= 5.0 && n) {
+              const double span = now - win_start;
+              fprintf(stderr, "[frametime] t=%.0fs %.1f fps, mean %.1f ms, worst %.1f ms, %u of %u frames over 34 ms\n",
+                      now - first, n / span, span * 1000.0 / n, worst, slow, n);
+              win_start = now; worst = 0.0; n = 0; slow = 0;
+          }
+      } }
     g.q_unflushed = 0;   /* the present's command buffer carries them */
     eng_surface_dump_frame();
     /* RSX_PRESENT_LOG=<from frame>: one line per present from that frame on:

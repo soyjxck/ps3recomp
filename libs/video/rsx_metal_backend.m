@@ -2377,6 +2377,8 @@ static MTLPixelFormat eng_pixel_format(rsx_be_format f)
 /* ---- staging ------------------------------------------------------------- */
 
 static void eng_encode_and_commit(id<MTLTexture> present_dst);
+static void eng_commit_async(void);
+static id<MTLCommandBuffer> s_eng_last_async_cb;
 
 /* A committed arena, back from the GPU. */
 static void eng_stage_release(id<MTLBuffer> b)
@@ -2497,6 +2499,7 @@ static void eng_shutdown(void* user)
     memset(s_eng_obj_retired, 0, sizeof s_eng_obj_retired);
     s_eng_pipe_count = s_eng_func_count = s_eng_samp_count = s_eng_view_count = 0;
     s_eng_rec_count = 0;
+    s_eng_last_async_cb = nil;
     for (u32 i = 0; i < s_eng_buf_count; i++) s_eng_buf[i] = nil;
     memset(s_eng_buf_retired, 0, sizeof s_eng_buf_retired);
     s_eng_buf_count = s_eng_buf_free_count = 0;
@@ -2986,6 +2989,18 @@ static void eng_bind_targets(void* user, const u32* surfaces, u32 count,
 {
     (void)user;
     if (count > RSX_BE_MAX_COLOR_TARGETS) count = RSX_BE_MAX_COLOR_TARGETS;
+    /* RSX_EARLY_COMMIT=<records>: at a pass boundary with at least this many
+     * records waiting, commit them now (eng_commit_async). Off by default: it
+     * moved six pixels of one regression frame by 1-3 levels for a reason not
+     * yet understood, and the live gain was within the noise. The draw's own
+     * constants are staged after this, into the next arena. */
+    { static u32 thresh = ~0u;
+      if (thresh == ~0u) { const char* e = getenv("RSX_EARLY_COMMIT"); thresh = e ? (u32)atoi(e) : 0u; }
+      if (thresh && s_eng_rec_count >= thresh) {
+          int same = s_eng_pending.nrt == count && s_eng_pending.depth == depth;
+          for (u32 i = 0; same && i < count; i++) same = s_eng_pending.rt[i] == surfaces[i];
+          if (!same) eng_commit_async();
+      } }
     for (u32 i = 0; i < RSX_BE_MAX_COLOR_TARGETS; i++)
         s_eng_pending.rt[i] = (i < count) ? surfaces[i] : 0;
     s_eng_pending.nrt   = count;
@@ -3516,6 +3531,75 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
  * in-flight semaphore instead, the same bound the vtable path uses, because
  * waiting on every frame is the one pattern where a driver cannot hide its
  * encoding work. */
+/* RSX_GPU_TIME=1: the GPU time of the engine's command buffers, and how many
+ * there were, summed over every 60 presents. */
+static void eng_gpu_time_hook(id<MTLCommandBuffer> cb, int pres)
+{
+    static int on = -1; if (on < 0) on = getenv("RSX_GPU_TIME") ? 1 : 0;
+    if (!on) return;
+    static double acc; static unsigned ncb, npres;
+    static os_unfair_lock lk = OS_UNFAIR_LOCK_INIT;
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
+        os_unfair_lock_lock(&lk);
+        acc += [c GPUEndTime] - [c GPUStartTime]; ncb++;
+        if (pres && ++npres % 60 == 0) {
+            fprintf(stderr, "[gpu-time] %u presents: %.2f ms GPU per present, %.1f command buffers per present\n",
+                    npres, acc * 1000.0 / 60.0, ncb / 60.0);
+            acc = 0; ncb = 0;
+        }
+        os_unfair_lock_unlock(&lk);
+    }];
+}
+
+/* Hand the GPU what has been recorded so far without waiting for it, so it
+ * renders the start of a frame while the walker records the rest; a query
+ * fence or a present then waits only for the tail. Occlusion reports stay
+ * pending for the next ordinary submit, which reads them once this one has
+ * completed as well. */
+static void eng_commit_async(void)
+{
+    @autoreleasepool {
+        if (!s_eng_rec_count) return;
+        id<MTLBuffer> stage = nil;
+        if (s_eng_stage_used) {
+            stage = s_eng_stage_buf;
+            s_eng_stage_buf = nil;
+            s_eng_stage = NULL;
+            s_eng_stage_cap = 0;
+        }
+        /* Clears recorded after the last draw belong to the pass the next
+         * draw opens: they stay behind, to be folded into its load actions. */
+        u32 keep_from = s_eng_rec_count;
+        while (keep_from > 0 && s_eng_rec[keep_from - 1].kind != ENG_REC_DRAW &&
+               (s_eng_rec[keep_from - 1].kind == ENG_REC_CLEAR_COLOR ||
+                s_eng_rec[keep_from - 1].kind == ENG_REC_CLEAR_DS))
+            keep_from--;
+        const u32 n_keep = s_eng_rec_count - keep_from;
+        s_eng_rec_count = keep_from;
+        s_eng_submit_seq++;
+        id<MTLCommandBuffer> cb = [s_queue commandBuffer];
+        eng_gpu_time_hook(cb, 0);
+        eng_encode_records(cb, stage);
+        if (n_keep) memmove(&s_eng_rec[0], &s_eng_rec[keep_from], n_keep * sizeof s_eng_rec[0]);
+        if (stage)
+            [cb addCompletedHandler:^(id<MTLCommandBuffer> _unused) {
+                (void)_unused;
+                eng_stage_release(stage);
+            }];
+        [cb commit];
+        s_eng_last_async_cb = cb;
+        if (s_eng_dropped) {
+            fprintf(stderr, "[rsx engine/metal] dropped %u record(s) (cap %d)\n",
+                    s_eng_dropped, ENG_MAX_RECORDS);
+            s_eng_dropped = 0;
+        }
+        s_eng_rec_count  = n_keep;
+        s_eng_stage_used = 0;
+        eng_collect_retired_objects();  /* both wait while records remain */
+        eng_collect_retired_buffers();
+    }
+}
+
 static void eng_encode_and_commit(id<MTLTexture> present_dst)
 {
     @autoreleasepool {
@@ -3547,25 +3631,12 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
         }
         s_eng_submit_seq++;
         id<MTLCommandBuffer> cb = [s_queue commandBuffer];
-        /* RSX_GPU_TIME=1: the GPU time of the engine's command buffers, and
-         * how many there were, summed over every 60 presents. */
-        { static int on = -1; if (on < 0) on = getenv("RSX_GPU_TIME") ? 1 : 0;
-          if (on) {
-              static double acc; static unsigned ncb, npres;
-              static os_unfair_lock lk = OS_UNFAIR_LOCK_INIT;
-              const int pres = present_dst != nil;
-              [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
-                  os_unfair_lock_lock(&lk);
-                  acc += [c GPUEndTime] - [c GPUStartTime]; ncb++;
-                  if (pres && ++npres % 60 == 0) {
-                      fprintf(stderr, "[gpu-time] %u presents: %.2f ms GPU per present, %.1f command buffers per present\n",
-                              npres, acc * 1000.0 / 60.0, ncb / 60.0);
-                      acc = 0; ncb = 0;
-                  }
-                  os_unfair_lock_unlock(&lk);
-              }];
-          } }
+        eng_gpu_time_hook(cb, present_dst != nil);
         eng_encode_records(cb, stage);
+        /* Early commits went ahead of this one; reports below are read only
+         * once they are done too. */
+        id<MTLCommandBuffer> prior = s_eng_last_async_cb;
+        s_eng_last_async_cb = nil;
         /* Occlusion reports: a windowed present delivers them from the
          * completion handler; a synchronous submit (no present, or headless)
          * delivers them on this thread after the wait, so the caller -- the
@@ -3580,6 +3651,7 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
                     id<MTLBuffer> vb = s_vis_buf;
                     [cb addCompletedHandler:^(id<MTLCommandBuffer> _unused) {
                         (void)_unused;
+                        if (prior) [prior waitUntilCompleted];
                         const u64* c = (const u64*)[vb contents];
                         for (u32 k = 0; k < n; k++)
                             rsx_draw_engine_query_result(reps[k].index, c[reps[k].slot]);
@@ -3604,6 +3676,7 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
         } else {
             [cb commit];
             [cb waitUntilCompleted];
+            if (prior) [prior waitUntilCompleted];
             if (stage) eng_stage_release(stage);
             if (sync_reps) {
                 const u64* c = (const u64*)[s_vis_buf contents];
