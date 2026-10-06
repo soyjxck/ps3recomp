@@ -20,6 +20,11 @@
 #include <string.h>
 #include <stdint.h>
 
+/* Environment switches are read where they are used, some of them per call:
+ * answer from the pointer-keyed cache (ps3emu/env_cache.h). */
+#include "ps3emu/env_cache.h"
+#define getenv(name) ps3_env(name)
+
 /* Bridge the real (BE) taskset EA + selected taskId from CreateTask to the image-22
  * SPU dispatch (spu_workload.c), so spurs_pm_build_context can build the leaf's
  * SpursTasksetContext from the real taskset. Set right before dispatch_async (the PPU

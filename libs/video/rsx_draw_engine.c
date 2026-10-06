@@ -28,6 +28,11 @@
 #endif
 #include <string.h>
 
+/* Environment switches are read where they are used, some of them per call:
+ * answer from the pointer-keyed cache (ps3emu/env_cache.h). */
+#include "ps3emu/env_cache.h"
+#define getenv(name) ps3_env(name)
+
 /* Guest memory and the RSX offset resolvers, declared the way every backend
  * that reads guest data declares them (rsx_vertex_fetch.h). */
 extern u8* vm_base;

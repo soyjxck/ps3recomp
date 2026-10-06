@@ -9,6 +9,11 @@
 #include <string.h>
 #include <stdlib.h>      /* getenv (else the pointer return is truncated to int) */
 
+/* Environment switches are read where they are used, some of them per call:
+ * answer from the pointer-keyed cache (ps3emu/env_cache.h). */
+#include "ps3emu/env_cache.h"
+#define getenv(name) ps3_env(name)
+
 /* ---------------------------------------------------------------------------
  * Globals
  * -----------------------------------------------------------------------*/

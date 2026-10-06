@@ -14,6 +14,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* Environment switches are read where they are used, some of them per call:
+ * answer from the pointer-keyed cache (ps3emu/env_cache.h). */
+#include "ps3emu/env_cache.h"
+#define getenv(name) ps3_env(name)
 #ifdef _WIN32
 #include <windows.h>
 #else

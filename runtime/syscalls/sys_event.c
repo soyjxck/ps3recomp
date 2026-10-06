@@ -10,6 +10,11 @@
 #include <string.h>
 #include <stdlib.h>               /* getenv */
 
+/* Environment switches are read where they are used, some of them per call:
+ * answer from the pointer-keyed cache (ps3emu/env_cache.h). */
+#include "ps3emu/env_cache.h"
+#define getenv(name) ps3_env(name)
+
 /* Recorded by sys_spu_thread_initialize (lv2_register.c): the SPURS kernel
  * context EA the title's SPU task runtime is dispatched against. */
 uint32_t g_ydkj_spurs_ctx_ea = 0;

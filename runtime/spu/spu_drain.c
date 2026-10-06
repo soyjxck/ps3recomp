@@ -200,6 +200,11 @@ void spu_img_restore(spu_context* ctx, int32_t saved_img)
 #include <stdio.h>
 #include <stdlib.h>
 
+/* Environment switches are read where they are used, some of them per call:
+ * answer from the pointer-keyed cache (ps3emu/env_cache.h). */
+#include "ps3emu/env_cache.h"
+#define getenv(name) ps3_env(name)
+
 /* ---- Deferred DMA-list stall-and-notify delivery --------------------------
  * Real MFC hardware processes a queued list command (the WWS job manager's
  * barriered null list, MFC_GETLB) ASYNCHRONOUSLY: the stall-and-notify -- and

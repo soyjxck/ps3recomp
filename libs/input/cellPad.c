@@ -194,13 +194,24 @@ static void pad_poll_keyboard(void)
 
 static void pad_poll_xinput(void)
 {
+    /* An empty slot is re-probed once a second, not on every sweep. Asking
+     * XInput about a slot with nothing plugged in makes it enumerate devices
+     * (DeviceIoControl, DevObjEnumDeviceInfo): the sweep of empty slots every
+     * 4 ms was 4-11% of the wait samples of Drakengard 3's main thread, the
+     * thread that polls the pad. A controller plugged in mid-game appears
+     * within a second; XInput has four user slots, so the rest never exist. */
+    static ULONGLONG next_probe[PAD_MAX_HOST_PORTS];
+    const ULONGLONG now = GetTickCount64();
     for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
         XINPUT_STATE state;
         memset(&state, 0, sizeof(state));
+        if (i >= XUSER_MAX_COUNT) { s_host_state[i].connected = 0; continue; }
+        if (!s_host_state[i].connected && now < next_probe[i]) continue;
 
         DWORD result = XInputGetState((DWORD)i, &state);
         if (result != ERROR_SUCCESS) {
             s_host_state[i].connected = 0;
+            next_probe[i] = now + 1000;
             continue;
         }
 

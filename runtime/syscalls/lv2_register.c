@@ -47,6 +47,11 @@ extern void spu_raw_note_image(uint32_t src_ea, uint32_t entry);
 
 #include "../platform/win32_compat.h"   /* QueryPerformanceCounter shim for the SPU_SPEED timing */
 
+/* Environment switches are read where they are used, some of them per call:
+ * answer from the pointer-keyed cache (ps3emu/env_cache.h). */
+#include "ps3emu/env_cache.h"
+#define getenv(name) ps3_env(name)
+
 /* ---------------------------------------------------------------------------
  * TTY syscalls (used by PS3 CRT for debug output)
  *

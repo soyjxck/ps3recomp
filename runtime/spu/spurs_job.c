@@ -44,6 +44,11 @@
 #include <string.h>
 #include <stddef.h>
 
+/* Environment switches are read where they are used, some of them per call:
+ * answer from the pointer-keyed cache (ps3emu/env_cache.h). */
+#include "ps3emu/env_cache.h"
+#define getenv(name) ps3_env(name)
+
 extern uint8_t* vm_base;
 extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
 
