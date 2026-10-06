@@ -783,23 +783,29 @@ static u32 eng_texture_span(u32 fmt, u32 w, u32 h, u32 levels, u32 pitch, int cu
     return lv[n - 1].offset + lv[n - 1].tl.face_bytes;
 }
 
-/* One hash per cached texture per presented frame. Word-at-a-time FNV over
- * the whole span is deliberately cheap: this is a mutation detector, not a
- * content id (rsx_live_draw.c:2002-2026). */
+/* One hash per cached texture per presented frame. FNV-style over the whole
+ * span is deliberately cheap: this is a mutation detector, not a content id
+ * (rsx_live_draw.c:2002-2026). Eight independent lanes, folded at the end: a
+ * single lane is one dependent 64-bit multiply per 8 bytes, latency-bound at a
+ * few GB/s, and it was 13% of the draw engine's time in Drakengard 3's battle
+ * areas. The lanes run in parallel and cover every byte as before. */
 static u64 eng_texture_content_hash(u32 location, u32 offset, u32 span,
                                     int* readable)
 {
     const u8* src = span ? eng_guest_ptr(NULL, location, offset, span) : NULL;
     if (!src) { *readable = 0; return 0; }
-    u64 hash = 1469598103934665603ull;
+    const u64 P = 1099511628211ull;
+    u64 h[8];
+    for (int k = 0; k < 8; k++) h[k] = 1469598103934665603ull + (u64)k;
     u32 i = 0;
-    for (; i + 8 <= span; i += 8) {
-        u64 word;
-        memcpy(&word, src + i, sizeof(word));
-        hash ^= word;
-        hash *= 1099511628211ull;
+    for (; i + 64 <= span; i += 64) {
+        u64 w[8];
+        memcpy(w, src + i, sizeof w);
+        for (int k = 0; k < 8; k++) h[k] = (h[k] ^ w[k]) * P;
     }
-    for (; i < span; i++) { hash ^= src[i]; hash *= 1099511628211ull; }
+    u64 hash = 1469598103934665603ull;
+    for (int k = 0; k < 8; k++) hash = (hash ^ h[k]) * P;
+    for (; i < span; i++) { hash ^= src[i]; hash *= P; }
     *readable = 1;
     return hash;
 }
@@ -1450,6 +1456,15 @@ static int dc_reserve_indices(u32 count)
  * than fetching a phantom vertex wherever the restart sentinel appears, then
  * collapse repeated references and fetch each unique vertex once.
  * rsx_live_draw.c's fetch_batches_hoisted (4165-4292). */
+/* RSX_VFETCH_CHECK totals, printed at exit. */
+static unsigned long *s_vfc_draws, *s_vfc_bad, *s_vfc_bytes;
+static void eng_vfetch_check_summary(void)
+{
+    if (s_vfc_draws)
+        fprintf(stderr, "[vfetch-check] total: %lu draws compared, %lu mismatched (%lu bytes)\n",
+                *s_vfc_draws, *s_vfc_bad, *s_vfc_bytes);
+}
+
 static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
 {
     for (u32 b = 0; b < dc.n_arr && dc.fetch_ok; b++)
@@ -1514,9 +1529,52 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
         dc.fetch_ok = 0;
         return;
     }
-    for (u32 i = 0; i < dc.n_refs; i++) {
-        u8* dst = layout->stride ? dc.verts + (u64)i * layout->stride : NULL;
-        if (!rsx_vertex_fetch_one(&dc.fetch_plan, &dc.refs[i], dst)) {
+    /* rsx_vertex_fetch_all decodes attribute by attribute (one format
+     * dispatch per attribute, not per component per vertex); it was the
+     * largest share of the draw engine's time. RSX_VFETCH_ONE=1 keeps the
+     * per-vertex rsx_vertex_fetch_one path; RSX_VFETCH_CHECK=1 runs both on
+     * every draw and reports any byte that differs. */
+    static int vf_mode = -1;
+    if (vf_mode < 0) vf_mode = getenv("RSX_VFETCH_ONE") ? 1 : getenv("RSX_VFETCH_CHECK") ? 2 : 0;
+    if (vf_mode == 1) {
+        for (u32 i = 0; i < dc.n_refs; i++) {
+            u8* dst = layout->stride ? dc.verts + (u64)i * layout->stride : NULL;
+            if (!rsx_vertex_fetch_one(&dc.fetch_plan, &dc.refs[i], dst)) {
+                dc.fetch_ok = 0;
+                return;
+            }
+        }
+    } else {
+        const int ok = rsx_vertex_fetch_all(&dc.fetch_plan, dc.refs, dc.n_refs, dc.verts);
+        if (vf_mode == 2) {
+            static u8* ref_buf; static u64 ref_cap;
+            static unsigned long draws, bad_draws, bad_bytes;
+            static int summary_armed = 0;
+            if (!summary_armed) { summary_armed = 1; atexit(eng_vfetch_check_summary); }
+            s_vfc_draws = &draws; s_vfc_bad = &bad_draws; s_vfc_bytes = &bad_bytes;
+            const u64 bytes = (u64)dc.n_refs * layout->stride;
+            int ref_ok = 1;
+            if (bytes > ref_cap) { free(ref_buf); ref_buf = (u8*)malloc(bytes); ref_cap = ref_buf ? bytes : 0; }
+            if (ref_buf || !bytes) {
+                for (u32 i = 0; i < dc.n_refs && ref_ok; i++)
+                    if (!rsx_vertex_fetch_one(&dc.fetch_plan, &dc.refs[i],
+                                              layout->stride ? ref_buf + (u64)i * layout->stride : NULL))
+                        ref_ok = 0;
+                draws++;
+                unsigned long nb = 0;
+                if (ok == ref_ok && ok)
+                    for (u64 k = 0; k < bytes; k++) nb += dc.verts[k] != ref_buf[k];
+                if (ok != ref_ok || nb) {
+                    bad_draws++; bad_bytes += nb;
+                    if (bad_draws <= 8)
+                        fprintf(stderr, "[vfetch-check] f%u MISMATCH: fetch_all ok=%d fetch_one ok=%d, %lu of %llu bytes differ (verts=%u stride=%u)\n",
+                                g.frames, ok, ref_ok, nb, (unsigned long long)bytes, dc.n_refs, layout->stride);
+                }
+                if ((draws % 20000) == 0)
+                    fprintf(stderr, "[vfetch-check] %lu draws compared, %lu mismatched (%lu bytes)\n", draws, bad_draws, bad_bytes);
+            }
+        }
+        if (!ok) {
             dc.fetch_ok = 0;
             return;
         }

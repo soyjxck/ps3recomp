@@ -297,6 +297,109 @@ int rsx_vertex_fetch_one(
     return 1;
 }
 
+/* ---- rsx_vertex_fetch_all ------------------------------------------------ */
+
+static inline u32 rsx_fa_be32(const u8* p) { u32 w; memcpy(&w, p, 4); return __builtin_bswap32(w); }
+static inline u16 rsx_fa_be16(const u8* p) { u16 w; memcpy(&w, p, 2); return __builtin_bswap16(w); }
+static inline float rsx_fa_f32(u32 w) { float f; memcpy(&f, &w, 4); return f; }
+
+/* The source of refs[i]'s element for one attribute, resolved exactly as
+ * rsx_vertex_fetch_one does: the prepared contiguous span, nothing for an
+ * inline draw outside its stream, or a per-element guest lookup. */
+static inline const u8* rsx_fa_source(const rsx_vertex_fetch_plan* plan,
+                                      const rsx_vertex_fetch_attr* fetch,
+                                      u32 attr, const rsx_vertex_ref* ref)
+{
+    const u32 element = rsx_vertex_element_index(
+        ref->vertex_id, ref->base_index, fetch->desc.frequency,
+        (plan->divider_mask >> attr) & 1u);
+    if (fetch->stable_base &&
+        element >= fetch->stable_first && element <= fetch->stable_last)
+        return fetch->stable_base + (u64)(element - fetch->stable_first) * fetch->stride;
+    if (plan->inline_data)
+        return NULL;
+    if (plan->guest_ptr)
+        return plan->guest_ptr(plan->guest_user, fetch->desc.location,
+                               plan->base_offset + fetch->desc.offset + element * fetch->stride,
+                               fetch->elem_size);
+    return NULL;
+}
+
+int rsx_vertex_fetch_all(
+    const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count,
+    u8* out)
+{
+    if (!plan || (!refs && count))
+        return 0;
+    const u32 ostride = plan->layout.stride;
+    if (!ostride)
+        return 1;
+    if (!out)
+        return 0;
+    for (u32 slot = 0; slot < plan->layout.count; slot++) {
+        const u32 attr = plan->layout.attrs[slot];
+        const rsx_vertex_fetch_attr* fetch = &plan->attr[attr];
+        u8* col = out + slot * 16u;
+        const u32 type = fetch->desc.type, size = fetch->desc.size;
+        if (!type || !size) {
+            for (u32 i = 0; i < count; i++)
+                memcpy(col + (size_t)i * ostride, fetch->default_value, 16);
+            continue;
+        }
+        const u32 n = size < 4 ? size : 4;
+        /* One loop per format. A source that cannot be read, or a format
+         * this engine does not decode, gets the attribute's default -- and
+         * fails the draw for ATTR0 -- as in rsx_vertex_fetch_one. */
+#define RSX_FA_LOOP(...)                                                       \
+        for (u32 i = 0; i < count; i++) {                                      \
+            float* v = (float*)(col + (size_t)i * ostride);                    \
+            const u8* s = rsx_fa_source(plan, fetch, attr, &refs[i]);          \
+            if (!s) {                                                          \
+                if (attr == 0) return 0;                                       \
+                memcpy(v, fetch->default_value, 16);                           \
+                continue;                                                      \
+            }                                                                  \
+            v[0] = v[1] = v[2] = 0.0f; v[3] = 1.0f;                            \
+            __VA_ARGS__                                                        \
+        }
+        switch (type) {
+        case RSX_VTX_TYPE_FLOAT:
+            RSX_FA_LOOP(for (u32 c = 0; c < n; c++) v[c] = rsx_fa_f32(rsx_fa_be32(s + c * 4));)
+            break;
+        case RSX_VTX_TYPE_HALF:
+            RSX_FA_LOOP(for (u32 c = 0; c < n; c++) v[c] = rsx_compact_be_f16(s + c * 2);)
+            break;
+        case RSX_VTX_TYPE_UNORM8:
+            RSX_FA_LOOP(for (u32 c = 0; c < n; c++) v[c] = s[c] / 255.0f;)
+            break;
+        case RSX_VTX_TYPE_UINT8:
+            RSX_FA_LOOP(for (u32 c = 0; c < n; c++) v[c] = (float)s[c];)
+            break;
+        case RSX_VTX_TYPE_SNORM16:
+            RSX_FA_LOOP(for (u32 c = 0; c < n; c++) v[c] = (s16)rsx_fa_be16(s + c * 2) / 32767.0f;)
+            break;
+        case RSX_VTX_TYPE_SINT16:
+            RSX_FA_LOOP(for (u32 c = 0; c < n; c++) v[c] = (float)(s16)rsx_fa_be16(s + c * 2);)
+            break;
+        case RSX_VTX_TYPE_CMP32:
+            RSX_FA_LOOP({ const u32 word = rsx_fa_be32(s);
+                          s32 x = (s32)(word & 0x7FF), y = (s32)((word >> 11) & 0x7FF), z = (s32)((word >> 22) & 0x3FF);
+                          if (x & 0x400) x -= 0x800;
+                          if (y & 0x400) y -= 0x800;
+                          if (z & 0x200) z -= 0x400;
+                          v[0] = (float)x / 1023.0f; v[1] = (float)y / 1023.0f; v[2] = (float)z / 511.0f; v[3] = 1.0f; })
+            break;
+        default:
+            if (attr == 0) return 0;
+            for (u32 i = 0; i < count; i++)
+                memcpy(col + (size_t)i * ostride, fetch->default_value, 16);
+            break;
+        }
+#undef RSX_FA_LOOP
+    }
+    return 1;
+}
+
 static u64 rsx_vertex_remap_hash(u64 value)
 {
     value ^= value >> 33;

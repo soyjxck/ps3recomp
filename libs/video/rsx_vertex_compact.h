@@ -116,6 +116,14 @@ void rsx_vertex_fetch_plan_prepare(
 int rsx_vertex_fetch_one(
     const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* ref, u8* out);
 
+/* Every vertex of a draw at once: out[i * layout.stride] for refs[i], the
+ * same bytes rsx_vertex_fetch_one writes, attribute by attribute so each
+ * attribute's format is dispatched once rather than per component per
+ * vertex. Returns 0 where rsx_vertex_fetch_one would fail for any vertex. */
+int rsx_vertex_fetch_all(
+    const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count,
+    u8* out);
+
 /* Collapse repeated (vertex_id, base_index) references in first-use order.
  * refs is rewritten in place with the unique prefix.  The occurrence map
  * remains valid until the next call using the same remap object. */
