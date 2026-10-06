@@ -124,6 +124,7 @@ static void* ppu_host_thread_proc(void* param)
     { extern void ppu_resv_register(ppu_context*); ppu_resv_register(&info->ctx); }
 
 #if defined(__APPLE__)
+    pthread_setname_np(info->name);   /* for sample, Instruments, [stutter-cpu] */
     /* PPU_QOS_INTERACTIVE=<prefix>[,<prefix>...]: a guest thread whose name
      * starts with one of them runs at user-interactive QoS. On the PS3 the
      * guest's priorities are strict, so its audio loop runs the moment it

@@ -1155,6 +1155,7 @@ static void* spu_pool_thread(void* p)
         extern void spu_task_begin(void);
         spu_task_begin();
 #if defined(__APPLE__)
+        { char nm[32]; snprintf(nm, sizeof nm, "spu img %d", j->image_id); pthread_setname_np(nm); }
         /* SPU_QOS_INTERACTIVE=<image id>[,...]: those images' tasks run at
          * user-interactive QoS -- an audio mixer, which must finish each block
          * in time however busy the rest of the machine is (see

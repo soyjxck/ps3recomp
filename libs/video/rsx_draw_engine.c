@@ -1322,6 +1322,7 @@ static int eng_async_on(void)
 static void* eng_pipe_worker(void* arg)
 {
     (void)arg;
+    pthread_setname_np("rsx pipeline build");
     for (;;) {
         pthread_mutex_lock(&s_pj_mu);
         while (!s_pj_head && !s_pj_quit) pthread_cond_wait(&s_pj_work, &s_pj_mu);
