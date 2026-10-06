@@ -52,6 +52,12 @@ extern uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size);
   #include <windows.h>
   #include <mmdeviceapi.h>
   #include <audioclient.h>
+#ifndef AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+#define AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM      0x80000000
+#endif
+#ifndef AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY
+#define AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY 0x08000000
+#endif
   #include <process.h>
 
   /* Define WASAPI COM GUIDs (avoids needing uuid.lib linkage for these) */
@@ -282,10 +288,16 @@ static int audio_backend_init(void)
     REFERENCE_TIME buf_duration = 200000; /* 20ms in 100ns units */
     s_wasapi_event = CreateEventW(NULL, FALSE, FALSE, NULL);
 
+    /* AUTOCONVERTPCM | SRC_DEFAULT_QUALITY: let the shared-mode mixer convert
+     * and resample. Without them Initialize answers
+     * AUDCLNT_E_UNSUPPORTED_FORMAT (0x88890008) on an endpoint whose mix
+     * format is not 48 kHz stereo float -- a 44.1 kHz or 7.1 device -- and
+     * the title ran silent. */
+    const DWORD convert = AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
     hr = s_wasapi_client->lpVtbl->Initialize(
         s_wasapi_client,
         AUDCLNT_SHAREMODE_SHARED,
-        AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+        AUDCLNT_STREAMFLAGS_EVENTCALLBACK | convert,
         buf_duration, 0, &wfx, NULL);
 
     if (FAILED(hr)) {
@@ -293,7 +305,7 @@ static int audio_backend_init(void)
         hr = s_wasapi_client->lpVtbl->Initialize(
             s_wasapi_client,
             AUDCLNT_SHAREMODE_SHARED,
-            0, buf_duration, 0, &wfx, NULL);
+            convert, buf_duration, 0, &wfx, NULL);
         if (FAILED(hr)) {
             printf("[cellAudio] WASAPI Initialize failed: 0x%08lX\n", hr);
             s_wasapi_client->lpVtbl->Release(s_wasapi_client);

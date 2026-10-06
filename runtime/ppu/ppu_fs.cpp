@@ -60,9 +60,16 @@ extern "C" const char* ppu_vfs_root = ".";
 #define CELL_FS_O_RDONLY     0
 #define CELL_FS_O_WRONLY     1
 #define CELL_FS_O_RDWR       2
-#define CELL_FS_O_CREAT      0x0200
-#define CELL_FS_O_TRUNC      0x0400
-#define CELL_FS_O_APPEND     0x0100
+/* The Cell SDK's values (cell/cell_fs.h; libs/filesystem/cellFs.h and
+ * runtime/syscalls/sys_fs.h agree): O_CREAT 0x40, O_EXCL 0x80, O_TRUNC 0x200,
+ * O_APPEND 0x400. This file had CREAT as 0x200 and TRUNC as 0x400, so a
+ * title's WRONLY|CREAT (0x41) opened without O_CREAT and failed with ENOENT:
+ * Drakengard 3's game-data install died on its first file and the title
+ * quit with BROKEN_EXIT_GAMEDATA. */
+#define CELL_FS_O_CREAT      0x0040
+#define CELL_FS_O_EXCL       0x0080
+#define CELL_FS_O_TRUNC      0x0200
+#define CELL_FS_O_APPEND     0x0400
 #define CELL_FS_SEEK_SET     0
 #define CELL_FS_SEEK_CUR     1
 #define CELL_FS_SEEK_END     2
@@ -191,6 +198,7 @@ static void cellFsOpen(ppu_context* ctx)
     int oflags = (acc == CELL_FS_O_RDWR)   ? O_RDWR
                : (acc == CELL_FS_O_WRONLY) ? O_WRONLY : O_RDONLY;
     if (flags & CELL_FS_O_CREAT)  oflags |= O_CREAT;
+    if (flags & CELL_FS_O_EXCL)   oflags |= O_EXCL;
     if (flags & CELL_FS_O_TRUNC)  oflags |= O_TRUNC;
     if (flags & CELL_FS_O_APPEND) oflags |= O_APPEND;
 

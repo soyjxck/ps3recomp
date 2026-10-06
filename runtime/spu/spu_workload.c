@@ -1064,6 +1064,21 @@ static DWORD WINAPI spu_async_thread(LPVOID p) {
      * runaway brsl recursion) can actually reach the STACKOVERFLOW reporter
      * instead of killing the process silently with 0x80000001. */
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
+    /* SPU_QOS_INTERACTIVE=<image id>[,...]: those images' tasks run at
+     * THREAD_PRIORITY_HIGHEST -- an audio mixer, which must finish each block
+     * in time however busy the rest of the machine is (the macOS pool thread
+     * raises its QoS the same way; see PPU_QOS_INTERACTIVE in
+     * sys_ppu_thread.c). The thread is this task's alone, so nothing to
+     * restore. */
+    { const spu_async_job* j = (const spu_async_job*)p;
+      const char* list = getenv("SPU_QOS_INTERACTIVE");
+      while (list && *list) {
+          char* end;
+          const long id = strtol(list, &end, 0);
+          if (end == list) break;
+          if (id == j->image_id) { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST); break; }
+          list = *end == ',' ? end + 1 : NULL;
+      } }
     spu_async_run((spu_async_job*)p);
     /* Nothing on this stack may stay in the lock-line reserver set. */
     { ULONG_PTR lo, hi; GetCurrentThreadStackLimits(&lo, &hi);

@@ -144,6 +144,26 @@ static void* ppu_host_thread_proc(void* param)
           }
           list = end ? end + 1 : NULL;
       } }
+#elif defined(_WIN32)
+    /* The same, with Windows priorities: THREAD_PRIORITY_HIGHEST puts the
+     * sound driver's threads ahead of the game's heavy ones in the scheduler,
+     * as user-interactive QoS does on macOS. The name goes to the thread
+     * description, which the VS profiler, WPA and Superluminal show. */
+    { wchar_t wname[64];
+      if (MultiByteToWideChar(CP_UTF8, 0, info->name, -1, wname, 64) > 0)
+          SetThreadDescription(GetCurrentThread(), wname); }
+    { const char* list = getenv("PPU_QOS_INTERACTIVE");
+      while (list && *list) {
+          const char* end = strchr(list, ',');
+          const size_t n = end ? (size_t)(end - list) : strlen(list);
+          if (n && strncmp(info->name, list, n) == 0) {
+              SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+              fprintf(stderr, "[THREAD %llu] \"%s\" runs at THREAD_PRIORITY_HIGHEST\n",
+                      (unsigned long long)info->ctx.thread_id, info->name);
+              break;
+          }
+          list = end ? end + 1 : NULL;
+      } }
 #endif
 
     fprintf(stderr, "[THREAD %llu] host thread started, entry=0x%08llX hosttid=%lu\n",

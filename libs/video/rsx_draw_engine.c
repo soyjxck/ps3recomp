@@ -1295,9 +1295,47 @@ static const char* const kEngFixedPS =
  * cached shader is ready well inside that, so nothing changes for it -- and
  * a slow one is skipped until it is ready: the effect appears a few frames
  * late, the first time, instead of the game stopping. RSX_ASYNC_SHADERS=0 builds on the walker as
- * before. Metal only: the backend's pipeline_create is made thread-safe there. */
-#if defined(__APPLE__)
+ * before. Metal and D3D12: both backends' pipeline_create are thread-safe. */
+#if defined(__APPLE__) || defined(_WIN32)
+#if defined(_WIN32)
+/* The pthread names the worker was written with, over Win32: an SRW lock,
+ * condition variables and CreateThread. The timed wait takes a deadline the
+ * caller computed with timespec_get, so it is converted to a span here. */
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+typedef SRWLOCK pj_mutex_t;
+typedef CONDITION_VARIABLE pj_cond_t;
+typedef HANDLE pj_thread_t;
+#define PJ_MUTEX_INIT SRWLOCK_INIT
+#define PJ_COND_INIT  CONDITION_VARIABLE_INIT
+static void pj_lock(pj_mutex_t* m)   { AcquireSRWLockExclusive(m); }
+static void pj_unlock(pj_mutex_t* m) { ReleaseSRWLockExclusive(m); }
+static void pj_wait(pj_cond_t* c, pj_mutex_t* m) { SleepConditionVariableSRW(c, m, INFINITE, 0); }
+static int  pj_timedwait(pj_cond_t* c, pj_mutex_t* m, const struct timespec* dl)
+{
+    struct timespec now; timespec_get(&now, TIME_UTC);
+    long long ms = (long long)(dl->tv_sec - now.tv_sec) * 1000LL + (dl->tv_nsec - now.tv_nsec) / 1000000LL;
+    if (ms <= 0) return 1;
+    return SleepConditionVariableSRW(c, m, (DWORD)ms, 0) ? 0 : 1;
+}
+static void pj_signal(pj_cond_t* c)    { WakeConditionVariable(c); }
+static void pj_broadcast(pj_cond_t* c) { WakeAllConditionVariable(c); }
+#else
 #include <pthread.h>
+typedef pthread_mutex_t pj_mutex_t;
+typedef pthread_cond_t  pj_cond_t;
+typedef pthread_t       pj_thread_t;
+#define PJ_MUTEX_INIT PTHREAD_MUTEX_INITIALIZER
+#define PJ_COND_INIT  PTHREAD_COND_INITIALIZER
+static void pj_lock(pj_mutex_t* m)   { pthread_mutex_lock(m); }
+static void pj_unlock(pj_mutex_t* m) { pthread_mutex_unlock(m); }
+static void pj_wait(pj_cond_t* c, pj_mutex_t* m) { pthread_cond_wait(c, m); }
+static int  pj_timedwait(pj_cond_t* c, pj_mutex_t* m, const struct timespec* dl) { return pthread_cond_timedwait(c, m, dl); }
+static void pj_signal(pj_cond_t* c)    { pthread_cond_signal(c); }
+static void pj_broadcast(pj_cond_t* c) { pthread_cond_broadcast(c); }
+#endif
 typedef struct eng_pipe_job {
     char* vs; char* ps;
     rsx_be_render_state rs;
@@ -1307,11 +1345,11 @@ typedef struct eng_pipe_job {
     u32 frame;
     struct eng_pipe_job* next;
 } eng_pipe_job;
-static pthread_mutex_t s_pj_mu = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t  s_pj_work = PTHREAD_COND_INITIALIZER, s_pj_done = PTHREAD_COND_INITIALIZER;
+static pj_mutex_t s_pj_mu = PJ_MUTEX_INIT;
+static pj_cond_t  s_pj_work = PJ_COND_INIT, s_pj_done = PJ_COND_INIT;
 static eng_pipe_job *s_pj_head, *s_pj_tail;
 static int s_pj_started, s_pj_quit;
-static pthread_t s_pj_thread;
+static pj_thread_t s_pj_thread;
 
 static int eng_async_on(void)
 {
@@ -1319,18 +1357,24 @@ static int eng_async_on(void)
     if (on < 0) { const char* e = getenv("RSX_ASYNC_SHADERS"); on = !(e && e[0] == '0'); }
     return on;
 }
+#if defined(_WIN32)
+static DWORD WINAPI eng_pipe_worker(LPVOID arg)
+#else
 static void* eng_pipe_worker(void* arg)
+#endif
 {
     (void)arg;
+#if defined(__APPLE__)
     pthread_setname_np("rsx pipeline build");
+#endif
     for (;;) {
-        pthread_mutex_lock(&s_pj_mu);
-        while (!s_pj_head && !s_pj_quit) pthread_cond_wait(&s_pj_work, &s_pj_mu);
-        if (!s_pj_head) { pthread_mutex_unlock(&s_pj_mu); return NULL; }
+        pj_lock(&s_pj_mu);
+        while (!s_pj_head && !s_pj_quit) pj_wait(&s_pj_work, &s_pj_mu);
+        if (!s_pj_head) { pj_unlock(&s_pj_mu); return 0; }
         eng_pipe_job* j = s_pj_head;
         s_pj_head = j->next;
         if (!s_pj_head) s_pj_tail = NULL;
-        pthread_mutex_unlock(&s_pj_mu);
+        pj_unlock(&s_pj_mu);
         struct timespec t0, t1;
         timespec_get(&t0, TIME_UTC);
         const u32 h = g.be->pipeline_create(g.be->user, j->vs, j->ps, &j->rs,
@@ -1341,11 +1385,11 @@ static void* eng_pipe_worker(void* arg)
             fprintf(stderr, "[pipe-slow] async build took %.1f ms (asked for in frame %u, ready in frame %u)%s\n",
                     ms, j->frame, g.frames, h ? "" : " -- FAILED");
         free(j->vs); free(j->ps); j->vs = j->ps = NULL;
-        pthread_mutex_lock(&s_pj_mu);
+        pj_lock(&s_pj_mu);
         j->handle = h;
         __atomic_store_n(&j->done, 1, __ATOMIC_RELEASE);
-        pthread_cond_broadcast(&s_pj_done);
-        pthread_mutex_unlock(&s_pj_mu);
+        pj_broadcast(&s_pj_done);
+        pj_unlock(&s_pj_mu);
     }
 }
 /* Queue a build and wait for it a little; the job is the entry's until done. */
@@ -1359,18 +1403,23 @@ static eng_pipe_job* eng_pipe_submit(const char* vs, const char* ps, const rsx_b
     if (!j->vs || !j->ps) { free(j->vs); free(j->ps); free(j); return NULL; }
     j->rs = *rs; j->layout = *layout; j->stride = stride; j->rt_fmt = rt_fmt; j->rt_count = rt_count;
     j->frame = g.frames;
-    pthread_mutex_lock(&s_pj_mu);
+    pj_lock(&s_pj_mu);
     if (!s_pj_started) {
         s_pj_started = 1; s_pj_quit = 0;
+#if defined(_WIN32)
+        s_pj_thread = CreateThread(NULL, 64u << 20, eng_pipe_worker, NULL, 0, NULL);
+        if (!s_pj_thread) s_pj_started = -1;
+#else
         pthread_attr_t at; pthread_attr_init(&at);
         pthread_attr_setstacksize(&at, 64u << 20);   /* glslang and spirv-opt recurse deeply */
         if (pthread_create(&s_pj_thread, &at, eng_pipe_worker, NULL) != 0) s_pj_started = -1;
         pthread_attr_destroy(&at);
+#endif
     }
-    if (s_pj_started < 0) { pthread_mutex_unlock(&s_pj_mu); free(j->vs); free(j->ps); free(j); return NULL; }
+    if (s_pj_started < 0) { pj_unlock(&s_pj_mu); free(j->vs); free(j->ps); free(j); return NULL; }
     if (s_pj_tail) s_pj_tail->next = j; else s_pj_head = j;
     s_pj_tail = j;
-    pthread_cond_signal(&s_pj_work);
+    pj_signal(&s_pj_work);
     /* The wait is a budget for the frame, not for each build: 38 new
      * effects at once had waited 8 ms apiece, 300 ms in one frame. */
     static long wait_ms = -1;
@@ -1383,21 +1432,25 @@ static eng_pipe_job* eng_pipe_submit(const char* vs, const char* ps, const rsx_b
         dl = t0;
         dl.tv_nsec += (left_us % 1000000L) * 1000L; dl.tv_sec += left_us / 1000000L + dl.tv_nsec / 1000000000L;
         dl.tv_nsec %= 1000000000L;
-        while (!j->done) if (pthread_cond_timedwait(&s_pj_done, &s_pj_mu, &dl) != 0) break;
+        while (!j->done) if (pj_timedwait(&s_pj_done, &s_pj_mu, &dl) != 0) break;
         struct timespec t1; timespec_get(&t1, TIME_UTC);
         left_us -= (long)((t1.tv_sec - t0.tv_sec) * 1000000L + (t1.tv_nsec - t0.tv_nsec) / 1000L);
     }
-    pthread_mutex_unlock(&s_pj_mu);
+    pj_unlock(&s_pj_mu);
     return j;
 }
 static void eng_pipe_stop(void)
 {
-    pthread_mutex_lock(&s_pj_mu);
+    pj_lock(&s_pj_mu);
     const int started = s_pj_started > 0;
     s_pj_quit = 1;
-    pthread_cond_broadcast(&s_pj_work);
-    pthread_mutex_unlock(&s_pj_mu);
+    pj_broadcast(&s_pj_work);
+    pj_unlock(&s_pj_mu);
+#if defined(_WIN32)
+    if (started) { WaitForSingleObject(s_pj_thread, INFINITE); CloseHandle(s_pj_thread); s_pj_thread = NULL; }
+#else
     if (started) pthread_join(s_pj_thread, NULL);
+#endif
     s_pj_started = 0;
 }
 /* An entry whose build is in flight: its handle once done (and the job
@@ -1541,7 +1594,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
             fi = -1;
     }
     struct eng_pipe_job* job = NULL;
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(_WIN32)
     if (vi > 0 && fi > 0 && !fixed && eng_async_on()) {
         job = eng_pipe_submit(s_vs_hlsl, s_ps_hlsl, rs, layout, layout->stride, rt_fmt, rt_count);
         if (job && __atomic_load_n(&job->done, __ATOMIC_ACQUIRE)) {

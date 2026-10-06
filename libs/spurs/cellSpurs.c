@@ -2498,6 +2498,7 @@ static struct {
     u32 reset;       /* value to restore when autoReset is set             */
     u32 pending;     /* notifications received, not yet consumed        */
     u32 auto_reset;
+    int ever_notified;   /* a notify has arrived at least once (jg_wait's timeout) */
     int active;
 } s_jobguards[MAX_JOBGUARDS];
 
@@ -2531,6 +2532,7 @@ s32 cellSpursJobGuardInitialize(u64 jc_ea, u64 guard_ea, u32 notify_count,
     s_jobguards[i].reset      = notify_count;
     s_jobguards[i].pending    = 0;
     s_jobguards[i].auto_reset = auto_reset;
+    s_jobguards[i].ever_notified = 0;
     s_jobguards[i].active     = 1;
 
     /* Mirror the count into guest memory. The SPU side reads the guard on
@@ -2558,6 +2560,7 @@ s32 cellSpursJobGuardNotify(u64 guard_ea)
      * was still running -- the title notified 6 times and the chain completed
      * 2 laps, so the thread waiting on the other 4 completions never woke. */
     s_jobguards[i].pending++;
+    s_jobguards[i].ever_notified = 1;
     { u32 remaining = (s_jobguards[i].pending >= s_jobguards[i].reset)
                     ? 0u : s_jobguards[i].reset - s_jobguards[i].pending;
       s_jobguards[i].count = remaining;
@@ -2588,7 +2591,17 @@ static int jg_wait(u32 ea)
 {
     int i = jg_find(ea);
     if (i < 0) return 1;
-    for (int spin = 0; spin < 20000; spin++) {     /* ~20 s at 1 ms */
+    /* A guard nobody has ever notified is a chain parked for work the title
+     * has not produced: on the hardware the SPU sits on it while the PPU goes
+     * on. Walking the chain on the PPU (SPURS_JC_SYNC) turned that into a
+     * 20 s stall at Drakengard 3's boot -- its first chain is GUARD, JOBLIST,
+     * SYNC, JOB, NEXT, and the title never notifies the guard in the whole
+     * run. Such a guard waits SPURS_GUARD_FIRST_MS (default 200); one that
+     * has been notified before keeps the full 20 s. */
+    static long first_ms = -1;
+    if (first_ms < 0) { const char* e = getenv("SPURS_GUARD_FIRST_MS"); first_ms = e ? atol(e) : 200; }
+    const int spins = s_jobguards[i].ever_notified ? 20000 : (int)first_ms;
+    for (int spin = 0; spin < spins; spin++) {     /* 1 ms each */
         if (s_jobguards[i].pending >= s_jobguards[i].reset) {
             /* Consume exactly one release worth of credits, so notifies that
              * arrived during the previous lap still count. */
@@ -2604,7 +2617,8 @@ static int jg_wait(u32 ea)
         usleep(1000);
 #endif
     }
-    printf("[cellSpurs] guard 0x%08X still closed after 20 s -- chain gives up\n", ea);
+    printf("[cellSpurs] guard 0x%08X still closed after %d ms%s -- chain gives up\n", ea, spins,
+           s_jobguards[i].ever_notified ? "" : " (never notified)");
     return 0;
 }
 
