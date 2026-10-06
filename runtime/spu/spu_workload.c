@@ -1121,6 +1121,103 @@ static void* spu_async_thread(void* p)
 }
 #endif
 
+#ifdef _WIN32
+/* The pool described below, for Windows. It was POSIX-only, so Windows went
+ * on creating a thread per task: CreateThread with a 256 MB reservation, the
+ * DLL_THREAD_ATTACH round of every loaded module, and the same again in
+ * reverse at exit. Drakengard 3's PhysX starts a handful of tasks a frame in
+ * a quiet scene and several times that when scenery breaks up, each from the
+ * thread the game thread is waiting on: with the pieces flying the frame rate
+ * fell to 16-34 fps with every core mostly idle. SPU_TASK_POOL=0: a thread
+ * per task. */
+typedef struct spu_pool_worker {
+    SRWLOCK            mu;
+    CONDITION_VARIABLE cv;
+    spu_async_job*     job;
+    struct spu_pool_worker* next;
+} spu_pool_worker;
+static SRWLOCK          s_pool_mu = SRWLOCK_INIT;
+static spu_pool_worker* s_pool_idle;
+
+static int spu_task_pool_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("SPU_TASK_POOL"); on = !(e && e[0] == '0'); }
+    return on;
+}
+
+static DWORD WINAPI spu_pool_thread(LPVOID p)
+{
+    spu_pool_worker* w = (spu_pool_worker*)p;
+    int named_image = -1;
+    /* Handler headroom for a stack overflow in lifted SPU code, as in
+     * spu_async_thread. */
+    { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
+    for (;;) {
+        AcquireSRWLockExclusive(&w->mu);
+        while (!w->job) SleepConditionVariableSRW(&w->cv, &w->mu, INFINITE, 0);
+        spu_async_job* j = w->job;
+        w->job = NULL;
+        ReleaseSRWLockExclusive(&w->mu);
+        extern void spu_task_begin(void);
+        spu_task_begin();
+        if (j->image_id != named_image) {
+            wchar_t nm[32]; swprintf(nm, 32, L"spu img %d", j->image_id);
+            SetThreadDescription(GetCurrentThread(), nm);
+            named_image = j->image_id;
+        }
+        /* SPU_QOS_INTERACTIVE=<image id>[,...]: see spu_async_thread. The
+         * thread goes on to other tasks, so the priority is put back. */
+        int raised = 0;
+        { const char* list = getenv("SPU_QOS_INTERACTIVE");
+          while (list && *list) {
+              char* end;
+              const long id = strtol(list, &end, 0);
+              if (end == list) break;
+              if (id == j->image_id) { raised = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) != 0; break; }
+              list = *end == ',' ? end + 1 : NULL;
+          } }
+        spu_async_run(j);
+        if (raised) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+        /* Nothing on this stack may stay in the lock-line reserver set. */
+        { ULONG_PTR lo, hi; GetCurrentThreadStackLimits(&lo, &hi);
+          extern void spu_coh_forget_range(uintptr_t, uintptr_t);
+          spu_coh_forget_range((uintptr_t)lo, (uintptr_t)hi); }
+        AcquireSRWLockExclusive(&s_pool_mu);
+        w->next = s_pool_idle;
+        s_pool_idle = w;
+        ReleaseSRWLockExclusive(&s_pool_mu);
+    }
+    return 0;
+}
+
+/* Hand j to an idle worker, or start a new one. 0: no thread could be made. */
+static int spu_task_pool_submit(spu_async_job* j)
+{
+    AcquireSRWLockExclusive(&s_pool_mu);
+    spu_pool_worker* w = s_pool_idle;
+    if (w) s_pool_idle = w->next;
+    ReleaseSRWLockExclusive(&s_pool_mu);
+    if (w) {
+        AcquireSRWLockExclusive(&w->mu);
+        w->job = j;
+        ReleaseSRWLockExclusive(&w->mu);
+        WakeConditionVariable(&w->cv);
+        return 1;
+    }
+    w = (spu_pool_worker*)calloc(1, sizeof *w);
+    if (!w) return 0;
+    InitializeSRWLock(&w->mu);
+    InitializeConditionVariable(&w->cv);
+    w->job = j;
+    HANDLE th = CreateThread(NULL, 256u << 20, spu_pool_thread, w,
+                             STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+    if (!th) { free(w); return 0; }
+    CloseHandle(th);   /* detached */
+    return 1;
+}
+#endif
+
 #ifndef _WIN32
 /* SPU task threads are kept and reused. A thread per task -- a 256 MB stack
  * reservation created and torn down each time -- cost the dispatching PPU
@@ -1708,6 +1805,7 @@ int spu_workload_dispatch_task(const uint8_t* image, uint32_t image_size,
             } } }
 
 #ifdef _WIN32
+    if (spu_task_pool_on() && spu_task_pool_submit(j)) return 1;
     /* 256MB RESERVE (not commit): the Bink SPU decoder's per-macroblock brsl
      * chains are deep host call chains with fat lifted frames -- a 1MB stack
      * blew the guard page (STATUS_GUARD_PAGE_VIOLATION 0x80000001, silent

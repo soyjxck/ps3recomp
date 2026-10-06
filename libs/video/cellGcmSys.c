@@ -832,6 +832,12 @@ unsigned long long ps3_ms_now(void)
 }
 
 static u32 s_sema_offset = 0;   /* NV406E semaphore offset (label window) */
+/* Called, when set, right after the walker has written a sync label (the
+ * NV4097 back-end / texture-read semaphore releases and the NV406E one). A
+ * guest thread polling a label can be woken the moment it lands, where
+ * waiting for the drain pass to end can be milliseconds later: the label is
+ * usually in the middle of a frame's commands. */
+void (*g_gcm_label_write_hook)(void) = 0;
 /* Backlog past which the drain stops honouring one-flip-per-tick and
  * catches up instead. Sized well above a frame's command list so a
  * title that keeps up never sees this path. */
@@ -2032,7 +2038,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     { static int sn = 0; if (getenv("GCM_RECDBG") && sn++ < 12)
                         fprintf(stderr, "[SEMA] m=0x%02X v=0x%08X off=0x%X\n", m, v, s_sema_offset); }
                     if (m == 0x64u)      s_sema_offset = v;
-                    else if (m == 0x6Cu) { gcm_report_copies_flush(); vm_write32(la, v); }
+                    else if (m == 0x6Cu) { gcm_report_copies_flush(); vm_write32(la, v);
+                                           if (g_gcm_label_write_hook) g_gcm_label_write_hook(); }
                     else if (m == 0x68u && vm_read32(la) != v) {
             /* GCM_SEMA_ACQUIRE=1 makes ACQUIRE actually block, which is what
              * the hardware does. Off by default: a title whose label nothing
@@ -2217,6 +2224,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 } else if (subch == 0 || (subch == 1 && !s1_2d)) {
                     if (m == 0x1D70u || m == 0x1D74u) gcm_report_copies_flush();
                     rsx_process_method(&s_state, m, vm_read32(dea));
+                    if ((m == 0x1D70u || m == 0x1D74u) && g_gcm_label_write_hook) g_gcm_label_write_hook();
                     /* NV406E_SET_REFERENCE: queue the fence value for PACED
                      * publication (gcm_ref_publish below) instead of letting a
                      * later fence in the same batch overwrite it. */

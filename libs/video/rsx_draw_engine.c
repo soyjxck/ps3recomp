@@ -3357,6 +3357,10 @@ void rsx_draw_engine_set_default(int on)
     g.default_on = on;
 }
 
+/* RSX_QUERY_NOSYNC (see the fence in rsx_draw_engine_method): -1 undecided.
+ * A global so a host can switch it in a run. */
+int g_rsx_query_nosync = -1;
+
 int rsx_draw_engine_enabled(void)
 {
     static int cached = -1;
@@ -3477,8 +3481,8 @@ void rsx_draw_engine_method(u32 method, u32 arg)
          * per-frame pool -- and culled whatever drew a 0: characters and props
          * flickered out for single frames. Finish the GPU work up to here and
          * deliver the counts before the fence lands. RSX_QUERY_NOSYNC=1 off. */
-        static int nosync = -1; if (nosync < 0) nosync = getenv("RSX_QUERY_NOSYNC") ? 1 : 0;
-        if (!nosync) g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_QUERY_FENCE);
+        if (g_rsx_query_nosync < 0) g_rsx_query_nosync = getenv("RSX_QUERY_NOSYNC") ? 1 : 0;
+        if (!g_rsx_query_nosync) g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_QUERY_FENCE);
         g.q_unflushed = 0;
     }
     if ((m == 0x17C8u || m == 0x1800u || m == 0x1D84u) && s_dtrace_frame >= 0 &&
