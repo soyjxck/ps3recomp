@@ -1007,6 +1007,41 @@ static u32 eng_texel_ops(u32 ops[16])
     return mask;
 }
 
+/* A fragment program's identity across draws: its structure without the
+ * inline constants (which titles patch per draw), as the pipeline log prints
+ * it ("fp-struct="). Per-title corrections name programs by it. */
+static u64 eng_fp_struct_id(const u8* fp_uc, u32 fp_size)
+{
+    return fp_uc ? rsx_fp_structural_hash(fp_uc, fp_size, 1469598103934665603ull) : 0;
+}
+
+/* RSX_FP_SAT_ALPHA=<fp-struct>[,<fp-struct>...]: clamp those programs' first
+ * colour export alpha to [0, 1]. A per-title correction, set by the title's
+ * runner: Drakengard 3's point-light shaft mask writes
+ * max(distance / radius, behind-the-light)^4 unclamped into an FP16 target,
+ * and its composite multiplies the scene by about 0.3 + 1.05 * mask^2 -- the
+ * smoky doorway and the windows of the village interior came out 15-70x too
+ * bright. Nothing in the microcode or the FP16 path bounds it, and RPCS3 does
+ * not either; clamped, the room matches the original by eye. */
+static int eng_fp_sat_alpha(const u8* fp_uc, u32 fp_size)
+{
+    static u64 ids[16]; static int n = -1;
+    if (n < 0) {
+        n = 0;
+        const char* e = getenv("RSX_FP_SAT_ALPHA");
+        while (e && *e && n < 16) {
+            char* end; const u64 v = strtoull(e, &end, 16);
+            if (end == e) break;
+            ids[n++] = v;
+            e = (*end == ',') ? end + 1 : end;
+        }
+    }
+    if (!n) return 0;
+    const u64 id = eng_fp_struct_id(fp_uc, fp_size);
+    for (int i = 0; i < n; i++) if (ids[i] == id) return 1;
+    return 0;
+}
+
 /* ---- pipelines ----------------------------------------------------------- */
 
 static u32 eng_vtex_mask(void)
@@ -1272,11 +1307,13 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         rsx_fp_set_shadow_units(shadow_mask, shadow_funcs);
         rsx_fp_set_unnorm_units(unnorm_mask, unnorm_dim);
         rsx_fp_set_texel_ops(texop_mask ? texel_ops : NULL);
+        rsx_fp_set_saturate_alpha(eng_fp_sat_alpha(fp_uc, fp_size));
         fi = rsx_fp_decompile_buffered_ex(fp_uc, fp_size, fp_ctrl, cube_mask,
                                           s_ps_hlsl, sizeof s_ps_hlsl, &nconst);
         rsx_fp_set_shadow_units(0, NULL);
         rsx_fp_set_unnorm_units(0, NULL);
         rsx_fp_set_texel_ops(NULL);
+        rsx_fp_set_saturate_alpha(0);
         if (unnorm_mask) { static int n = 0; if (n++ < 6)
             fprintf(stderr, "[rsx engine] unnormalised units 0x%X (unit %u %ux%u)\n", unnorm_mask,
                     __builtin_ctz(unnorm_mask), unnorm_dim[__builtin_ctz(unnorm_mask)][0], unnorm_dim[__builtin_ctz(unnorm_mask)][1]); }
@@ -1306,11 +1343,12 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         for (const char* c = s_ps_hlsl; *c; c++) ph = (ph ^ (unsigned char)*c) * 1099511628211ull;
         fprintf(stderr, "[rsx engine] pipeline %016llx: %s vp %d, fp %d,"
                         " %u constants -> %s handle=%u fp-hash=%016llx fp-size=%u blend=%u(%X/%X) vp-hlsl=%016llx fp-hlsl=%016llx vp-start=%u vp-instrs=%u"
-                        " prec(h/x12/x9)=%u/%u/%u exptex=%u\n",
+                        " prec(h/x12/x9)=%u/%u/%u exptex=%u fp-struct=%016llx\n",
                 (unsigned long long)key, fixed ? "built-in" : "guest",
                 vi, fi, nconst, handle ? "ok" : "FAILED (draw dropped)", handle, fh, fp_size,
                 rs->blend_enable, rs->sf_rgb, rs->df_rgb, vh, ph, rsx_dsp_vp_start(&g.rsx), vp_instrs,
-                g_rsx_fp_stats.prec[1], g_rsx_fp_stats.prec[2], g_rsx_fp_stats.prec[3], g_rsx_fp_stats.exp_tex);
+                g_rsx_fp_stats.prec[1], g_rsx_fp_stats.prec[2], g_rsx_fp_stats.prec[3], g_rsx_fp_stats.exp_tex,
+                (unsigned long long)eng_fp_struct_id(fp_uc, fp_size));
         /* RSX_VP_HEX=<vp-hlsl hash>: that program's microcode, four words per
          * instruction, for decoding a field by hand against the decompiler. */
         { static unsigned long long want = 0; static int got = -1;

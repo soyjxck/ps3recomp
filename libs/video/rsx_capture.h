@@ -20,6 +20,9 @@
  *   RSX_CAPTURE_BRIGHT=<mean>     ...or the first frame from then whose presented
  *                                 image has at least this mean brightness (0-255)
  *   RSX_CAPTURE_FRAMES=<n>        presents to record (default 120)
+ *   RSX_CAPTURE_TRIGGER=<file>    ...or start when this file appears (it is
+ *                                 deleted): `touch` it while the problem is
+ *                                 on screen
  *
  * Not recorded: the contents of render targets at the starting frame (a pass
  * that reads last frame's luminance or history starts from black -- record a

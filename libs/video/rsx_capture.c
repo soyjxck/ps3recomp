@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <zlib.h>
+#include <unistd.h>
 
 extern u8* vm_base;
 extern u32 ppu_vm_size;
@@ -106,6 +107,7 @@ void rsx_capture_display_buffer(u32 id, u32 location, u32 offset, u32 pitch,
 }
 
 static const char* s_path = (const char*)1;
+static const char* s_trigger;
 static long s_from, s_bright, s_nframes;
 
 static void cap_config(void)
@@ -116,6 +118,7 @@ static void cap_config(void)
     s_from    = (e = getenv("RSX_CAPTURE_FROM"))   ? atol(e) : 0;
     s_bright  = (e = getenv("RSX_CAPTURE_BRIGHT")) ? atol(e) : -1;
     s_nframes = (e = getenv("RSX_CAPTURE_FRAMES")) ? atol(e) : 120;
+    s_trigger = getenv("RSX_CAPTURE_TRIGGER");
     if (s_nframes <= 0) s_nframes = 120;
 }
 
@@ -153,7 +156,11 @@ void rsx_capture_present(u32 frame, double mean,
         return;
     }
     if (!s_path || !*s_path || s_done || (long)frame < s_from) return;
-    if (s_bright >= 0 && (mean < 0 || mean < (double)s_bright)) return;
+    if (s_trigger && *s_trigger) {
+        /* Armed by a file: start on the first present after it appears. */
+        if ((frame % 15u) != 0 || access(s_trigger, F_OK) != 0) return;
+        unlink(s_trigger);
+    } else if (s_bright >= 0 && (mean < 0 || mean < (double)s_bright)) return;
 
     s_gz = gzopen(s_path, "wb1");
     if (!s_gz) {

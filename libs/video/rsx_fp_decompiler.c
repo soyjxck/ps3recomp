@@ -452,6 +452,11 @@ static void fp_coord2(u32 u, const char* xy, char* out, u32 out_size)
         snprintf(out, out_size, "%s", xy);
 }
 
+/* Saturate the first colour export's alpha in the next decompile; see
+ * rsx_fp_set_saturate_alpha in the header. */
+static int s_sat_alpha;
+void rsx_fp_set_saturate_alpha(int on) { s_sat_alpha = on ? 1 : 0; }
+
 /* Per-unit texel conversions for the next decompile; see
  * rsx_fp_set_texel_ops in the header. */
 static u32 s_texop_mask;
@@ -996,10 +1001,11 @@ static int rsx_fp_decompile_internal(
         if (wrote[half_exports][t]) { targets = t + 1; break; }
 
     if (targets == 1) {
-        char tail[96];
+        char tail[160];
         snprintf(tail, sizeof(tail),
-                 "    float4 _o = %s[0];\n"
-                 "    return (_o == _o) ? _o : (float4)0;\n}\n", export_file);
+                 "    float4 _o = %s[0];\n%s"
+                 "    return (_o == _o) ? _o : (float4)0;\n}\n", export_file,
+                 s_sat_alpha ? "    _o.w = saturate(_o.w);\n" : "");
         out_puts(&o, tail);
     } else {
         /* Multiple render targets. The NaN guard is per target: a poisoned
@@ -1007,11 +1013,12 @@ static int rsx_fp_decompile_internal(
          * are computed independently. */
         out_puts(&o, "    PSOutput _out;\n");
         for (u32 t = 0; t < targets; t++) {
-            char line[192];
+            char line[240];
             snprintf(line, sizeof(line),
-                     "    float4 _o%u = %s[%u];\n"
+                     "    float4 _o%u = %s[%u];\n%s"
                      "    _out.t%u = (_o%u == _o%u) ? _o%u : (float4)0;\n",
                      t, export_file, fp_export_reg[half_exports][t],
+                     (s_sat_alpha && t == 0) ? "    _o0.w = saturate(_o0.w);\n" : "",
                      t, t, t, t);
             out_puts(&o, line);
         }
