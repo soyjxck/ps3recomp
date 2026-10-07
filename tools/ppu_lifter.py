@@ -289,6 +289,120 @@ static inline void ppu_vstu4(void* v, const uint32_t in[4]) {
     for (int i = 0; i < 4; i++) { uint32_t b = ppu_vbswap32(in[i]); memcpy(p + i*4, &b, 4); }
 }
 
+/* The common AltiVec operations as one call each. On x86-64 they are SSE
+ * (SSSE3/SSE4.1, which every x86 this runs on has): byte operations work on
+ * the big-endian register bytes directly, float operations swap each lane
+ * in and out with one pshufb. Elsewhere the scalar forms below, which are
+ * what every site used to spell out inline. The float forms are unfused
+ * (multiply, then add), as the scalar ones were. */
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(PPU_NO_SSE_VMX)
+#include <immintrin.h>
+static inline __m128i ppu_vbswap128(__m128i x) {
+    const __m128i m = _mm_setr_epi8(3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12);
+    return _mm_shuffle_epi8(x, m);
+}
+static inline __m128i ppu_vld128(const void* v) { return _mm_loadu_si128((const __m128i*)v); }
+static inline void    ppu_vst128(void* v, __m128i x) { _mm_storeu_si128((__m128i*)v, x); }
+static inline __m128  ppu_vldps(const void* v) { return _mm_castsi128_ps(ppu_vbswap128(ppu_vld128(v))); }
+static inline void    ppu_vstps(void* v, __m128 f) { ppu_vst128(v, ppu_vbswap128(_mm_castps_si128(f))); }
+static inline void ppu_vmaddfp(void* d, const void* a, const void* b, const void* c)
+{ ppu_vstps(d, _mm_add_ps(_mm_mul_ps(ppu_vldps(a), ppu_vldps(c)), ppu_vldps(b))); }
+static inline void ppu_vnmsubfp(void* d, const void* a, const void* b, const void* c)
+{ ppu_vstps(d, _mm_sub_ps(ppu_vldps(b), _mm_mul_ps(ppu_vldps(a), ppu_vldps(c)))); }
+static inline void ppu_vaddfp(void* d, const void* a, const void* b) { ppu_vstps(d, _mm_add_ps(ppu_vldps(a), ppu_vldps(b))); }
+static inline void ppu_vsubfp(void* d, const void* a, const void* b) { ppu_vstps(d, _mm_sub_ps(ppu_vldps(a), ppu_vldps(b))); }
+static inline void ppu_vmulfp(void* d, const void* a, const void* b) { ppu_vstps(d, _mm_mul_ps(ppu_vldps(a), ppu_vldps(b))); }
+/* vperm: byte i of the result is byte sel[i]&31 of a||b. */
+static inline void ppu_vperm(void* d, const void* a, const void* b, const void* c)
+{
+    const __m128i sel = _mm_and_si128(ppu_vld128(c), _mm_set1_epi8(0x1F));
+    const __m128i idx = _mm_and_si128(sel, _mm_set1_epi8(0x0F));
+    const __m128i pa = _mm_shuffle_epi8(ppu_vld128(a), idx);
+    const __m128i pb = _mm_shuffle_epi8(ppu_vld128(b), idx);
+    const __m128i hi = _mm_slli_epi16(_mm_and_si128(sel, _mm_set1_epi8(0x10)), 3);   /* 0x10 -> 0x80 */
+    ppu_vst128(d, _mm_blendv_epi8(pa, pb, hi));
+}
+static inline void ppu_vspltw(void* d, const void* b, int u)
+{ uint32_t w; memcpy(&w, (const uint8_t*)b + 4 * u, 4); ppu_vst128(d, _mm_set1_epi32((int)w)); }
+/* Float compares: the mask lanes are all-ones or all-zero, so they need no
+ * swap; returns how many lanes were true (the dot form's CR6). */
+static inline int ppu_vcmpfp(void* d, const void* a, const void* b, int op)
+{
+    const __m128 x = ppu_vldps(a), y = ppu_vldps(b);
+    const __m128 m = op == 0 ? _mm_cmpeq_ps(x, y) : op == 1 ? _mm_cmpge_ps(x, y) : _mm_cmpgt_ps(x, y);
+    ppu_vst128(d, _mm_castps_si128(m));
+    const int k = _mm_movemask_ps(m);
+    return (k & 1) + ((k >> 1) & 1) + ((k >> 2) & 1) + ((k >> 3) & 1);
+}
+static inline int ppu_vcmpequw(void* d, const void* a, const void* b)
+{
+    const __m128i m = _mm_cmpeq_epi32(ppu_vld128(a), ppu_vld128(b));
+    ppu_vst128(d, m);
+    const int k = _mm_movemask_ps(_mm_castsi128_ps(m));
+    return (k & 1) + ((k >> 1) & 1) + ((k >> 2) & 1) + ((k >> 3) & 1);
+}
+/* vmrgh and vmrgl: interleave the first (high) or second (low) half of the
+ * elements of a and b, in memory order. */
+static inline void ppu_vmrg(void* d, const void* a, const void* b, int esz, int high)
+{
+    const __m128i x = ppu_vld128(a), y = ppu_vld128(b);
+    __m128i r;
+    if (esz == 1)      r = high ? _mm_unpacklo_epi8(x, y)  : _mm_unpackhi_epi8(x, y);
+    else if (esz == 2) r = high ? _mm_unpacklo_epi16(x, y) : _mm_unpackhi_epi16(x, y);
+    else               r = high ? _mm_unpacklo_epi32(x, y) : _mm_unpackhi_epi32(x, y);
+    ppu_vst128(d, r);
+}
+/* vsldoi: bytes SH..SH+15 of a||b (SH a constant). */
+#define PPU_VSLDOI(d, a, b, SH) ppu_vst128((d), _mm_alignr_epi8(ppu_vld128(b), ppu_vld128(a), (SH)))
+#else
+static inline void ppu_vmaddfp(void* d, const void* a, const void* b, const void* c)
+{ float x[4],y[4],z[4],r[4]; ppu_vldf4(a,x); ppu_vldf4(b,y); ppu_vldf4(c,z); for(int i=0;i<4;i++) r[i]=x[i]*z[i]+y[i]; ppu_vstf4(d,r); }
+static inline void ppu_vnmsubfp(void* d, const void* a, const void* b, const void* c)
+{ float x[4],y[4],z[4],r[4]; ppu_vldf4(a,x); ppu_vldf4(b,y); ppu_vldf4(c,z); for(int i=0;i<4;i++) r[i]=y[i]-x[i]*z[i]; ppu_vstf4(d,r); }
+static inline void ppu_vaddfp(void* d, const void* a, const void* b)
+{ float x[4],y[4],r[4]; ppu_vldf4(a,x); ppu_vldf4(b,y); for(int i=0;i<4;i++) r[i]=x[i]+y[i]; ppu_vstf4(d,r); }
+static inline void ppu_vsubfp(void* d, const void* a, const void* b)
+{ float x[4],y[4],r[4]; ppu_vldf4(a,x); ppu_vldf4(b,y); for(int i=0;i<4;i++) r[i]=x[i]-y[i]; ppu_vstf4(d,r); }
+static inline void ppu_vmulfp(void* d, const void* a, const void* b)
+{ float x[4],y[4],r[4]; ppu_vldf4(a,x); ppu_vldf4(b,y); for(int i=0;i<4;i++) r[i]=x[i]*y[i]; ppu_vstf4(d,r); }
+static inline void ppu_vperm(void* d, const void* a, const void* b, const void* c)
+{
+    const uint8_t* pa = (const uint8_t*)a; const uint8_t* pb = (const uint8_t*)b; const uint8_t* pc = (const uint8_t*)c;
+    uint8_t tmp[16];
+    for (int i = 0; i < 16; i++) { uint8_t sel = pc[i] & 0x1F; tmp[i] = (sel < 16) ? pa[sel] : pb[sel - 16]; }
+    memcpy(d, tmp, 16);
+}
+static inline void ppu_vspltw(void* d, const void* b, int u)
+{ uint32_t w; memcpy(&w, (const uint8_t*)b + 4 * u, 4); uint32_t r[4] = { w, w, w, w }; memcpy(d, r, 16); }
+static inline int ppu_vcmpfp(void* d, const void* a, const void* b, int op)
+{
+    float x[4], y[4]; uint32_t r[4]; int t = 0;
+    ppu_vldf4(a, x); ppu_vldf4(b, y);
+    for (int i = 0; i < 4; i++) { int k = op == 0 ? (x[i] == y[i]) : op == 1 ? (x[i] >= y[i]) : (x[i] > y[i]); r[i] = k ? ~0u : 0u; t += k; }
+    memcpy(d, r, 16);
+    return t;
+}
+static inline int ppu_vcmpequw(void* d, const void* a, const void* b)
+{
+    uint32_t x[4], y[4], r[4]; int t = 0;
+    memcpy(x, a, 16); memcpy(y, b, 16);
+    for (int i = 0; i < 4; i++) { int k = x[i] == y[i]; r[i] = k ? ~0u : 0u; t += k; }
+    memcpy(d, r, 16);
+    return t;
+}
+static inline void ppu_vmrg(void* d, const void* a, const void* b, int esz, int high)
+{
+    const uint8_t* pa = (const uint8_t*)a; const uint8_t* pb = (const uint8_t*)b;
+    uint8_t t[16]; const int n = 16 / esz, half = n / 2, start = high ? 0 : half;
+    for (int i = 0; i < half; i++) {
+        memcpy(t + (2 * i) * esz, pa + (start + i) * esz, (size_t)esz);
+        memcpy(t + (2 * i + 1) * esz, pb + (start + i) * esz, (size_t)esz);
+    }
+    memcpy(d, t, 16);
+}
+#define PPU_VSLDOI(d, a, b, SH) do { uint8_t tmp_[32]; memcpy(tmp_, (a), 16); memcpy(tmp_ + 16, (b), 16); memcpy((d), tmp_ + (SH), 16); } while (0)
+#endif
+
 /* The guest timebase (mftb/mftbu): one global monotonic clock scaled to the
  * PS3's 79.8 MHz, provided by the runtime (runtime/syscalls/sys_timer.c). */
 #ifdef __cplusplus
@@ -934,43 +1048,122 @@ class PPULifter:
     #
     # Host code reading r14-r31 out of the context (PPU_CSCHECK, the flOw
     # probe) sees the value at the last call boundary, not the live one.
+    # The same holds for the non-volatile floating-point (f14-f31) and
+    # vector (v20-v31) registers, and for CR, XER and CTR: a callee may
+    # clobber the volatile CR fields, XER's carry and CTR, but no compiled
+    # caller reads them after a call, and the non-volatile fields (cr2-cr4)
+    # it preserves. CTR is written to the file before every call because an
+    # indirect call takes its target from ctx->ctr.
     _NV_TOKEN = re.compile(r"ctx->gpr\[(1[4-9]|2[0-9]|3[01])\]")
+    _NV_FPR = re.compile(r"ctx->fpr\[(1[4-9]|2[0-9]|3[01])\]")
+    _NV_VR = re.compile(r"ctx->vr\[(2[0-9]|3[01])\]")
+    _NV_SPR = re.compile(r"ctx->(cr|xer|ctr)\b")
     _NV_CALL = re.compile(r"\bfunc_[0-9A-Fa-f]+\(ctx\)|ps3_indirect_call\(ctx\)|ps3_hle_call\(|lv2_syscall\(ctx\)")
     _NV_RESTORE = re.compile(r"^\s*ctx->gpr\[(\d+)\] = _cs_(\d+);\s*$")
+    _NV_RET = re.compile(r"\breturn\b")
+    # Every point in a line where control can leave the function or enter
+    # another one; the write-back goes IMMEDIATELY before it, inside the
+    # line, because a line can set a register and transfer in one go
+    # (`ctx->ctr = ctx->lr; ps3_indirect_call(ctx);` is how blrl lifts).
+    _NV_XFER = re.compile(r"\bfunc_[0-9A-Fa-f]+\(ctx\)|ps3_indirect_call\(ctx\)|ps3_hle_call\(|lv2_syscall\(ctx\)|g_trampoline_fn = |\breturn\b")
+    _NV_SPR_TYPES = {"cr": "uint32_t", "xer": "uint32_t", "ctr": "uint64_t"}
+    # Where a call has returned: the end of the trampoline drain that follows
+    # every call, and a syscall (which has no drain).
+    _NV_AFTER = re.compile(r"DRAIN_TRAMPOLINE\(ctx\);|lv2_syscall\(ctx\);")
+
+    def _nv_brace_if(self, line: str) -> str:
+        st = line.lstrip()
+        if not st.startswith("if ("):
+            return line
+        i = len(line) - len(st) + 3          # index of the opening paren
+        depth = 0
+        for j in range(i, len(line)):
+            c = line[j]
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+        else:
+            return line
+        rest = line[j + 1:]
+        if rest.lstrip().startswith("{") or not self._NV_XFER.search(rest) or "//" in rest:
+            return line
+        return line[:j + 1] + " { " + rest.strip() + " }"
 
     def _nonvolatile_locals_pass(self, func) -> None:
-        used = set()
+        gprs, fprs, vrs, sprs = set(), set(), set(), set()
+        kinds = set(os.environ.get("PPU_NV_KINDS", "gpr,fpr,vr,spr").split(","))
         for _l in func.body_lines:
-            for _m in self._NV_TOKEN.finditer(_l):
-                used.add(int(_m.group(1)))
-        if not used:
+            if "gpr" in kinds:
+                for _m in self._NV_TOKEN.finditer(_l): gprs.add(int(_m.group(1)))
+            if "fpr" in kinds:
+                for _m in self._NV_FPR.finditer(_l): fprs.add(int(_m.group(1)))
+            if "vr" in kinds:
+                for _m in self._NV_VR.finditer(_l): vrs.add(int(_m.group(1)))
+            if "spr" in kinds:
+                for _m in self._NV_SPR.finditer(_l): sprs.add(_m.group(1))
+        if not (gprs or fprs or vrs or sprs):
             return
-        regs = sorted(used)
-        writeback = "    " + " ".join(f"ctx->gpr[{n}] = r{n};" for n in regs)
+        decls = []
+        wb = []
+        for n in sorted(gprs): decls.append(f"uint64_t r{n} = ctx->gpr[{n}];"); wb.append(f"ctx->gpr[{n}] = r{n};")
+        for n in sorted(fprs): decls.append(f"double f{n} = ctx->fpr[{n}];"); wb.append(f"ctx->fpr[{n}] = f{n};")
+        for n in sorted(vrs): decls.append(f"ppu_vr v{n} = ctx->vr[{n}];"); wb.append(f"ctx->vr[{n}] = v{n};")
+        for n in sorted(sprs): decls.append(f"{self._NV_SPR_TYPES[n]} {n} = ctx->{n};"); wb.append(f"ctx->{n} = {n};")
+        decl_line = "    " + " ".join(decls)
+        writeback = "    " + " ".join(wb)
+
+        wb_inline = " ".join(wb) + " "
+        # The non-GPR locals are re-read after every call. A callee may change
+        # them in the file in ways the ABI allows but a cached copy misses:
+        # out-of-line _restfpr/_restvr routines restore f14-f31/v20-v31 into
+        # the file, mtcrf restores cr2-cr4, CTR and XER are volatile. Without
+        # the re-read, the caller's stale copy is written back over them at
+        # its next transfer. GPRs keep the cheaper no-reload form: the
+        # _cs_ restore above already covers the out-of-line GPR restores.
+        rl = []
+        for n in sorted(fprs): rl.append(f"f{n} = ctx->fpr[{n}];")
+        for n in sorted(vrs): rl.append(f"v{n} = ctx->vr[{n}];")
+        for n in sorted(sprs): rl.append(f"{n} = ctx->{n};")
+        rl_inline = (" " + " ".join(rl)) if rl else ""
+        def rewrite(line):
+            if gprs: line = self._NV_TOKEN.sub(lambda m: f"r{m.group(1)}", line)
+            if fprs: line = self._NV_FPR.sub(lambda m: f"f{m.group(1)}", line)
+            if vrs: line = self._NV_VR.sub(lambda m: f"v{m.group(1)}", line)
+            if sprs: line = self._NV_SPR.sub(lambda m: m.group(1), line)
+            # A conditional return lifts as an unbraced `if (c) return;`.
+            # Brace it first, or the write-back inserted before `return`
+            # would end the if and the return would run unconditionally.
+            line = self._nv_brace_if(line)
+            line = self._NV_XFER.sub(lambda m: wb_inline + m.group(0), line)
+            if rl_inline:
+                line = self._NV_AFTER.sub(lambda m: m.group(0) + rl_inline, line)
+            return line
+
         out = []
         decl_done = False
         for _l in func.body_lines:
             stripped = _l.strip()
-            if not decl_done and (stripped.startswith("uint64_t _cs_")):
+            if not decl_done and stripped.startswith("uint64_t _cs_"):
                 out.append(_l)            # snapshots read the file at entry, before the locals
                 continue
             if not decl_done:
                 decl_done = True
-                out.append("    " + " ".join(f"uint64_t r{n} = ctx->gpr[{n}];" for n in regs))
+                out.append(decl_line)
             _m = self._NV_RESTORE.match(_l)
-            if _m and int(_m.group(1)) in used:
+            if _m and int(_m.group(1)) in gprs:
                 n = int(_m.group(1))
                 out.append(f"    r{n} = _cs_{_m.group(2)}; ctx->gpr[{n}] = _cs_{_m.group(2)};")
                 continue
-            if self._NV_CALL.search(_l) or stripped.startswith("return"):
-                out.append(writeback)
-            out.append(self._NV_TOKEN.sub(lambda m: f"r{m.group(1)}", _l))
+            out.append(rewrite(_l))
         if not decl_done:
-            out.append("    " + " ".join(f"uint64_t r{n} = ctx->gpr[{n}];" for n in regs))
+            out.append(decl_line)
         # The fall-through trampoline appended after the body enters another
         # function with whatever the file holds.
         last = next((l.strip() for l in reversed(out) if l.strip() and not l.strip().endswith(":")), "")
-        if not last.startswith("return"):
+        if not self._NV_RET.search(last):
             out.append(writeback)
         func.body_lines = out
 
@@ -2427,24 +2620,14 @@ class PPULifter:
             va = int(ops[1][1:])
             vb = int(ops[2][1:])
             vc = int(ops[3][1:])
-            return (f"{{ uint8_t* a = (uint8_t*)&ctx->vr[{va}]; "
-                    f"uint8_t* b = (uint8_t*)&ctx->vr[{vb}]; "
-                    f"uint8_t* c = (uint8_t*)&ctx->vr[{vc}]; "
-                    f"uint8_t* d = (uint8_t*)&ctx->vr[{vd}]; "
-                    f"uint8_t tmp[16]; "
-                    f"for (int i = 0; i < 16; i++) {{ "
-                    f"uint8_t sel = c[i] & 0x1F; "
-                    f"tmp[i] = (sel < 16) ? a[sel] : b[sel - 16]; }} "
-                    f"memcpy(d, tmp, 16); }}")
+            return f"ppu_vperm(&ctx->vr[{vd}], &ctx->vr[{va}], &ctx->vr[{vb}], &ctx->vr[{vc}]);"
 
         # VMX splat (vspltw, vsplth, vspltb) — duplicate one element across vector
         if mn == "vspltw":
             vd = int(ops[0][1:])
             vb = int(ops[1][1:])
             uimm = int(ops[2]) & 3
-            return (f"{{ uint32_t* d = (uint32_t*)&ctx->vr[{vd}]; "
-                    f"uint32_t val = ((uint32_t*)&ctx->vr[{vb}])[{uimm}]; "
-                    f"d[0] = d[1] = d[2] = d[3] = val; }}")
+            return f"ppu_vspltw(&ctx->vr[{vd}], &ctx->vr[{vb}], {uimm});"
 
         if mn == "vxor":
             vd = int(ops[0][1:])
@@ -2474,15 +2657,9 @@ class PPULifter:
         # Temps handle vD aliasing vA/vB (`vmrghw v0,v0,v13`).
         if mn in ("vmrghb","vmrghh","vmrghw","vmrglb","vmrglh","vmrglw"):
             vd = int(ops[0][1:]); va = int(ops[1][1:]); vb = int(ops[2][1:])
-            esz = mn[5]
-            ctype, n = ({"b":("uint8_t",16), "h":("uint16_t",8), "w":("uint32_t",4)})[esz]
-            half = n // 2
-            start = 0 if mn[4] == 'h' else half
-            asg = " ".join(f"t[{2*i}]=a[{start+i}]; t[{2*i+1}]=b[{start+i}];"
-                           for i in range(half))
-            return (f"{{ {ctype}* d=({ctype}*)&ctx->vr[{vd}]; "
-                    f"{ctype}* a=({ctype}*)&ctx->vr[{va}]; {ctype}* b=({ctype}*)&ctx->vr[{vb}]; "
-                    f"{ctype} t[{n}]; {asg} memcpy(d, t, 16); }}")
+            esz = {"b": 1, "h": 2, "w": 4}[mn[5]]
+            high = 1 if mn[4] == 'h' else 0
+            return f"ppu_vmrg(&ctx->vr[{vd}], &ctx->vr[{va}], &ctx->vr[{vb}], {esz}, {high});"
 
         # ------- VMX floating-point arithmetic -------
         # CRITICAL operand order: our disassembler (ppu_disasm.py VA-form, line
@@ -2502,9 +2679,7 @@ class PPULifter:
             va = int(ops[1][1:])
             vb = int(ops[2][1:])   # ops[2] = vB = addend (encoding order)
             vc = int(ops[3][1:])   # ops[3] = vC = multiplicand
-            return (f"{{ float a[4],b[4],c[4],d[4]; ppu_vldf4(&ctx->vr[{va}],a); "
-                    f"ppu_vldf4(&ctx->vr[{vb}],b); ppu_vldf4(&ctx->vr[{vc}],c); "
-                    f"for(int i=0;i<4;i++) d[i]=a[i]*c[i]+b[i]; ppu_vstf4(&ctx->vr[{vd}],d); }}")
+            return f"ppu_vmaddfp(&ctx->vr[{vd}], &ctx->vr[{va}], &ctx->vr[{vb}], &ctx->vr[{vc}]);"
 
         if mn == "vnmsubfp":
             # vD = -(vA*vC - vB) = vB - vA*vC. Encoding order [vD,vA,vB,vC]:
@@ -2513,25 +2688,12 @@ class PPULifter:
             va = int(ops[1][1:])
             vb = int(ops[2][1:])   # ops[2] = vB = minuend (encoding order)
             vc = int(ops[3][1:])   # ops[3] = vC = multiplicand
-            return (f"{{ float a[4],b[4],c[4],d[4]; ppu_vldf4(&ctx->vr[{va}],a); "
-                    f"ppu_vldf4(&ctx->vr[{vb}],b); ppu_vldf4(&ctx->vr[{vc}],c); "
-                    f"for(int i=0;i<4;i++) d[i]=b[i]-a[i]*c[i]; ppu_vstf4(&ctx->vr[{vd}],d); }}")
+            return f"ppu_vnmsubfp(&ctx->vr[{vd}], &ctx->vr[{va}], &ctx->vr[{vb}], &ctx->vr[{vc}]);"
 
-        if mn == "vaddfp":
+        if mn in ("vaddfp", "vsubfp", "vmulfp"):
+            # (vmulfp is not a real PPC instruction but some disassemblers emit it.)
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ float a[4],b[4],d[4]; ppu_vldf4(&ctx->vr[{va}],a); ppu_vldf4(&ctx->vr[{vb}],b); "
-                    f"for(int i=0;i<4;i++) d[i]=a[i]+b[i]; ppu_vstf4(&ctx->vr[{vd}],d); }}")
-
-        if mn == "vsubfp":
-            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ float a[4],b[4],d[4]; ppu_vldf4(&ctx->vr[{va}],a); ppu_vldf4(&ctx->vr[{vb}],b); "
-                    f"for(int i=0;i<4;i++) d[i]=a[i]-b[i]; ppu_vstf4(&ctx->vr[{vd}],d); }}")
-
-        if mn == "vmulfp":
-            # Not a real PPC instruction but some disassemblers emit it
-            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ float a[4],b[4],d[4]; ppu_vldf4(&ctx->vr[{va}],a); ppu_vldf4(&ctx->vr[{vb}],b); "
-                    f"for(int i=0;i<4;i++) d[i]=a[i]*b[i]; ppu_vstf4(&ctx->vr[{vd}],d); }}")
+            return f"ppu_{mn}(&ctx->vr[{vd}], &ctx->vr[{va}], &ctx->vr[{vb}]);"
 
         # VMX select (vsel) — bitwise select: vD = (vA & ~vC) | (vB & vC)
         if mn == "vsel":
@@ -2555,16 +2717,10 @@ class PPULifter:
         if mn.rstrip(".") in vcmp_f or mn.rstrip(".") == "vcmpequw":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
             if mn.rstrip(".") == "vcmpequw":
-                load = (f"uint32_t a[4],b[4]; ppu_vldu4(&ctx->vr[{va}],a); "
-                        f"ppu_vldu4(&ctx->vr[{vb}],b); ")
-                pred = "a[i]==b[i]"
+                body = f"{{ int t = ppu_vcmpequw(&ctx->vr[{vd}], &ctx->vr[{va}], &ctx->vr[{vb}]);"
             else:
-                load = (f"float a[4],b[4]; ppu_vldf4(&ctx->vr[{va}],a); "
-                        f"ppu_vldf4(&ctx->vr[{vb}],b); ")
-                pred = vcmp_f[mn.rstrip(".")]
-            body = (f"{{ {load}uint32_t d[4]; int t=0; "
-                    f"for(int i=0;i<4;i++){{ int r=({pred}); d[i]=r?~0u:0u; t+=r; }} "
-                    f"memcpy(&ctx->vr[{vd}], d, 16);")
+                op = {"vcmpeqfp": 0, "vcmpgefp": 1, "vcmpgtfp": 2}[mn.rstrip(".")]
+                body = f"{{ int t = ppu_vcmpfp(&ctx->vr[{vd}], &ctx->vr[{va}], &ctx->vr[{vb}], {op});"
             if mn.endswith("."):
                 body += (" uint32_t c6=(t==4?8u:0u)|(t==0?2u:0u); "
                          "ctx->cr=(ctx->cr & ~(0xFu<<4))|(c6<<4);")
@@ -2576,9 +2732,7 @@ class PPULifter:
             va = int(ops[1][1:])
             vb = int(ops[2][1:])
             sh = int(ops[3])  # numeric shift count (disasm emits plain number)
-            return (f"{{ uint8_t tmp[32]; "
-                    f"memcpy(tmp, &ctx->vr[{va}], 16); memcpy(tmp+16, &ctx->vr[{vb}], 16); "
-                    f"memcpy(&ctx->vr[{vd}], tmp + {sh}, 16); }}")
+            return f"PPU_VSLDOI(&ctx->vr[{vd}], &ctx->vr[{va}], &ctx->vr[{vb}], {sh});"
 
         # VMX integer multiply-accumulate
         if mn == "vmsumshm":
