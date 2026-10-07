@@ -555,6 +555,8 @@ class PPULifter:
     """Translates PPU instructions into C source."""
 
     def __init__(self, prefix: str = ""):
+        # --nonvolatile-locals: see _nonvolatile_locals_pass.
+        self.nonvolatile_locals = False
         self.functions: list[LiftedFunction] = []
         self.call_targets: set[int] = set()
         self.branch_targets: set[int] = set()  # all func_X references (b/bc trampolines)
@@ -906,8 +908,71 @@ class PPULifter:
                        for _n, _off in sorted(_mem_snap.items()) if _n not in _reg_snap]
             func.body_lines = _decls + func.body_lines
 
+        if self.nonvolatile_locals:
+            self._nonvolatile_locals_pass(func)
+
         self.functions.append(func)
         return func
+
+    # Non-volatile registers (r14-r31) as C locals.
+    #
+    # Every lifted statement reads and writes the register file in memory,
+    # `ctx->gpr[N]`, so a loop that keeps its counters and pointers in r14-r31
+    # -- which is where a compiler keeps them -- loads and stores them on
+    # every instruction, and Clang can keep nothing in a host register
+    # across a volatile guest access. This is XenonRecomp's
+    # `non_volatile_as_local`: the function holds r14-r31 in locals, and the
+    # register file sees them only where another function could look:
+    # before a call (a lifted callee entered mid-function -- a tail entry --
+    # reads the caller's registers from the file), before a return, and
+    # before the fall-through trampoline at the end. Nothing is reloaded
+    # after a call: every lifted callee restores r14-r31 in the file to what
+    # it found (the _cs_ snapshot above), and the ABI promises the same of
+    # the title's own code. The restore lines keep writing the file, so a
+    # caller still finds its registers where it left them, and set the local
+    # as well so this function's own view agrees.
+    #
+    # Host code reading r14-r31 out of the context (PPU_CSCHECK, the flOw
+    # probe) sees the value at the last call boundary, not the live one.
+    _NV_TOKEN = re.compile(r"ctx->gpr\[(1[4-9]|2[0-9]|3[01])\]")
+    _NV_CALL = re.compile(r"\bfunc_[0-9A-Fa-f]+\(ctx\)|ps3_indirect_call\(ctx\)|ps3_hle_call\(|lv2_syscall\(ctx\)")
+    _NV_RESTORE = re.compile(r"^\s*ctx->gpr\[(\d+)\] = _cs_(\d+);\s*$")
+
+    def _nonvolatile_locals_pass(self, func) -> None:
+        used = set()
+        for _l in func.body_lines:
+            for _m in self._NV_TOKEN.finditer(_l):
+                used.add(int(_m.group(1)))
+        if not used:
+            return
+        regs = sorted(used)
+        writeback = "    " + " ".join(f"ctx->gpr[{n}] = r{n};" for n in regs)
+        out = []
+        decl_done = False
+        for _l in func.body_lines:
+            stripped = _l.strip()
+            if not decl_done and (stripped.startswith("uint64_t _cs_")):
+                out.append(_l)            # snapshots read the file at entry, before the locals
+                continue
+            if not decl_done:
+                decl_done = True
+                out.append("    " + " ".join(f"uint64_t r{n} = ctx->gpr[{n}];" for n in regs))
+            _m = self._NV_RESTORE.match(_l)
+            if _m and int(_m.group(1)) in used:
+                n = int(_m.group(1))
+                out.append(f"    r{n} = _cs_{_m.group(2)}; ctx->gpr[{n}] = _cs_{_m.group(2)};")
+                continue
+            if self._NV_CALL.search(_l) or stripped.startswith("return"):
+                out.append(writeback)
+            out.append(self._NV_TOKEN.sub(lambda m: f"r{m.group(1)}", _l))
+        if not decl_done:
+            out.append("    " + " ".join(f"uint64_t r{n} = ctx->gpr[{n}];" for n in regs))
+        # The fall-through trampoline appended after the body enters another
+        # function with whatever the file holds.
+        last = next((l.strip() for l in reversed(out) if l.strip() and not l.strip().endswith(":")), "")
+        if not last.startswith("return"):
+            out.append(writeback)
+        func.body_lines = out
 
     # ------------------------------------------------------------------ #
     # Per-instruction translation
@@ -4041,7 +4106,8 @@ _WORKER_STATE: dict = {}
 
 def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
                  function_entries=None, code_lo=0, code_hi=None, jump_tables=None,
-                 toc_base=0):
+                 toc_base=0, nonvolatile_locals=False):
+    _WORKER_STATE["nonvolatile_locals"] = nonvolatile_locals
     _WORKER_STATE["segs"] = segs
     _WORKER_STATE["be"] = big_endian
     _WORKER_STATE["names"] = name_map
@@ -4071,6 +4137,7 @@ def _worker_lift(task):
     lifter.code_hi = _WORKER_STATE.get("code_hi", None)
     lifter.jump_tables = _WORKER_STATE.get("jump_tables", {})
     lifter.toc_base = _WORKER_STATE.get("toc_base", 0)
+    lifter.nonvolatile_locals = _WORKER_STATE.get("nonvolatile_locals", False)
     results = []
     for start, end in bounds:
         blob = b""
@@ -4105,7 +4172,8 @@ def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
                    initargs=(segs, big_endian, lifter.name_map, lifter.prefix,
                              lifter.hle_stub_nids, lifter.function_entries,
                              lifter.code_lo, lifter.code_hi, lifter.jump_tables,
-                             getattr(lifter, "toc_base", 0)))
+                             getattr(lifter, "toc_base", 0),
+                             getattr(lifter, "nonvolatile_locals", False)))
     try:
         for idx0, results, ct, bt in pool.imap_unordered(_worker_lift, tasks):
             results_by_idx[idx0] = results
@@ -4169,6 +4237,10 @@ def main() -> None:
                         help="Prefix for every emitted func_*/function_table "
                              "symbol (e.g. 'libsre_') so a relocated PRX image "
                              "links alongside the main title without collisions")
+    parser.add_argument("--nonvolatile-locals", action="store_true",
+                        help="Keep r14-r31 in C locals inside each function, written to "
+                             "the register file only at call boundaries (see "
+                             "PPULifter._nonvolatile_locals_pass)")
     parser.add_argument("--hle-stubs", metavar="FILE", default=None,
                         help="EBOOT.imports.json ([{library,nid,stub}]). Each "
                              "import stub address is lifted as ps3_hle_call(nid) "
@@ -4619,6 +4691,7 @@ def main() -> None:
         lifter.code_lo = min(s for s, _ in func_bounds)
         lifter.code_hi = max(e for _, e in func_bounds)
     lifter.hle_stub_nids = hle_stubs
+    lifter.nonvolatile_locals = args.nonvolatile_locals
     lifter.function_entries = _func_entries
     lifter.jump_tables = jt_dispatchers
 
