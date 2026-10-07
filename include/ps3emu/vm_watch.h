@@ -45,6 +45,11 @@ void     vm_watch_touch(uint32_t ea, uint32_t len);
  * 1 when it was a watched page (now writable, marked written). */
 int      vm_watch_fault(uintptr_t addr, int is_write);
 void     vm_watch_stats(uint64_t* faults, uint64_t* pages_protected);
+/* Commit the RESERVED pages of host range [p, p+n) read-write and leave the
+ * committed ones alone; 1 on success. Every commit of guest memory goes
+ * through this: on Windows, MEM_COMMIT over a page that is already committed
+ * resets its protection, which would silently re-open a watched page. */
+int      vm_commit_reserved(void* p, uint64_t n);
 
 #ifdef __cplusplus
 }

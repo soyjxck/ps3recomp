@@ -968,7 +968,9 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
         if (e->handle && e->last_hash_frame != g.frames) {
             e->last_hash_frame = g.frames;
             int need_hash = 1;
-            if (eng_tex_watch_on()) {
+            /* Not while capturing: the hash's read is what records the
+             * texture's pages in the capture. */
+            if (eng_tex_watch_on() && !g_rsx_capture_on) {
                 /* Armed before the hash, so a write during or after it
                  * changes next frame's stamp. */
                 u64 st = 0;
@@ -1876,7 +1878,9 @@ static int eng_vc_checking(void)
  * draw the cache does not take (an inline stream, or no batches). */
 static u64 eng_vc_key(const rsx_vertex_layout_plan* layout, u32 prim, int rebuild)
 {
-    if (!eng_vc_enabled() || dc.inl || dc.inl_bytes) return 0;
+    /* A capture records the guest pages a draw reads (eng_guest_ptr); a
+     * cache hit reads none, so while one runs every draw converts afresh. */
+    if (!eng_vc_enabled() || g_rsx_capture_on || dc.inl || dc.inl_bytes) return 0;
     if (!dc.n_arr && !dc.n_idx) return 0;
     rsx_vertex_fetch_plan plan;
     rsx_vertex_fetch_plan_init(&plan, &g.rsx, layout, eng_guest_ptr, NULL);

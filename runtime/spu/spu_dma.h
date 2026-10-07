@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdio.h>
 #include "../platform/win32_compat.h"
+#include "../../include/ps3emu/vm_watch.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -63,7 +64,7 @@ static inline int mfc_ea_range_committed(uint64_t ea, uint32_t size)
           uint8_t* p = vm_base + ((uintptr_t)pg[i] << 16);
           if (VirtualQuery(p, &mbi, sizeof mbi) == 0) return 0;
           if (mbi.State != MEM_COMMIT) {
-              if (!VirtualAlloc(p, 0x10000, MEM_COMMIT, PAGE_READWRITE)) return 0;
+              if (!vm_commit_reserved(p, 0x10000)) return 0;   /* not over watched pages */
           } else if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) {
               return 0;
           }

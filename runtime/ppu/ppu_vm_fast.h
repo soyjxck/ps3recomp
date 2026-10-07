@@ -68,23 +68,33 @@ void     vm_write64_slow(uint64_t addr, uint64_t val);
 }
 #endif
 
-static inline int ppu_vm_load_fast_ok(uint32_t a)
+/* Always inline: in the largest lifted functions (thousands of lines of
+ * float code) clang's inliner gives up on these and emits real calls --
+ * func_00272F58, the hottest function in heavy destruction scenes, had 242
+ * call sites to an out-of-line vm_fast_read32/write32. */
+#if defined(__GNUC__) || defined(__clang__)
+#define PPU_VM_INLINE static inline __attribute__((always_inline))
+#else
+#define PPU_VM_INLINE static __forceinline
+#endif
+
+PPU_VM_INLINE int ppu_vm_load_fast_ok(uint32_t a)
 {
     return g_ppu_vm_page[a >> 16] & PPU_VM_PAGE_RD;
 }
 
-static inline int ppu_vm_store_fast_ok(uint32_t a)
+PPU_VM_INLINE int ppu_vm_store_fast_ok(uint32_t a)
 {
     return (g_ppu_vm_page[a >> 16] & (PPU_VM_PAGE_WR | PPU_VM_PAGE_COH)) == PPU_VM_PAGE_WR;
 }
 
-static inline uint8_t vm_fast_read8(uint64_t ea)
+PPU_VM_INLINE uint8_t vm_fast_read8(uint64_t ea)
 {
     uint32_t a = (uint32_t)ea;
     if (__builtin_expect(ppu_vm_load_fast_ok(a), 1)) return *(volatile uint8_t*)(vm_base + a);
     return vm_read8_slow(ea);
 }
-static inline uint16_t vm_fast_read16(uint64_t ea)
+PPU_VM_INLINE uint16_t vm_fast_read16(uint64_t ea)
 {
     uint32_t a = (uint32_t)ea;
     if (__builtin_expect(ppu_vm_load_fast_ok(a), 1)) {
@@ -92,7 +102,7 @@ static inline uint16_t vm_fast_read16(uint64_t ea)
     }
     return vm_read16_slow(ea);
 }
-static inline uint32_t vm_fast_read32(uint64_t ea)
+PPU_VM_INLINE uint32_t vm_fast_read32(uint64_t ea)
 {
     uint32_t a = (uint32_t)ea;
     /* A read of the GCM ref register is not a plain load: the slow path
@@ -104,7 +114,7 @@ static inline uint32_t vm_fast_read32(uint64_t ea)
     }
     return vm_read32_slow(ea);
 }
-static inline uint64_t vm_fast_read64(uint64_t ea)
+PPU_VM_INLINE uint64_t vm_fast_read64(uint64_t ea)
 {
     uint32_t a = (uint32_t)ea;
     if (__builtin_expect(ppu_vm_load_fast_ok(a), 1)) {
@@ -112,25 +122,25 @@ static inline uint64_t vm_fast_read64(uint64_t ea)
     }
     return vm_read64_slow(ea);
 }
-static inline void vm_fast_write8(uint64_t ea, uint8_t v)
+PPU_VM_INLINE void vm_fast_write8(uint64_t ea, uint8_t v)
 {
     uint32_t a = (uint32_t)ea;
     if (__builtin_expect(ppu_vm_store_fast_ok(a), 1)) { *(volatile uint8_t*)(vm_base + a) = v; return; }
     vm_write8_slow(ea, v);
 }
-static inline void vm_fast_write16(uint64_t ea, uint16_t v)
+PPU_VM_INLINE void vm_fast_write16(uint64_t ea, uint16_t v)
 {
     uint32_t a = (uint32_t)ea;
     if (__builtin_expect(ppu_vm_store_fast_ok(a), 1)) { *(volatile uint16_t*)(vm_base + a) = __builtin_bswap16(v); return; }
     vm_write16_slow(ea, v);
 }
-static inline void vm_fast_write32(uint64_t ea, uint32_t v)
+PPU_VM_INLINE void vm_fast_write32(uint64_t ea, uint32_t v)
 {
     uint32_t a = (uint32_t)ea;
     if (__builtin_expect(ppu_vm_store_fast_ok(a), 1)) { *(volatile uint32_t*)(vm_base + a) = __builtin_bswap32(v); return; }
     vm_write32_slow(ea, v);
 }
-static inline void vm_fast_write64(uint64_t ea, uint64_t v)
+PPU_VM_INLINE void vm_fast_write64(uint64_t ea, uint64_t v)
 {
     uint32_t a = (uint32_t)ea;
     if (__builtin_expect(ppu_vm_store_fast_ok(a), 1)) { *(volatile uint64_t*)(vm_base + a) = __builtin_bswap64(v); return; }

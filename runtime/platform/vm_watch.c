@@ -42,14 +42,23 @@ static int wp_protect_run(uint32_t p0, uint32_t p1)   /* pages [p0, p1] */
     uint8_t* a = s_base + ((uint64_t)p0 << WP_SHIFT);
     const SIZE_T n = (SIZE_T)(p1 - p0 + 1) << WP_SHIFT;
     /* The VM is committed on first touch; a reserved page cannot be
-     * protected. Committing the 64 KiB around the run first is idempotent
-     * for the pages that already are. */
-    uint8_t* c0 = (uint8_t*)((uintptr_t)a & ~(uintptr_t)0xFFFF);
-    uint8_t* c1 = (uint8_t*)(((uintptr_t)a + n + 0xFFFF) & ~(uintptr_t)0xFFFF);
-    if (!VirtualAlloc(c0, (SIZE_T)(c1 - c0), MEM_COMMIT, PAGE_READWRITE)) return 0;
-    DWORD old;
-    if (!VirtualProtect(a, n, PAGE_READONLY, &old)) return 0;
+     * protected, so commit the run first. Only the run: MEM_COMMIT on pages
+     * that are already committed RESETS their protection to the one given,
+     * so committing the 64 KiB around the run (as this once did) silently
+     * re-opened protected pages of neighbouring textures. Their writes then
+     * never faulted, the engine never re-hashed them, and they kept stale
+     * contents (black barrels in the town). The run's own pages are open
+     * already, so committing them read-write changes nothing. */
+    if (!vm_commit_reserved(a, n)) return 0;
+    /* Marked before the protection takes effect: a write that faults the
+     * instant it does must find the page marked, or the fault handler would
+     * not know it as the watch's. */
     for (uint32_t p = p0; p <= p1; p++) s_prot[p] = 1;
+    DWORD old;
+    if (!VirtualProtect(a, n, PAGE_READONLY, &old)) {
+        for (uint32_t p = p0; p <= p1; p++) s_prot[p] = 0;
+        return 0;
+    }
     InterlockedAdd64(&s_protected, (LONGLONG)(p1 - p0 + 1));
     return 1;
 }
@@ -112,6 +121,23 @@ int vm_watch_fault(uintptr_t addr, int is_write)
     return 1;
 }
 
+int vm_commit_reserved(void* p, uint64_t n)
+{
+    uint8_t* a = (uint8_t*)p;
+    uint8_t* const end = a + n;
+    while (a < end) {
+        MEMORY_BASIC_INFORMATION mi;
+        if (!VirtualQuery(a, &mi, sizeof mi)) return 0;
+        uint8_t* r_end = (uint8_t*)mi.BaseAddress + mi.RegionSize;
+        if (r_end > end) r_end = end;
+        if (mi.State == MEM_FREE) return 0;
+        if (mi.State == MEM_RESERVE &&
+            !VirtualAlloc(a, (SIZE_T)(r_end - a), MEM_COMMIT, PAGE_READWRITE)) return 0;
+        a = r_end;
+    }
+    return 1;
+}
+
 void vm_watch_stats(uint64_t* faults, uint64_t* pages_protected)
 {
     if (faults) *faults = (uint64_t)s_faults;
@@ -126,5 +152,6 @@ uint64_t vm_watch_arm(uint32_t ea, uint32_t len, uint32_t* unwatched) { (void)ea
 void     vm_watch_touch(uint32_t ea, uint32_t len) { (void)ea; (void)len; }
 int      vm_watch_fault(uintptr_t addr, int is_write) { (void)addr; (void)is_write; return 0; }
 void     vm_watch_stats(uint64_t* faults, uint64_t* pages_protected) { if (faults) *faults = 0; if (pages_protected) *pages_protected = 0; }
+int      vm_commit_reserved(void* p, uint64_t n) { (void)p; (void)n; return 1; }
 
 #endif

@@ -16,6 +16,7 @@
 
 #include "../../include/ps3emu/ps3types.h"
 #include "../../include/ps3emu/error_codes.h"
+#include "../../include/ps3emu/vm_watch.h"
 
 #include <stdint.h>
 #include <stddef.h>
@@ -282,8 +283,11 @@ static inline int32_t vm_commit(uint32_t addr, uint32_t size)
     size = VM_ALIGN_UP(size, VM_PAGE_SIZE);
 
 #ifdef _WIN32
-    if (!VirtualAlloc(vm_base + addr, size, MEM_COMMIT, PAGE_READWRITE))
-        return CELL_ENOMEM;
+    /* Reserved pages only: re-committing a committed page resets its
+     * protection, and a page the texture write-watch protected (a freed
+     * texture's memory being reallocated) would then take writes without
+     * faulting -- the engine kept drawing its old contents. */
+    if (!vm_commit_reserved(vm_base + addr, size)) return CELL_ENOMEM;
 #else
     if (vm__mprotect_pages(addr, size, PROT_READ | PROT_WRITE) != 0)
         return CELL_ENOMEM;

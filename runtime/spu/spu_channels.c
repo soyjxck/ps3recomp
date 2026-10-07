@@ -2134,7 +2134,21 @@ static int spu_smc_microstep(spu_context* ctx)
         /* Stop at the drain's return point too: it sits mid-function, so it is
          * no lifted entry, and a job's return would otherwise run on through
          * the caller's code (GH3's song-freeze; see drain_ret_pc). */
-        return spu_interp_run_until(ctx, pc, ctx->drain_ret_pc) ? 1 : 0;
+        {
+            /* How much runs interpreted: the interpreter is 50-100x slower
+             * than lifted code, so a job that lands here often is a stall.
+             * Reported every 64 hand-offs with the image and the time. */
+            static long long s_n, s_steps; static double s_ms;
+            extern uint64_t g_spu_interp_steps;
+            const uint64_t t0 = spu_host_ns();
+            const int rc = spu_interp_run_until(ctx, pc, ctx->drain_ret_pc) ? 1 : 0;
+                        const double ms = (double)(spu_host_ns() - t0) / 1e6;
+            s_ms += ms; s_steps += (long long)g_spu_interp_steps;
+            if ((++s_n % 64) == 1 || ms > 2.0)
+                fprintf(stderr, "[spu-smc] interpreter hand-offs: %lld, %.1f ms, %lld steps in all; this one img=%d from 0x%05X: %.2f ms, %llu steps\n",
+                        s_n, s_ms, s_steps, ctx->image_id, pc, ms, (unsigned long long)g_spu_interp_steps);
+            return rc;
+        }
     }
     { static int _n = 0; if (_n++ < 4)
         fprintf(stderr, "[spu-smc] microstep img=%d runaway (4096 steps from 0x%05X)\n",
