@@ -229,11 +229,19 @@ static inline double ppu_fp_default_qnan(void)
     memcpy(&d, &q, 8);
     return d;
 }
-static inline double ppu_fp_bin(double a, double b, double r)
+/* One test on the hot path: a NaN input always gives a NaN result on x86 as
+ * well, so only a NaN result needs the PPC priority rules (FRA's NaN, then
+ * FRB's, else the default QNaN rather than x86's negative one). Bit-identical
+ * to testing the inputs first; the hot float code ran three compares per op. */
+static double ppu_fp_bin_nan(double a, double b)
 {
     if (a != a) return ppu_fp_quiet(a);
     if (b != b) return ppu_fp_quiet(b);
-    if (r != r) return ppu_fp_default_qnan();
+    return ppu_fp_default_qnan();
+}
+static inline double ppu_fp_bin(double a, double b, double r)
+{
+    if (__builtin_expect(r != r, 0)) return ppu_fp_bin_nan(a, b);
     return r;
 }
 static inline double ppu_fadd(double a, double b) { return ppu_fp_bin(a, b, a + b); }
@@ -242,13 +250,17 @@ static inline double ppu_fmul(double a, double b) { return ppu_fp_bin(a, b, a * 
 static inline double ppu_fdiv(double a, double b) { return ppu_fp_bin(a, b, a / b); }
 /* FRT = (neg_res ? - : +)([FRA*FRC] + (neg_b ? -FRB : FRB)), fused.
  * NaN priority: FRA, FRB, FRC (negations never apply to propagated NaNs). */
-static inline double ppu_fmadd_core(double a, double c, double b, int neg_b, int neg_res)
+static double ppu_fmadd_nan(double a, double c, double b)
 {
     if (a != a) return ppu_fp_quiet(a);
     if (b != b) return ppu_fp_quiet(b);
     if (c != c) return ppu_fp_quiet(c);
-    double r = fma(a, c, neg_b ? -b : b);
-    if (r != r) return ppu_fp_default_qnan();
+    return ppu_fp_default_qnan();
+}
+static inline double ppu_fmadd_core(double a, double c, double b, int neg_b, int neg_res)
+{
+    const double r = fma(a, c, neg_b ? -b : b);
+    if (__builtin_expect(r != r, 0)) return ppu_fmadd_nan(a, c, b);   /* any NaN input lands here */
     return neg_res ? -r : r;
 }
 /* Round-to-single of a NaN keeps the full double payload (quieted). */
