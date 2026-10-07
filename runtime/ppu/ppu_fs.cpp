@@ -15,6 +15,7 @@
  */
 #include "ppu_recomp.h"      /* ppu_context */
 #include "../../libs/filesystem/edat.h"
+#include "ps3emu/vm_watch.h"
 #include "ps3emu/nid.h"      /* ps3_compute_nid */
 #include "ps3emu/guest_call.h" /* ps3_invoke_guest: AIO completion is a guest OPD */
 #include "sdata_decrypt.h"   /* SDATA/EDAT (NPD) decryption for cellFsSdataOpen */
@@ -376,6 +377,8 @@ static void cellFsClose(ppu_context* ctx)
 static inline void fs_prefault(uint32_t buf, uint64_t len)
 {
     if (!vm_base || !len) return;
+    /* The kernel's write cannot fault a write-watched page open; open it. */
+    vm_watch_touch(buf, len > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)len);
     volatile uint8_t* p = (volatile uint8_t*)(vm_base + buf);
     for (uint64_t o = 0; o < len; o += 0x1000) p[o] = p[o];
     p[len - 1] = p[len - 1];

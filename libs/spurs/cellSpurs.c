@@ -2992,6 +2992,46 @@ static void jc_async_run(int slot, int workers)
     JC_UNLOCK(&s_jcpool.m);
 }
 
+/* SPURS_JC_PAR=<n>: the synchronous walk (SPURS_JC_SYNC) with its JOB
+ * commands run by n pool workers instead of one after another on the calling
+ * thread. The caller still walks the chain and returns only when it is done,
+ * so the ordering the synchronous mode exists for holds; between two SYNC
+ * (or END, RET, GUARD) commands the jobs run concurrently, as consecutive
+ * jobs do on the SPUs. Drakengard 3's render thread spent a fifth of its
+ * time inside RunJobChain, and its 40 ms frames at 4K were caught decoding
+ * LZF streams there. Changed at run time by the host (an A/B switch): each
+ * walk reads it once. 0 = off, -1 = not yet read. */
+int g_spurs_jc_par = -1;
+/* Walk statistics for the slow-frame report (rsx_draw_engine.c). */
+double g_jc_walk_ms; unsigned g_jc_walks;
+static double jc_now_ms(void)
+{
+#ifdef _WIN32
+    LARGE_INTEGER f, c; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&c);
+    return (double)c.QuadPart * 1000.0 / (double)f.QuadPart;
+#else
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec / 1e6;
+#endif
+}
+static DWORD WINAPI jc_thread_par(LPVOID p)
+{
+    int slot = (int)(intptr_t)p;
+    for (;;) {
+        jc_execute_async(slot);
+        if (InterlockedExchange(&s_jobchains[slot].rerun, 0)) continue;
+        s_jobchains[slot].running = 0;
+        if (s_jobchains[slot].rerun &&
+            _InterlockedCompareExchange(&s_jobchains[slot].running, 1, 0) == 0) {
+            InterlockedExchange(&s_jobchains[slot].rerun, 0);
+            continue;
+        }
+        break;
+    }
+    jc_signal_done(s_jobchains[slot].jc_ea);
+    return 0;
+}
+
 static DWORD WINAPI jc_thread(LPVOID p)
 {
     int slot = (int)(intptr_t)p;
@@ -3093,8 +3133,14 @@ static s32 jc_start(u64 jc_ea, const char* who)
         static int sync_walk = -1;
         if (sync_walk < 0) sync_walk = getenv("SPURS_JC_SYNC") ? 1 : 0;
         if (sync_walk) {
+            if (g_spurs_jc_par < 0) { const char* e = getenv("SPURS_JC_PAR"); g_spurs_jc_par = e ? atoi(e) : 0; }
+            const int par = g_spurs_jc_par;
+            if (par > 0) jc_pool_init(par);
             if (_InterlockedCompareExchange(&s_jobchains[i].running, 1, 0) == 0) {
-                jc_thread((LPVOID)(intptr_t)i);     /* walks, honours queued re-runs, clears running */
+                const double t0 = jc_now_ms();
+                if (par > 0) jc_thread_par((LPVOID)(intptr_t)i);
+                else jc_thread((LPVOID)(intptr_t)i);     /* walks, honours queued re-runs, clears running */
+                g_jc_walk_ms += jc_now_ms() - t0; g_jc_walks++;
             } else {
                 InterlockedExchange(&s_jobchains[i].rerun, 1);
             }

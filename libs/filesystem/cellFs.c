@@ -7,6 +7,7 @@
 
 #include "cellFs.h"
 #include "../../runtime/platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
+#include "ps3emu/vm_watch.h"
 #include "ps3emu/endian.h"
 #include <stdio.h>
 #include <string.h>
@@ -496,6 +497,7 @@ s32 cellFsRead(CellFsFd fd, void* buf, u64 nbytes, u64* nread)
          * which made this look handled -- but the file contents were being read
          * to a raw guest address interpreted as a host one, so nothing the
          * title loaded ever landed in guest memory. */
+        vm_watch_touch((uint32_t)buf, (uint32_t)nbytes);
         bytes_read = (u64)fread(gptr(buf), 1, (size_t)nbytes, s_files[fd].host_fp);
     }
 

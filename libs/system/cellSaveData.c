@@ -5,6 +5,7 @@
  * Save data is stored under: {root}/gamedata/dev_hdd0/home/00000001/savedata/{dirName}/
  */
 
+#include "ps3emu/vm_watch.h"
 #include "cellSaveData.h"
 #include "ps3emu/guest_call.h"
 #include "../../runtime/ppu/ppu_memory.h"
@@ -268,7 +269,7 @@ static s32 dispatch_func_file(uint32_t func_opd, uint32_t* userdata_ea,
     out->fileBuf = buffer ? vm_base + buffer : NULL;
     /* fread/fwrite on fileBuf go through the kernel, which cannot fault in a
      * demand-committed guest page (see sys_fs_read). Commit it first. */
-    if (buffer && out->fileBufSize) vm_commit(buffer, out->fileBufSize);
+    if (buffer && out->fileBufSize) { vm_commit(buffer, out->fileBufSize); vm_watch_touch(buffer, out->fileBufSize); }
     return marshal_cbresult_read_result(cb_ea);
 }
 

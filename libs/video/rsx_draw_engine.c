@@ -30,6 +30,7 @@
 
 /* Environment switches are read where they are used, some of them per call:
  * answer from the pointer-keyed cache (ps3emu/env_cache.h). */
+#include "ps3emu/vm_watch.h"
 #include "ps3emu/env_cache.h"
 #define getenv(name) ps3_env(name)
 
@@ -122,6 +123,8 @@ typedef struct {
     u64 content_hash;
     u32 last_hash_frame;
     u64 last_use_serial;
+    u64 watch_stamp;       /* vm_watch_arm's stamp when the bytes were last hashed */
+    u32 watched;           /* every page under it was protected then              */
 } eng_texture;
 
 struct eng_pipe_job;
@@ -839,7 +842,13 @@ static int eng_staging_reserve(u32 bytes)
  * the backend. Returns the backend handle, or 0. */
 /* What the walker did in the current frame, for the stutter line in
  * eng_present (DOD3_STUTTER_MS). */
-static struct { u32 tex; u64 tex_bytes; u32 vc_store; u64 vc_bytes; u32 pipes; double pipe_ms; } s_fstat;
+static struct { u32 tex; u64 tex_bytes; u32 vc_store; u64 vc_bytes; u32 pipes; double pipe_ms;
+                u32 vc_evicts; double vc_evict_ms; u32 vc_evicted; u32 draws; double draw_ms; u32 tex_skipped; } s_fstat;
+static double eng_now_ms(void)
+{
+    struct timespec ts; timespec_get(&ts, TIME_UTC);
+    return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec / 1e6;
+}
 
 static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                               u32 levels, u32 pitch, int cube, u32 remap)
@@ -922,6 +931,26 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
  * cache full evicts the least recently used entry rather than returning
  * nothing: returning white "made the recovered orphanage render as flat
  * green/black geometry" (rsx_live_draw.c:2326-2334). */
+/* The write-watch (ps3emu/vm_watch.h) in place of a hash per texture per
+ * frame: when every page under a texture is protected and none was written
+ * since the last hash, the bytes are known unchanged. RSX_TEX_WATCH=0, or a
+ * host without it, hashes as before. -1 undecided; a host may switch it. */
+int g_eng_tex_watch = -1;
+static int eng_tex_watch_on(void)
+{
+    if (g_eng_tex_watch < 0) g_eng_tex_watch = vm_watch_available() && !s_guest_reader ? 1 : 0;
+    return g_eng_tex_watch > 0;
+}
+/* Arm the watch over a texture's bytes; 1 when the stamp can be trusted. */
+static int eng_tex_watch_arm(u32 location, u32 offset, u32 span, u64* stamp)
+{
+    const u32 ea = cellGcmResolveLocated(location == RSX_LOCATION_LOCAL, offset);
+    u32 unwatched = 1;
+    if (!ea) { *stamp = 0; return 0; }
+    *stamp = vm_watch_arm(ea, span, &unwatched);
+    return unwatched == 0;
+}
+
 static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                             u32 levels, u32 pitch, int cube, u32 remap)
 {
@@ -937,11 +966,20 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
             e->cubemap != (u32)(cube != 0))
             continue;
         if (e->handle && e->last_hash_frame != g.frames) {
-            int readable = 0;
-            const u64 hash = eng_texture_content_hash(location, offset, span,
-                                                      &readable);
             e->last_hash_frame = g.frames;
-            if (readable && hash != e->content_hash) {
+            int need_hash = 1;
+            if (eng_tex_watch_on()) {
+                /* Armed before the hash, so a write during or after it
+                 * changes next frame's stamp. */
+                u64 st = 0;
+                const int watched = eng_tex_watch_arm(location, offset, span, &st);
+                if (watched && e->watched && st == e->watch_stamp) need_hash = 0;
+                e->watch_stamp = st; e->watched = (u32)watched;
+                if (!need_hash) s_fstat.tex_skipped++;
+            }
+            int readable = 0;
+            const u64 hash = need_hash ? eng_texture_content_hash(location, offset, span, &readable) : 0;
+            if (need_hash && readable && hash != e->content_hash) {
                 const u32 fresh = eng_texture_upload(location, offset, fmt, w, h,
                                                      levels, pitch, cube, remap);
                 if (fresh) {
@@ -974,6 +1012,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     e.remap = remap; e.cubemap = (u32)(cube != 0);
     e.last_hash_frame = g.frames;
     e.last_use_serial = ++g.texture_use_serial;
+    if (eng_tex_watch_on()) { u64 st = 0; e.watched = (u32)eng_tex_watch_arm(location, offset, span, &st); e.watch_stamp = st; }
     { int readable = 0;
       e.content_hash = eng_texture_content_hash(location, offset, span, &readable); }
     e.handle = eng_texture_upload(location, offset, fmt, w, h, levels, pitch,
@@ -1945,6 +1984,8 @@ static void eng_vc_free(EngVCEntry* e)
  * everything, when even the recent draws would leave it nearly full again. */
 static void eng_vc_evict(void)
 {
+    const double t0 = eng_now_ms();
+    const u32 before = s_vc_count;
     size_t recent = 0;
     u32 n_recent = 0;
     for (u32 i = 0; i < ENG_VC_SLOTS; i++)
@@ -1964,6 +2005,7 @@ static void eng_vc_evict(void)
         s_vc_count++;
     }
     free(old);
+    s_fstat.vc_evicts++; s_fstat.vc_evict_ms += eng_now_ms() - t0; s_fstat.vc_evicted += before - s_vc_count;
 }
 
 static void eng_vc_store(u64 key, const EngVCFill* f, const u8* verts,
@@ -2409,6 +2451,7 @@ static void eng_draw_stats_tick(void)
     if (s_dtrace_frame == -2) { const char* e = getenv("RSX_DRAW_TRACE_FRAME"); s_dtrace_frame = e ? atol(e) : -1; }
 }
 uint32_t g_rsx_engine_frame = 0;   /* the present count, for frame-gated logs elsewhere */
+uint32_t g_rsx_engine_hitches = 0; /* presents more than 25 ms after the one before */
 static void eng_draw_stats_report(void)
 {
     if (s_dstat_on != 1 || (g.frames % 120u) != 0u) return;
@@ -2556,7 +2599,16 @@ static void eng_draw_trace(const char* outcome, u32 prim, int indexed, u32 n_dra
               fprintf(stderr, " c%u=(%.3g %.3g %.3g %.3g)", slots[k], c[0], c[1], c[2], c[3]); }
           fputc('\n', stderr); } }
 }
+static void sink_end_impl(void* user, const rsx_dispatch* r);
+/* Timed, for the slow-frame report: how much of a frame the walker spent
+ * issuing draws (conversion, hashing, cache, records). */
 static void sink_end(void* user, const rsx_dispatch* r)
+{
+    const double t0 = eng_now_ms();
+    sink_end_impl(user, r);
+    s_fstat.draws++; s_fstat.draw_ms += eng_now_ms() - t0;
+}
+static void sink_end_impl(void* user, const rsx_dispatch* r)
 {
     (void)user; (void)r;
     if (!g.ready || !dc.n_packets) return;
@@ -3187,13 +3239,18 @@ static void eng_present(u32 buffer_id)
           struct timespec ts; timespec_get(&ts, TIME_UTC);
           const double now = (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec / 1e6;
           if (last > 0 && now - last > thr)
+              { extern double g_jc_walk_ms; extern unsigned g_jc_walks;
               fprintf(stderr, "[stutter-rsx] frame %u took %.0f ms: %u textures uploaded (%llu KB), "
-                      "%u vertex conversions stored (%llu KB), %u pipelines built (%.0f ms)\n",
+                      "%u vertex conversions stored (%llu KB), %u pipelines built (%.0f ms), "
+                      "%u cache evictions (%u entries, %.1f ms), %u draws in %.1f ms of walker; "
+                      "%u job-chain walks, %.1f ms, on the render thread\n",
                       g.frames, now - last, s_fstat.tex, (unsigned long long)(s_fstat.tex_bytes >> 10),
                       s_fstat.vc_store, (unsigned long long)(s_fstat.vc_bytes >> 10),
-                      s_fstat.pipes, s_fstat.pipe_ms);
+                      s_fstat.pipes, s_fstat.pipe_ms, s_fstat.vc_evicts, s_fstat.vc_evicted, s_fstat.vc_evict_ms,
+                      s_fstat.draws, s_fstat.draw_ms, g_jc_walks, g_jc_walk_ms); }
           last = now;
           memset(&s_fstat, 0, sizeof s_fstat);
+          { extern double g_jc_walk_ms; extern unsigned g_jc_walks; g_jc_walk_ms = 0; g_jc_walks = 0; }
       } }
     /* Every 5 s: presents per second and frame times, worst included -- the
      * numbers a player feels. RSX_FRAMETIME=0 turns the line off. */
@@ -3206,6 +3263,7 @@ static void eng_present(u32 buffer_id)
               const double ft = (now - last) * 1000.0;
               if (ft > worst) worst = ft;
               if (ft > 34.0) slow++;
+              if (ft > 25.0) g_rsx_engine_hitches++;
               n++;
           } else {
               win_start = first = now;

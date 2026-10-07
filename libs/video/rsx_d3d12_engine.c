@@ -116,9 +116,8 @@ typedef struct {
  *
  * RSX_DISPLAY=windowed|borderless|fullscreen: a bordered window of
  * RSX_WINDOW=<w>x<h> (default 1280x720); a borderless window the size of
- * the primary display; or exclusive full screen, at the display's own mode
- * or, with RSX_WINDOW, a mode switch to that size. (RSX_FULLSCREEN=1 is the
- * old spelling of borderless.) The present blit resamples the surface to
+ * the primary display; or exclusive full screen at the display's current
+ * mode. (RSX_FULLSCREEN=1 is the old spelling of borderless.) The present blit resamples the surface to
  * the window whatever the two sizes are. */
 static float s_scale = 1.0f;
 static u32 s_win_w, s_win_h;                 /* the window and swap chain */
@@ -220,6 +219,11 @@ typedef struct {
 
 static int s_active, s_headless, s_ready;
 static HWND s_hwnd; static int s_window_closed;
+/* Exclusive full screen is dropped by DXGI when the window loses focus and
+ * does not come back on its own: set by WM_ACTIVATEAPP, acted on before the
+ * next present (SetFullscreenState and the ResizeBuffers it requires must
+ * not run inside the message handler). */
+static int s_fs_restore;
 static u32 s_width, s_height;
 static ID3D12Device* s_dev;
 static ID3D12CommandQueue* s_queue;
@@ -669,6 +673,21 @@ static int eng_stage_copy(const void* src, u32 bytes, u32* out_off)
 
 /* ---- buffers the engine keeps across frames (vertex cache) ------------------ */
 
+/* Retired vertex buffers are kept and reused, by size class (powers of two
+ * from 64 KiB). Creating a committed resource is a kernel allocation
+ * (NtGdiDdDDICreateAllocation) and releasing one a kernel free, each a
+ * millisecond or more on the thread that walks the FIFO; Drakengard 3's
+ * vertex cache turns over a few hundred of these a minute, and the slow
+ * frames at 60 fps caught the walker inside those calls. The pool is bounded;
+ * past it, buffers are released as before. */
+#define ENG_BUF_POOL        256
+#define ENG_BUF_POOL_BYTES  ((u64)512 << 20)
+static struct { ID3D12Resource* res; u32 cap; } s_buf_pool[ENG_BUF_POOL];
+static u32 s_buf_pool_n; static u64 s_buf_pool_bytes;
+static u32 s_buf_cap[ENG_MAX_BUFS];
+static u32 buf_class(u32 bytes) { u32 c = 65536u; while (c < bytes) c <<= 1; return c; }
+int g_eng_buf_pool = 1;   /* RSX_BUF_POOL=0 turns the pool off; a host may switch it in a run */
+
 static u32 eng_buffer_wrap(void* user, void* data, u32 bytes)
 {
     (void)user;
@@ -679,8 +698,18 @@ static u32 eng_buffer_wrap(void* user, void* data, u32 bytes)
     else return 0;
     /* D3D12 cannot read the engine's memory in place; it is copied into an
      * upload-heap buffer and, ownership being ours, freed here. */
-    ID3D12Resource* b = make_buffer(D3D12_HEAP_TYPE_UPLOAD, bytes, D3D12_RESOURCE_STATE_GENERIC_READ);
+    const u32 cap = buf_class(bytes);
+    ID3D12Resource* b = NULL;
+    for (u32 i = 0; i < s_buf_pool_n; i++) {
+        if (s_buf_pool[i].cap != cap) continue;
+        b = s_buf_pool[i].res;
+        s_buf_pool_bytes -= cap;
+        s_buf_pool[i] = s_buf_pool[--s_buf_pool_n];
+        break;
+    }
+    if (!b) b = make_buffer(D3D12_HEAP_TYPE_UPLOAD, cap, D3D12_RESOURCE_STATE_GENERIC_READ);
     if (!b) return 0;
+    s_buf_cap[slot] = cap;
     void* m = NULL; D3D12_RANGE nr = {0, 0};
     if (FAILED(CALL(b, Map, 0, &nr, &m))) { RELEASE(b); return 0; }
     memcpy(m, data, bytes);
@@ -699,7 +728,13 @@ static void eng_collect_retired_buffers(void)
     for (u32 i = 0; i < s_buf_count; i++) {
         if (!s_buf_retired[i] || !fence_done(s_buf_retired_fence[i])) continue;
         s_buf_retired[i] = 0;
-        RELEASE(s_buf[i]);
+        if (g_eng_buf_pool && s_buf_pool_n < ENG_BUF_POOL && s_buf_pool_bytes + s_buf_cap[i] <= ENG_BUF_POOL_BYTES) {
+            s_buf_pool[s_buf_pool_n].res = s_buf[i]; s_buf_pool[s_buf_pool_n].cap = s_buf_cap[i];
+            s_buf_pool_n++; s_buf_pool_bytes += s_buf_cap[i];
+            s_buf[i] = NULL;
+        } else {
+            RELEASE(s_buf[i]);
+        }
         s_buf_free[s_buf_free_count++] = i;
     }
 }
@@ -717,6 +752,9 @@ static LRESULT CALLBACK eng_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
     case WM_CLOSE:   s_window_closed = 1; DestroyWindow(hwnd); return 0;
+    case WM_ACTIVATEAPP:
+        if (wp && s_display == DISP_FULLSCREEN) s_fs_restore = 1;
+        break;
     case WM_DESTROY: PostQuitMessage(0); return 0;
     case WM_KEYDOWN:
         if (wp == VK_ESCAPE) { s_window_closed = 1; DestroyWindow(hwnd); }
@@ -1043,6 +1081,8 @@ static void eng_shutdown(void* user)
     for (u32 i = 0; i < s_blob_count; i++) RELEASE(s_blob[i].blob);
     s_blob_count = s_samp_count = s_view_count = s_rec_count = 0;
     for (u32 i = 0; i < s_buf_count; i++) RELEASE(s_buf[i]);
+    for (u32 i = 0; i < s_buf_pool_n; i++) RELEASE(s_buf_pool[i].res);
+    s_buf_pool_n = 0; s_buf_pool_bytes = 0;
     s_buf_count = s_buf_free_count = 0; memset(s_buf_retired, 0, sizeof s_buf_retired);
     for (int i = 0; i < ENG_STAGE_POOL; i++) {
         if (s_stage[i].res) { CALL(s_stage[i].res, Unmap, 0, NULL); RELEASE(s_stage[i].res); }
@@ -2075,9 +2115,32 @@ static void eng_poll_submits(void)
 
 static void eng_dump_frame(u32 surface);
 
+/* Back in exclusive full screen after a focus loss. The GPU is drained first
+ * (the back buffers are released and recreated), so this costs a frame. */
+static void eng_fullscreen_restore(void)
+{
+    s_fs_restore = 0;
+    if (!s_swap || s_headless) return;
+    BOOL fs = FALSE;
+    if (FAILED(CALL(s_swap, GetFullscreenState, &fs, NULL)) || fs) return;
+    fence_wait(fence_signal());
+    if (FAILED(CALL(s_swap, SetFullscreenState, TRUE, NULL))) {
+        fprintf(stderr, "[rsx engine/d3d12] could not re-enter full screen; staying windowed\n");
+        return;
+    }
+    for (u32 i = 0; i < 3; i++) RELEASE(s_backbuf[i]);
+    HRESULT hr = CALL(s_swap, ResizeBuffers, 0, 0, 0, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH);
+    if (FAILED(hr)) { fprintf(stderr, "[rsx engine/d3d12] ResizeBuffers after full screen failed: 0x%08lX\n", (long)hr); return; }
+    for (u32 i = 0; i < 3; i++) {
+        if (FAILED(CALL(s_swap, GetBuffer, i, &IID_ID3D12Resource, (void**)&s_backbuf[i]))) return;
+        CALL(s_dev, CreateRenderTargetView, s_backbuf[i], NULL, cpu_handle(s_backbuf_rtv_heap, s_rtv_step, i));
+    }
+}
+
 static void eng_submit(u32 present_surface, int wait)
 {
     if (!s_ready) { s_rec_count = 0; s_stage_used = 0; s_stage_cur = -1; s_vis_npending = 0; return; }
+    if (s_fs_restore && present_surface) eng_fullscreen_restore();
     if (!s_rec_count && !present_surface) return;
     eng_poll_submits();
 
@@ -2376,6 +2439,7 @@ int rsx_d3d12_engine_init(u32 width, u32 height, const char* title)
     s_width = width ? width : 1280; s_height = height ? height : 720;
     { const char* v = getenv("RSX_VSYNC"); if (v && *v) s_vsync = atoi(v) ? 1 : 0; }
     eng_read_scale();
+    { const char* e = getenv("RSX_BUF_POOL"); if (e && *e == '0') g_eng_buf_pool = 0; }
     /* Per-monitor DPI awareness, before any window exists: without it a
      * 4K display at 125% scaling reports 3072x1728, the borderless window
      * covers that and Windows stretches it, and a 1280x720 window is drawn
@@ -2400,8 +2464,8 @@ int rsx_d3d12_engine_init(u32 width, u32 height, const char* title)
       if (ws && *ws && !have_ws) fprintf(stderr, "[RSX d3d12] RSX_WINDOW=%s ignored (want <w>x<h>)\n", ws);
       if (s_display == DISP_WINDOWED) { if (have_ws) { s_win_w = ww; s_win_h = wh; } }
       else {
+          /* Both over the display at its current mode: no mode switch. */
           s_win_w = (u32)GetSystemMetrics(SM_CXSCREEN); s_win_h = (u32)GetSystemMetrics(SM_CYSCREEN);
-          if (s_display == DISP_FULLSCREEN && have_ws) { s_win_w = ww; s_win_h = wh; }   /* a mode switch */
       } }
 
     /* The engine is this backend's default; PS3RECOMP_RSX_ENGINE=vtable is

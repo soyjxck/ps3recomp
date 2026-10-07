@@ -2,6 +2,7 @@
  * ps3recomp - Filesystem syscalls (implementation)
  */
 
+#include "ps3emu/vm_watch.h"
 #include "sys_fs.h"
 #include "../../libs/filesystem/edat.h"
 #include "../memory/vm.h"
@@ -471,7 +472,7 @@ int64_t sys_fs_read(ppu_context* ctx)
      * fails instead, and fread comes back short. GH3's Bink reader saw that
      * as a read error on every movie and never decoded a frame -- solid green
      * video. ppu_fs.cpp fs_prefault is the same fix for cellFs. */
-    if (size) vm_commit(buf_addr, (uint32_t)size);
+    if (size) { vm_commit(buf_addr, (uint32_t)size); vm_watch_touch(buf_addr, (uint32_t)size); }
     size_t nread = fread(buf, 1, (size_t)size, f->fp);
 
     /* PS3_FSTRACE=<n>: every nth read, the fd and the file offset it came from.
