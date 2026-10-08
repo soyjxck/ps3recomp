@@ -1012,8 +1012,97 @@ static void nv3089_blit(void)
                out_w, out_h, f, src, in_pitch, dst, dst_pitch, out_x, out_y); } }
 }
 
+/* NV0039 memory-to-memory copy (cellGcmSetTransferData and friends; libgcm
+ * binds it on subchannel 1 and NV3089 on 6). LINE_COUNT lines of
+ * LINE_LENGTH_IN bytes go from (BUFFER_IN, OFFSET_IN) to (BUFFER_OUT,
+ * OFFSET_OUT), each line PITCH_IN / PITCH_OUT apart; BUFFER_NOTIFY starts the
+ * copy. The DMA objects are the usual 0xFEED0000 (local) and 0xFEED0001
+ * (main) -- and 0x66626660, CELL_GCM_CONTEXT_DMA_FROM_MEMORY_GET_REPORT,
+ * which reads the RSX's own report area. That one is how a title gets its
+ * occlusion-query results without the PPU touching the report window:
+ * cellGcmSetTransferReportData copies the CellGcmReportData records into a
+ * main-memory buffer the title then reads. Drakengard 3 (Unreal Engine 3)
+ * issues one per occlusion query; with the copy unimplemented its buffer
+ * stayed zero, every queried primitive read "no pixels passed" after its
+ * first test, and the player, enemies and distant buildings vanished a few
+ * frames after they appeared. */
+static struct {
+    u32 dma_in, dma_out, off_in, off_out, pitch_in, pitch_out, len, lines, fmt;
+} s_nv0039;
+
+static u8 nv0039_report_byte(u32 report_off)
+{
+    /* The report area is 16-byte CellGcmReportData records, big-endian:
+     * {u64 timestamp; u32 value; u32 zero}. */
+    const u32 idx = report_off / 16u, rem = report_off % 16u;
+    u8 rec[16];
+    memset(rec, 0, sizeof rec);
+    if (idx < CELL_GCM_MAX_REPORT_COUNT) {
+        const u64 ts = s_report_data[idx].timestamp;
+        const u32 v = s_report_data[idx].value;
+        for (int i = 0; i < 8; i++) rec[i] = (u8)(ts >> (56 - 8 * i));
+        for (int i = 0; i < 4; i++) rec[8 + i] = (u8)(v >> (24 - 8 * i));
+    }
+    return rec[rem];
+}
+
+static void nv0039_copy(void)
+{
+    const u32 len = s_nv0039.len, lines = s_nv0039.lines ? s_nv0039.lines : 1u;
+    const u32 in_pitch = s_nv0039.pitch_in ? s_nv0039.pitch_in : len;
+    const u32 out_pitch = s_nv0039.pitch_out ? s_nv0039.pitch_out : len;
+    const int from_report = (s_nv0039.dma_in == 0x66626660u);
+    if (!len) return;
+    /* A copy no title issues: the walker has lost its place and is decoding
+     * data as NV0039 methods (seen: 1.6 GB x 171116 lines into the command
+     * ring). Executing it would overwrite the ring and everything after it,
+     * turning one desync into a cascade. */
+    if (len > 0x400000u || (u64)len * lines > 0x1000000ull ||
+        (s_nv0039.dma_in != 0xFEED0000u && s_nv0039.dma_in != 0xFEED0001u && !from_report) ||
+        (s_nv0039.dma_out != 0xFEED0000u && s_nv0039.dma_out != 0xFEED0001u)) {
+        static int n = 0; if (n++ < 8)
+            printf("[NV0039] implausible copy dropped: in=0x%08X+0x%08X out=0x%08X+0x%08X len=%u lines=%u\n",
+                   s_nv0039.dma_in, s_nv0039.off_in, s_nv0039.dma_out, s_nv0039.off_out, len, lines);
+        return;
+    }
+    const u32 src = from_report ? s_nv0039.off_in
+                  : cellGcmResolveLocated(s_nv0039.dma_in != 0xFEED0001u, s_nv0039.off_in);
+    const u32 dst = cellGcmResolveLocated(s_nv0039.dma_out != 0xFEED0001u, s_nv0039.off_out);
+    if (!dst || (!from_report && !src)) {
+        static int n = 0; if (n++ < 4)
+            printf("[NV0039] copy dropped: unresolved %s (in dma 0x%08X off 0x%08X, out dma 0x%08X off 0x%08X)\n",
+                   dst ? "source" : "destination", s_nv0039.dma_in, s_nv0039.off_in, s_nv0039.dma_out, s_nv0039.off_out);
+        return;
+    }
+    for (u32 l = 0; l < lines; l++) {
+        const u32 s0 = src + l * in_pitch, d0 = dst + l * out_pitch;
+        if (from_report) {
+            for (u32 i = 0; i < len; i++) vm_write8(d0 + i, nv0039_report_byte(s0 + i));
+        } else {
+            for (u32 i = 0; i < len; i++) vm_write8(d0 + i, vm_read8(s0 + i));
+        }
+    }
+}
+
 static void gcm_2d_method(u32 subch, u32 method, u32 data)
 {
+    /* Subchannel 1 reaches here only under GCM_SUBCH1_2D=1 (the walker treats
+     * it as NV4097 otherwise): libgcm's own bindings put NV0039 there. */
+    if (subch == 1) {
+        switch (method) {
+        case 0x0184: s_nv0039.dma_in    = data; return;
+        case 0x0188: s_nv0039.dma_out   = data; return;
+        case 0x030C: s_nv0039.off_in    = data; return;
+        case 0x0310: s_nv0039.off_out   = data; return;
+        case 0x0314: s_nv0039.pitch_in  = data; return;
+        case 0x0318: s_nv0039.pitch_out = data; return;
+        case 0x031C: s_nv0039.len       = data; return;
+        case 0x0320: s_nv0039.lines     = data; return;
+        case 0x0324: s_nv0039.fmt       = data; return;
+        case 0x0328: nv0039_copy();             return;
+        default: break;                     /* not NV0039: logged as unhandled below */
+        }
+    }
     /* GCM2D_TRACE=1: histogram of (subchannel, method) actually seen. The
      * subchannel a title binds each 2D object to is libgcm-version-specific and
      * SET_OBJECT binds are not tracked, so state landing on an unexpected
@@ -1117,7 +1206,7 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
         }
         return;
     }
-    /* NV0039 / NV309E: not implemented yet -- log first sightings. */
+    /* NV309E: not implemented yet -- log first sightings. */
     /* GCM2D_DBG=<N> raises the cap and adds the data word: the fixed 8 showed
      * only that SOMETHING was unhandled, not enough to implement it. */
     static int warned = 0, wcap = -1;
@@ -1848,9 +1937,20 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * which is the macOS path under PS3RECOMP_RSX_ENGINE=dispatch.
                  * It wants the raw method with its subchannel bits for the
                  * same reason the live engine does, and masks them itself. */
+                /* Every subchannel goes to the engine by default, since a title
+                 * may bind NV4097 anywhere. A title on libgcm's own bindings
+                 * (GCM_SUBCH1_2D=1: NV0039 on 1, the 2D objects on 2..6) gets
+                 * only subchannel 0 and 7's driver methods there: the engine
+                 * strips the subchannel from everything below 0xE000, so a 2D
+                 * object's methods landed in the 3D register bank. Every
+                 * NV0039 report copy (Drakengard 3: one per occlusion query)
+                 * wrote its offsets, pitches, length and format into
+                 * ALPHA_REF, BLEND_*, COLOR_MASK and STENCIL_TEST_ENABLE,
+                 * and the next draws came out tinted or missing. */
                 { static int eng = -1;
                   if (eng < 0) eng = rsx_draw_engine_enabled();
-                  if (eng) rsx_draw_engine_method((subch << 13) | m, vm_read32(dea)); }
+                  const int to_3d = !s1_2d || subch == 0 || subch == 7;
+                  if (eng && to_3d) rsx_draw_engine_method((subch << 13) | m, vm_read32(dea)); }
 
                 /* RSX_LIVE_FEED_DBG=1: what the FIFO actually carries. Counted
                  * for any run, live engine or not, so the method stream and the
