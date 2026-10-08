@@ -384,32 +384,9 @@ static inline void fs_prefault(uint32_t buf, uint64_t len)
     p[len - 1] = p[len - 1];
 }
 
-/* FS_READ_TIME=1: every read with a time stamp (ms since the first), the host
- * thread, the size and how long the host read took -- the cadence of a
- * streaming burst, which says whether the reads are slow or far apart. */
-#include <chrono>
-#include <thread>
-#include <functional>
-static int fs_read_time_on(void)
-{
-    static int on = -1;
-    if (on < 0) on = getenv("FS_READ_TIME") ? 1 : 0;
-    return on;
-}
-static double fs_now_ms(void)
-{
-    static const auto t0 = std::chrono::steady_clock::now();
-    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-}
-extern "C" void fs_read_time_log(const char* kind, int fd, uint64_t off, uint64_t size, uint64_t got, double t_start)
-{
-    if (!fs_read_time_on()) return;
-    const double t = fs_now_ms();
-    fprintf(stderr, "[fsr] %.3f %s fd=%d off=%llu size=%llu got=%llu %.1f us tid=%lu\n", t_start, kind, fd,
-            (unsigned long long)off, (unsigned long long)size, (unsigned long long)got, (t - t_start) * 1000.0,
-            (unsigned long)(std::hash<std::thread::id>{}(std::this_thread::get_id()) % 100000u));
-}
-extern "C" double fs_read_time_start(void) { return fs_read_time_on() ? fs_now_ms() : 0.0; }
+/* FS_READ_TIME=1 (runtime/syscalls/sys_fs.c, where the lv2 reads log too). */
+extern "C" double fs_read_time_start(void);
+extern "C" void fs_read_time_log(const char* kind, int fd, uint64_t off, uint64_t size, uint64_t got, double t_start);
 
 static void cellFsRead(ppu_context* ctx)
 {

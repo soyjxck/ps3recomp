@@ -32,6 +32,9 @@ static u32 s_gcm_context_ea = 0;
 
 #ifdef _WIN32
 #include <windows.h>
+/* WaitOnAddress / WakeByAddressAll (the ring-full recycle): every program
+ * that links this, rsx_replay included, needs the library. */
+#pragma comment(lib, "synchronization.lib")
 #else
 #include <time.h>
 #endif

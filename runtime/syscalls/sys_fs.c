@@ -23,6 +23,7 @@
   #include <unistd.h>
   #include <dirent.h>
   #include <time.h>     /* nanosleep: the delay in the open-retry loop */
+  #include <pthread.h>  /* pthread_self: FS_READ_TIME */
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -450,6 +451,46 @@ int64_t sys_fs_open(ppu_context* ctx)
  * r5 = size
  * r6 = pointer to receive bytes read (u64*)
  * -----------------------------------------------------------------------*/
+
+/* FS_READ_TIME=1: every read (lv2 here, cellFsRead/cellFsAioRead in
+ * runtime/ppu/ppu_fs.cpp) with a time stamp (ms since the first), the size
+ * and how long the host read took -- the cadence of a streaming burst, which
+ * says whether the reads are slow or far apart. */
+static int fs_read_time_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("FS_READ_TIME") ? 1 : 0;
+    return on;
+}
+static double fs_now_ms(void)
+{
+#ifdef _WIN32
+    static LARGE_INTEGER f, t0; LARGE_INTEGER c;
+    if (!f.QuadPart) { QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0); }
+    QueryPerformanceCounter(&c);
+    return (double)(c.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart;
+#else
+    static double t0 = -1.0;
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    const double t = (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+    if (t0 < 0.0) t0 = t;
+    return t - t0;
+#endif
+}
+double fs_read_time_start(void) { return fs_read_time_on() ? fs_now_ms() : 0.0; }
+void fs_read_time_log(const char* kind, int fd, uint64_t off, uint64_t size, uint64_t got, double t_start)
+{
+    if (!fs_read_time_on()) return;
+    const double t = fs_now_ms();
+#ifdef _WIN32
+    const unsigned long tid = (unsigned long)GetCurrentThreadId();
+#else
+    const unsigned long tid = (unsigned long)(uintptr_t)pthread_self();
+#endif
+    fprintf(stderr, "[fsr] %.3f %s fd=%d off=%llu size=%llu got=%llu %.1f us tid=%lu\n", t_start, kind, fd,
+            (unsigned long long)off, (unsigned long long)size, (unsigned long long)got, (t - t_start) * 1000.0, tid);
+}
+
 int64_t sys_fs_read(ppu_context* ctx)
 {
     int32_t  fd         = LV2_ARG_S32(ctx, 0);
@@ -473,8 +514,8 @@ int64_t sys_fs_read(ppu_context* ctx)
      * as a read error on every movie and never decoded a frame -- solid green
      * video. ppu_fs.cpp fs_prefault is the same fix for cellFs. */
     if (size) { vm_commit(buf_addr, (uint32_t)size); vm_watch_touch(buf_addr, (uint32_t)size); }
-    extern double fs_read_time_start(void);
-    extern void fs_read_time_log(const char*, int, uint64_t, uint64_t, uint64_t, double);
+
+
     const double t_rd = fs_read_time_start();
     size_t nread = fread(buf, 1, (size_t)size, f->fp);
     fs_read_time_log("lv2", fd, (uint64_t)pos_before, (uint64_t)size, (uint64_t)nread, t_rd);
