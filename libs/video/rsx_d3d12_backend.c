@@ -19,6 +19,7 @@
 #include <time.h>
 #include "rsx_d3d12_backend.h"
 #include "rsx_d3d12_engine.h"
+#include "rsx_vulkan_engine.h"
 #include "rsx_draw_engine.h"
 #include "rsx_primitives.h"
 #include "rsx_vertex_fetch.h"
@@ -6589,6 +6590,12 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
      * as it is on Metal: every title-specific rendering fix lives there.
      * PS3RECOMP_RSX_ENGINE=vtable, or a device the engine cannot bring up,
      * falls through to the rsx_state path below. */
+    /* RSX_BACKEND=vulkan: the same draw engine over Vulkan (rsx_vulkan_engine.c);
+     * D3D12 when it cannot come up. */
+    if (rsx_vulkan_engine_wanted()) {
+        if (rsx_vulkan_engine_init(width, height, title) == 0) return 0;
+        fprintf(stderr, "[RSX] Vulkan unavailable; using D3D12\n");
+    }
     if (rsx_d3d12_engine_init(width, height, title) == 0) return 0;
     memset(&s_d3d, 0, sizeof(s_d3d));
     s_d3d.width = width;
@@ -6658,6 +6665,7 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
 
 void rsx_d3d12_backend_shutdown(void)
 {
+    if (rsx_vulkan_engine_active()) { rsx_vulkan_engine_shutdown(); return; }
     if (rsx_d3d12_engine_active()) { rsx_d3d12_engine_shutdown(); return; }
     if (!s_d3d.initialized) return;
 
@@ -6696,6 +6704,7 @@ void rsx_d3d12_backend_shutdown(void)
 
 int rsx_d3d12_backend_pump_messages(void)
 {
+    if (rsx_vulkan_engine_active()) return rsx_vulkan_engine_pump_messages();
     if (rsx_d3d12_engine_active()) return rsx_d3d12_engine_pump_messages();
     MSG msg;
     while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
@@ -6712,7 +6721,7 @@ void rsx_d3d12_backend_present(void)
      * flip itself calls here, and a title whose FIFO carries 0xE944 presents
      * through the engine's own sink. Present the buffer cellGcmSys says the
      * guest flipped to (see rsx_metal_backend_present). */
-    if (rsx_d3d12_engine_active()) {
+    if (rsx_d3d12_engine_active() || rsx_vulkan_engine_active()) {
         extern u32 cellGcmGetCurrentDisplayBufferId(void);
         rsx_draw_engine_present_buffer(cellGcmGetCurrentDisplayBufferId());
         return;

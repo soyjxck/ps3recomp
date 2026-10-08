@@ -54,6 +54,9 @@ endif()
 # to a stub wherever the shader tools are absent, so it is part of the
 # library everywhere. See the "Guest shaders on Metal" section below.
 list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_msl.cpp")
+# HLSL -> SPIR-V for the Vulkan backend; a stub without glslang. See "Vulkan"
+# below.
+list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_spirv.cpp")
 # cellAtrac decodes with FFmpeg's ATRAC3plus decoder as extracted by PPSSPP
 # (LGPL-2.1, kept separate in third_party/at3_standalone -- see its README).
 file(GLOB AT3_SOURCES "third_party/at3_standalone/*.cpp")
@@ -402,6 +405,32 @@ if(UNIX)
             "${CMAKE_CURRENT_SOURCE_DIR}/include"
         )
         target_link_libraries(test_shader_msl PRIVATE ps3recomp_msl_translation)
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
+# Vulkan (Windows for now): libs/video/rsx_vulkan_engine.c, RSX_BACKEND=vulkan
+# ---------------------------------------------------------------------------
+# Headers and glslang (static) from the LunarG Vulkan SDK ($VULKAN_SDK). The
+# loader, vulkan-1.dll, is opened at run time, so a machine without a Vulkan
+# driver still runs the D3D12 backend; without the SDK at configure time the
+# backend compiles to stubs that say so. Only the two Vulkan files see the
+# SDK's include directory.
+if(WIN32 AND DEFINED ENV{VULKAN_SDK})
+    file(TO_CMAKE_PATH "$ENV{VULKAN_SDK}" PS3RECOMP_VKSDK)
+    if(EXISTS "${PS3RECOMP_VKSDK}/Include/vulkan/vulkan.h" AND EXISTS "${PS3RECOMP_VKSDK}/Lib/glslang.lib")
+        message(STATUS "ps3recomp: Vulkan backend with the SDK at ${PS3RECOMP_VKSDK}")
+        set_property(SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_vulkan_engine.c"
+                            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_spirv.cpp"
+                     APPEND PROPERTY INCLUDE_DIRECTORIES "${PS3RECOMP_VKSDK}/Include")
+        set_property(SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_vulkan_engine.c"
+                     APPEND PROPERTY COMPILE_DEFINITIONS PS3RECOMP_HAVE_VULKAN=1)
+        set_property(SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_spirv.cpp"
+                     APPEND PROPERTY COMPILE_DEFINITIONS PS3RECOMP_HAVE_GLSLANG_SPIRV=1)
+        foreach(lib glslang MachineIndependent GenericCodeGen OSDependent SPIRV
+                    glslang-default-resource-limits SPIRV-Tools-opt SPIRV-Tools)
+            target_link_libraries(ps3recomp_runtime PRIVATE "${PS3RECOMP_VKSDK}/Lib/${lib}.lib")
+        endforeach()
     endif()
 endif()
 

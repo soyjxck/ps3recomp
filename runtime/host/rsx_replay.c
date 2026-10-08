@@ -35,6 +35,7 @@
 #endif
 #include <windows.h>
 #include "../../libs/video/rsx_d3d12_engine.h"
+#include "../../libs/video/rsx_vulkan_engine.h"
 static int setenv(const char* k, const char* v, int overwrite)
 {
     if (!overwrite && getenv(k)) return 0;
@@ -167,8 +168,11 @@ int main(int argc, char** argv)
     }
 
 #ifdef _WIN32
-    if (rsx_d3d12_engine_init(1280, 720, "rsx_replay") != 0) {
-        fprintf(stderr, "D3D12 engine backend init failed\n"); return 1;
+    /* RSX_BACKEND=vulkan replays through the Vulkan backend instead. */
+    const int use_vulkan = rsx_vulkan_engine_wanted();
+    if (use_vulkan ? rsx_vulkan_engine_init(1280, 720, "rsx_replay") != 0
+                   : rsx_d3d12_engine_init(1280, 720, "rsx_replay") != 0) {
+        fprintf(stderr, "%s engine backend init failed\n", use_vulkan ? "Vulkan" : "D3D12"); return 1;
     }
 #else
     if (rsx_metal_backend_init(1280, 720, "rsx_replay") != 0) {
@@ -235,7 +239,7 @@ int main(int argc, char** argv)
     }
     gzclose(s_gz);
 #ifdef _WIN32
-    rsx_d3d12_engine_shutdown();
+    if (use_vulkan) rsx_vulkan_engine_shutdown(); else rsx_d3d12_engine_shutdown();
 #endif
     const double dt = now_s() - t0;
     fprintf(stderr, "[replay] %ld presents, %llu methods, %llu pages in %.1f s (%.1f presents/s)\n",
