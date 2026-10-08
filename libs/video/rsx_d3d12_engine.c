@@ -1646,6 +1646,7 @@ static u32 eng_pipeline_create_locked(const char* vs_hlsl, const char* ps_hlsl,
 
 /* The engine may build pipelines on a worker thread as well as the walker;
  * the blob cache and the table are shared, so one at a time. */
+static ID3D12PipelineState* eng_pso(u32 pipeline, int cls);   /* below */
 static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_hlsl,
                                const rsx_be_render_state* rs,
                                const rsx_vertex_layout_plan* layout,
@@ -1655,6 +1656,15 @@ static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
     AcquireSRWLockExclusive(&s_pipe_lock);
     const u32 h = eng_pipeline_create_locked(vs_hlsl, ps_hlsl, rs, layout, vertex_stride, rt_fmt, rt_count);
     ReleaseSRWLockExclusive(&s_pipe_lock);
+    /* The pipeline state for triangles too, here: this runs on the draw
+     * engine's build thread (RSX_ASYNC_SHADERS), and a state object is the
+     * driver's compile -- milliseconds, tens of them for a shader it has not
+     * cached -- which on the walker, at the pipeline's first draw, was a
+     * hitch the first time anything new came on screen. Points and lines,
+     * rare, are still built on first use. RSX_PSO_PREWARM=0: all on first use. */
+    { static int warm = -1;
+      if (warm < 0) { const char* e = getenv("RSX_PSO_PREWARM"); warm = !(e && e[0] == '0'); }
+      if (h && warm) eng_pso(h, 2); }
     return h;
 }
 
@@ -1672,12 +1682,15 @@ static void eng_pipeline_release(void* user, u32 pipeline)
 
 /* The PSO for a pipeline and a topology class, built on first use: D3D12
  * bakes the class into the state object where Metal does not. */
+extern double g_rsx_frame_pso_ms;   /* rsx_draw_engine.c: pipeline states built on the walker this frame */
+static DWORD s_walker_tid;
 static ID3D12PipelineState* eng_pso(u32 pipeline, int cls)
 {
     if (!pipeline || pipeline > s_pipe_count) return NULL;
     EngPipeline* p = &s_pipe[pipeline - 1];
     if (!p->vs || p->failed[cls]) return NULL;
     if (p->pso[cls]) return p->pso[cls];
+    LARGE_INTEGER pq0, pq1, pqf; QueryPerformanceFrequency(&pqf); QueryPerformanceCounter(&pq0);
     AcquireSRWLockExclusive(&s_pipe_lock);
     if (!p->pso[cls] && !p->failed[cls]) {
         D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = p->desc;
@@ -1694,6 +1707,14 @@ static ID3D12PipelineState* eng_pso(u32 pipeline, int cls)
         }
     }
     ReleaseSRWLockExclusive(&s_pipe_lock);
+    QueryPerformanceCounter(&pq1);
+    const double pso_ms = (double)(pq1.QuadPart - pq0.QuadPart) * 1000.0 / (double)pqf.QuadPart;
+    const int on_walker = GetCurrentThreadId() == s_walker_tid;
+    if (on_walker) g_rsx_frame_pso_ms += pso_ms;
+    /* RSX_PSO_LOG=1: every pipeline state built, how long, and where. */
+    { static int lg = -1; if (lg < 0) lg = getenv("RSX_PSO_LOG") ? 1 : 0;
+      if (lg) fprintf(stderr, "[pso] pipeline %u class %d: %.2f ms on the %s\n", pipeline, cls, pso_ms,
+                      on_walker ? "walker" : "build thread"); }
     return p->pso[cls];
 }
 
@@ -2665,8 +2686,10 @@ static void eng_fullscreen_restore(void)
     }
 }
 
+/* s_walker_tid (above eng_pso): the thread that encodes -- PSO time there is walker time. */
 static void eng_submit(u32 present_surface, int wait)
 {
+    if (!s_walker_tid) s_walker_tid = GetCurrentThreadId();
     if (!s_ready) { s_rec_count = 0; s_stage_used = 0; s_stage_cur = -1; s_vis_npending = 0; return; }
     if (s_fs_restore && present_surface) eng_fullscreen_restore();
     if (!s_rec_count && !present_surface) return;

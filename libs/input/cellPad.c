@@ -813,15 +813,24 @@ skip_inject: ;
           s_sf = (e && *e) ? 1 : 0;
           if (s_sf) { strncpy(sf_path, e, sizeof sf_path - 1); sf_path[sizeof sf_path - 1] = 0;
                       if (!s_st) { s_v[0] = 128; s_v[1] = 0; s_v[2] = 128; s_v[3] = 128; } } }
+        /* The file may name the position: "lx ly rx ry" (0-255, 128 centred),
+         * so a script can steer and turn the camera; empty, the default. */
+        static unsigned char f_v[4]; static int f_has = 0;
         if (s_sf && port_no == 0) {
           const unsigned long long now = GetTickCount64();
           if (now - s_chk >= 200) { s_chk = now;
             FILE* f = fopen(sf_path, "rb");
             const int on = f != NULL;
-            if (f) fclose(f);
+            if (f) {
+              char buf[64]; int a, b, c, d;
+              f_has = fgets(buf, sizeof buf, f) && sscanf(buf, "%d %d %d %d", &a, &b, &c, &d) == 4;
+              if (f_has) { f_v[0] = (unsigned char)a; f_v[1] = (unsigned char)b; f_v[2] = (unsigned char)c; f_v[3] = (unsigned char)d; }
+              fclose(f);
+            }
             if (on != s_on) { s_on = on; printf("[cellPad] PAD_STICK_FILE hold %s\n", on ? "on" : "off"); fflush(stdout); } }
-          if (s_on) { hs->analog_lx = s_v[0]; hs->analog_ly = s_v[1];
-                      hs->analog_rx = s_v[2]; hs->analog_ry = s_v[3]; hs->connected = 1; } } }
+          if (s_on) { const unsigned char* v = f_has ? f_v : s_v;
+                      hs->analog_lx = v[0]; hs->analog_ly = v[1];
+                      hs->analog_rx = v[2]; hs->analog_ry = v[3]; hs->connected = 1; } } }
       /* PAD_SWEEP=<seconds per step>: walk the sticks through a fixed set of
        * deflections instead of holding one. Guessing a single stick position and
        * re-running costs ~5 minutes a try; a sweep answers "can input move the

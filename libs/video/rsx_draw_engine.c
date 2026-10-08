@@ -2564,6 +2564,7 @@ uint32_t g_rsx_engine_hitches = 0; /* presents more than 25 ms after the one bef
  * (main.cpp hands it to the sampling profiler's slow-frame report). */
 void (*g_rsx_hitch_hook)(double frame_ms) = 0;
 double g_rsx_frame_gpu_wait_ms = 0.0;   /* a backend's blocking GPU waits since the last present */
+double g_rsx_frame_pso_ms = 0.0;        /* a backend's pipeline states built on the walker since then */
 static void eng_draw_stats_report(void)
 {
     if (s_dstat_on != 1 || (g.frames % 120u) != 0u) return;
@@ -3385,9 +3386,17 @@ static void eng_present(u32 buffer_id)
                 /* With the walker's blocking GPU waits in the frame (the
                  * D3D12 backend adds them up; 0 elsewhere). */
                 if (hl > 0.0 && ft > hl)
-                    fprintf(stderr, "[hitch] frame %u: %.1f ms (walker blocked on the GPU %.1f ms of it)\n",
-                            g.frames, ft, g_rsx_frame_gpu_wait_ms);
-                g_rsx_frame_gpu_wait_ms = 0.0; }
+                    fprintf(stderr, "[hitch] frame %u: %.1f ms (walker blocked on the GPU %.1f ms of it; "
+                            "%u textures uploaded %llu KB, %u vertex conversions %llu KB, %u pipelines built %.1f ms, "
+                            "%u draws %.1f ms, pipeline states %.1f ms)\n",
+                            g.frames, ft, g_rsx_frame_gpu_wait_ms,
+                            s_fstat.tex, (unsigned long long)(s_fstat.tex_bytes >> 10),
+                            s_fstat.vc_store, (unsigned long long)(s_fstat.vc_bytes >> 10),
+                            s_fstat.pipes, s_fstat.pipe_ms, s_fstat.draws, s_fstat.draw_ms, g_rsx_frame_pso_ms);
+                g_rsx_frame_gpu_wait_ms = 0.0; g_rsx_frame_pso_ms = 0.0;
+                /* The stutter report resets these per frame; without it, here. */
+                { static int st = -1; if (st < 0) st = getenv("DOD3_STUTTER_MS") ? 1 : 0;
+                  if (!st) memset(&s_fstat, 0, sizeof s_fstat); } }
               n++;
           } else {
               win_start = first = now;
