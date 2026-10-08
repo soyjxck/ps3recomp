@@ -67,15 +67,54 @@ uint64_t ppu_timebase_now(void)
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     if (!t0) t0 = now.QuadPart;   /* benign race: same anchor either way */
-    uint64_t d = (uint64_t)(now.QuadPart - t0);
+    const int64_t g = ps3_guest_ticks(now.QuadPart);
+    uint64_t d = g > t0 ? (uint64_t)(g - t0) : 0;
     uint64_t q = (uint64_t)s_qpc_freq.QuadPart;
     return (d / q) * PS3_TIMEBASE_FREQ + (d % q) * PS3_TIMEBASE_FREQ / q;
 #else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * PS3_TIMEBASE_FREQ +
-           (uint64_t)ts.tv_nsec * PS3_TIMEBASE_FREQ / 1000000000ull;
+    const uint64_t ns = (uint64_t)ps3_guest_ticks((int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec);
+    return (ns / 1000000000ull) * PS3_TIMEBASE_FREQ +
+           (ns % 1000000000ull) * PS3_TIMEBASE_FREQ / 1000000000ull;
 #endif
+}
+
+/* Guest time = host time - the time spent paused, held at s_guest_hold while
+ * paused. Readers load the hold before the paused total and the resume
+ * stores the total before clearing the hold, so a reader racing the resume
+ * still clamps to the hold: the clocks never step back. */
+static int64_t s_guest_paused;               /* host ticks spent paused */
+static int64_t s_guest_hold = INT64_MAX;     /* while paused: the guest ticks the clocks hold at */
+
+int64_t ps3_guest_ticks(int64_t host)
+{
+    const int64_t hold = __atomic_load_n(&s_guest_hold, __ATOMIC_ACQUIRE);
+    const int64_t t = host - __atomic_load_n(&s_guest_paused, __ATOMIC_ACQUIRE);
+    return t < hold ? t : hold;
+}
+
+void ps3_guest_clock_pause(int paused)
+{
+#ifdef _WIN32
+    LARGE_INTEGER c;
+    ensure_qpc_init();
+    QueryPerformanceCounter(&c);
+    const int64_t now = c.QuadPart, ms = s_qpc_freq.QuadPart / 1000;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    const int64_t now = (int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec, ms = 1000000;
+#endif
+    const int64_t hold = __atomic_load_n(&s_guest_hold, __ATOMIC_ACQUIRE);
+    if (paused && hold == INT64_MAX) {
+        /* A millisecond on: a reader that took its host time just before this
+         * and has not seen the hold yet cannot pass it, then step back. */
+        __atomic_store_n(&s_guest_hold, now + ms - s_guest_paused, __ATOMIC_RELEASE);
+    } else if (!paused && hold != INT64_MAX) {
+        __atomic_store_n(&s_guest_paused, now - hold, __ATOMIC_RELEASE);   /* on from the hold */
+        __atomic_store_n(&s_guest_hold, INT64_MAX, __ATOMIC_RELEASE);
+    }
 }
 
 static void write_be32(uint32_t addr, uint32_t val)
@@ -358,6 +397,7 @@ int64_t sys_time_get_current_time(ppu_context* ctx)
     ensure_qpc_init();
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
+    now.QuadPart = ps3_guest_ticks(now.QuadPart);
 
     /* Convert QPC to seconds + nanoseconds */
     sec  = (uint64_t)(now.QuadPart / s_qpc_freq.QuadPart);

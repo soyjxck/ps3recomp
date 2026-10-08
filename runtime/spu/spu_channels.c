@@ -17,6 +17,7 @@
 #include "spu_helpers.h"   /* spu_splat_u32 / spu_ls_read128 (SMC microstep) */
 #include "spu_lockstep.h"
 #include "spu_interp.h"    /* spu_lifted_fn / spu_lifted_lookup -- defined below */
+int64_t ps3_guest_ticks(int64_t host_ticks);   /* sys_timer.c: the decrementer stands still while paused */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -70,6 +71,7 @@ static uint64_t spu_host_ns(void)
     LARGE_INTEGER c;
     if (!s_freq.QuadPart) QueryPerformanceFrequency(&s_freq);
     QueryPerformanceCounter(&c);
+    c.QuadPart = ps3_guest_ticks(c.QuadPart);
     /* Split the divide to keep the multiply from overflowing: QPC counters are
      * large enough that (count * 1e9) wraps a u64 within hours of uptime. */
     return (uint64_t)(c.QuadPart / s_freq.QuadPart) * 1000000000ull
@@ -78,7 +80,7 @@ static uint64_t spu_host_ns(void)
 #else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    return (uint64_t)ps3_guest_ticks((int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec);
 #endif
 }
 

@@ -12,6 +12,7 @@
  */
 #include "ppu_recomp.h"     /* ppu_context */
 #include "ps3emu/nid.h"     /* ps3_compute_nid */
+extern "C" int64_t ps3_guest_ticks(int64_t host_ticks);   /* sys_timer.c: still while paused */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -71,10 +72,11 @@ static void sys_time_get_system_time(ppu_context* ctx)
     static LARGE_INTEGER s_freq, s_base;
     if (!s_freq.QuadPart) { QueryPerformanceFrequency(&s_freq); QueryPerformanceCounter(&s_base); }
     LARGE_INTEGER now; QueryPerformanceCounter(&now);
-    ctx->gpr[3] = (uint64_t)((now.QuadPart - s_base.QuadPart) * 1000000ull / (uint64_t)s_freq.QuadPart);
+    const int64_t g = ps3_guest_ticks(now.QuadPart);
+    ctx->gpr[3] = g > s_base.QuadPart ? (uint64_t)((g - s_base.QuadPart) * 1000000ull / (uint64_t)s_freq.QuadPart) : 0;
 #else
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    ctx->gpr[3] = (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+    ctx->gpr[3] = (uint64_t)ps3_guest_ticks((int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec) / 1000ull;
 #endif
 }
 

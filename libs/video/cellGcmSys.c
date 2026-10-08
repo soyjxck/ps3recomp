@@ -14,6 +14,7 @@
 #include "../../runtime/platform/win32_compat.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 (translate + byte-swap, OOB-safe) */
 #include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
+int64_t ps3_guest_ticks(int64_t host_ticks);   /* sys_timer.c: still while paused */
 #include "rsx_commands.h"                    /* rsx_state, rsx_process_command_buffer */
 #include "../../include/ps3emu/guest_call.h" /* g_ps3_guest_caller for direct handler dispatch */
 
@@ -60,6 +61,7 @@ static u64 get_timestamp_ns(void)
     LARGE_INTEGER now;
     ensure_qpc_init();
     QueryPerformanceCounter(&now);
+    now.QuadPart = ps3_guest_ticks(now.QuadPart);   /* still while paused */
     /* Convert to nanoseconds: (count * 1e9) / freq */
     return (u64)((double)now.QuadPart * 1000000000.0 / (double)s_qpc_freq.QuadPart);
 }
@@ -68,7 +70,7 @@ static u64 get_timestamp_ns(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (u64)ts.tv_sec * 1000000000ULL + (u64)ts.tv_nsec;
+    return (u64)ps3_guest_ticks((int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec);   /* still while paused */
 }
 #endif
 

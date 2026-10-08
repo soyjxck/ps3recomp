@@ -32,6 +32,18 @@ extern "C" {
  * to the PS3 timebase. Called from every lifted mftb site (ppu_lifter.py). */
 uint64_t ppu_timebase_now(void);
 
+/* The guest clocks stand still while the host pauses the title (dod3:
+ * DOD3_UNFOCUSED=pause, its window out of focus). The clocks the guest times
+ * itself by -- mftb, sys_time_get_system_time / _current_time, the SPU
+ * decrementer, the RSX timestamps -- read their host counter through
+ * ps3_guest_ticks(), which leaves out the time spent paused and holds while
+ * paused: as in RPCS3, whose guest time leaves out the time the emulator was
+ * paused, so nothing in the title sees the pause as a hitch. Ticks are the
+ * host counter's: QueryPerformanceCounter on Windows, CLOCK_MONOTONIC
+ * nanoseconds elsewhere. ps3_guest_clock_pause() is called from one thread. */
+int64_t ps3_guest_ticks(int64_t host_ticks);
+void    ps3_guest_clock_pause(int paused);
+
 #ifdef _WIN32
 /* Sub-millisecond timed-wait support for the lv2 sync primitives.
  * SleepConditionVariableCS / WaitForSingleObject floor a timed wait to 1 ms,

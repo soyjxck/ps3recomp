@@ -165,6 +165,12 @@ static mutex_t       s_audio_mutex;
 static float s_mix_buffer[CELL_AUDIO_BLOCK_SAMPLES * 2];
 static unsigned long long g_audio_gaps, g_audio_gap_blocks;   /* AUDIO_GAPS totals */
 
+/* The host's hold on the output (dod3: DOD3_UNFOCUSED, the window out of
+ * focus). 1: mixed as usual, played as silence. 2: paused -- the ports are
+ * not read and the title is not notified, so its audio (music, a movie's
+ * soundtrack) waits where it is; the device is fed silence. */
+volatile int g_audio_hold = 0;
+
 /* ---------------------------------------------------------------------------
  * Host audio output backend
  * -----------------------------------------------------------------------*/
@@ -703,8 +709,14 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
         if (room >= 0 && (UINT32)room >= s_wasapi_buf_frames - CELL_AUDIO_BLOCK_SAMPLES && blocks > 8)
             q0.QuadPart -= period;                                                                /* DAC faster: gain */
         blocks++;
+        if (g_audio_hold == 2) {
+            memset(s_mix_buffer, 0, sizeof s_mix_buffer);
+            audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
+            continue;
+        }
         /* Mix and submit one block */
         audio_mix_one_block();
+        if (g_audio_hold) memset(s_mix_buffer, 0, sizeof s_mix_buffer);
         /* AUDIO_PEAK=1: report the mixed block's peak amplitude periodically so
          * "is any port producing sound" is answerable (LBP Bink movie audio). */
         { static int _ap = -1; if (_ap < 0) _ap = getenv("AUDIO_PEAK") ? 1 : 0;
@@ -786,7 +798,13 @@ static void* audio_mix_thread_func(void* arg)
             if (el - due > 0.05) t0 = now, blocks = 0;   /* far behind: drop the backlog */
         }
         blocks++;
+        if (g_audio_hold == 2) {   /* paused: as the Windows loop */
+            memset(s_mix_buffer, 0, sizeof s_mix_buffer);
+            audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
+            continue;
+        }
         audio_mix_one_block();
+        if (g_audio_hold) memset(s_mix_buffer, 0, sizeof s_mix_buffer);
         /* AUDIO_WAV=<file>: the final mix as raw f32le stereo 48 kHz
          * (ffmpeg -f f32le -ar 48000 -ac 2 -i <file>). */
         { static FILE* wf = (FILE*)-1;
