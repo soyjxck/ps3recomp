@@ -931,6 +931,15 @@ int64_t sys_fs_readdir(ppu_context* ctx)
     }
     name = entry->d_name;
     is_dir = (entry->d_type == DT_DIR) ? 1 : 0;
+    /* A symlink (a game's data folders linked onto its disc tree) or a file
+     * system that leaves d_type unset: what it points at decides, as stat()
+     * and the cellFs listing (ppu_fs.cpp) see it. */
+    if (entry->d_type == DT_LNK || entry->d_type == DT_UNKNOWN) {
+        char full[1024];
+        struct stat st;
+        snprintf(full, sizeof(full), "%s/%s", d->path, name);
+        is_dir = (stat(full, &st) == 0 && S_ISDIR(st.st_mode)) ? 1 : 0;
+    }
 #endif
 
     if (dirent_addr != 0 && name != NULL) {
