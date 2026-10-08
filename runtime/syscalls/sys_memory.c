@@ -27,6 +27,15 @@ uint32_t g_sys_mem_bump_ptr = 0;
 #define SYS_MEM_ALLOC_BASE  0x40000000u
 #define SYS_MEM_ALLOC_END   0x50000000u
 
+/* Overflow window, used once the one above is exhausted. A title can need
+ * more than the PS3's ~213 MB here, because the HLE does not reproduce every
+ * way the real system bounds or recycles memory; failing it with ENOMEM ends
+ * the run (UE3 treats it as fatal) where real hardware would have carried on.
+ * 0x70000000..0x80000000 sits above sys_vm and below the sign bit, so a guest
+ * that compares pointers as signed still sees a positive one. */
+#define SYS_MEM_OVERFLOW_BASE 0x70000000u
+#define SYS_MEM_OVERFLOW_END  0x80000000u
+
 static uint32_t s_total_allocated = 0;
 
 /* Guest threads are real host threads; serialize the bump allocator. */
@@ -89,9 +98,18 @@ int64_t sys_memory_allocate(ppu_context* ctx)
     /* Align bump pointer */
     g_sys_mem_bump_ptr = VM_ALIGN_UP(g_sys_mem_bump_ptr, alignment);
 
-    /* Check if we have room */
-    if (g_sys_mem_bump_ptr + size > SYS_MEM_ALLOC_END) {
+    /* Check if we have room; spill into the overflow window once */
+    if (g_sys_mem_bump_ptr < SYS_MEM_OVERFLOW_BASE &&
+        g_sys_mem_bump_ptr + size > SYS_MEM_ALLOC_END) {
+        fprintf(stderr, "[sys_memory] primary window exhausted at 0x%08X -- continuing in 0x%08X..0x%08X\n",
+                g_sys_mem_bump_ptr, SYS_MEM_OVERFLOW_BASE, SYS_MEM_OVERFLOW_END);
+        g_sys_mem_bump_ptr = SYS_MEM_OVERFLOW_BASE;
+    }
+    if (g_sys_mem_bump_ptr + size > (g_sys_mem_bump_ptr >= SYS_MEM_OVERFLOW_BASE
+                                     ? SYS_MEM_OVERFLOW_END : SYS_MEM_ALLOC_END)) {
         bump_unlock();
+        fprintf(stderr, "[sys_memory] allocate(size=0x%X) -> ENOMEM: window exhausted (bump 0x%08X)\n",
+                size, g_sys_mem_bump_ptr);
         return (int64_t)(int32_t)CELL_ENOMEM;
     }
 
@@ -102,6 +120,8 @@ int64_t sys_memory_allocate(ppu_context* ctx)
     }
     if (slot < 0) {
         bump_unlock();
+        fprintf(stderr, "[sys_memory] allocate(size=0x%X) -> ENOMEM: all %d allocation slots in use\n",
+                size, SYS_MEMORY_ALLOC_MAX);
         return (int64_t)(int32_t)CELL_ENOMEM;
     }
 

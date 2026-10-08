@@ -2247,8 +2247,9 @@ static int64_t sys_process_is_spu_lock_line_reservation_address(ppu_context* ctx
         rc = (int64_t)(int32_t)CELL_EINVAL;
     } else if (addr >= VM_MAIN_MEM_BASE && addr < VM_MAIN_MEM_BASE + VM_MAIN_MEM_SIZE) {
         rc = 0;                                   /* main memory */
-    } else if (addr >= 0x40000000u && addr < 0x50000000u) {
-        rc = 0;                                   /* sys_memory window */
+    } else if ((addr >= 0x40000000u && addr < 0x50000000u) ||
+               (addr >= 0x70000000u && addr < 0x80000000u)) {
+        rc = 0;                                   /* sys_memory windows */
     } else if (addr >= 0xC0000000u && addr < 0xD0000000u) {
         rc = 0;                                   /* RSX local memory */
     } else if (addr >= 0xD0000000u && addr < 0xE0000000u) {
