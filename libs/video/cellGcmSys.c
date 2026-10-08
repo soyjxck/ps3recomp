@@ -97,6 +97,14 @@ static u32 s_current_display_buffer_id = 0;
 static volatile int s_flip_pending = 0;
 /* A flip _cellGcmSetFlipCommand queued in the FIFO: | bufferId, bit 8 = ours. */
 #define GCM_FLIP_MARKER 0xFEAD0100u
+/* Queued by cellGcmSetPrepareFlip: the drain flips when it reaches it. */
+#define GCM_PREPARE_MARKER 0xFEAD0200u
+/* The buffer whose prepare marker the drain reached last (-1: none), and
+ * whether this title has ever prepared a flip. cellGcmSetFlipImmediate on a
+ * prepared title succeeds only for that buffer -- the hardware fails it until
+ * the RSX has executed the preparation, and a title paces on that. */
+static volatile int s_prepared_id = -1;
+static int s_prepare_used = 0;
 /* ponytail: fixed headroom, far above one frame's commands (Simpsons ~10 KB);
  * derive it from the observed per-frame volume if a title outgrows it. */
 #define GCM_FLIP_WRAP_BYTES 0x40000u
@@ -1466,6 +1474,48 @@ void cellGcm_rsx_process_fifo(void)
     ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
 }
 
+/* A flip or prepare-flip whose marker did not fit before the ring's end (the
+ * last GCM_RECYCLE_SLACK bytes are the title's, see gcm_word_into_fifo): its
+ * position, the IO offset of the write head when the title asked for it, and
+ * the buffer. The drain does what the marker would have done when `get`
+ * reaches that offset -- after every command queued before it. A host flip
+ * on the spot instead would come too early, and the draw engine ignores host
+ * presents once a title flips through its FIFO (rsx_draw_engine_fifo_flip),
+ * so that frame would never be shown: Drakengard 3 prepares about one flip
+ * in 30 within the last 4 KB of its 3 MB ring, each a 33-35 ms frame (the
+ * previous one held for two) every 10-20 s at 60 fps. */
+#define GCM_NO_POS_FLIP 0xFFFFFFFFu
+static volatile u32 s_pos_flip_io = GCM_NO_POS_FLIP;
+static volatile u32 s_pos_flip_id = 0;
+static volatile int s_pos_flip_prepare = 0;
+/* Queue a flip (prepare = 0) or prepare-flip at ctx->current; 0 if it cannot. */
+static int gcm_pos_flip_set(u32 ctx, u32 bufferId, int prepare)
+{
+    if (!ctx || bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM || !s_display_buffer_set[bufferId])
+        return 0;
+    const u32 io = gcm_ea2io(vm_read32(ctx + 8));
+    if (io == 0xFFFFFFFFu) return 0;
+    s_pos_flip_id = bufferId;
+    s_pos_flip_prepare = prepare;
+    atomic_thread_fence(memory_order_seq_cst);
+    s_pos_flip_io = io;
+    return 1;
+}
+static void gcm_fire_pos_flip(void)
+{
+    const u32 id = s_pos_flip_id;
+    s_pos_flip_io = GCM_NO_POS_FLIP;
+    s_current_display_buffer_id = id & 7u;
+    s_flip_pending = 1;
+    s_flip_request_count++;
+    if (s_pos_flip_prepare) {                       /* as the GCM_PREPARE_MARKER case */
+        s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
+        s_last_flip_time = get_timestamp_ns();
+        s_prepared_id = (int)(id & 7u);
+    }
+    rsx_draw_engine_fifo_flip(s_current_display_buffer_id);
+}
+
 static void gcm_rsx_process_fifo_unlocked(void)
 {
     { static unsigned _n = 0; static unsigned long long _t0 = 0;
@@ -1582,7 +1632,13 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * short of `put` every tick is the signature of a FIFO that can never
      * catch up, and the reason is the whole diagnosis. */
     const char* why = "caught-up";
+    if (s_fifo_getoff == s_pos_flip_io) gcm_fire_pos_flip();
     while (s_fifo_getoff != put && budget-- > 0) {
+        if (s_fifo_getoff == s_pos_flip_io) {
+            gcm_fire_pos_flip();
+            if (put < s_fifo_getoff || put - s_fifo_getoff < GCM_FIFO_CATCHUP_BYTES)
+                { why = "flip"; break; }
+        }
         u32 ea = gcm_io2ea(s_fifo_getoff);
         if (!ea) {
             /* get is sitting on an IO offset with no mapping -- the title
@@ -1637,13 +1693,40 @@ static void gcm_rsx_process_fifo_unlocked(void)
                           flips, 10); }
             if ((w & 0xFFFFFF00u) == GCM_FLIP_MARKER) {
                 /* Queued by _cellGcmSetFlipCommand, which already did the
-                 * guest-visible half of the request. */
+                 * guest-visible half of the request. A position flip still
+                 * waiting is one the walker skipped past (a resync): this
+                 * later frame replaces it. */
+                s_pos_flip_io = GCM_NO_POS_FLIP;
                 s_current_display_buffer_id = w & 7u;
                 s_flip_pending = 1;
                 s_flip_request_count++;
+            } else if ((w & 0xFFFFFF00u) == GCM_PREPARE_MARKER) {
+                s_pos_flip_io = GCM_NO_POS_FLIP;
+                /* Queued by cellGcmSetPrepareFlip: the frame in this buffer
+                 * is complete here, so flip now, and let
+                 * cellGcmSetFlipImmediate(id) succeed from here on.
+                 *
+                 * Not through gcm_flip_request: that also calls the title's
+                 * flip handler, and this is the drain thread. A handler that
+                 * takes a lock the title's render thread holds while it waits
+                 * in the command-buffer callback for this very drain would
+                 * deadlock (Drakengard 3 did, until the callback's timeout).
+                 * The flip handler runs where it does on hardware: at the
+                 * next vblank tick, from the pump. */
+                s_current_display_buffer_id = w & 7u;
+                s_flip_pending = 1;
+                s_flip_request_count++;
+                s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
+                s_last_flip_time = get_timestamp_ns();
+                s_prepared_id = (int)(w & 7u);
             } else {
                 cellGcmSetFlipCommand(w & 0xFFu);
             }
+            /* Present here, in order with the draws, when the draw engine is
+             * up. The ticker's present comes later, and by then this drain
+             * may have run through several more frames (the catch-up below),
+             * so the buffer it names already holds a later frame's clear. */
+            rsx_draw_engine_fifo_flip(s_current_display_buffer_id);
             /* ...unless the FIFO is badly backlogged. One flip per drain is
              * right while `get` is keeping up with `put`; when it is megabytes
              * behind it is a deadlock, because the title's ring can only be
@@ -2278,15 +2361,14 @@ s32 cellGcmSetFlipCommand(u32 bufferId) { return gcm_flip_request(bufferId, 0); 
  * at ctx->current instead; the drain stops at it and fires the flip there,
  * exactly as it does for the 0xFEAD words a statically-linked libgcm emits.
  * Returns 0 when there is no room or ctx is not a mapped command buffer. */
-static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
+static int gcm_word_into_fifo(u32 ctx, u32 word, int allow_wrap)
 {
-    if (!ctx || bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM ||
-        !s_display_buffer_set[bufferId]) return 0;
+    if (!ctx) return 0;
     const u32 end = vm_read32(ctx + 4), cur = vm_read32(ctx + 8);
     /* Never near the end: those bytes are the title's reserve before its
      * ring wraps, and the recycle above keys on them. */
     if (cur + 8 + GCM_RECYCLE_SLACK > end || gcm_ea2io(cur) == 0xFFFFFFFFu) return 0;
-    vm_write32(cur, GCM_FLIP_MARKER | bufferId);
+    vm_write32(cur, word);
     /* Wrap here, on the guest thread, once the ring is nearly used -- what the
      * SDK's buffer-full callback does. Otherwise the drain thread recycles it
      * (see "recycled the title's own ring"), rewriting ctx->current and put
@@ -2295,7 +2377,12 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
      * it spins on `ref` for good. Safe when the walker has left the head of
      * the ring well behind, which is the region the guest writes next. */
     const u32 begin = vm_read32(ctx), io_begin = gcm_ea2io(begin);
-    if (end - (cur + 4) < GCM_FLIP_WRAP_BYTES && io_begin != 0xFFFFFFFFu &&
+    /* Not for a prepare-flip marker: wrapping here skips the title's own
+     * buffer-full callback, which waits for the RSX to leave the head of the
+     * ring before handing it back. Drakengard 3's Unreal Engine 3 RHI then
+     * wrote its next frames over commands the walker had not read yet. Its
+     * callback wraps the ring correctly. */
+    if (allow_wrap && end - (cur + 4) < GCM_FLIP_WRAP_BYTES && io_begin != 0xFFFFFFFFu &&
         s_fifo_getoff >= io_begin + GCM_RECYCLE_MARGIN) {
         vm_write32(cur + 4, 0x20000000u | io_begin);   /* JUMP -> begin */
         vm_write32(ctx + 8, begin);
@@ -2303,6 +2390,11 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
     }
     vm_write32(ctx + 8, cur + 4);
     return 1;
+}
+static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
+{
+    if (bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM || !s_display_buffer_set[bufferId]) return 0;
+    return gcm_word_into_fifo(ctx, GCM_FLIP_MARKER | bufferId, 1);
 }
 
 /* cellGcmSetFlip(context, buffer_id) — immediate flip request. PSL1GHT's
@@ -2330,29 +2422,38 @@ s32 cellGcmSetFlipCommandWithWaitLabel(u32 bufferId, u32 labelIndex, u32 labelVa
 /* NID: 0xA2478CA3 */
 s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
 {
-    (void)ctx;  /* command buffer context -- not used in HLE */
-
+    /* libgcm writes the preparation into the command buffer and RETURNS THE
+     * BUFFER ID; the flip itself is the RSX's when it reaches the command,
+     * or the PPU's through cellGcmSetFlipImmediate(id) once it has. Unreal
+     * Engine 3 on PS3 (Drakengard 3) carries that return value through a
+     * user command to its vblank handler, which calls SetFlipImmediate with
+     * it every second vblank. This HLE used to flip on the spot -- before
+     * the frame's commands had been drained, so the host presented the
+     * buffer the drain was still drawing into -- and return CELL_OK, so the
+     * title then flipped to buffer 0 every frame as well: that buffer is the
+     * light-attenuation scratch the title clears to white while another is
+     * displayed, and the picture flashed white, cyan and half-drawn. */
     if (bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM)
         return CELL_GCM_ERROR_INVALID_VALUE;
 
     if (!s_display_buffer_set[bufferId])
         return CELL_GCM_ERROR_INVALID_VALUE;
 
-    printf("[cellGcmSys] SetPrepareFlip(bufferId=%u)\n", bufferId);
-
-    s_current_display_buffer_id = bufferId;
-    s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
-    s_flip_request_count++;
-    s_last_flip_time = get_timestamp_ns();
-
-    /* Invoke the guest flip handler via OPD resolution -- s_flip_handler holds
-     * the raw guest OPD (e.g. 0x530D70); calling it as a host function pointer
-     * jumps into guest code and crashes. See cellGcmSetFlipCommand for why
-     * GCM_FLIPCB_ONTICK exists. */
-    if (s_flip_handler_opd && g_ps3_guest_caller && !gcm_flipcb_on_tick_only())
-        g_ps3_guest_caller(s_flip_handler_opd, 0, 0, 0, 0, 0, 0, 0, 0);
-
-    return CELL_OK;
+    if (gcm_word_into_fifo((u32)(uintptr_t)ctx, GCM_PREPARE_MARKER | bufferId, 0)) {
+        s_prepare_used = 1;
+        return (s32)bufferId;
+    }
+    /* No room for the marker before the ring's end: the drain prepares the
+     * flip at this position instead (see s_pos_flip_io). */
+    if (gcm_pos_flip_set((u32)(uintptr_t)ctx, bufferId, 1)) {
+        s_prepare_used = 1;
+        return (s32)bufferId;
+    }
+    /* No command buffer to queue into: flip now, as before. */
+    gcm_flip_request(bufferId, 0);
+    s_prepared_id = (int)bufferId;
+    s_prepare_used = 1;
+    return (s32)bufferId;
 }
 
 /* NID: 0x1BFAB6EE */
@@ -3025,6 +3126,10 @@ s32 _cellGcmSetFlipCommand(void* ctx, u32 bufferId)
 {
     if (gcm_flip_into_fifo((u32)(uintptr_t)ctx, bufferId))
         return gcm_flip_request(bufferId, 1);
+    /* No room for the marker: the drain flips at this position instead (see
+     * s_pos_flip_io). */
+    if (gcm_pos_flip_set((u32)(uintptr_t)ctx, bufferId, 0))
+        return gcm_flip_request(bufferId, 1);
     return cellGcmSetFlipCommand(bufferId);
 }
 
@@ -3250,7 +3355,14 @@ u32 cellGcmGetDefaultSegmentWordSize(void)
 /* Immediate flip — perform flip right now */
 s32 cellGcmSetFlipImmediate(u32 bufferId)
 {
-    printf("[cellGcmSys] SetFlipImmediate(bufferId=%u)\n", bufferId);
+    if (s_prepare_used) {
+        /* The flip the drain performed at this buffer's prepare marker IS
+         * this flip; a second one would re-present the same buffer. Until
+         * the drain gets there the hardware answer is failure, and the title
+         * keeps the id pending and asks again next vblank. */
+        if (s_prepared_id == (int)bufferId) { s_prepared_id = -1; return CELL_OK; }
+        return CELL_GCM_ERROR_FAILURE;
+    }
     return cellGcmSetFlipCommand(bufferId);
 }
 

@@ -248,6 +248,12 @@ void rsx_draw_engine_flush(void);
 void rsx_draw_engine_present(void);
 /* A runner retiring a queued flip names the buffer explicitly. */
 void rsx_draw_engine_present_buffer(u32 buffer_id);
+/* A flip the FIFO drain reached (a libgcm 0xFEADxxxx flip or prepare-flip
+ * word): present now, in order with the draws. After the first one, host
+ * presents (rsx_draw_engine_present / _present_buffer) are ignored -- they
+ * come late and would show a later frame's partly drawn buffer. Returns 0
+ * when the engine is not running. */
+int rsx_draw_engine_fifo_flip(u32 buffer_id);
 
 /* --- test hooks ---------------------------------------------------------- */
 
