@@ -76,6 +76,38 @@ static void fs_normalize_sep(char* p) {
 #endif
 }
 
+/* PS3_VFS_OVERLAY=<dir>: a file that exists under <dir> at the same relative
+ * path replaces the one under the VFS root ($PS3_VFS_ROOT) -- patched copies
+ * of game files without touching the dump. Regular files only; everything
+ * else resolves as before. */
+static void ps3_vfs_overlay(char* path, size_t cap)
+{
+    static const char* ov; static const char* root; static size_t rootlen; static int init;
+    if (!init) {
+        ov = getenv("PS3_VFS_OVERLAY"); root = getenv("PS3_VFS_ROOT");
+        if (ov && !*ov) ov = NULL;
+        rootlen = root ? strlen(root) : 0;
+        init = 1;
+    }
+    if (!ov || !rootlen) return;
+    size_t i = 0;
+    for (; i < rootlen; i++) {
+        char a = path[i], b = root[i];
+        if (a == '\\') a = '/';
+        if (b == '\\') b = '/';
+        if (a != b) return;
+    }
+    if (path[i] != '/' && path[i] != '\\') return;
+    char alt[1024];
+    if (snprintf(alt, sizeof alt, "%s%s", ov, path + i) >= (int)sizeof alt) return;
+    struct stat st;
+    if (stat(alt, &st) == 0 && (st.st_mode & S_IFREG)) {
+        static int said;
+        if (said < 32) { said++; fprintf(stderr, "[vfs] overlay: %s\n", alt); }
+        snprintf(path, cap, "%s", alt);
+    }
+}
+
 /* Extracted game trees come in two shapes: the disc layout (<root>/PS3_GAME/
  * USRDIR/...) and a flattened one (<root>/USRDIR/...). cellGame hands the title
  * disc-style paths either way -- cellGameContentPermit reports
@@ -86,13 +118,22 @@ static void fs_normalize_sep(char* p) {
  * Additive and last-resort: if the translated path does not exist but dropping
  * a PS3_GAME component yields one that does, use that. When neither exists the
  * original is kept, so failure messages still name the path the guest asked for.
+ * The overlay is applied after, to the path this settles on.
  *
  * All three path translators call this -- sys_fs, cellFs and ppu_fs each do
  * their own translation (see docs), and a guest path can arrive at any of them. */
+static void ps3game_fallback(char* path, size_t cap);
 void ps3_vfs_ps3game_fallback(char* path, size_t cap)
 {
+    if (!path || !*path) return;
+    ps3game_fallback(path, cap);
+    ps3_vfs_overlay(path, cap);
+}
+
+static void ps3game_fallback(char* path, size_t cap)
+{
     struct stat st;
-    if (!path || !*path || stat(path, &st) == 0)
+    if (stat(path, &st) == 0)
         return;
     char* p = strstr(path, "/PS3_GAME/");
     if (!p) {
