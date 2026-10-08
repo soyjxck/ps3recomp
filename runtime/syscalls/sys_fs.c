@@ -473,7 +473,11 @@ int64_t sys_fs_read(ppu_context* ctx)
      * as a read error on every movie and never decoded a frame -- solid green
      * video. ppu_fs.cpp fs_prefault is the same fix for cellFs. */
     if (size) { vm_commit(buf_addr, (uint32_t)size); vm_watch_touch(buf_addr, (uint32_t)size); }
+    extern double fs_read_time_start(void);
+    extern void fs_read_time_log(const char*, int, uint64_t, uint64_t, uint64_t, double);
+    const double t_rd = fs_read_time_start();
     size_t nread = fread(buf, 1, (size_t)size, f->fp);
+    fs_read_time_log("lv2", fd, (uint64_t)pos_before, (uint64_t)size, (uint64_t)nread, t_rd);
 
     /* PS3_FSTRACE=<n>: every nth read, the fd and the file offset it came from.
      *

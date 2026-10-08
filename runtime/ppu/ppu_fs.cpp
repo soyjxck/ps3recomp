@@ -384,6 +384,33 @@ static inline void fs_prefault(uint32_t buf, uint64_t len)
     p[len - 1] = p[len - 1];
 }
 
+/* FS_READ_TIME=1: every read with a time stamp (ms since the first), the host
+ * thread, the size and how long the host read took -- the cadence of a
+ * streaming burst, which says whether the reads are slow or far apart. */
+#include <chrono>
+#include <thread>
+#include <functional>
+static int fs_read_time_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("FS_READ_TIME") ? 1 : 0;
+    return on;
+}
+static double fs_now_ms(void)
+{
+    static const auto t0 = std::chrono::steady_clock::now();
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+extern "C" void fs_read_time_log(const char* kind, int fd, uint64_t off, uint64_t size, uint64_t got, double t_start)
+{
+    if (!fs_read_time_on()) return;
+    const double t = fs_now_ms();
+    fprintf(stderr, "[fsr] %.3f %s fd=%d off=%llu size=%llu got=%llu %.1f us tid=%lu\n", t_start, kind, fd,
+            (unsigned long long)off, (unsigned long long)size, (unsigned long long)got, (t - t_start) * 1000.0,
+            (unsigned long)(std::hash<std::thread::id>{}(std::this_thread::get_id()) % 100000u));
+}
+extern "C" double fs_read_time_start(void) { return fs_read_time_on() ? fs_now_ms() : 0.0; }
+
 static void cellFsRead(ppu_context* ctx)
 {
     int fd          = (int)(uint32_t)ctx->gpr[3];
@@ -395,7 +422,9 @@ static void cellFsRead(ppu_context* ctx)
     long fpos_before = ftell(g_files[fd]);
     if (ppu_vm_size && (uint64_t)buf + nbytes > ppu_vm_size) nbytes = ppu_vm_size - buf;
     fs_prefault(buf, nbytes);
+    const double t_rd = fs_read_time_start();
     size_t n = fread(vm_base + buf, 1, (size_t)nbytes, g_files[fd]);   /* raw bytes, no swap */
+    fs_read_time_log("read", fd, (uint64_t)fpos_before, nbytes, n, t_rd);
     /* PS3_FSLOG_EOF=<fd>,<bytes>: report end-of-file past <bytes> on one descriptor.
      * The intro cinematic is 28 seconds and this port renders it at a few frames
      * a second, so it cannot be watched to its end -- truncating the stream makes
@@ -771,8 +800,10 @@ static void cellFsAioRead(ppu_context* ctx)
         fs_prefault(buf, size);
         /* AIO reads are absolute -- they do not disturb the fd's own file
          * position, and the guest interleaves them freely across threads. */
+        const double t_rd = fs_read_time_start();
         if (HOST_FSEEK64(g_files[fd], offset) == 0)
             n = fread(vm_base + buf, 1, (size_t)size, g_files[fd]);
+        fs_read_time_log("aio", fd, offset, size, n, t_rd);
         err = CELL_OK;
     }
     if (getenv("PS3_FSLOG"))
