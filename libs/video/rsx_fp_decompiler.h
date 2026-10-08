@@ -108,6 +108,14 @@ float rsx_fp_alpha_ref(u32 raw, u32 surface_color_format);
 int rsx_fp_decompile_ex(const u8* ucode, u32 max_bytes, u32 ctrl,
                         u32 tex_cube_mask, char* out, u32 out_size);
 
+/* Shadow-map units for the NEXT decompile call: bit u of mask makes unit u a
+ * depth-compare sample with function funcs[u] (CELL_GCM_TEXTURE_ZFUNC_*,
+ * 1 LESS .. 7 ALWAYS, from TEXTURE_ADDRESS bits 28-31), returning the
+ * filtered comparison result instead of the depth. The caller sets it from
+ * the textures bound at draw time, keys its pipeline on it, and resets it to
+ * 0 afterwards. A shadow unit takes no texel conversions. */
+void rsx_fp_set_shadow_units(u32 mask, const u8* funcs);
+
 /* Texel conversions for the NEXT decompile call, one word per unit: bits 0-3
  * convert the R, G, B, A of every sample from sRGB to linear (TEXTURE_ADDRESS
  * gamma), bits 4-7 expand them from biased unsigned to signed (UNSIGNED_REMAP

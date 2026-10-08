@@ -18,6 +18,8 @@
  *   FP  TEX r0, TC0 unit 0, CUBE (END)     ... with unit 0 a cube map
  *   FP  TEX r0, TC0 unit 0, texel ops      ... with sRGB gamma on RGB and a
  *                                          biased-expanded alpha
+ *   FP  TEX r0, TC0 unit 0, GEQUAL shadow  ... with unit 0 a depth-compare
+ *                                          (shadow map) unit
  *   VP  MOV o0, v0 ; TXL o1, v8 (END)      a vertex texture sampled at t16
  *   FP  MOV r0, COL0 ; MOV r2, COL0.zyxw   two colour targets: what --mrt runs
  *
@@ -191,6 +193,38 @@ int main(int argc, char** argv)
         check("TEX texel-op FP HLSL", g_hlsl, "float4(0.0, 0.0, 0.0, 1.0)");   /* expand on A */
         if (translate("TEX texel-op FP", RSX_SHADER_STAGE_FRAGMENT) == 0)
             check("TEX texel-op FP MSL", g_msl, "[[texture(0)]]");
+    }
+
+    /* ---- the same TEX on a shadow-map unit ---------------------------------
+     * A depth texture whose TEXTURE_ADDRESS has ZFUNC GEQUAL (6): the sample is
+     * the filtered result of "stored depth >= reference", through the unit's
+     * rsx_shadow helper, and texel conversions set on the same unit are not
+     * applied on top of it. */
+    {
+        u8 fp[16];
+        u8 funcs[16] = { 0 };
+        u32 ops[16] = { 0 };
+        funcs[0] = 6u;
+        ops[0] = 0x1u << 4;   /* a biased-expansion bit the shadow unit must ignore */
+        rsx_test_fp_tex_r0_tc0(fp, 0);
+        rsx_fp_set_shadow_units(1u, funcs);
+        rsx_fp_set_texel_ops(ops);
+        check_count("TEX shadow FP", rsx_fp_decompile_buffered_ex(fp, sizeof fp, 0x40u, 0,
+                                                                  g_hlsl, sizeof g_hlsl, NULL), 1);
+        rsx_fp_set_texel_ops(NULL);
+        rsx_fp_set_shadow_units(0, NULL);
+        check("TEX shadow FP HLSL", g_hlsl, "float4 rsx_shadow0(float3 c)");
+        check("TEX shadow FP HLSL", g_hlsl, "rsx_shadow0(((input.tc0).xyzw).xyz)");
+        check("TEX shadow FP HLSL", g_hlsl, "dq.x >= rq");
+        if (strstr(g_hlsl, "rsx_texop0(rsx_shadow0")) {
+            printf("[FAIL] TEX shadow FP HLSL -- texel conversion applied to a shadow unit\n");
+            g_fail++;
+        } else {
+            printf("[PASS] TEX shadow FP HLSL -- no texel conversion on the shadow unit\n");
+            g_pass++;
+        }
+        if (translate("TEX shadow FP", RSX_SHADER_STAGE_FRAGMENT) == 0)
+            check("TEX shadow FP MSL", g_msl, "[[texture(0)]]");
     }
 
     /* ---- vertex program sampling a VERTEX TEXTURE ------------------------
