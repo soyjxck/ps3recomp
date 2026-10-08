@@ -16,6 +16,19 @@
 #define SPU_SETJMP(env)     setjmp(env)
 #define SPU_LONGJMP(env, v) longjmp(env, v)
 #endif
+/* SPU_NOUNWIND(env), right after setjmp's first return: on Windows x64 a
+ * longjmp unwinds every frame back to the setjmp through RtlUnwindEx unless
+ * the buffer's Frame is 0 -- then it restores the registers and jumps
+ * (measured: 637 ns -> 14 ns across 8 frames). Every SPU job that halts ends
+ * with one, hundreds a frame on the render thread and the RSX walker, where
+ * the unwind (_NLG_Return2, RtlVirtualUnwind2) was 6-8% of the walker. The
+ * frames in between are lifted SPU code and this C runtime: no __try, no
+ * destructors, nothing an unwind would run. */
+#if defined(_WIN32) && defined(_M_X64)
+#define SPU_NOUNWIND(env)   (((_JUMP_BUFFER*)(env))->Frame = 0)
+#else
+#define SPU_NOUNWIND(env)   ((void)0)
+#endif
 
 /* See spu_context.h `irq_frame`. */
 typedef struct spu_irq_frame {
@@ -462,6 +475,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
                         ctx->irq_frame = &f;
                     }
                     if (SPU_SETJMP(f.env) == 0) {
+                        SPU_NOUNWIND(f.env);
                         vf(ctx);
                     } else {
                         /* iret fired deeper: registers restored, pc = srr0 */

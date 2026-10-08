@@ -30,6 +30,19 @@
 #define SPU_SETJMP(env)     setjmp(env)
 #define SPU_LONGJMP(env, v) longjmp(env, v)
 #endif
+/* SPU_NOUNWIND(env), right after setjmp's first return: on Windows x64 a
+ * longjmp unwinds every frame back to the setjmp through RtlUnwindEx unless
+ * the buffer's Frame is 0 -- then it restores the registers and jumps
+ * (measured: 637 ns -> 14 ns across 8 frames). Every SPU job that halts ends
+ * with one, hundreds a frame on the render thread and the RSX walker, where
+ * the unwind (_NLG_Return2, RtlVirtualUnwind2) was 6-8% of the walker. The
+ * frames in between are lifted SPU code and this C runtime: no __try, no
+ * destructors, nothing an unwind would run. */
+#if defined(_WIN32) && defined(_M_X64)
+#define SPU_NOUNWIND(env)   (((_JUMP_BUFFER*)(env))->Frame = 0)
+#else
+#define SPU_NOUNWIND(env)   ((void)0)
+#endif
 #ifndef _WIN32
 #include <sched.h>   /* sched_yield */
 #endif
@@ -280,6 +293,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
         SPU_DRAIN(ctx);
         break;
     default:
+        SPU_NOUNWIND(s_spu_halt_env);
         /* SPU_DRAIN trampoline model: the top-level entry runs until its first
          * cross-function tail transfer, which sets g_spu_trampoline_fn and
          * returns; the drain loop re-enters each queued target until the SPU

@@ -1806,6 +1806,8 @@ typedef struct {
     size_t bytes;
     u32 buf;                                /* backend buffer, or 0          */
     u32 ib_off;                             /* the indices' offset in it     */
+    u64 watch_stamp;                        /* write-watch stamp at the last hash */
+    int watched;                            /* 1: every page was watched then */
 } EngVCEntry;
 typedef struct {
     int ok;
@@ -1819,7 +1821,7 @@ typedef struct {
 static EngVCEntry* s_vc;
 static u32 s_vc_count;
 static size_t s_vc_bytes;
-static struct { unsigned long long hit, miss, stored, uncacheable, check_bad, stale; } s_vcstat;
+static struct { unsigned long long hit, miss, stored, uncacheable, check_bad, stale, hit_watch; } s_vcstat;
 
 static inline u64 eng_vc_mum(u64 a, u64 b)
 {
@@ -1960,17 +1962,77 @@ static EngVCEntry* eng_vc_slot(u64 key)
     return NULL;
 }
 
-/* A valid entry for the key: present, and the bytes it read unchanged. */
+/* Arm the texture write-watch (vm_watch) over everything validating an entry
+ * would hash -- its vertex spans and this draw's index ranges -- and return
+ * the combined stamp; *trusted is 1 when every page is watched. Armed before
+ * any hash, so a write during or after one changes the next stamp. */
+int g_eng_vc_watch = 1;   /* DOD3_AB=vcwatch switches it in a run */
+static u64 eng_vc_arm(const EngVCEntry* e, int* trusted)
+{
+    *trusted = 0;
+    if (!g_eng_vc_watch || !eng_tex_watch_on() || g_rsx_capture_on) return 0;
+    int ok = 1;
+    u64 st = 0x5643574154434801ull;
+    for (u32 i = 0; i < e->n_spans; i++) {
+        u64 x = 0;
+        if (!eng_tex_watch_arm(e->span[i].location, e->span[i].start, e->span[i].len, &x)) ok = 0;
+        st = eng_vc_mum(st ^ x, 0x9E3779B97F4A7C15ull) + e->span[i].start;
+    }
+    if (dc.n_idx) {
+        rsx_dsp_index_array ia;
+        rsx_dsp_get_index_array(&g.rsx, &ia);
+        const u32 esz = ia.is_u32 ? 4u : 2u;
+        const u32 ia_loc = ia.location ? RSX_LOCATION_MAIN : RSX_LOCATION_LOCAL;
+        for (u32 b = 0; b < dc.n_idx; b++) {
+            const u64 start = (u64)ia.offset + (u64)dc.idx[b].first * esz;
+            const u64 bytes = (u64)dc.idx[b].count * esz;
+            if (!bytes) continue;
+            if (start + bytes > 0x100000000ull) return 0;
+            u64 x = 0;
+            if (!eng_tex_watch_arm(ia_loc, (u32)start, (u32)bytes, &x)) ok = 0;
+            st = eng_vc_mum(st ^ x, 0x9E3779B97F4A7C15ull) + start;
+        }
+    }
+    *trusted = ok;
+    return st;
+}
+
+/* A valid entry for the key: present, and the bytes it read unchanged --
+ * known from the write-watch when every page it reads is watched and none
+ * was written since the last check, otherwise by hashing them again (the
+ * texture cache does the same; RSX_TEX_WATCH=0 turns both off). */
 static EngVCEntry* eng_vc_lookup(u64 key)
 {
     EngVCEntry* e = eng_vc_slot(key);
     if (!e || e->key != key) return NULL;
+    int trusted = 0;
+    const u64 st = eng_vc_arm(e, &trusted);
+    if (trusted && e->watched && st == e->watch_stamp) {
+        /* RSX_VC_WATCH_CHECK=1: hash anyway and count the hits the watch got
+         * wrong (a write it never saw) as check mismatches. */
+        static int chk = -1;
+        if (chk < 0) chk = getenv("RSX_VC_WATCH_CHECK") ? 1 : 0;
+        if (chk) {
+            u64 hc = key;
+            if (!eng_vc_hash_indices(&hc) || !eng_vc_hash_spans(e->span, e->n_spans, &hc) || hc != e->content) {
+                s_vcstat.check_bad++;
+                e->watched = 0;
+                return NULL;
+            }
+        }
+        s_vcstat.hit_watch++;
+        e->last_frame = g.frames;
+        return e;
+    }
     u64 h = key;
     if (!eng_vc_hash_indices(&h) || !eng_vc_hash_spans(e->span, e->n_spans, &h) ||
         h != e->content) {
         s_vcstat.stale++;
+        e->watched = 0;
         return NULL;
     }
+    e->watch_stamp = st;
+    e->watched = trusted;
     e->last_frame = g.frames;
     return e;
 }
@@ -2072,6 +2134,7 @@ static void eng_vc_store(u64 key, const EngVCFill* f, const u8* verts,
     }
     e->key = key;
     e->content = f->content;
+    e->watch_stamp = 0; e->watched = 0;   /* validated by hashing until a lookup arms the watch */
     e->last_frame = g.frames;
     e->n_verts = n_verts; e->stride = stride;
     e->n_source_refs = n_source_refs;
@@ -2460,10 +2523,10 @@ static void eng_draw_stats_report(void)
 {
     if (s_dstat_on != 1 || (g.frames % 120u) != 0u) return;
     fprintf(stderr, "[draw-stats] frame %u: issued %lu, dropped topo=%lu fetch=%lu targets=%lu pipeline=%lu empty=%lu; "
-            "refs %llu, vertices %llu (%llu KB); vcache hit %llu miss %llu uncacheable %llu stored %llu (stale %llu), %u entries %zu MB, check mismatches %llu\n",
+            "refs %llu, vertices %llu (%llu KB); vcache hit %llu (%llu by the write-watch) miss %llu uncacheable %llu stored %llu (stale %llu), %u entries %zu MB, check mismatches %llu\n",
             g.frames, s_dstat.issued, s_dstat.drop_topo, s_dstat.drop_fetch, s_dstat.drop_targets,
             s_dstat.drop_pipeline, s_dstat.drop_empty, s_dstat.refs, s_dstat.verts, s_dstat.vbytes >> 10,
-            s_vcstat.hit, s_vcstat.miss, s_vcstat.uncacheable, s_vcstat.stored, s_vcstat.stale, s_vc_count, s_vc_bytes >> 20,
+            s_vcstat.hit, s_vcstat.hit_watch, s_vcstat.miss, s_vcstat.uncacheable, s_vcstat.stored, s_vcstat.stale, s_vc_count, s_vc_bytes >> 20,
             s_vcstat.check_bad);
     memset(&s_vcstat, 0, sizeof s_vcstat);
     memset(&s_dstat, 0, sizeof s_dstat);

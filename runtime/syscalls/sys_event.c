@@ -291,7 +291,92 @@ void sys_event_queue_cancel_by_id(uint32_t queue_id)
 /* Diagnostic gates polled on every receive (~140k/s in GH3): read once. */
 static int s_ps3_waitbt = -1, s_ydkj_sputask = -1, s_ydkj_spurs_ready = -1, s_ydkj_fakecomplete = -1, s_ydkj_hle_draw = -1;
 
+
+/* PS3_EVQ_WHO=1 (Windows): every 5 s, for each event queue, which threads
+ * waited in sys_event_queue_receive on it and for how long, and which threads
+ * pushed events into it -- named by their thread description. A thread
+ * blocked on a queue is waiting for whoever pushes into it; this names that
+ * thread, which a per-call-site wait profile cannot. */
+#ifdef _WIN32
+#include <windows.h>
+typedef struct { char who[40]; unsigned q; int push; double ms; unsigned long long n; } evq_who_rec;
+static evq_who_rec s_evqw[512];
+static int s_evqw_n;
+static SRWLOCK s_evqw_lock = SRWLOCK_INIT;
+static int evq_who_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("PS3_EVQ_WHO") ? 1 : 0;
+    return on;
+}
+static const char* evq_who_name(void)
+{
+    static __declspec(thread) char name[40];
+    static __declspec(thread) int got;
+    if (!got) {
+        got = 1;
+        PWSTR w = NULL;
+        if (SUCCEEDED(GetThreadDescription(GetCurrentThread(), &w)) && w && w[0]) {
+            WideCharToMultiByte(CP_UTF8, 0, w, -1, name, (int)sizeof name, NULL, NULL);
+        } else {
+            snprintf(name, sizeof name, "host %lu", (unsigned long)GetCurrentThreadId());
+        }
+        if (w) LocalFree(w);
+    }
+    return name;
+}
+static void evq_who_add(unsigned q, int push, double ms)
+{
+    const char* who = evq_who_name();
+    AcquireSRWLockExclusive(&s_evqw_lock);
+    int i;
+    for (i = 0; i < s_evqw_n; i++)
+        if (s_evqw[i].q == q && s_evqw[i].push == push && !strcmp(s_evqw[i].who, who)) break;
+    if (i == s_evqw_n && s_evqw_n < (int)(sizeof s_evqw / sizeof s_evqw[0])) {
+        s_evqw_n++;
+        memset(&s_evqw[i], 0, sizeof s_evqw[i]);
+        strncpy(s_evqw[i].who, who, sizeof s_evqw[i].who - 1);
+        s_evqw[i].q = q; s_evqw[i].push = push;
+    }
+    if (i < s_evqw_n) { s_evqw[i].ms += ms; s_evqw[i].n++; }
+    static ULONGLONG last;
+    const ULONGLONG now = GetTickCount64();
+    if (!last) last = now;
+    if (now - last >= 5000) {
+        const double secs = (now - last) / 1000.0;
+        last = now;
+        fprintf(stderr, "[evq-who] ---- %.1f s ----\n", secs);
+        for (int k = 0; k < s_evqw_n; k++) {
+            if (!s_evqw[k].n) continue;
+            if (s_evqw[k].push)
+                fprintf(stderr, "[evq-who] q%-3u push %-26s %8.0f/s\n", s_evqw[k].q, s_evqw[k].who, s_evqw[k].n / secs);
+            else
+                fprintf(stderr, "[evq-who] q%-3u wait %-26s %8.0f/s %7.1f ms/s\n", s_evqw[k].q, s_evqw[k].who,
+                        s_evqw[k].n / secs, s_evqw[k].ms / secs);
+            s_evqw[k].n = 0; s_evqw[k].ms = 0;
+        }
+    }
+    ReleaseSRWLockExclusive(&s_evqw_lock);
+}
+#endif
+
+static int64_t sys_event_queue_receive_impl(ppu_context* ctx);
 int64_t sys_event_queue_receive(ppu_context* ctx)
+{
+#ifdef _WIN32
+    if (evq_who_on()) {
+        const unsigned q = LV2_ARG_U32(ctx, 0);
+        LARGE_INTEGER f, a, b; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&a);
+        const int64_t rc = sys_event_queue_receive_impl(ctx);
+        QueryPerformanceCounter(&b);
+        evq_who_add(q, 0, (double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)f.QuadPart);
+        return rc;
+    }
+#endif
+    return sys_event_queue_receive_impl(ctx);
+}
+
+static int64_t sys_event_queue_receive_impl(ppu_context* ctx)
 {
     uint32_t queue_id    = LV2_ARG_U32(ctx, 0);
     uint32_t event_addr  = LV2_ARG_PTR(ctx, 1);
@@ -703,6 +788,9 @@ int64_t sys_event_queue_drain(ppu_context* ctx)
 /* Helper to enqueue an event into a queue */
 static int event_queue_push(sys_event_queue_info* q, const sys_event_t* evt)
 {
+#ifdef _WIN32
+    if (evq_who_on()) evq_who_add((unsigned)(q - g_sys_event_queues) + 1u, 1, 0.0);
+#endif
     /* PS3_EVQSTAT=<n>: every n pushes, report each live queue's push count and
      * how many events are sitting in it unread.
      *
