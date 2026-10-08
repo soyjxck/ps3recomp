@@ -103,8 +103,9 @@ static inline int32_t spu_run_interp_job(uint8_t* local_store, uint32_t entry_pc
     if (local_store) memcpy(local_store, ctx.ls, SPU_LS_SIZE);
     /* `ctx` is about to go out of scope: take it out of the reserving set
      * first, or the coherency walk dereferences this stack frame after it is
-     * gone. See spu_coh_unregister. */
+     * gone. See spu_coh_unregister. Its MFC slot goes back as well. */
     spu_coh_unregister(&ctx);
+    { extern void spu_mfc_release(spu_context*); spu_mfc_release(&ctx); }
     return (int32_t)ctx.stop_code;
 }
 
@@ -333,6 +334,10 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
      * in the reserver set it is walked by the next PPU store to that line.
      * GH3's Havok task returning is what first hit it. */
     spu_coh_unregister(&ctx);
+    /* And its MFC slot: transfers are synchronous, so the engine is idle. A
+     * job context never gave it back, so slots were only reused by the next
+     * job whose context happened to land at the same stack address. */
+    { extern void spu_mfc_release(spu_context*); spu_mfc_release(&ctx); }
     if (local_store) memcpy(local_store, ctx.ls, SPU_LS_SIZE);  /* LS back out */
     return 0;
 }

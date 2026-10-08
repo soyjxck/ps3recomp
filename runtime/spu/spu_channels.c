@@ -335,7 +335,15 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
  *     stored both took the same slot and then shared one engine's queue and tag
  *     state -- one SPU's tag wait satisfied by the other SPU's transfer.
  * ===========================================================================*/
-#define SPU_MAX_CONTEXTS 8
+/* Contexts that hold an engine at the same time, not over the run: a job
+ * context gives its slot back when the job ends (spu_run_lifted_job_abi), a
+ * policy-module context keeps one for life. Eight was the number of SPUs, but
+ * SPURS tasks run on as many host threads as are runnable at once -- Havok's
+ * per-step tasks in Drakengard 3's destruction scenes took the pool past
+ * eight, and every DMA of every later context then went through the shared
+ * fallback engine and its lock: 20-30% of those threads' time was spent in
+ * the lock, on the path the game thread waits on. */
+#define SPU_MAX_CONTEXTS 64
 
 typedef struct {
     spu_context* volatile ctx;
@@ -344,12 +352,20 @@ typedef struct {
 
 static spu_mfc_slot s_mfc_slots[SPU_MAX_CONTEXTS];
 static SRWLOCK      s_mfc_claim_lock = SRWLOCK_INIT;
+/* The slot this thread used last: one context issues every DMA of a run, so
+ * this almost always answers without the scan. Checked against the slot's
+ * owner, so a slot released and claimed by another context is not reused. */
+static SPU_TLS spu_mfc_slot* t_mfc_slot;
 
 static mfc_engine* mfc_for(spu_context* ctx)
 {
+    spu_mfc_slot* t = t_mfc_slot;
+    if (t && t->ctx == ctx) return &t->mfc;
     for (int i = 0; i < SPU_MAX_CONTEXTS; i++)
-        if (s_mfc_slots[i].ctx == ctx)
+        if (s_mfc_slots[i].ctx == ctx) {
+            t_mfc_slot = &s_mfc_slots[i];
             return &s_mfc_slots[i].mfc;
+        }
 
     /* No slot yet: take one. The engine is initialized before the slot is
      * published, so it is never visible to anyone in a half-reset state. */
@@ -360,6 +376,7 @@ static mfc_engine* mfc_for(spu_context* ctx)
         mfc_engine_init(&s_mfc_slots[i].mfc);
         s_mfc_slots[i].ctx = ctx;
         e = &s_mfc_slots[i].mfc;
+        t_mfc_slot = &s_mfc_slots[i];
     }
     if (!e) {
         /* Out of slots: fall back to a shared engine (correct for single-SPU).
