@@ -263,10 +263,26 @@ int64_t sys_timer_usleep(ppu_context* ctx)
             if (!timer) timer = CreateWaitableTimerW(NULL, TRUE, NULL);
         }
         if (timer) {
+            /* PS3_USLEEP_LOG=<ms>: a sleep that asked for, or took, more than
+             * that, with its caller and the frame -- whether a long frame was
+             * the guest asking to sleep or the sleep running over. */
+            static long ul = -1;
+            if (ul < 0) { const char* e = getenv("PS3_USLEEP_LOG"); ul = e ? atol(e) : 0; }
+            LARGE_INTEGER uq0, uq1, uqf;
+            if (ul > 0) { QueryPerformanceFrequency(&uqf); QueryPerformanceCounter(&uq0); }
             LARGE_INTEGER due;
             due.QuadPart = -((LONGLONG)usec * 10); /* 100ns units, negative = relative */
             SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE);
             WaitForSingleObject(timer, INFINITE);
+            if (ul > 0) {
+                QueryPerformanceCounter(&uq1);
+                const double took = (double)(uq1.QuadPart - uq0.QuadPart) * 1000.0 / (double)uqf.QuadPart;
+                if (usec > (uint64_t)ul * 1000u || took > (double)ul) {
+                    extern uint32_t g_rsx_engine_frame;
+                    fprintf(stderr, "[usleep] frame %u tid %u lr=0x%08X asked %.2f ms, slept %.2f ms\n",
+                            g_rsx_engine_frame, (unsigned)ctx->thread_id, (uint32_t)ctx->lr, usec / 1000.0, took);
+                }
+            }
         } else {
             Sleep((DWORD)(usec / 1000));
         }

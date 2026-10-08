@@ -2560,6 +2560,10 @@ static void eng_draw_stats_tick(void)
 }
 uint32_t g_rsx_engine_frame = 0;   /* the present count, for frame-gated logs elsewhere */
 uint32_t g_rsx_engine_hitches = 0; /* presents more than 25 ms after the one before */
+/* Set by the host: called with a frame's time when RSX_HITCH_LOG reports it
+ * (main.cpp hands it to the sampling profiler's slow-frame report). */
+void (*g_rsx_hitch_hook)(double frame_ms) = 0;
+double g_rsx_frame_gpu_wait_ms = 0.0;   /* a backend's blocking GPU waits since the last present */
 static void eng_draw_stats_report(void)
 {
     if (s_dstat_on != 1 || (g.frames % 120u) != 0u) return;
@@ -3372,6 +3376,18 @@ static void eng_present(u32 buffer_id)
               if (ft > worst) worst = ft;
               if (ft > 34.0) slow++;
               if (ft > 25.0) g_rsx_engine_hitches++;
+              /* RSX_HITCH_LOG=<ms>: each present that came later than that,
+               * with its frame number -- nothing else switched on, so the
+               * log does not make hitches of its own. */
+              { static double hl = -1.0;
+                if (hl < 0.0) { const char* e = getenv("RSX_HITCH_LOG"); hl = e ? atof(e) : 0.0; }
+                if (hl > 0.0 && ft > hl && g_rsx_hitch_hook) g_rsx_hitch_hook(ft);
+                /* With the walker's blocking GPU waits in the frame (the
+                 * D3D12 backend adds them up; 0 elsewhere). */
+                if (hl > 0.0 && ft > hl)
+                    fprintf(stderr, "[hitch] frame %u: %.1f ms (walker blocked on the GPU %.1f ms of it)\n",
+                            g.frames, ft, g_rsx_frame_gpu_wait_ms);
+                g_rsx_frame_gpu_wait_ms = 0.0; }
               n++;
           } else {
               win_start = first = now;

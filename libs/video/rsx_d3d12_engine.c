@@ -542,17 +542,24 @@ static void sync_stats_add(int line, double ms)
     }
 }
 
+extern double g_rsx_frame_gpu_wait_ms;   /* rsx_draw_engine.c: blocking GPU waits since the last present */
 static void fence_wait_at(u64 v, int line)
 {
     if (!v || CALL0(s_fence, GetCompletedValue) >= v) return;
     if (s_sync_stats < 0) s_sync_stats = getenv("RSX_SYNC_STATS") ? 1 : 0;
+    static int hl = -1;
+    if (hl < 0) hl = getenv("RSX_HITCH_LOG") ? 1 : 0;
     LARGE_INTEGER qf, q0, q1;
-    if (s_sync_stats) { QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&q0); }
+    if (s_sync_stats || hl) { QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&q0); }
     CALL(s_fence, SetEventOnCompletion, v, s_fence_event);
     for (int tries = 0; tries < 5; tries++) {
         if (WaitForSingleObject(s_fence_event, 2000) != WAIT_TIMEOUT) {
-            if (s_sync_stats) { QueryPerformanceCounter(&q1);
-                sync_stats_add(line, (double)(q1.QuadPart - q0.QuadPart) * 1000.0 / (double)qf.QuadPart); }
+            if (s_sync_stats || hl) {
+                QueryPerformanceCounter(&q1);
+                const double ms = (double)(q1.QuadPart - q0.QuadPart) * 1000.0 / (double)qf.QuadPart;
+                if (s_sync_stats) sync_stats_add(line, ms);
+                g_rsx_frame_gpu_wait_ms += ms;
+            }
             return;
         }
         HRESULT rr = CALL0(s_dev, GetDeviceRemovedReason);
@@ -2435,6 +2442,13 @@ static void eng_submit(u32 present_surface, int wait)
     s_submit_seq++;
 
     if (windowed) {
+        /* RSX_HITCH_LOG=<ms>: a Present or a pacing wait that took more than
+         * a third of that, with its time -- whether a long frame was spent
+         * here, in the display path, or before the walker had the frame. */
+        static double hl = -1.0;
+        if (hl < 0.0) { const char* e = getenv("RSX_HITCH_LOG"); hl = e ? atof(e) : 0.0; }
+        LARGE_INTEGER pq0, pq1, pq2, pqf;
+        if (hl > 0.0) { QueryPerformanceFrequency(&pqf); QueryPerformanceCounter(&pq0); }
         HRESULT hr = CALL(s_swap, Present, (UINT)s_vsync,
                           (!s_vsync && s_tearing && s_display != DISP_FULLSCREEN) ? DXGI_PRESENT_ALLOW_TEARING : 0);
         if (FAILED(hr)) {
@@ -2442,8 +2456,17 @@ static void eng_submit(u32 present_surface, int wait)
             if (n++ < 8) fprintf(stderr, "[rsx engine/d3d12] Present failed: 0x%08lX (removed 0x%08lX)\n",
                                  (long)hr, (long)CALL0(s_dev, GetDeviceRemovedReason));
         }
+        if (hl > 0.0) QueryPerformanceCounter(&pq1);
         /* Pace: at most ENG_INFLIGHT presents queued. */
         if (f > ENG_INFLIGHT) fence_wait(f - ENG_INFLIGHT);
+        if (hl > 0.0) {
+            QueryPerformanceCounter(&pq2);
+            const double pres = (double)(pq1.QuadPart - pq0.QuadPart) * 1000.0 / (double)pqf.QuadPart;
+            const double pace = (double)(pq2.QuadPart - pq1.QuadPart) * 1000.0 / (double)pqf.QuadPart;
+            if (pres > hl / 3.0 || pace > hl / 3.0)
+                fprintf(stderr, "[hitch-present] submit %llu: Present %.1f ms, pacing wait %.1f ms\n",
+                        (unsigned long long)f, pres, pace);
+        }
     }
     if (wait || (present_surface && s_headless)) fence_wait(f);
     if (s_dropped) {
