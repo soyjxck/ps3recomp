@@ -313,6 +313,20 @@ void cellGame_init_from_paramsfo(const char* sfo_path)
 /* Central title-id accessor so other modules (cellSysutil etc.) don't hardcode it. */
 const char* cellGame_get_title_id(void) { return s_title_id; }
 
+/* PS3_GAME_PATCH=1: the title boots as its installed update, the way a PS3
+ * runs a disc game that has a patch on the HDD. cellGameBootCheck then sets
+ * CELL_GAME_ATTRIBUTE_PATCH, cellGamePatchCheck opens the patch, and the
+ * cellGameContentPermit after it reports /dev_hdd0/game/<title id>(/USRDIR):
+ * the update's directory, where UE3 titles look for their PATCH folder. A
+ * title that only checks for a patch when the boot says so (Drakengard 3
+ * 1.01) never reads the update's files without it, so a build of the
+ * original executable can share the same game tree. */
+static int boot_as_patch(void)
+{
+    const char* e = getenv("PS3_GAME_PATCH");
+    return e && e[0] == '1';
+}
+
 s32 cellGameBootCheck(u32* type, u32* attributes, CellGameContentSize* size,
                        char* dirName)
 {
@@ -342,7 +356,7 @@ s32 cellGameBootCheck(u32* type, u32* attributes, CellGameContentSize* size,
     uint32_t dir_ea  = (uint32_t)(uintptr_t)dirName;
 
     if (type_ea) vm_write32(type_ea, (uint32_t)s_game_type);
-    if (attr_ea) vm_write32(attr_ea, 0);
+    if (attr_ea) vm_write32(attr_ea, boot_as_patch() ? CELL_GAME_ATTRIBUTE_PATCH : 0);
 
     if (size_ea) {
         vm_write32(size_ea + 0, (u32)content_free_kb());
@@ -409,6 +423,28 @@ s32 cellGameContentPermit(char* contentInfoPath, char* usrdirPath)
         memcpy(vm_base + usr_ea, tmp, (size_t)n + 1);
     }
 
+    return CELL_OK;
+}
+
+/* cellGamePatchCheck (NID 0xCE4374F6): is the title running as its update?
+ * Only when it booted as one (PS3_GAME_PATCH, above); the ContentPermit that
+ * follows then reports the update's directory. Unregistered, it faked
+ * CELL_OK -- a patch that is not there. */
+s32 cellGamePatchCheck(CellGameContentSize* size, u64 reserved)
+{
+    (void)reserved;
+    const int patch = boot_as_patch();
+    printf("[cellGame] PatchCheck() -> %s\n", patch ? s_title_id : "not booted as a patch");
+    if (!patch) return CELL_GAME_ERROR_NOTPATCH;
+    s_check_is_disc = 0;
+    strncpy(s_check_dir, s_title_id, sizeof(s_check_dir) - 1);
+    s_check_dir[sizeof(s_check_dir) - 1] = '\0';
+    uint32_t size_ea = (uint32_t)(uintptr_t)size;
+    if (size_ea) {
+        vm_write32(size_ea + 0, (u32)content_free_kb());
+        vm_write32(size_ea + 4, (uint32_t)CELL_GAME_SIZEKB_NOTCALC);
+        vm_write32(size_ea + 8, 0);
+    }
     return CELL_OK;
 }
 
