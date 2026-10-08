@@ -935,6 +935,18 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
  * frame: when every page under a texture is protected and none was written
  * since the last hash, the bytes are known unchanged. RSX_TEX_WATCH=0, or a
  * host without it, hashes as before. -1 undecided; a host may switch it. */
+/* RSX_AA=fxaa: FXAA on the presented frame (rsx_present_passes.h). Read on
+ * first use; the port's settings page sets it while running. */
+int g_rsx_aa = -1;
+int rsx_aa_mode(void)
+{
+    if (g_rsx_aa < 0) {
+        const char* e = getenv("RSX_AA");
+        g_rsx_aa = (e && (!strcmp(e, "fxaa") || !strcmp(e, "FXAA") || !strcmp(e, "1"))) ? 1 : 0;
+    }
+    return g_rsx_aa;
+}
+
 /* Set (by the port's settings page) when RSX_VSYNC / RSX_DISPLAY /
  * RSX_WINDOW have changed; the backend applies them at its next message
  * pump and clears it. */

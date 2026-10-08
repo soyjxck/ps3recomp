@@ -254,6 +254,55 @@ static void eng_encode_draw(const EngRecord* r, EngStage* stage)
     if (query) { vkCmdEndQuery(s_cmd, s_qpool[s_slot], s_q_used); s_q_vis[s_q_used++] = (r->vis - 1) | (scaled ? ENG_Q_SCALED : 0u); }
 }
 
+/* A present pass: the whole of `src` through `pso` into `dst` (both RGBA8
+ * engine objects), linear sampler. */
+static void eng_present_pass(VkPipeline pso, u32 src_h, u32 dst_h)
+{
+    EngObj* src = eng_owner(src_h); EngObj* dst = eng_obj(dst_h);
+    if (!src || !dst || !pso) return;
+    render_end();
+    obj_layout(src, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    obj_layout(dst, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    const u32 rt[1] = { dst_h };
+    render_begin(rt, 1, 0, dst->w, dst->h);
+    vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pso);
+    s_cur_pso = pso;
+    VkViewport vp = { 0.0f, (float)dst->h, (float)dst->w, -(float)dst->h, 0.0f, 1.0f };
+    VkRect2D sc = { { 0, 0 }, { dst->w, dst->h } };
+    vkCmdSetViewport(s_cmd, 0, 1, &vp);
+    vkCmdSetScissor(s_cmd, 0, 1, &sc);
+    vkCmdSetStencilReference(s_cmd, VK_STENCIL_FACE_FRONT_AND_BACK, 0);
+    vkCmdSetPrimitiveTopology(s_cmd, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST); s_cur_topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    EngSetDesc d; memset(&d, 0, sizeof d);
+    for (u32 u = 0; u < 16; u++) { d.fs_view[u] = null_view(0); d.fs_smp[u] = s_linear_sampler; }
+    for (u32 u = 0; u < 4; u++) { d.vs_view[u] = null_view(0); d.vs_smp[u] = s_point_sampler; }
+    d.fs_view[0] = eng_obj(src_h) && eng_obj(src_h)->kind == OBJ_VIEW ? eng_obj(src_h)->view : src->view;
+    d.vs_buf = d.fs_buf = s_zero_buf;
+    const VkDescriptorSet set = eng_set(&d);
+    if (!set) { render_end(); return; }
+    const u32 dyn[2] = { 0, 0 };
+    vkCmdBindDescriptorSets(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pl, 0, 1, &set, 2, dyn);
+    vkCmdDraw(s_cmd, 3, 1, 0, 0);
+    render_end();
+}
+
+/* An RGBA8 target for a present pass, remade when the size changes. No guest
+ * size: nothing treats it as scaled, and eng_rescale leaves it alone. */
+static u32 eng_present_target(u32* slot, u32 w, u32 h)
+{
+    EngObj* o = eng_obj(*slot);
+    if (o && o->w == w && o->h == h) return *slot;
+    if (o) eng_obj_release(NULL, *slot);
+    *slot = eng_image(OBJ_COLOR, VK_FORMAT_R8G8B8A8_UNORM, w, h, 1, 1,
+                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    o = eng_obj(*slot);
+    if (!o) return 0;
+    o->gw = o->gh = 0;
+    o->view = make_view(o->img, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, k_identity);
+    o->att = make_view(o->img, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, k_identity);
+    return *slot;
+}
+
 /* The depth resolve passes: the depth plane drawn into a colour snapshot. */
 static void eng_encode_depth_resolve(const EngRecord* r)
 {
@@ -474,6 +523,20 @@ static void eng_submit(u32 present_surface, int wait)
                 /* Leave this frame unpresented; the chain is rebuilt below. */
             } else if (ar == VK_SUCCESS || ar == VK_SUBOPTIMAL_KHR) {
                 presenting = 1;
+                /* RSX_AA=fxaa first, at the frame's size; then, scaling
+                 * down, the area-filtered pass at the window's size
+                 * (rsx_present_passes.h), so the blit is 1:1. */
+                u32 shown = present_surface;
+                if (rsx_aa_mode() == 1 && s_fxaa_pso) {
+                    const u32 aa = eng_present_target(&s_aa_obj, src->w, src->h);
+                    if (aa) { eng_present_pass(s_fxaa_pso, shown, aa); shown = aa; }
+                }
+                if (s_area_pso && (src->w > s_swap_ext.width + s_swap_ext.width / 4 ||
+                                   src->h > s_swap_ext.height + s_swap_ext.height / 4)) {
+                    const u32 ar2 = eng_present_target(&s_area_obj, s_swap_ext.width, s_swap_ext.height);
+                    if (ar2) { eng_present_pass(s_area_pso, shown, ar2); shown = ar2; }
+                }
+                if (shown != present_surface) src = eng_obj(shown);
                 obj_layout(src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
                 VkImageLayout sl = VK_IMAGE_LAYOUT_UNDEFINED;
                 img_layout(s_swap_img[img_index], &sl, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
@@ -690,7 +753,8 @@ static void eng_present(void* user, u32 surface)
     (void)user;
     if (!eng_owner(surface)) { eng_submit(0, 0); return; }
     eng_submit(surface, 0);
-    eng_dump_frame(surface);
+    /* The frame grab shows what was presented: after FXAA when it is on. */
+    eng_dump_frame(rsx_aa_mode() == 1 && s_aa_obj && !s_headless ? s_aa_obj : surface);
 }
 
 static int eng_init(void* user, u32 width, u32 height) { (void)user; (void)width; (void)height; return s_dev ? 0 : -1; }
@@ -1038,7 +1102,9 @@ static int eng_init_device(void)
     { VkSamplerCreateInfo si = { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
       si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
       si.maxAnisotropy = 1.0f;
-      VKCHECK(vkCreateSampler(s_dev, &si, NULL, &s_point_sampler), "sampler"); }
+      VKCHECK(vkCreateSampler(s_dev, &si, NULL, &s_point_sampler), "sampler");
+      si.magFilter = si.minFilter = VK_FILTER_LINEAR;
+      VKCHECK(vkCreateSampler(s_dev, &si, NULL, &s_linear_sampler), "sampler"); }
     s_null_tex = eng_image(OBJ_TEXTURE, VK_FORMAT_R8G8B8A8_UNORM, 1, 1, 1, 1, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
     s_null_cube = eng_image(OBJ_TEXTURE, VK_FORMAT_R8G8B8A8_UNORM, 1, 1, 1, 6, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
     if (!s_null_tex || !s_null_cube) return -1;
@@ -1076,6 +1142,26 @@ static int eng_init_device(void)
     s_helper_ps_pack = eng_module(kHelperPackPS, RSX_SPV_STAGE_FRAGMENT, "helper pack");
     s_depth_pso = eng_helper_pso(s_helper_ps_depth, VK_FORMAT_R32_SFLOAT);
     s_depth_pack_pso = eng_helper_pso(s_helper_ps_pack, VK_FORMAT_R8G8B8A8_UNORM);
+    /* The present passes (rsx_present_passes.h), each with its entry renamed
+     * main and its sampler at s0 -- here a linear one bound in the set. */
+    { const char* ents[2] = { "float4 ps_fxaa(", "float4 ps_blit_area(" };
+      VkPipeline* out[2] = { &s_fxaa_pso, &s_area_pso };
+      for (int k = 0; k < 2; k++) {
+          size_t n = strlen(kPresentHLSL);
+          char* t = (char*)malloc(n + 16);
+          if (!t) continue;
+          memcpy(t, kPresentHLSL, n + 1);
+          char* r = strstr(t, "register(s1)"); if (r) r[10] = '0';
+          char* f = strstr(t, ents[k]);
+          if (f) {   /* "float4 ps_xxx(" -> "float4 main(" */
+              const size_t from = strlen(ents[k]);
+              memmove(f + 12, f + from, strlen(f + from) + 1);
+              memcpy(f, "float4 main(", 12);
+              *out[k] = eng_helper_pso(eng_module(t, RSX_SPV_STAGE_FRAGMENT, k ? "present blit" : "present fxaa"),
+                                       VK_FORMAT_R8G8B8A8_UNORM);
+          }
+          free(t);
+      } }
 
     if (!s_headless && eng_swapchain_create() != 0) { fprintf(stderr, "[RSX vulkan] swap chain creation failed\n"); return -1; }
     return 0;
@@ -1117,6 +1203,9 @@ static void eng_release_device(void)
         if (s_depth_pso) vkDestroyPipeline(s_dev, s_depth_pso, NULL);
         if (s_depth_pack_pso) vkDestroyPipeline(s_dev, s_depth_pack_pso, NULL);
         if (s_point_sampler) vkDestroySampler(s_dev, s_point_sampler, NULL);
+        if (s_linear_sampler) vkDestroySampler(s_dev, s_linear_sampler, NULL);
+        if (s_fxaa_pso) vkDestroyPipeline(s_dev, s_fxaa_pso, NULL);
+        if (s_area_pso) vkDestroyPipeline(s_dev, s_area_pso, NULL);
         if (s_zero_buf) vkDestroyBuffer(s_dev, s_zero_buf, NULL);
         if (s_rb_buf) vkDestroyBuffer(s_dev, s_rb_buf, NULL);
         if (s_pl) vkDestroyPipelineLayout(s_dev, s_pl, NULL);

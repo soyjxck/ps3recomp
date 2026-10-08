@@ -304,6 +304,8 @@ static ID3D12QueryHeap* s_pheap; static ID3D12Resource* s_pread;
 static ID3D12RootSignature* s_rootsig;
 static ID3D12RootSignature* s_helper_rootsig;
 static ID3D12PipelineState* s_blit_pso, *s_depth_pso, *s_depth_pack_pso;
+static ID3D12PipelineState* s_present_pso, *s_fxaa_pso;   /* rsx_present_passes.h */
+int rsx_aa_mode(void);                                    /* rsx_draw_engine.c */
 static ID3D12Resource* s_null_tex;
 static SRWLOCK s_pipe_lock = SRWLOCK_INIT;
 static int s_vsync = 1;
@@ -919,6 +921,8 @@ static HWND eng_create_window(u32 width, u32 height, const char* title)
 
 /* ---- helper shaders: present blit, depth resolve, depth pack --------------- */
 
+#include "rsx_present_passes.h"
+
 static const char kHelperHLSL[] =
     "struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
     "VSOut vs_main(uint vid : SV_VertexID) {\n"
@@ -1005,7 +1009,8 @@ static int eng_make_root_signatures(void)
     RELEASE(sig);
     if (FAILED(hr)) return -1;
 
-    /* The helper passes: one texture, one point/clamp sampler. */
+    /* The helper passes: one texture; s0 point/clamp, s1 linear/clamp (the
+     * present passes, rsx_present_passes.h). */
     D3D12_DESCRIPTOR_RANGE hr_srv = {0};
     hr_srv.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; hr_srv.NumDescriptors = 1;
     D3D12_ROOT_PARAMETER hp[1] = {0};
@@ -1015,8 +1020,10 @@ static int eng_make_root_signatures(void)
     ss.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
     ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
     ss.MaxLOD = D3D12_FLOAT32_MAX; ss.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_STATIC_SAMPLER_DESC hs[2] = { ss, ss };
+    hs[1].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR; hs[1].ShaderRegister = 1;
     D3D12_ROOT_SIGNATURE_DESC hd = {0};
-    hd.NumParameters = 1; hd.pParameters = hp; hd.NumStaticSamplers = 1; hd.pStaticSamplers = &ss;
+    hd.NumParameters = 1; hd.pParameters = hp; hd.NumStaticSamplers = 2; hd.pStaticSamplers = hs;
     if (FAILED(D3D12SerializeRootSignature(&hd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err))) { RELEASE(err); return -1; }
     hr = CALL(s_dev, CreateRootSignature, 0, CALL0(sig, GetBufferPointer), CALL0(sig, GetBufferSize),
               &IID_ID3D12RootSignature, (void**)&s_helper_rootsig);
@@ -1211,6 +1218,12 @@ static int eng_init_device(u32 width, u32 height)
         ID3DBlob* pd = eng_compile(kHelperHLSL, sizeof kHelperHLSL - 1, "ps_depth", "ps_5_0", "helper depth");
         ID3DBlob* pp = eng_compile(kHelperHLSL, sizeof kHelperHLSL - 1, "ps_pack", "ps_5_0", "helper pack");
         if (vs && pb) s_blit_pso = eng_helper_pso(vs, pb, DXGI_FORMAT_R8G8B8A8_UNORM);
+        { ID3DBlob* pvs = eng_compile(kPresentHLSL, sizeof kPresentHLSL - 1, "vs_main", "vs_5_0", "present vs");
+          ID3DBlob* pa = eng_compile(kPresentHLSL, sizeof kPresentHLSL - 1, "ps_blit_area", "ps_5_0", "present blit");
+          ID3DBlob* pf = eng_compile(kPresentHLSL, sizeof kPresentHLSL - 1, "ps_fxaa", "ps_5_0", "present fxaa");
+          if (pvs && pa) s_present_pso = eng_helper_pso(pvs, pa, DXGI_FORMAT_R8G8B8A8_UNORM);
+          if (pvs && pf) s_fxaa_pso = eng_helper_pso(pvs, pf, DXGI_FORMAT_R8G8B8A8_UNORM);
+          RELEASE(pvs); RELEASE(pa); RELEASE(pf); }
         if (vs && pd) s_depth_pso = eng_helper_pso(vs, pd, DXGI_FORMAT_R32_FLOAT);
         if (vs && pp) s_depth_pack_pso = eng_helper_pso(vs, pp, DXGI_FORMAT_R8G8B8A8_UNORM);
         RELEASE(vs); RELEASE(pb); RELEASE(pd); RELEASE(pp);
@@ -2982,6 +2995,28 @@ static void eng_fullscreen_restore(void)
     }
 }
 
+/* The frame after FXAA, as large as the frame: an object with no guest
+ * size, so no pass treats it as scaled and eng_rescale leaves it alone. */
+static u32 s_aa_obj;
+static u32 eng_aa_target(u32 w, u32 h)
+{
+    EngObj* o = eng_obj(s_aa_obj);
+    if (o && o->w == w && o->h == h) return s_aa_obj;
+    if (o) eng_obj_release(NULL, s_aa_obj);
+    s_aa_obj = 0;
+    D3D12_CLEAR_VALUE cv = {0}; cv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    ID3D12Resource* t = make_texture(DXGI_FORMAT_R8G8B8A8_UNORM, w, h, 1, 1, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                                     D3D12_RESOURCE_STATE_RENDER_TARGET, &cv);
+    const u32 handle = eng_obj_add(t, OBJ_COLOR, DXGI_FORMAT_R8G8B8A8_UNORM, w, h, 1, 1, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    if (!handle) return 0;
+    s_obj[handle - 1].gw = s_obj[handle - 1].gh = 0;
+    eng_write_srv(handle, t, DXGI_FORMAT_R8G8B8A8_UNORM, 1, 1, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+    CALL(s_dev, CreateRenderTargetView, t, NULL, obj_rtv(handle));
+    s_obj[handle - 1].has_rtv = 1;
+    s_aa_obj = handle;
+    return handle;
+}
+
 /* s_walker_tid (above eng_pso): the thread that encodes -- PSO time there is walker time. */
 static void eng_submit(u32 present_surface, int wait)
 {
@@ -3011,11 +3046,27 @@ static void eng_submit(u32 present_surface, int wait)
                 dst = s_backbuf[bbi]; rtv = cpu_handle(s_backbuf_rtv_heap, s_rtv_step, bbi);
                 before = D3D12_RESOURCE_STATE_PRESENT; windowed = 1;
             }
+            /* RSX_AA=fxaa: the frame through FXAA first, at its own size. */
+            u32 shown = present_surface;
+            if (rsx_aa_mode() == 1 && s_fxaa_pso && !s_headless) {
+                const u32 aa = eng_aa_target(src->w, src->h);
+                EngObj* ao = eng_obj(aa);
+                if (ao && ao->res) {
+                    res_transition(ao->res, &ao->state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                    res_transition(src->res, &src->state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                    bar_flush();
+                    eng_fullscreen_pass(s_fxaa_pso, obj_rtv(aa), src->w, src->h, obj_srv(present_surface));
+                    res_transition(ao->res, &ao->state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                    src = ao; shown = aa;
+                }
+            }
             D3D12_RESOURCE_STATES st = before;
             res_transition(dst, &st, D3D12_RESOURCE_STATE_RENDER_TARGET);
             res_transition(src->res, &src->state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             bar_flush();
-            eng_fullscreen_pass(s_blit_pso, rtv, s_win_w, s_win_h, obj_srv(present_surface));
+            /* The area-filtered blit for the window; the headless target
+             * keeps the plain one, which the replay references were made with. */
+            eng_fullscreen_pass(s_present_pso && !s_headless ? s_present_pso : s_blit_pso, rtv, s_win_w, s_win_h, obj_srv(shown));
             if (windowed) res_transition(dst, &st, D3D12_RESOURCE_STATE_PRESENT);
             else s_offscreen_state = st;
             bar_flush();
@@ -3232,7 +3283,8 @@ static void eng_present(void* user, u32 surface)
           s_stat_tex = s_stat_rt = s_stat_snap = s_stat_snap_reused = s_stat_buf = 0; } }
     if (!eng_owner(surface)) { eng_submit(0, 0); return; }
     eng_submit(surface, 0);
-    eng_dump_frame(surface);
+    /* The frame grab shows what was presented: after FXAA when it is on. */
+    eng_dump_frame(rsx_aa_mode() == 1 && s_aa_obj && !s_headless ? s_aa_obj : surface);
 }
 
 static const rsx_draw_backend s_engine_backend = {
@@ -3284,6 +3336,7 @@ static void eng_release_device(void)
     if (s_swap && s_display == DISP_FULLSCREEN) CALL(s_swap, SetFullscreenState, FALSE, NULL);
     RELEASE(s_zero_cb); RELEASE(s_readback); s_readback_cap = 0; RELEASE(s_aux_alloc);
     RELEASE(s_null_tex); RELEASE(s_blit_pso); RELEASE(s_depth_pso); RELEASE(s_depth_pack_pso);
+    RELEASE(s_present_pso); RELEASE(s_fxaa_pso);
     RELEASE(s_rootsig); RELEASE(s_helper_rootsig);
     RELEASE(s_qheap); RELEASE(s_qread); RELEASE(s_tsheap); RELEASE(s_tsread); RELEASE(s_pheap); RELEASE(s_pread);
     for (u32 i = 0; i < ENG_FRAMES; i++) { RELEASE(s_smp_gpu[i]); RELEASE(s_alloc[i]); s_alloc_fence[i] = 0; }

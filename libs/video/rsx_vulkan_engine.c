@@ -51,6 +51,7 @@
 #include "rsx_texture_layout.h"
 #include "rsx_shader_spirv.h"
 #include "rsx_vulkan_engine.h"
+#include "rsx_present_passes.h"
 
 #define ENG_MAX_OBJECTS   4096
 #define ENG_MAX_PIPES     4096
@@ -281,7 +282,10 @@ static u32 s_null_tex, s_null_cube;
 static EngPipeline s_pipe[ENG_MAX_PIPES]; static u32 s_pipe_count;
 static EngModule s_mod[ENG_MAX_MODULES]; static u32 s_mod_count;
 static EngSampler s_samp[ENG_MAX_SAMPLERS]; static u32 s_samp_count;
-static VkSampler s_point_sampler;
+static VkSampler s_point_sampler, s_linear_sampler;
+static VkPipeline s_fxaa_pso, s_area_pso;   /* rsx_present_passes.h */
+static u32 s_aa_obj, s_area_obj;            /* their targets: frame-sized, window-sized */
+int rsx_aa_mode(void);                      /* rsx_draw_engine.c */
 static EngView s_view[ENG_MAX_VIEWS]; static u32 s_view_count;
 static EngRecord s_rec[ENG_MAX_RECORDS]; static u32 s_rec_count, s_dropped;
 static EngRecord s_pending;
