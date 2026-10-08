@@ -982,11 +982,15 @@ static float fp_half_to_float(u16 h)
 
 float rsx_fp_alpha_ref(u32 raw, u32 surface_color_format)
 {
-    /* NV4097 surface color formats: 14=W16Z16Y16X16,
-     * 15=W32Z32Y32X32, 16=X32. */
-    if (surface_color_format == 14u)
+    /* CELL_GCM_SURFACE_F_W16Z16Y16X16 = 11, F_W32Z32Y32X32 = 12, F_X32 = 13
+     * (the register value SET_SURFACE_FORMAT carries). This used to test
+     * 14/15/16 -- X8B8G8R8_Z8B8G8R8, X8B8G8R8_O8B8G8R8 and A8B8G8R8 -- so an
+     * FP16 target's half-float reference was read as its low byte (Drakengard
+     * 3's HDR pass: 0x3C00, 1.0, came out 0.0) and three 8-bit formats had
+     * their byte reinterpreted as a half or a float. */
+    if (surface_color_format == 11u)
         return fp_half_to_float((u16)(raw & 0xFFFFu));
-    if (surface_color_format == 15u || surface_color_format == 16u) {
+    if (surface_color_format == 12u || surface_color_format == 13u) {
         float value;
         memcpy(&value, &raw, sizeof(value));
         return value;

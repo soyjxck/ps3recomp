@@ -300,6 +300,23 @@ int main(void)
         check_absent("lif_handled", hlsl, "unhandled FP opcode");
     }
 
+    /* The alpha-test reference is read in the colour target's format:
+     * CELL_GCM_SURFACE_F_W16Z16Y16X16 (11) as a half, F_W32Z32Y32X32 (12)
+     * and F_X32 (13) as a float, every 8-bit format as a byte. */
+    {
+        const float h = rsx_fp_alpha_ref(0x3C00u, 11u);        /* half 1.0 */
+        const float f = rsx_fp_alpha_ref(0x3F000000u, 12u);    /* float 0.5 */
+        const float x = rsx_fp_alpha_ref(0x3E800000u, 13u);    /* float 0.25 */
+        const float b = rsx_fp_alpha_ref(0x80u, 5u);           /* A8R8G8B8: 128/255 */
+        const float b14 = rsx_fp_alpha_ref(0x3C40u, 14u);      /* X8B8G8R8_Z8B8G8R8: low byte */
+        printf("-- alpha ref: half %g float %g x32 %g byte %g byte14 %g\n", h, f, x, b, b14);
+        check_true("alpha_ref_f16", h == 1.0f);
+        check_true("alpha_ref_f32", f == 0.5f);
+        check_true("alpha_ref_x32", x == 0.25f);
+        check_true("alpha_ref_8bit", b > 0.501f && b < 0.503f);
+        check_true("alpha_ref_8bit_14", b14 > 0.250f && b14 < 0.252f);
+    }
+
     printf("\n===========================================\n");
     printf("Results: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
