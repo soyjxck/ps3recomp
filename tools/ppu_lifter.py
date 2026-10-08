@@ -263,6 +263,20 @@ static inline double ppu_fmadd_core(double a, double c, double b, int neg_b, int
     if (__builtin_expect(r != r, 0)) return ppu_fmadd_nan(a, c, b);   /* any NaN input lands here */
     return neg_res ? -r : r;
 }
+/* The single-precision arithmetic forms, fused: one NaN test and the round
+ * to single, where ppu_fp_single(ppu_fadd(..)) tested twice. Identical
+ * results: a NaN result takes the same priority rules and keeps its double
+ * payload (ppu_fp_single leaves NaNs alone); anything else is rounded. */
+static inline double ppu_fadds(double a, double b) { const double r = a + b; if (__builtin_expect(r != r, 0)) return ppu_fp_bin_nan(a, b); return (double)(float)r; }
+static inline double ppu_fsubs(double a, double b) { const double r = a - b; if (__builtin_expect(r != r, 0)) return ppu_fp_bin_nan(a, b); return (double)(float)r; }
+static inline double ppu_fmuls(double a, double b) { const double r = a * b; if (__builtin_expect(r != r, 0)) return ppu_fp_bin_nan(a, b); return (double)(float)r; }
+static inline double ppu_fdivs(double a, double b) { const double r = a / b; if (__builtin_expect(r != r, 0)) return ppu_fp_bin_nan(a, b); return (double)(float)r; }
+static inline double ppu_fmadds_core(double a, double c, double b, int neg_b, int neg_res)
+{
+    const double r = fma(a, c, neg_b ? -b : b);
+    if (__builtin_expect(r != r, 0)) return ppu_fmadd_nan(a, c, b);
+    return (double)(float)(neg_res ? -r : r);
+}
 /* Round-to-single of a NaN keeps the full double payload (quieted). */
 static inline double ppu_fp_single(double r)
 {
@@ -683,6 +697,10 @@ class PPULifter:
     def __init__(self, prefix: str = ""):
         # --nonvolatile-locals: see _nonvolatile_locals_pass.
         self.nonvolatile_locals = False
+        # --hook ADDR: emit that function's body as func_ADDR_lifted. Calls
+        # still go to func_ADDR, which the game supplies natively (a wrapper
+        # that times it, or a replacement that may call the lifted body).
+        self.hooks: set[int] = set()
         self.functions: list[LiftedFunction] = []
         self.call_targets: set[int] = set()
         self.branch_targets: set[int] = set()  # all func_X references (b/bc trampolines)
@@ -1068,6 +1086,9 @@ class PPULifter:
     # indirect call takes its target from ctx->ctr.
     _NV_TOKEN = re.compile(r"ctx->gpr\[(1[4-9]|2[0-9]|3[01])\]")
     _NV_FPR = re.compile(r"ctx->fpr\[(1[4-9]|2[0-9]|3[01])\]")
+    # Every GPR/FPR, for the volatile kinds (vgpr r0-r13, vfpr f0-f13).
+    _NV_GPR_ANY = re.compile(r"ctx->gpr\[(\d+)\]")
+    _NV_FPR_ANY = re.compile(r"ctx->fpr\[(\d+)\]")
     _NV_VR = re.compile(r"ctx->vr\[(2[0-9]|3[01])\]")
     _NV_SPR = re.compile(r"ctx->(cr|xer|ctr)\b")
     _NV_CALL = re.compile(r"\bfunc_[0-9A-Fa-f]+\(ctx\)|ps3_indirect_call\(ctx\)|ps3_hle_call\(|lv2_syscall\(ctx\)")
@@ -1106,12 +1127,21 @@ class PPULifter:
 
     def _nonvolatile_locals_pass(self, func) -> None:
         gprs, fprs, vrs, sprs = set(), set(), set(), set()
-        kinds = set(os.environ.get("PPU_NV_KINDS", "gpr,fpr,vr,spr").split(","))
+        # Kinds: gpr r14-r31, vgpr r0-r13, fpr f14-f31, vfpr f0-f13, vr
+        # v20-v31, spr CR/XER/CTR. The volatile kinds are kept in locals too:
+        # in the file they are reloaded after every guest store, because the
+        # build has no strict aliasing and a store through vm_base may alias
+        # ctx. They follow the same rules -- written back before every
+        # transfer, re-read after every call (a callee returns in r3/r4/f1-f4
+        # and may clobber the rest).
+        kinds = set(os.environ.get("PPU_NV_KINDS", "gpr,vgpr,fpr,vfpr,vr,spr").split(","))
         for _l in func.body_lines:
-            if "gpr" in kinds:
-                for _m in self._NV_TOKEN.finditer(_l): gprs.add(int(_m.group(1)))
-            if "fpr" in kinds:
-                for _m in self._NV_FPR.finditer(_l): fprs.add(int(_m.group(1)))
+            for _m in self._NV_GPR_ANY.finditer(_l):
+                n = int(_m.group(1))
+                if (n >= 14 and "gpr" in kinds) or (n < 14 and "vgpr" in kinds): gprs.add(n)
+            for _m in self._NV_FPR_ANY.finditer(_l):
+                n = int(_m.group(1))
+                if (n >= 14 and "fpr" in kinds) or (n < 14 and "vfpr" in kinds): fprs.add(n)
             if "vr" in kinds:
                 for _m in self._NV_VR.finditer(_l): vrs.add(int(_m.group(1)))
             if "spr" in kinds:
@@ -1136,13 +1166,15 @@ class PPULifter:
         # its next transfer. GPRs keep the cheaper no-reload form: the
         # _cs_ restore above already covers the out-of-line GPR restores.
         rl = []
+        for n in sorted(gprs):
+            if n < 14: rl.append(f"r{n} = ctx->gpr[{n}];")
         for n in sorted(fprs): rl.append(f"f{n} = ctx->fpr[{n}];")
         for n in sorted(vrs): rl.append(f"v{n} = ctx->vr[{n}];")
         for n in sorted(sprs): rl.append(f"{n} = ctx->{n};")
         rl_inline = (" " + " ".join(rl)) if rl else ""
         def rewrite(line):
-            if gprs: line = self._NV_TOKEN.sub(lambda m: f"r{m.group(1)}", line)
-            if fprs: line = self._NV_FPR.sub(lambda m: f"f{m.group(1)}", line)
+            if gprs: line = self._NV_GPR_ANY.sub(lambda m: f"r{m.group(1)}" if int(m.group(1)) in gprs else m.group(0), line)
+            if fprs: line = self._NV_FPR_ANY.sub(lambda m: f"f{m.group(1)}" if int(m.group(1)) in fprs else m.group(0), line)
             if vrs: line = self._NV_VR.sub(lambda m: f"v{m.group(1)}", line)
             if sprs: line = self._NV_SPR.sub(lambda m: m.group(1), line)
             # A conditional return lifts as an unbraced `if (c) return;`.
@@ -2004,10 +2036,10 @@ class PPULifter:
         # PPC NaN semantics + default +QNaN via preamble helpers (a plain C
         # expression yields x86's NEGATIVE indefinite NaN on inf-inf etc.).
         fp_binary = {
-            "fadd": "ppu_fadd", "fadds": "ppu_fadd",
-            "fsub": "ppu_fsub", "fsubs": "ppu_fsub",
-            "fmul": "ppu_fmul", "fmuls": "ppu_fmul",
-            "fdiv": "ppu_fdiv", "fdivs": "ppu_fdiv",
+            "fadd": "ppu_fadd", "fadds": "ppu_fadds",
+            "fsub": "ppu_fsub", "fsubs": "ppu_fsubs",
+            "fmul": "ppu_fmul", "fmuls": "ppu_fmuls",
+            "fdiv": "ppu_fdiv", "fdivs": "ppu_fdivs",
         }
         mn_base = mn.rstrip(".")
         if mn_base in fp_binary:
@@ -2015,11 +2047,10 @@ class PPULifter:
             fra = _reg_idx(ops[1])
             frb = _reg_idx(ops[2])
             helper = fp_binary[mn_base]
-            expr = f"{helper}(ctx->fpr[{fra}], ctx->fpr[{frb}])"
             # Book I 4.6.5: the single forms round the result to single
-            # precision (NaNs keep the double payload -- ppu_fp_single).
-            if mn_base.endswith("s"):
-                expr = f"ppu_fp_single({expr})"
+            # precision (NaNs keep the double payload); ppu_fadds etc. do
+            # the operation and the rounding with one NaN test.
+            expr = f"{helper}(ctx->fpr[{fra}], ctx->fpr[{frb}])"
             return f"ctx->fpr[{frd}] = {expr};"
 
         if mn_base in ("fmr",):
@@ -2054,10 +2085,9 @@ class PPULifter:
         if mn_base in fma_map:
             frd, fra, frc, frb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2]), _reg_idx(ops[3])
             neg_b, neg_res = fma_map[mn_base]
-            expr = (f"ppu_fmadd_core(ctx->fpr[{fra}], ctx->fpr[{frc}], "
+            core = "ppu_fmadds_core" if mn_base.endswith("s") else "ppu_fmadd_core"
+            expr = (f"{core}(ctx->fpr[{fra}], ctx->fpr[{frc}], "
                     f"ctx->fpr[{frb}], {neg_b}, {neg_res})")
-            if mn_base.endswith("s"):
-                expr = f"ppu_fp_single({expr})"
             return f"ctx->fpr[{frd}] = {expr};"
 
         if mn_base in ("frsp",):
@@ -3529,6 +3559,8 @@ class PPULifter:
         # Forward declarations
         for func in self.functions:
             lines.append(f"void {func.name}(ppu_context* ctx);")
+            if func.start_addr in self.hooks:
+                lines.append(f"void {func.name}_lifted(ppu_context* ctx); /* --hook: func_ is native */")
         # Also declare any call targets that aren't defined
         defined = {f.start_addr for f in self.functions}
         for target in sorted((self.call_targets | self.branch_targets) - defined):
@@ -3691,7 +3723,8 @@ class PPULifter:
         label = self.name_map.get(func.start_addr)
         if label:
             lines.append(f"/* {label} */")
-        lines.append(f"void {func.name}(ppu_context* ctx) {{")
+        hooked = "_lifted" if func.start_addr in self.hooks else ""
+        lines.append(f"void {func.name}{hooked}(ppu_context* ctx) {{")
         for bline in func.body_lines:
             lines.append(f"    {bline}" if not bline.endswith(":") else bline)
 
@@ -4403,6 +4436,9 @@ def main() -> None:
                         help="Prefix for every emitted func_*/function_table "
                              "symbol (e.g. 'libsre_') so a relocated PRX image "
                              "links alongside the main title without collisions")
+    parser.add_argument("--hook", action="append", default=[], metavar="ADDR",
+                        help="Emit the function at ADDR as func_ADDR_lifted and leave "
+                             "func_ADDR to native code (repeatable)")
     parser.add_argument("--nonvolatile-locals", action="store_true",
                         help="Keep r14-r31 in C locals inside each function, written to "
                              "the register file only at call boundaries (see "
@@ -4858,6 +4894,7 @@ def main() -> None:
         lifter.code_hi = max(e for _, e in func_bounds)
     lifter.hle_stub_nids = hle_stubs
     lifter.nonvolatile_locals = args.nonvolatile_locals
+    lifter.hooks = {int(h, 0) for h in args.hook}
     lifter.function_entries = _func_entries
     lifter.jump_tables = jt_dispatchers
 
