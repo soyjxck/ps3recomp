@@ -836,7 +836,19 @@ s32 cellSpursCreateTasksetWithAttribute(CellSpurs* spurs,
       else if (e && !strcmp(e, "all")) serial = 1;
       else if (e && strtoul(e, 0, 16) == taskset_ea) serial = 1; }
     extern void spu_taskset_set_serial(uint32_t, int);
+    extern void spu_taskset_set_contention(uint32_t, int);
     if (serial) spu_taskset_set_serial(taskset_ea, 1);
+    /* SPURS_TASKSET_CONTENTION=<hex ea>|all: at most maxContention of the
+     * taskset's tasks run at once (and no more than it has SPUs), as on
+     * hardware, instead of as many as there are host threads. */
+    else if (a) {
+        const char* e = getenv("SPURS_TASKSET_CONTENTION");
+        if (e && (!strcmp(e, "all") || strtoul(e, 0, 16) == taskset_ea)) {
+            int n = (int)a->maxContention;
+            if (spus && spus < n) n = spus;
+            if (n > 0) spu_taskset_set_contention(taskset_ea, n);
+        }
+    }
     return rc;
 }
 
