@@ -1164,9 +1164,36 @@ static VkPipeline eng_pso_for(u32 pipeline, int cls, int unscaled)
 
 /* ---- samplers ---------------------------------------------------------------------- */
 
-static int eng_sampler_slot(const rsx_be_sampler_desc* d)
+/* RSX_ANISO=<1..16> (default 16): anisotropic filtering for the textures the
+ * title filters linearly and mipmaps -- the world's ground and walls, which
+ * the RSX's own trilinear blurs at a glancing angle. Only for a guest
+ * texture with a real mip chain bound to a linear, mipmapped sampler: render
+ * targets, their views and snapshots (shadow maps, packed depth, post-process
+ * inputs) carry data that spreading samples corrupts -- 16x over them put red
+ * and cyan speckle on the ground and the cloth. 1 is off. */
+static int s_has_aniso;
+extern int g_rsx_aniso;   /* rsx_d3d12_engine.c */
+static int eng_aniso(void)
 {
-    const u64 key = (u64)d->min_linear | ((u64)d->mag_linear << 1)
+    int a = g_rsx_aniso;
+    if (a <= 0) {
+        const char* e = getenv("RSX_ANISO");
+        a = (e && *e) ? atoi(e) : 16;
+        g_rsx_aniso = a;
+    }
+    return a < 1 ? 1 : a > 16 ? 16 : a;
+}
+
+/* A guest texture with a mip chain (not a target, view or snapshot). */
+static int eng_aniso_tex(u32 handle)
+{
+    const EngObj* o = eng_obj(handle);
+    return o && o->kind == OBJ_TEXTURE && o->mips > 1;
+}
+static int eng_sampler_slot(const rsx_be_sampler_desc* d, int aniso_ok)
+{
+    aniso_ok = aniso_ok && eng_aniso() > 1 && d->min_linear && d->mag_linear && d->mip_present;
+    const u64 key = ((u64)(aniso_ok ? eng_aniso() : 0) << 56) | (u64)d->min_linear | ((u64)d->mag_linear << 1)
                   | ((u64)d->mip_linear << 2) | ((u64)d->mip_present << 3)
                   | ((u64)d->wrap_s << 4) | ((u64)d->wrap_t << 8) | ((u64)d->wrap_r << 12)
                   | ((u64)(u32)(d->min_lod * 256.0f) << 16)
@@ -1182,6 +1209,11 @@ static int eng_sampler_slot(const rsx_be_sampler_desc* d)
     si.maxLod = d->mip_present ? d->max_lod : 0.0f;
     if (si.maxLod < si.minLod) si.maxLod = si.minLod;
     si.maxAnisotropy = 1.0f;
+    if (s_has_aniso && aniso_ok) {
+        si.anisotropyEnable = VK_TRUE;
+        si.maxAnisotropy = (float)eng_aniso();
+        if (si.maxAnisotropy > s_props.limits.maxSamplerAnisotropy) si.maxAnisotropy = s_props.limits.maxSamplerAnisotropy;
+    }
     si.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
     VkSampler s = VK_NULL_HANDLE;
     if (vkCreateSampler(s_dev, &si, NULL, &s) != VK_SUCCESS) return -1;
@@ -1430,7 +1462,7 @@ static void eng_bind_textures(void* user, const u32* textures, const rsx_be_samp
     (void)user;
     for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
         s_pending.tex[u]  = ((mask >> u) & 1u) ? textures[u] : 0;
-        s_pending.samp[u] = ((mask >> u) & 1u) ? eng_sampler_slot(&samplers[u]) : -1;
+        s_pending.samp[u] = ((mask >> u) & 1u) ? eng_sampler_slot(&samplers[u], eng_aniso_tex(textures[u])) : -1;
     }
 }
 static void eng_bind_vertex_textures(void* user, const u32* textures, const rsx_be_sampler_desc* samplers, u32 mask)
@@ -1438,7 +1470,7 @@ static void eng_bind_vertex_textures(void* user, const u32* textures, const rsx_
     (void)user;
     for (u32 u = 0; u < RSX_BE_MAX_VERTEX_TEXTURES; u++) {
         s_pending.vtex[u]  = ((mask >> u) & 1u) ? textures[u] : 0;
-        s_pending.vsamp[u] = ((mask >> u) & 1u) ? eng_sampler_slot(&samplers[u]) : -1;
+        s_pending.vsamp[u] = ((mask >> u) & 1u) ? eng_sampler_slot(&samplers[u], 0) : -1;
     }
 }
 static void eng_set_viewport(void* user, float x, float y, float w, float h)

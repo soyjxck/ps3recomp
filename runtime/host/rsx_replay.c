@@ -142,6 +142,9 @@ int main(int argc, char** argv)
      * before `from` are skipped by turning the dump off until then. */
     setenv("PS3RECOMP_METAL_HEADLESS", "1", 1);
     setenv("PS3RECOMP_D3D12_HEADLESS", "1", 1);
+    /* The regression's references predate RSX_ANISO: compare without it
+     * unless asked. */
+    setenv("RSX_ANISO", "1", 0);
     if (surf) {   /* the engine counts presents from 0, as the loop below does */
         char v[32];
         setenv("RSX_SURF_DUMP_DIR", surf, 1);

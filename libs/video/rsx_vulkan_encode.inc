@@ -945,6 +945,8 @@ static int eng_init_device(void)
     e2.features.occlusionQueryPrecise = f2.features.occlusionQueryPrecise;
     s_query_precise = f2.features.occlusionQueryPrecise ? 1 : 0;
     e2.features.independentBlend = f2.features.independentBlend;
+    e2.features.samplerAnisotropy = f2.features.samplerAnisotropy;
+    s_has_aniso = f2.features.samplerAnisotropy ? 1 : 0;
     const float prio = 1.0f;
     VkDeviceQueueCreateInfo qi = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO };
     qi.queueFamilyIndex = s_qfam; qi.queueCount = 1; qi.pQueuePriorities = &prio;
