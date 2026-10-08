@@ -2251,11 +2251,11 @@ static u32 s_eng_obj_gw[ENG_MAX_OBJECTS], s_eng_obj_gh[ENG_MAX_OBJECTS];
 static u32 s_eng_tgt_gw[ENG_MAX_OBJECTS], s_eng_tgt_gh[ENG_MAX_OBJECTS];
 static u8  s_eng_obj_mipped[ENG_MAX_OBJECTS];
 /* MSAA (RSX_AA=msaa2|msaa4|msaa8): a target drawn by a multisampled pass has
- * a multisampled twin (eng_ms_twin); s_eng_twin_stale when the target was
- * written since by anything else. s_eng_pass_samples is the pass being
- * encoded. */
+ * a memoryless multisampled twin (eng_ms_twin). s_eng_pass_samples is the
+ * pass being encoded. */
 static id<MTLTexture> s_eng_twin[ENG_MAX_OBJECTS];
-static u8  s_eng_twin_stale[ENG_MAX_OBJECTS];
+static u8  s_eng_twin_stale[ENG_MAX_OBJECTS];   /* a depth twin behind its target */
+static id<MTLTexture> s_eng_stencil_view[ENG_MAX_OBJECTS];   /* a depth target's stencil, for the reload */
 static u32 s_eng_pass_samples = 1;
 static u32 sc_dim(u32 v) { u32 r = (u32)((float)v * s_eng_scale + 0.5f); return v && !r ? 1u : r; }
 /* [x, x+w) in guest pixels -> host pixels, as the two ends rounded, so
@@ -2309,12 +2309,12 @@ typedef struct {
     /* The descriptor and fragment functions it was built from: a live
      * RSX_SCALE change makes pso_scaled again from ps_wpos (the HLSL, for a
      * program that reads WPOS), and MSAA builds pso_ms -- [scaled][2x, 4x,
-     * 8x] -- on first use. zwrite: its draws can write depth or stencil. */
+     * 8x] -- on first use. */
     char*                        ps_wpos;
     id<MTLFunction>              fs, fs_scaled;
     MTLRenderPipelineDescriptor* pd;
     id<MTLRenderPipelineState>   pso_ms[2][3];
-    u8                           zwrite;
+    u8                           zwrite;   /* its draws can write depth or stencil */
 } EngPipeline;
 static EngPipeline s_eng_pipe[ENG_MAX_PIPES];
 static u32 s_eng_pipe_count;
@@ -2452,11 +2452,6 @@ static NSString* const kEngHelperMSL = @
 "    uint v = uint(clamp(src.read(uint2(i.pos.xy)), 0.0, 1.0) * 16777215.0 + 0.5);\n"
 "    return float4(float((v >> 8) & 255u), float(v & 255u), 0.0, float((v >> 16) & 255u)) / 255.0;\n"
 "}\n"
-"/* A stale MSAA depth twin made again from its target: every sample of a\n"
-" * pixel the target's depth there. */\n"
-"fragment ZOut eng_zcopy_fs(BOut i [[stage_in]], depth2d<float> src [[texture(0)]]) {\n"
-"    ZOut o; o.d = src.read(uint2(i.pos.xy)); return o;\n"
-"}\n"
 "/* The present blit scaling down (an internal resolution above the window's,\n"
 " * the Resolution setting's supersampling): the taps averaged over each window\n"
 " * pixel's footprint -- an exact box at 2x and 3x -- instead of one bilinear\n"
@@ -2559,6 +2554,7 @@ static u32 eng_obj_add(id<MTLTexture> t)
     s_eng_tgt_gw[slot] = s_eng_tgt_gh[slot] = 0;   /* a target creator sets them */
     s_eng_obj_mipped[slot] = 0;
     s_eng_twin[slot] = nil;
+    s_eng_stencil_view[slot] = nil;
     return slot + 1;
 }
 
@@ -3046,8 +3042,9 @@ static u32 eng_depth_target_create(void* user, u32 w, u32 h)
                                                            width:sw height:sh
                                                        mipmapped:NO];
     /* ShaderRead as well as RenderTarget: depth-as-texture resolves through a
-     * pass that samples this as a depth2d, so it cannot be write-only. */
-    td.usage       = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+     * pass that samples this as a depth2d, so it cannot be write-only.
+     * PixelFormatView: MSAA's reload reads its stencil through a stencil view. */
+    td.usage       = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
     td.storageMode = MTLStorageModePrivate;
     const u32 handle = eng_obj_add([s_dev newTextureWithDescriptor:td]);
     if (sw != w || sh != h) eng_obj_set_guest(handle, w, h);
@@ -3721,36 +3718,83 @@ static void eng_clear_depth_stencil_rect(void* user, u32 depth, u32 flags,
 /* ---- MSAA ------------------------------------------------------------------
  *
  * RSX_AA=msaa2|msaa4|msaa8 (rsx_aa_mode, rsx_draw_engine.c), as the D3D12 and
- * Vulkan engines: a pass is multisampled when it has a real depth target and
- * every attachment is a full-size target (guest 960x540 or more) -- the 3D
- * scene, not the post-process chain or the UI. It draws into multisampled
- * twins of its attachments and resolves them into the targets as it ends
- * (colour averaged, depth and stencil sample 0, the store action), so every
- * read -- textures, snapshots, copies, readbacks, the present -- reads the
- * targets and finds them current. A target written by anything else marks
- * its twin stale, and the next multisampled pass makes the twin again from
- * the target first (a depth twin's stencil is cleared: it cannot be copied).
- * Clear rectangles clear both. Occlusion counts are divided by the samples.
- * A changed sample count makes twins and pipelines again on use. */
+ * Vulkan engines decide it: a pass is multisampled when it has a real depth
+ * target and every attachment is a full-size target (guest 960x540 or more)
+ * -- the 3D scene, not the post-process chain or the UI.
+ *
+ * Built for a tile-based GPU. The pass resolves its twins into the targets
+ * as it ends (colour averaged, depth and stencil sample 0), so every read --
+ * textures, snapshots, copies, readbacks, the present -- reads the targets
+ * and finds them current. The colour twins are memoryless: they live in tile
+ * memory for one pass and are never stored, and the next multisampled pass
+ * starts from the targets -- its first draw (eng_ms_reload) copies each
+ * colour attachment it does not clear into every sample (exact: a resolved
+ * colour is the average). The title splits its scene into many passes (each
+ * snapshot ends one), and storing and reloading four or eight colour samples
+ * a pixel at every split was most of what MSAA cost here. Depth cannot be
+ * rebuilt that way -- a sample's depth is not its pixel's sample 0 on a
+ * slope, and the base pass tests LEQUAL against the pre-pass, so samples
+ * fail -- so the depth twin is kept and stored. Written by anything else (a
+ * single-sampled pass that writes depth or stencil) it is stale, and the
+ * next multisampled pass rebuilds it from its target the same way (the best
+ * there is); clear rectangles clear it too. Occlusion counts are divided by
+ * the samples. The sample count is read per frame. */
 extern int rsx_aa_mode(void);
 static pthread_mutex_t s_eng_pipe_mu;
+static id<MTLLibrary> s_eng_ms_lib;     /* eng_ms_reload_fs; nil: MSAA off (it would not compile) */
+static int s_eng_ms_lib_tried;
+static NSString* const kEngMsReloadMSL = @
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"struct BOut { float4 pos [[position]]; float2 uv; };\n"
+"constant uint kColors [[function_constant(0)]];\n"
+"struct MsReloadOut {\n"
+"    float4 c0 [[color(0)]]; float4 c1 [[color(1)]]; float4 c2 [[color(2)]]; float4 c3 [[color(3)]];\n"
+"    float d [[depth(any)]];\n"
+"    uint s [[stencil]];\n"
+"};\n"
+"fragment MsReloadOut eng_ms_reload_fs(BOut i [[stage_in]],\n"
+"    texture2d<float> t0 [[texture(0)]], texture2d<float> t1 [[texture(1)]],\n"
+"    texture2d<float> t2 [[texture(2)]], texture2d<float> t3 [[texture(3)]],\n"
+"    depth2d<float> z [[texture(4)]], texture2d<uint> st [[texture(5)]]) {\n"
+"    uint2 p = uint2(i.pos.xy);\n"
+"    MsReloadOut o;\n"
+"    o.c0 = kColors > 0 ? t0.read(p) : float4(0.0);\n"
+"    o.c1 = kColors > 1 ? t1.read(p) : float4(0.0);\n"
+"    o.c2 = kColors > 2 ? t2.read(p) : float4(0.0);\n"
+"    o.c3 = kColors > 3 ? t3.read(p) : float4(0.0);\n"
+"    o.d = z.read(p);\n"
+"    o.s = st.read(p).r;\n"
+"    return o;\n"
+"}\n";
+
 static u32 eng_ms_samples(void)
 {
     const int m = rsx_aa_mode();
     u32 n = (m == 2 || m == 4 || m == 8) ? (u32)m : 1;
+    if (n > 1 && !s_eng_ms_lib_tried) {
+        s_eng_ms_lib_tried = 1;
+        NSError* err = nil;
+        s_eng_ms_lib = [s_dev newLibraryWithSource:kEngMsReloadMSL options:nil error:&err];
+        if (!s_eng_ms_lib)
+            fprintf(stderr, "[rsx engine/metal] MSAA off: its reload shader failed: %s\n",
+                    [[err localizedDescription] UTF8String]);
+    }
+    if (!s_eng_ms_lib) return 1;
     while (n > 1 && ![s_dev supportsTextureSampleCount:n]) n >>= 1;
     return n;
 }
 static int eng_ms_idx(u32 n) { return n <= 2 ? 0 : n == 4 ? 1 : 2; }
 
-/* Target `handle`'s twin at n samples, made (stale) if it has none of that
- * count and size. */
+/* Target `handle`'s twin at n samples: memoryless for colour, kept (and
+ * stale until filled) for depth. */
 static id<MTLTexture> eng_ms_twin(u32 handle, u32 n)
 {
     id<MTLTexture> t = eng_obj(handle);
     if (!t) return nil;
     id<MTLTexture> w = s_eng_twin[handle - 1];
-    if (w && [w sampleCount] == n && [w width] == [t width] && [w height] == [t height]) return w;
+    if (w && [w sampleCount] == n && [w width] == [t width] && [w height] == [t height] &&
+        [w pixelFormat] == [t pixelFormat]) return w;
     MTLTextureDescriptor* td = [MTLTextureDescriptor new];
     td.textureType = MTLTextureType2DMultisample;
     td.pixelFormat = [t pixelFormat];
@@ -3758,7 +3802,8 @@ static id<MTLTexture> eng_ms_twin(u32 handle, u32 n)
     td.height      = [t height];
     td.sampleCount = n;
     td.usage       = MTLTextureUsageRenderTarget;
-    td.storageMode = MTLStorageModePrivate;
+    const int depth = [t pixelFormat] == MTL_DEPTH_FORMAT;
+    td.storageMode = depth ? MTLStorageModePrivate : MTLStorageModeMemoryless;
     w = [s_dev newTextureWithDescriptor:td];
     s_eng_twin[handle - 1] = w;
     s_eng_twin_stale[handle - 1] = 1;
@@ -3768,87 +3813,100 @@ static id<MTLTexture> eng_ms_twin(u32 handle, u32 n)
 /* The pass's sample count: n when it qualifies, else 1. */
 static u32 eng_ms_pass(const u32* rt, u32 attach, u32 depth, id<MTLTexture> zbuf, id<MTLTexture> zfallback)
 {
+    if (!depth || !zbuf || zbuf == zfallback) return 1;
     const u32 n = eng_ms_samples();
-    if (n < 2 || !depth || !zbuf || zbuf == zfallback) return 1;
+    if (n < 2) return 1;
     if (s_eng_tgt_gw[depth - 1] < 960 || s_eng_tgt_gh[depth - 1] < 540) return 1;
     for (u32 k = 0; k < attach; k++)
         if (!rt[k] || s_eng_tgt_gw[rt[k] - 1] < 960 || s_eng_tgt_gh[rt[k] - 1] < 540) return 1;
     return n;
 }
 
-/* Full-screen helper pipelines at n samples. */
-typedef struct { MTLPixelFormat fmt; u32 n; id<MTLRenderPipelineState> pso; } EngMsHelper;
-static EngMsHelper s_eng_ms_copy[32];
-static u32 s_eng_ms_copy_n;
-static id<MTLRenderPipelineState> s_eng_ms_zcopy[3], s_eng_ms_zclear[3];
-static id<MTLDepthStencilState> s_eng_ms_zcopy_ds;
-static id<MTLRenderPipelineState> eng_ms_helper(NSString* fs, MTLPixelFormat color, u32 n)
+/* The reload draw's pipelines, keyed on the pass's formats and sample count
+ * and which attachments it writes, and its depth-stencil states. */
+typedef struct {
+    MTLPixelFormat fmt[RSX_BE_MAX_COLOR_TARGETS];
+    u32 count, n, cmask;
+    id<MTLRenderPipelineState> pso;
+} EngMsReload;
+static EngMsReload s_eng_ms_reload[64];
+static u32 s_eng_ms_reload_n;
+static id<MTLDepthStencilState> s_eng_ms_reload_ds[4];   /* [depth write | stencil write << 1] */
+static id<MTLRenderPipelineState> s_eng_ms_zclear[3];     /* clear rectangles on depth twins */
+
+/* The first draw of a multisampled pass: every attachment it does not clear
+ * copied from its target into all its samples. cmask: the colour attachments
+ * to fill; zw / sw: depth and stencil. */
+static void eng_ms_reload(id<MTLRenderCommandEncoder> e, id<MTLTexture> const* tex, u32 attach,
+                          u32 depth, u32 n, u32 cmask, int zw, int sw)
 {
-    MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
-    pd.vertexFunction   = [s_eng_helper_lib newFunctionWithName:@"eng_fullscreen_vs"];
-    pd.fragmentFunction = [s_eng_helper_lib newFunctionWithName:fs];
-    if (color != MTLPixelFormatInvalid) pd.colorAttachments[0].pixelFormat = color;
-    else {
+    id<MTLTexture> zbuf = eng_obj(depth);
+    if (!zbuf || (!cmask && !zw && !sw)) return;
+    id<MTLRenderPipelineState> pso = nil;
+    for (u32 k = 0; k < s_eng_ms_reload_n && !pso; k++) {
+        const EngMsReload* c = &s_eng_ms_reload[k];
+        int same = c->count == attach && c->n == n && c->cmask == cmask;
+        for (u32 a = 0; same && a < attach; a++) same = c->fmt[a] == [tex[a] pixelFormat];
+        if (same) pso = c->pso;
+    }
+    if (!pso) {
+        uint32_t cnt = attach;
+        MTLFunctionConstantValues* fc = [MTLFunctionConstantValues new];
+        [fc setConstantValue:&cnt type:MTLDataTypeUInt atIndex:0];
+        NSError* err = nil;
+        id<MTLFunction> fn = [s_eng_ms_lib newFunctionWithName:@"eng_ms_reload_fs" constantValues:fc error:&err];
+        MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
+        pd.vertexFunction   = [s_eng_helper_lib newFunctionWithName:@"eng_fullscreen_vs"];
+        pd.fragmentFunction = fn;
+        for (u32 a = 0; a < attach; a++) {
+            pd.colorAttachments[a].pixelFormat = [tex[a] pixelFormat];
+            pd.colorAttachments[a].writeMask = ((cmask >> a) & 1u) ? MTLColorWriteMaskAll : MTLColorWriteMaskNone;
+        }
         pd.depthAttachmentPixelFormat   = MTL_DEPTH_FORMAT;
         pd.stencilAttachmentPixelFormat = MTL_DEPTH_FORMAT;
-    }
-    pd.rasterSampleCount = n;
-    NSError* err = nil;
-    id<MTLRenderPipelineState> p = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
-    if (!p) fprintf(stderr, "[rsx engine/metal] MSAA helper %s failed: %s\n", [fs UTF8String],
-                    [[err localizedDescription] UTF8String]);
-    return p;
-}
-
-/* A stale twin made again from its target. */
-static void eng_ms_refresh(id<MTLCommandBuffer> cb, u32 handle)
-{
-    id<MTLTexture> t = eng_obj(handle), w = s_eng_twin[handle - 1];
-    if (!t || !w || !s_eng_helper_lib) return;
-    const u32 n = (u32)[w sampleCount];
-    const int depth = [t pixelFormat] == MTL_DEPTH_FORMAT;
-    id<MTLRenderPipelineState> pso = nil;
-    MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
-    if (depth) {
-        __strong id<MTLRenderPipelineState>* slot = &s_eng_ms_zcopy[eng_ms_idx(n)];
-        if (!*slot) *slot = eng_ms_helper(@"eng_zcopy_fs", MTLPixelFormatInvalid, n);
-        pso = *slot;
-        if (!s_eng_ms_zcopy_ds) {
-            MTLDepthStencilDescriptor* dd = [MTLDepthStencilDescriptor new];
-            dd.depthCompareFunction = MTLCompareFunctionAlways;
-            dd.depthWriteEnabled = YES;
-            s_eng_ms_zcopy_ds = [s_dev newDepthStencilStateWithDescriptor:dd];
+        pd.rasterSampleCount = n;
+        if (fn) pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+        if (!pso) {
+            fprintf(stderr, "[rsx engine/metal] MSAA reload pipeline failed: %s\n", [[err localizedDescription] UTF8String]);
+            return;
         }
-        rp.depthAttachment.texture       = w;
-        rp.depthAttachment.loadAction    = MTLLoadActionDontCare;
-        rp.depthAttachment.storeAction   = MTLStoreActionStore;
-        rp.stencilAttachment.texture     = w;
-        rp.stencilAttachment.loadAction  = MTLLoadActionClear;
-        rp.stencilAttachment.clearStencil = 0;
-        rp.stencilAttachment.storeAction = MTLStoreActionStore;
-        rp.renderTargetWidth  = [w width];
-        rp.renderTargetHeight = [w height];
-    } else {
-        for (u32 k = 0; k < s_eng_ms_copy_n; k++)
-            if (s_eng_ms_copy[k].fmt == [t pixelFormat] && s_eng_ms_copy[k].n == n) pso = s_eng_ms_copy[k].pso;
-        if (!pso && s_eng_ms_copy_n < 32) {
-            pso = eng_ms_helper(@"eng_blit_fs", [t pixelFormat], n);
-            s_eng_ms_copy[s_eng_ms_copy_n++] = (EngMsHelper){ [t pixelFormat], n, pso };
+        if (s_eng_ms_reload_n < 64) {
+            EngMsReload* c = &s_eng_ms_reload[s_eng_ms_reload_n++];
+            for (u32 a = 0; a < attach; a++) c->fmt[a] = [tex[a] pixelFormat];
+            c->count = attach; c->n = n; c->cmask = cmask; c->pso = pso;
         }
-        rp.colorAttachments[0].texture     = w;
-        rp.colorAttachments[0].loadAction  = MTLLoadActionDontCare;
-        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
     }
-    if (!pso) return;
-    id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
-    if (!e) return;
+    const int dsi = (zw ? 1 : 0) | (sw ? 2 : 0);
+    if (!s_eng_ms_reload_ds[dsi]) {
+        MTLDepthStencilDescriptor* dd = [MTLDepthStencilDescriptor new];
+        dd.depthCompareFunction = MTLCompareFunctionAlways;
+        dd.depthWriteEnabled    = zw ? YES : NO;
+        if (sw) {
+            MTLStencilDescriptor* sd = [MTLStencilDescriptor new];
+            sd.stencilCompareFunction    = MTLCompareFunctionAlways;
+            sd.stencilFailureOperation   = MTLStencilOperationReplace;
+            sd.depthFailureOperation     = MTLStencilOperationReplace;
+            sd.depthStencilPassOperation = MTLStencilOperationReplace;
+            sd.readMask = 0xFF; sd.writeMask = 0xFF;
+            dd.frontFaceStencil = sd;
+            dd.backFaceStencil  = sd;
+        }
+        s_eng_ms_reload_ds[dsi] = [s_dev newDepthStencilStateWithDescriptor:dd];
+    }
+    id<MTLTexture> sv = s_eng_stencil_view[depth - 1];
+    if (!sv || [sv parentTexture] != zbuf) {
+        sv = [zbuf newTextureViewWithPixelFormat:MTLPixelFormatX32_Stencil8];
+        s_eng_stencil_view[depth - 1] = sv;
+    }
     [e setRenderPipelineState:pso];
-    if (depth) [e setDepthStencilState:s_eng_ms_zcopy_ds];
-    [e setFragmentTexture:t atIndex:0];
-    [e setFragmentSamplerState:s_eng_point_sampler atIndex:0];
+    [e setDepthStencilState:s_eng_ms_reload_ds[dsi]];
+    [e setCullMode:MTLCullModeNone];
+    [e setViewport:(MTLViewport){ 0, 0, (double)[zbuf width], (double)[zbuf height], 0.0, 1.0 }];
+    for (u32 a = 0; a < 4; a++)
+        [e setFragmentTexture:(a < attach ? tex[a] : s_null_tex) atIndex:a];
+    [e setFragmentTexture:zbuf atIndex:4];
+    [e setFragmentTexture:sv atIndex:5];
     [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
-    [e endEncoding];
-    s_eng_twin_stale[handle - 1] = 0;
 }
 
 /* A pipeline's state for a pass of s_eng_pass_samples, built on first use. */
@@ -3939,13 +3997,22 @@ static void eng_encode_clear_rect(id<MTLCommandBuffer> cb, const EngRecord* r)
     [e setFragmentBytes:&z length:sizeof z atIndex:0];
     [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [e endEncoding];
-    /* A current MSAA twin is cleared the same way (a stale one is made
-     * again from this target before it is used). */
+    /* A current MSAA depth twin is cleared the same way (a stale one is
+     * rebuilt from this target before it is used). */
     id<MTLTexture> tw2 = s_eng_twin[r->depth - 1];
     if (!tw2 || s_eng_twin_stale[r->depth - 1]) return;
     const u32 n = (u32)[tw2 sampleCount];
     __strong id<MTLRenderPipelineState>* slot = &s_eng_ms_zclear[eng_ms_idx(n)];
-    if (!*slot) *slot = eng_ms_helper(@"eng_zclear_fs", MTLPixelFormatInvalid, n);
+    if (!*slot) {
+        MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
+        pd.vertexFunction   = [s_eng_helper_lib newFunctionWithName:@"eng_fullscreen_vs"];
+        pd.fragmentFunction = [s_eng_helper_lib newFunctionWithName:@"eng_zclear_fs"];
+        pd.depthAttachmentPixelFormat   = MTL_DEPTH_FORMAT;
+        pd.stencilAttachmentPixelFormat = MTL_DEPTH_FORMAT;
+        pd.rasterSampleCount = n;
+        NSError* err = nil;
+        *slot = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+    }
     if (!*slot) { s_eng_twin_stale[r->depth - 1] = 1; return; }
     rp.depthAttachment.texture   = tw2;
     rp.stencilAttachment.texture = tw2;
@@ -4177,7 +4244,6 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
         if (attach && !zbuf) zbuf = zfallback;
 
         /* MSAA: the twins this pass draws into, made current first. */
-        const int clear_ds_here = have_clear_ds && depth == cd;
         u32 msn = (attach == nrt) ? eng_ms_pass(rt, attach, depth, zbuf, zfallback) : 1;
         id<MTLTexture> twin[RSX_BE_MAX_COLOR_TARGETS];
         id<MTLTexture> ztwin = nil;
@@ -4186,17 +4252,6 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
             for (u32 k = 0; k < attach && ok; k++) ok = (twin[k] = eng_ms_twin(rt[k], msn)) != nil;
             if (ok) ok = (ztwin = eng_ms_twin(depth, msn)) != nil;
             if (!ok) msn = 1;
-        }
-        if (msn > 1) {
-            for (u32 k = 0; k < attach; k++) {
-                int cleared = 0;
-                for (u32 c = 0; c < n_cc; c++) if (cc_surf[c] == rt[k]) cleared = 1;
-                if (cleared) s_eng_twin_stale[rt[k] - 1] = 0;
-                else if (s_eng_twin_stale[rt[k] - 1]) eng_ms_refresh(cb, rt[k]);
-            }
-            const int both = clear_ds_here && (ds_flags & RSX_BE_CLEAR_DEPTH) && (ds_flags & RSX_BE_CLEAR_STENCIL);
-            if (both) s_eng_twin_stale[depth - 1] = 0;
-            else if (s_eng_twin_stale[depth - 1]) eng_ms_refresh(cb, depth);
         }
 
         MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -4240,33 +4295,50 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
             rp.renderTargetWidth  = [zbuf width];
             rp.renderTargetHeight = [zbuf height];
         }
+        u32 ms_cmask = 0;
+        int ms_zw = 0, ms_sw = 0;
         if (msn > 1) {
-            /* Draw into the twins; resolve into the targets as the pass ends. */
+            /* Draw into the twins (tile memory); resolve into the targets as
+             * the pass ends; what it does not clear is reloaded first. */
             for (u32 k = 0; k < attach; k++) {
                 rp.colorAttachments[k].texture        = twin[k];
                 rp.colorAttachments[k].resolveTexture = tex[k];
-                rp.colorAttachments[k].storeAction    = MTLStoreActionStoreAndMultisampleResolve;
+                rp.colorAttachments[k].storeAction    = MTLStoreActionMultisampleResolve;
+                if (rp.colorAttachments[k].loadAction != MTLLoadActionClear) {
+                    rp.colorAttachments[k].loadAction = MTLLoadActionDontCare;
+                    ms_cmask |= 1u << k;
+                }
             }
+            const int zstale = s_eng_twin_stale[depth - 1];
             rp.depthAttachment.texture             = ztwin;
             rp.depthAttachment.resolveTexture      = zbuf;
             rp.depthAttachment.depthResolveFilter  = MTLMultisampleDepthResolveFilterSample0;
             rp.depthAttachment.storeAction         = MTLStoreActionStoreAndMultisampleResolve;
+            if (rp.depthAttachment.loadAction != MTLLoadActionClear && zstale) {
+                rp.depthAttachment.loadAction = MTLLoadActionDontCare;
+                ms_zw = 1;
+            }
             rp.stencilAttachment.texture             = ztwin;
             rp.stencilAttachment.resolveTexture      = zbuf;
             rp.stencilAttachment.stencilResolveFilter = MTLMultisampleStencilResolveFilterSample0;
             rp.stencilAttachment.storeAction         = MTLStoreActionStoreAndMultisampleResolve;
+            if (rp.stencilAttachment.loadAction != MTLLoadActionClear && zstale) {
+                rp.stencilAttachment.loadAction = MTLLoadActionDontCare;
+                ms_sw = 1;
+            }
+            s_eng_twin_stale[depth - 1] = 0;
         }
 
         id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
         u32 cur_vis = 0;
-        int pass_zwrite = clear_ds_here;
+        if (enc && msn > 1) eng_ms_reload(enc, tex, attach, depth, msn, ms_cmask, ms_zw, ms_sw);
+        int pass_zwrite = have_clear_ds && depth == cd;
         /* A draw's pipeline declares as many colour attachments as its record
          * named, so a pass that could not bind them all takes its clears and
          * skips those draws rather than encoding a mismatch. */
         if (!enc || attach != nrt) {
             if (enc) [enc endEncoding];
-            for (u32 k = 0; k < attach; k++) if (s_eng_twin[rt[k] - 1]) s_eng_twin_stale[rt[k] - 1] = 1;
-            if (depth && clear_ds_here && s_eng_twin[depth - 1]) s_eng_twin_stale[depth - 1] = 1;
+            if (depth && have_clear_ds && depth == cd && s_eng_twin[depth - 1]) s_eng_twin_stale[depth - 1] = 1;
             while (i < s_eng_rec_count && s_eng_rec[i].kind == ENG_REC_DRAW &&
                    eng_record_targets_are(&s_eng_rec[i], rt, nrt)) i++;
             continue;
@@ -4295,17 +4367,13 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
             i++;
         }
         [enc endEncoding];
-        /* What a single-sampled pass wrote leaves the twins behind. */
-        if (msn == 1) {
-            for (u32 k = 0; k < attach; k++) if (s_eng_twin[rt[k] - 1]) s_eng_twin_stale[rt[k] - 1] = 1;
-            if (depth && zbuf != zfallback && pass_zwrite && s_eng_twin[depth - 1]) s_eng_twin_stale[depth - 1] = 1;
-        }
+        /* A single-sampled pass that wrote depth or stencil leaves the depth
+         * twin behind. */
+        if (msn == 1 && depth && zbuf != zfallback && pass_zwrite && s_eng_twin[depth - 1])
+            s_eng_twin_stale[depth - 1] = 1;
     }
 }
 
-/* Put a surface on the drawable. A straight blit would need matching formats
- * and sizes; a full-screen sample needs neither, and the guest's surfaces are
- * routinely a different size from the window. */
 /* A full-screen helper pipeline into one colour format, made on first use. */
 static id<MTLRenderPipelineState> eng_present_pso(NSString* fs, MTLPixelFormat fmt,
                                                   __strong id<MTLRenderPipelineState>* cache, MTLPixelFormat* cache_fmt)
@@ -4357,6 +4425,9 @@ static id<MTLTexture> eng_fxaa(id<MTLCommandBuffer> cb, id<MTLTexture> src)
     return s_eng_fxaa_tex;
 }
 
+/* Put a surface on the drawable. A straight blit would need matching formats
+ * and sizes; a full-screen sample needs neither, and the guest's surfaces are
+ * routinely a different size from the window. */
 static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
                                 id<MTLTexture> dst)
 {
