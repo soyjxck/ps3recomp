@@ -118,9 +118,15 @@ static void write_be64(uint32_t addr, uint64_t val)
  * returns nonzero and the full sleep is skipped. */
 int (*g_lv2_usleep_hook)(uint32_t lr, uint64_t usec) = 0;
 
+/* Called first on every guest usleep, when set: the title may use the time
+ * the guest asked to sleep (run deferred work on this thread, ctx as it is)
+ * and shorten `*usec` by what that took. */
+void (*g_lv2_usleep_pre)(ppu_context* ctx, uint64_t* usec) = 0;
+
 int64_t sys_timer_usleep(ppu_context* ctx)
 {
     uint64_t usec = LV2_ARG_U64(ctx, 0);
+    if (g_lv2_usleep_pre) g_lv2_usleep_pre(ctx, &usec);
     if (g_lv2_usleep_hook && g_lv2_usleep_hook((uint32_t)ctx->lr, usec)) return CELL_OK;
     /* A single sleep longer than a second is almost always a computed delay
      * gone wrong (a negative interval, a timebase in the wrong units) -- and a
