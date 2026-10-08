@@ -16,6 +16,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
 /* win32_compat.h is <windows.h> on Windows (CRITICAL_SECTION for the real
  * lwmutex exclusion) and the POSIX shims elsewhere -- Sleep, DWORD, QPC. */
 #include "../platform/win32_compat.h"
@@ -417,25 +421,90 @@ static void sys_lwcond_create(ppu_context* ctx)
     ctx->gpr[3] = 0;
 }
 static void sys_lwcond_destroy(ppu_context* ctx)    { ctx->gpr[3] = 0; }
-static void sys_lwcond_signal(ppu_context* ctx)     { ctx->gpr[3] = 0; }
-static void sys_lwcond_signal_all(ppu_context* ctx) { ctx->gpr[3] = 0; }
-static void sys_lwcond_signal_to(ppu_context* ctx)  { ctx->gpr[3] = 0; }
-/* Now that the lwmutex is REAL, a no-op wait that keeps holding it deadlocks the
- * signaler. Release the paired lwmutex, wait briefly, reacquire (poll-style: the
- * guest's while(!predicate) loop re-checks; signalers stay no-ops). Handles the
- * common single (non-recursive) hold. */
+
+/* Wake-ups. A signal used to be a no-op and a wait a 1 ms sleep, so every
+ * hand-off through an lwcond took a millisecond and a half however soon the
+ * signal came. FIOS passes each read request through several threads that way
+ * (client, scheduler, media thread, completion): Drakengard 3's reads went
+ * out one every ~5 ms whatever their size, and a chain of small dependent
+ * reads -- a sound bank's header, its tables, its data -- took that long per
+ * read. Now a signal bumps a per-lwcond generation and wakes its waiters, and
+ * a wait sleeps until the generation moves. The wait is still capped at
+ * PS3_LWCOND_POLL_MS (default 1) so a change made some other way is seen as
+ * soon as before; the guest's own loop re-checks its predicate either way.
+ * PS3_LWCOND_SLEEP=1: the old fixed sleep. Keyed by the id create hands out
+ * (+0x04); an lwcond made some other way waits the old way. */
+enum { LWC_TAB = 4096 };
+static std::atomic<uint32_t> s_lwc_gen[LWC_TAB];
+static std::atomic<uint32_t>* lwc_gen(uint32_t lwcond)
+{
+    const uint32_t id = vm_read32(lwcond + 0x04);
+    return (id & 0xFF000000u) == 0x4C000000u ? &s_lwc_gen[id & (LWC_TAB - 1)] : nullptr;
+}
+#ifndef _WIN32
+static std::mutex              s_lwc_mu[64];
+static std::condition_variable s_lwc_cv[64];
+#endif
+static void lwc_wake(uint32_t lwcond)
+{
+    std::atomic<uint32_t>* g = lwc_gen(lwcond);
+    if (!g) return;
+    g->fetch_add(1, std::memory_order_release);
+#ifdef _WIN32
+    WakeByAddressAll((PVOID)g);
+#else
+    const size_t k = (size_t)(g - s_lwc_gen) & 63;
+    { std::lock_guard<std::mutex> lk(s_lwc_mu[k]); }
+    s_lwc_cv[k].notify_all();
+#endif
+}
+static int lwc_sleep_mode(void)
+{ static int v = -1; if (v < 0) v = getenv("PS3_LWCOND_SLEEP") ? 1 : 0; return v; }
+static uint32_t lwc_poll_us(void)
+{
+    static uint32_t v = 0;
+    if (!v) { const char* e = getenv("PS3_LWCOND_POLL_MS"); v = (e && atoi(e) > 0 ? (uint32_t)atoi(e) : 1u) * 1000u; }
+    return v;
+}
+static void lwc_wait(std::atomic<uint32_t>* g, uint32_t seen, uint32_t max_us)
+{
+#ifdef _WIN32
+    WaitOnAddress((volatile VOID*)g, &seen, sizeof seen, (max_us + 999) / 1000);
+#else
+    const size_t k = (size_t)(g - s_lwc_gen) & 63;
+    std::unique_lock<std::mutex> lk(s_lwc_mu[k]);
+    s_lwc_cv[k].wait_for(lk, std::chrono::microseconds(max_us),
+                         [&] { return g->load(std::memory_order_acquire) != seen; });
+#endif
+}
+
+static void sys_lwcond_signal(ppu_context* ctx)     { lwc_wake((uint32_t)ctx->gpr[3]); ctx->gpr[3] = 0; }
+static void sys_lwcond_signal_all(ppu_context* ctx) { lwc_wake((uint32_t)ctx->gpr[3]); ctx->gpr[3] = 0; }
+static void sys_lwcond_signal_to(ppu_context* ctx)  { lwc_wake((uint32_t)ctx->gpr[3]); ctx->gpr[3] = 0; }
+/* Release the paired lwmutex, wait for a signal (or the poll interval, or the
+ * guest's own timeout if shorter), reacquire. The guest's while(!predicate)
+ * loop re-checks. Handles the common single (non-recursive) hold. */
 static void sys_lwcond_wait(ppu_context* ctx)
 {
     uint32_t lwcond  = (uint32_t)ctx->gpr[3];
+    const uint64_t timeout_us = ctx->gpr[4];
     uint32_t lwmutex = vm_read32(lwcond + 0x00);
     HANDLE s = lwm_sem(lwmutex);
     if (s) {
+        std::atomic<uint32_t>* g = lwc_sleep_mode() ? nullptr : lwc_gen(lwcond);
+        const uint32_t seen = g ? g->load(std::memory_order_acquire) : 0;   /* before the unlock: no lost signal */
         uint32_t own = vm_read32(lwmutex + LWM_OWNER);
         uint32_t rc  = vm_read32(lwmutex + LWM_RECUR);
         vm_write32(lwmutex + LWM_RECUR, 0);
         vm_write32(lwmutex + LWM_OWNER, 0);
         lwm_unlock_any(lwmutex, s);
-        Sleep(1);
+        if (g) {
+            uint32_t max_us = lwc_poll_us();
+            if (timeout_us && timeout_us < max_us) max_us = (uint32_t)timeout_us;
+            if (g->load(std::memory_order_acquire) == seen) lwc_wait(g, seen, max_us);
+        } else {
+            Sleep(1);
+        }
         lwm_lock_wait(lwmutex, s, INFINITE);
         vm_write32(lwmutex + LWM_OWNER, own);
         vm_write32(lwmutex + LWM_RECUR, rc ? rc : 1);
