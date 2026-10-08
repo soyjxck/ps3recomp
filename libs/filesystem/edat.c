@@ -647,6 +647,25 @@ const char* edat_resolve(const char* host_path, char* buf, size_t cap)
     if (stat(host_path, &ss) == 0 && stat(buf, &ds) == 0 && ds.st_mtime >= ss.st_mtime)
         return buf;                                    /* cache still valid */
 
-    if (edat_decrypt_file(host_path, buf) != 0) return host_path;
-    return buf;
+    if (edat_decrypt_file(host_path, buf) == 0) return buf;
+
+    /* No key for it, but nothing to decrypt either: the EDAT header (plain
+     * text) gives the file's size, and an empty file is empty whatever the
+     * license. Drakengard 3's DLC ships its engine INI this way -- every
+     * pack's "<pack>__PS3-SQEX03ENGINE.INI.EDAT" holds 0 bytes -- and the
+     * engine reads it; handed the ciphertext it would parse 272 bytes of
+     * noise as INI text. */
+    unsigned char h[0x90];
+    FILE* f = fopen(host_path, "rb");
+    size_t n = f ? fread(h, 1, sizeof h, f) : 0;
+    if (f) fclose(f);
+    if (n == sizeof h && be64(h + 0x88) == 0) {
+        FILE* o = fopen(buf, "wb");
+        if (o) {
+            fclose(o);
+            fprintf(stderr, "[edat] %s: empty (size 0 in its header) -- served as an empty file\n", host_path);
+            return buf;
+        }
+    }
+    return host_path;
 }
