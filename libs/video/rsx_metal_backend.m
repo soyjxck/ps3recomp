@@ -494,6 +494,12 @@ static int create_offscreen(void)
 typedef enum { DISP_WINDOWED = 0, DISP_BORDERLESS, DISP_FULLSCREEN } MtlDisplayMode;
 static MtlDisplayMode s_display_mode = DISP_WINDOWED;
 static int            s_vsync = 1;
+/* g_rsx_display_reload (rsx_draw_engine.c): the Graphics Settings page
+ * changed RSX_SCALE / RSX_DISPLAY / RSX_WINDOW / RSX_VSYNC. The internal
+ * resolution is remade after the frame in flight is submitted (eng_present);
+ * the window, which only the main thread may touch, at the next pump. */
+extern volatile int g_rsx_display_reload;
+static volatile int s_disp_window_pending;
 static volatile u32   s_view_px_w, s_view_px_h;   /* the content view in pixels; 0 = not known */
 
 /* Main thread: the window's content size in pixels, for the next present. */
@@ -2239,6 +2245,11 @@ static float s_eng_scale = 1.0f;
 /* The guest size of a scaled object (target, snapshot, view of one); 0 for
  * everything created at the size the guest gave. */
 static u32 s_eng_obj_gw[ENG_MAX_OBJECTS], s_eng_obj_gh[ENG_MAX_OBJECTS];
+/* Every colour and depth target's guest size, scaled or not -- what a live
+ * RSX_SCALE change (eng_rescale) makes it again from -- and the guest
+ * textures with a mip chain (the ones anisotropic filtering is for). */
+static u32 s_eng_tgt_gw[ENG_MAX_OBJECTS], s_eng_tgt_gh[ENG_MAX_OBJECTS];
+static u8  s_eng_obj_mipped[ENG_MAX_OBJECTS];
 static u32 sc_dim(u32 v) { u32 r = (u32)((float)v * s_eng_scale + 0.5f); return v && !r ? 1u : r; }
 /* [x, x+w) in guest pixels -> host pixels, as the two ends rounded, so
  * neighbouring rectangles still meet. */
@@ -2288,6 +2299,11 @@ typedef struct {
     id<MTLDepthStencilState>   ds;
     MTLCullMode cull;
     MTLWinding  winding;
+    /* A fragment program that reads WPOS: its HLSL, its function and the
+     * descriptor, so a live RSX_SCALE change can make pso_scaled again. */
+    char*                        ps_wpos;
+    id<MTLFunction>              fs;
+    MTLRenderPipelineDescriptor* pd;
 } EngPipeline;
 static EngPipeline s_eng_pipe[ENG_MAX_PIPES];
 static u32 s_eng_pipe_count;
@@ -2447,6 +2463,8 @@ static u32 eng_obj_add(id<MTLTexture> t)
     }
     s_eng_obj[slot] = t;
     s_eng_obj_gw[slot] = s_eng_obj_gh[slot] = 0;   /* a scaled creator sets them */
+    s_eng_tgt_gw[slot] = s_eng_tgt_gh[slot] = 0;   /* a target creator sets them */
+    s_eng_obj_mipped[slot] = 0;
     return slot + 1;
 }
 
@@ -2754,6 +2772,10 @@ static void eng_shutdown(void* user)
         s_eng_pipe[i].pso = nil;
         s_eng_pipe[i].pso_scaled = nil;
         s_eng_pipe[i].ds = nil;
+        free(s_eng_pipe[i].ps_wpos);
+        s_eng_pipe[i].ps_wpos = NULL;
+        s_eng_pipe[i].fs = nil;
+        s_eng_pipe[i].pd = nil;
     }
     for (u32 i = 0; i < s_eng_func_count; i++) s_eng_func[i].fn = nil;
     for (u32 i = 0; i < s_eng_samp_count; i++) s_eng_samp[i].samp = nil;
@@ -2810,7 +2832,9 @@ static u32 eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
     td.swizzle = MTLTextureSwizzleChannelsMake(
         swizzle_sel(sel[1]), swizzle_sel(sel[2]),
         swizzle_sel(sel[3]), swizzle_sel(sel[0]));
-    return eng_obj_add([s_dev newTextureWithDescriptor:td]);
+    const u32 handle = eng_obj_add([s_dev newTextureWithDescriptor:td]);
+    if (handle && td.mipmapLevelCount > 1) s_eng_obj_mipped[handle - 1] = 1;
+    return handle;
 }
 
 static void eng_texture_upload(void* user, u32 handle, u32 face, u32 mip,
@@ -2877,7 +2901,22 @@ static u32 eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 h,
     }
     const u32 handle = eng_obj_add(t);
     if (sw != w || sh != h) eng_obj_set_guest(handle, w, h);
+    if (handle) { s_eng_tgt_gw[handle - 1] = w; s_eng_tgt_gh[handle - 1] = h; }
     return handle;
+}
+
+/* A sampling view of a target, wearing a unit's crossbar as a swizzle. */
+static id<MTLTexture> eng_make_view(id<MTLTexture> t, u32 remap, u32 rsx_format)
+{
+    u8 sel[4];
+    rsx_texture_component_remap(remap, rsx_format & 0x9Fu, sel);
+    return [t newTextureViewWithPixelFormat:[t pixelFormat]
+                                textureType:MTLTextureType2D
+                                     levels:NSMakeRange(0, 1)
+                                     slices:NSMakeRange(0, 1)
+                                    swizzle:MTLTextureSwizzleChannelsMake(
+                                                swizzle_sel(sel[1]), swizzle_sel(sel[2]),
+                                                swizzle_sel(sel[3]), swizzle_sel(sel[0]))];
 }
 
 static u32 eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_format)
@@ -2890,17 +2929,7 @@ static u32 eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_format)
             s_eng_view[i].format == rsx_format)
             return s_eng_view[i].view;
     if (s_eng_view_count >= ENG_MAX_VIEWS) return 0;
-    u8 sel[4];
-    rsx_texture_component_remap(remap, rsx_format & 0x9Fu, sel);
-    id<MTLTexture> v =
-        [t newTextureViewWithPixelFormat:[t pixelFormat]
-                             textureType:MTLTextureType2D
-                                  levels:NSMakeRange(0, 1)
-                                  slices:NSMakeRange(0, 1)
-                                 swizzle:MTLTextureSwizzleChannelsMake(
-                                             swizzle_sel(sel[1]), swizzle_sel(sel[2]),
-                                             swizzle_sel(sel[3]), swizzle_sel(sel[0]))];
-    const u32 handle = eng_obj_add(v);
+    const u32 handle = eng_obj_add(eng_make_view(t, remap, rsx_format));
     if (!handle) return 0;
     eng_obj_set_guest(handle, s_eng_obj_gw[surface - 1], s_eng_obj_gh[surface - 1]);
     s_eng_view[s_eng_view_count].surface = surface;
@@ -2927,6 +2956,7 @@ static u32 eng_depth_target_create(void* user, u32 w, u32 h)
     td.storageMode = MTLStorageModePrivate;
     const u32 handle = eng_obj_add([s_dev newTextureWithDescriptor:td]);
     if (sw != w || sh != h) eng_obj_set_guest(handle, w, h);
+    if (handle) { s_eng_tgt_gw[handle - 1] = w; s_eng_tgt_gh[handle - 1] = h; }
     return handle;
 }
 
@@ -3136,6 +3166,40 @@ static u32 eng_pipeline_create_locked(void* user, const char* vs_hlsl, const cha
  * buffers and the function cache are shared. Encoding reads only entries
  * whose handle it was given, which were complete before it got it. */
 static pthread_mutex_t s_eng_pipe_mu = PTHREAD_MUTEX_INITIALIZER;
+
+/* With the internal resolution raised, a fragment program's WPOS (the
+ * decompiler's `input.position`) arrives in host pixels in a pass into a
+ * scaled target; the title computes screen UVs and offsets from it in its
+ * own. So a program that reads it gets a second function that divides it
+ * back, as rsx_d3d12_engine.c does -- every use of the input wrapped, the
+ * text being what the function and MSL caches are keyed on -- and a second
+ * pipeline state, chosen per pass (eng_encode_draw): a pass into a target
+ * left at the guest's size (eng_scales) runs the first, exactly as at 1x. */
+static id<MTLFunction> eng_wpos_function(const char* ps_hlsl, float scale)
+{
+    const char* needle = "input.position";
+    const char* repl = "(input.position*RSX_WPOS)";
+    const size_t nl = strlen(needle), rl = strlen(repl), src_len = strlen(ps_hlsl);
+    size_t n = 0;
+    for (const char* q = ps_hlsl; (q = strstr(q, needle)) != NULL; q += nl) n++;
+    if (!n) return nil;
+    char head[96];
+    snprintf(head, sizeof head, "static const float4 RSX_WPOS = float4(%.8f, %.8f, 1.0, 1.0);\n",
+             1.0 / (double)scale, 1.0 / (double)scale);
+    char* text = (char*)malloc(src_len + n * (rl - nl) + strlen(head) + 1);
+    if (!text) return nil;
+    char* d = text + sprintf(text, "%s", head);
+    for (const char* q = ps_hlsl;;) {
+        const char* hit = strstr(q, needle);
+        if (!hit) { strcpy(d, q); break; }
+        memcpy(d, q, (size_t)(hit - q)); d += hit - q;
+        memcpy(d, repl, rl); d += rl;
+        q = hit + nl;
+    }
+    id<MTLFunction> fn = eng_function(text, RSX_SHADER_STAGE_FRAGMENT, "fp");
+    free(text);
+    return fn;
+}
 static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_hlsl,
                                const rsx_be_render_state* rs,
                                const rsx_vertex_layout_plan* layout,
@@ -3165,39 +3229,11 @@ static u32 eng_pipeline_create_locked(void* user, const char* vs_hlsl, const cha
     if (!vs) return 0;
     id<MTLFunction> fs = eng_function(ps_hlsl, RSX_SHADER_STAGE_FRAGMENT, "fp");
     if (!fs) return 0;
-    /* With the internal resolution raised, a fragment program's WPOS (the
-     * decompiler's `input.position`) arrives in host pixels in a pass into a
-     * scaled target; the title computes screen UVs and offsets from it in its
-     * own. So a program that reads it gets a second function that divides it
-     * back, as rsx_d3d12_engine.c does -- every use of the input wrapped, the
-     * text being what the function and MSL caches are keyed on -- and a second
-     * pipeline state, chosen per pass (eng_encode_draw): a pass into a target
-     * left at the guest's size (eng_scales) runs the first, exactly as at 1x. */
-    id<MTLFunction> fs_scaled = nil;
-    const char* wp = (s_eng_scale != 1.0f) ? strstr(ps_hlsl, "input.position") : NULL;
-    if (wp) {
-        const char* needle = "input.position";
-        const char* repl = "(input.position*RSX_WPOS)";
-        const size_t nl = strlen(needle), rl = strlen(repl), src_len = strlen(ps_hlsl);
-        size_t n = 0;
-        for (const char* q = wp; (q = strstr(q, needle)) != NULL; q += nl) n++;
-        char head[96];
-        snprintf(head, sizeof head, "static const float4 RSX_WPOS = float4(%.8f, %.8f, 1.0, 1.0);\n",
-                 1.0 / (double)s_eng_scale, 1.0 / (double)s_eng_scale);
-        char* text = (char*)malloc(src_len + n * (rl - nl) + strlen(head) + 1);
-        if (text) {
-            char* d = text + sprintf(text, "%s", head);
-            for (const char* q = ps_hlsl;;) {
-                const char* hit = strstr(q, needle);
-                if (!hit) { strcpy(d, q); break; }
-                memcpy(d, q, (size_t)(hit - q)); d += hit - q;
-                memcpy(d, repl, rl); d += rl;
-                q = hit + nl;
-            }
-            fs_scaled = eng_function(text, RSX_SHADER_STAGE_FRAGMENT, "fp");
-            free(text);
-        }
-    }
+    /* WPOS at the internal resolution: eng_wpos_function. */
+    const int reads_wpos = strstr(ps_hlsl, "input.position") != NULL;
+    { static int log = -1; if (log < 0) log = getenv("RSX_PIPE_LOG") ? 1 : 0;
+      if (log && reads_wpos) fprintf(stderr, "[rsx engine/metal] pipeline %u reads WPOS\n", s_eng_pipe_count + 1); }
+    id<MTLFunction> fs_scaled = (reads_wpos && s_eng_scale != 1.0f) ? eng_wpos_function(ps_hlsl, s_eng_scale) : nil;
 
     /* Attribute index is the layout SLOT, not the guest's ATTRn number.
      * glslang numbers an HLSL input struct's members in DECLARATION order --
@@ -3259,6 +3295,7 @@ static u32 eng_pipeline_create_locked(void* user, const char* vs_hlsl, const cha
     if (fs_scaled) {
         pd.fragmentFunction = fs_scaled;
         pso_scaled = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+        pd.fragmentFunction = fs;
     }
 
     /* Depth and stencil are pipeline state in D3D12 and an encoder object in
@@ -3297,6 +3334,9 @@ static u32 eng_pipeline_create_locked(void* user, const char* vs_hlsl, const cha
     s_eng_pipe[slot].pso = pso;
     s_eng_pipe[slot].pso_scaled = pso_scaled;
     s_eng_pipe[slot].ds  = ds;
+    s_eng_pipe[slot].ps_wpos = reads_wpos ? strdup(ps_hlsl) : NULL;
+    s_eng_pipe[slot].fs = reads_wpos ? fs : nil;
+    s_eng_pipe[slot].pd = reads_wpos ? pd : nil;
     /* CULL_FACE FRONT=0x0404 BACK=0x0405 FRONT_AND_BACK=0x0408 (front here,
      * as in the D3D12 engine); FRONT_FACE CW=0x0900 CCW=0x0901. */
     s_eng_pipe[slot].cull = MTLCullModeNone;
@@ -3319,15 +3359,47 @@ static void eng_pipeline_release(void* user, u32 pipeline)
         s_eng_pipe[pipeline - 1].pso = nil;
         s_eng_pipe[pipeline - 1].pso_scaled = nil;
         s_eng_pipe[pipeline - 1].ds  = nil;
+        free(s_eng_pipe[pipeline - 1].ps_wpos);
+        s_eng_pipe[pipeline - 1].ps_wpos = NULL;
+        s_eng_pipe[pipeline - 1].fs = nil;
+        s_eng_pipe[pipeline - 1].pd = nil;
     }
     pthread_mutex_unlock(&s_eng_pipe_mu);
 }
 
 /* ---- per-draw binding ---------------------------------------------------- */
 
-static int eng_sampler_slot(const rsx_be_sampler_desc* d)
+/* RSX_ANISO=<1..16> (default 16): anisotropic filtering for the textures the
+ * title filters linearly and mipmaps -- the world's ground and walls, which
+ * the RSX's own trilinear blurs at a glancing angle -- as rsx_d3d12_engine.c.
+ * Only for a guest texture with a real mip chain bound to a linear,
+ * mipmapped sampler: render targets, their views and snapshots (shadow maps,
+ * packed depth, post-process inputs) carry data that spreading samples
+ * corrupts. 1 is off. The level is part of the sampler key, so a change
+ * (the Graphics Settings page writes g_rsx_aniso) takes effect at the next
+ * bind. */
+int g_rsx_aniso;          /* 0 until read from RSX_ANISO */
+int g_eng_aniso_on = 1;   /* the host A/B (DOD3_AB=aniso) flips it */
+static int eng_aniso(void)
 {
-    const u64 key = (u64)d->min_linear | ((u64)d->mag_linear << 1)
+    int a = g_rsx_aniso;
+    if (a <= 0) {
+        const char* e = getenv("RSX_ANISO");
+        a = (e && *e) ? atoi(e) : 16;
+        g_rsx_aniso = a;
+    }
+    return a < 1 ? 1 : a > 16 ? 16 : a;
+}
+static int eng_aniso_tex(u32 handle)
+{
+    return handle && handle <= s_eng_obj_count && s_eng_obj_mipped[handle - 1];
+}
+
+static int eng_sampler_slot(const rsx_be_sampler_desc* d, int aniso_ok)
+{
+    aniso_ok = aniso_ok && g_eng_aniso_on && eng_aniso() > 1 && d->min_linear && d->mag_linear && d->mip_present;
+    const u64 key = ((u64)(aniso_ok ? eng_aniso() : 0) << 56)
+                  | (u64)d->min_linear | ((u64)d->mag_linear << 1)
                   | ((u64)d->mip_linear << 2) | ((u64)d->mip_present << 3)
                   | ((u64)d->wrap_s << 4) | ((u64)d->wrap_t << 8)
                   | ((u64)d->wrap_r << 12)
@@ -3350,6 +3422,7 @@ static int eng_sampler_slot(const rsx_be_sampler_desc* d)
     sd.tAddressMode = gcm_wrap_to_metal(d->wrap_t);
     sd.rAddressMode = gcm_wrap_to_metal(d->wrap_r);
     sd.borderColor  = MTLSamplerBorderColorTransparentBlack;
+    if (aniso_ok) sd.maxAnisotropy = (NSUInteger)eng_aniso();
     id<MTLSamplerState> s = [s_dev newSamplerStateWithDescriptor:sd];
     if (!s) return -1;
     const int slot = (int)s_eng_samp_count++;
@@ -3417,7 +3490,7 @@ static void eng_bind_textures(void* user, const u32* textures,
     (void)user;
     for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
         s_eng_pending.tex[u]  = ((mask >> u) & 1u) ? textures[u] : 0;
-        s_eng_pending.samp[u] = ((mask >> u) & 1u) ? eng_sampler_slot(&samplers[u]) : -1;
+        s_eng_pending.samp[u] = ((mask >> u) & 1u) ? eng_sampler_slot(&samplers[u], eng_aniso_tex(textures[u])) : -1;
     }
 }
 
@@ -3427,7 +3500,7 @@ static void eng_bind_vertex_textures(void* user, const u32* textures,
     (void)user;
     for (u32 u = 0; u < RSX_BE_MAX_VERTEX_TEXTURES; u++) {
         s_eng_pending.vtex[u]  = ((mask >> u) & 1u) ? textures[u] : 0;
-        s_eng_pending.vsamp[u] = ((mask >> u) & 1u) ? eng_sampler_slot(&samplers[u]) : -1;
+        s_eng_pending.vsamp[u] = ((mask >> u) & 1u) ? eng_sampler_slot(&samplers[u], 0) : -1;
     }
 }
 
@@ -4235,6 +4308,91 @@ static void eng_dump_frame(id<MTLTexture> src, u32 surface)
     free(rgba);
 }
 
+/* RSX_SCALE changed while running. Every colour and depth target is made
+ * again at the new size under the same handle (cleared: a target the title
+ * never draws all of -- its bloom chain's one-pixel border -- must not show
+ * whatever the new memory held), each view cut from one is cut again, the
+ * programs that read WPOS get pso_scaled for the new divisor, and the
+ * host-sized fallback depth goes. Called with no records waiting, so no
+ * recorded copy or pass pairs an old texture with a new one; command
+ * buffers in flight keep the old textures alive. A frame or two of black:
+ * the title draws nearly every target each frame. */
+static void eng_rescale(void)
+{
+    @autoreleasepool {
+        u32 nt = 0, nv = 0, np = 0;
+        id<MTLCommandBuffer> cb = [s_queue commandBuffer];
+        for (u32 i = 0; i < s_eng_obj_count; i++) {
+            const u32 gw = s_eng_tgt_gw[i], gh = s_eng_tgt_gh[i];
+            id<MTLTexture> t = s_eng_obj[i];
+            if (!gw || !gh || !t || s_eng_obj_retired[i]) continue;
+            const int scl = eng_scales(gw, gh);
+            const u32 nw = scl ? sc_dim(gw) : gw, nh = scl ? sc_dim(gh) : gh;
+            if ([t width] == nw && [t height] == nh) continue;
+            MTLTextureDescriptor* td =
+                [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:[t pixelFormat]
+                                                                   width:nw height:nh mipmapped:NO];
+            td.usage = [t usage];
+            td.storageMode = [t storageMode];
+            id<MTLTexture> n = [s_dev newTextureWithDescriptor:td];
+            if (!n) continue;
+            s_eng_obj[i] = n;
+            s_eng_obj_gw[i] = (nw != gw || nh != gh) ? gw : 0;
+            s_eng_obj_gh[i] = (nw != gw || nh != gh) ? gh : 0;
+            MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+            if ([t pixelFormat] == MTL_DEPTH_FORMAT) {
+                rp.depthAttachment.texture = n;
+                rp.depthAttachment.loadAction = MTLLoadActionClear;
+                rp.depthAttachment.storeAction = MTLStoreActionStore;
+                rp.depthAttachment.clearDepth = 1.0;
+                rp.stencilAttachment.texture = n;
+                rp.stencilAttachment.loadAction = MTLLoadActionClear;
+                rp.stencilAttachment.storeAction = MTLStoreActionStore;
+                rp.stencilAttachment.clearStencil = 0;
+            } else {
+                rp.colorAttachments[0].texture = n;
+                rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+                rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+                rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+            }
+            id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+            [e endEncoding];
+            for (u32 v = 0; v < s_eng_view_count; v++) {
+                const EngView* ev = &s_eng_view[v];
+                if (ev->surface != i + 1 || !ev->view || ev->view > s_eng_obj_count) continue;
+                s_eng_obj[ev->view - 1] = eng_make_view(n, ev->remap, ev->format);
+                s_eng_obj_gw[ev->view - 1] = s_eng_obj_gw[i];
+                s_eng_obj_gh[ev->view - 1] = s_eng_obj_gh[i];
+                nv++;
+            }
+            nt++;
+        }
+        [cb commit];
+        s_eng_zfallback = nil;
+        pthread_mutex_lock(&s_eng_pipe_mu);
+        for (u32 i = 0; i < s_eng_pipe_count; i++) {
+            EngPipeline* p = &s_eng_pipe[i];
+            if (!p->pso || !p->ps_wpos || !p->pd || !p->fs) continue;
+            id<MTLRenderPipelineState> scaled = nil;
+            if (s_eng_scale != 1.0f) {
+                id<MTLFunction> f = eng_wpos_function(p->ps_wpos, s_eng_scale);
+                if (f) {
+                    NSError* err = nil;
+                    p->pd.fragmentFunction = f;
+                    scaled = [s_dev newRenderPipelineStateWithDescriptor:p->pd error:&err];
+                    p->pd.fragmentFunction = p->fs;
+                }
+            }
+            p->pso_scaled = scaled;
+            np++;
+        }
+        pthread_mutex_unlock(&s_eng_pipe_mu);
+        fprintf(stderr, "[RSX metal] internal resolution x%.2f (%ux%u): %u targets, %u views and %u of %u pipelines "
+                "(those reading WPOS) remade\n",
+                (double)s_eng_scale, sc_dim(s_width), sc_dim(s_height), nt, nv, np, s_eng_pipe_count);
+    }
+}
+
 static void eng_present(void* user, u32 surface)
 {
     (void)user;
@@ -4246,9 +4404,18 @@ static void eng_present(void* user, u32 surface)
           fprintf(stderr, "[rsx engine/metal] objects: %u slots used, %u free, %u live (present %u)\n",
                   s_eng_obj_count, s_eng_obj_free_count, s_eng_obj_count - s_eng_obj_free_count, n); }
     id<MTLTexture> src = eng_obj(surface);
-    if (!src) { eng_encode_and_commit(nil); return; }
-    eng_encode_and_commit(src);
-    eng_dump_frame(src, surface);
+    if (!src) eng_encode_and_commit(nil);
+    else {
+        eng_encode_and_commit(src);
+        eng_dump_frame(src, surface);
+    }
+    if (g_rsx_display_reload) {
+        g_rsx_display_reload = 0;
+        s_disp_window_pending = 1;
+        const float os = s_eng_scale;
+        eng_read_scale();
+        if (s_eng_scale != os) eng_rescale();
+    }
 }
 
 static void eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
@@ -4507,6 +4674,56 @@ int rsx_metal_backend_window_focused(void)
 #endif
 }
 
+/* Main thread: the window after a display change (s_disp_window_pending).
+ * V-sync is the layer's; a size or mode change restyles the window. macOS
+ * full screen is its own Space, entered and left with an animation: leaving
+ * it is started here and the rest waits for a later pump. Returns 1 when
+ * done. */
+static int display_apply(void)
+{
+    if (!s_window || !s_layer) return 1;
+    u32 ww, wh;
+    read_display_options(&ww, &wh);   /* the wanted mode, size and v-sync */
+    s_layer.displaySyncEnabled = s_vsync ? YES : NO;
+    const NSWindowStyleMask sm = [s_window styleMask];
+    const int in_fs = (sm & NSWindowStyleMaskFullScreen) != 0;
+    const MtlDisplayMode now = in_fs ? DISP_FULLSCREEN
+                             : (sm & NSWindowStyleMaskTitled) ? DISP_WINDOWED : DISP_BORDERLESS;
+    const NSSize cur = [s_window contentRectForFrameRect:[s_window frame]].size;
+    const char* name = s_display_mode == DISP_FULLSCREEN ? "full screen" :
+                       s_display_mode == DISP_BORDERLESS ? "borderless" : "windowed";
+    static int s_toggled;   /* leaving full screen has been asked for */
+    if (now == s_display_mode &&
+        (now != DISP_WINDOWED || ((u32)cur.width == ww && (u32)cur.height == wh))) {
+        s_toggled = 0;
+        fprintf(stderr, "[RSX metal] display: %s, window %ux%u, vsync %d\n", name, ww, wh, s_vsync);
+        return 1;   /* the window is as wanted (or only v-sync changed) */
+    }
+    if (in_fs) {
+        if (!s_toggled) { [s_window toggleFullScreen:nil]; s_toggled = 1; }
+        return 0;
+    }
+    s_toggled = 0;
+    NSScreen* screen = [s_window screen] ? [s_window screen] : [NSScreen mainScreen];
+    if (s_display_mode == DISP_BORDERLESS && screen) {
+        [s_window setStyleMask:NSWindowStyleMaskBorderless];
+        [s_window setFrame:[screen frame] display:YES];
+        [NSApp setPresentationOptions:NSApplicationPresentationAutoHideDock |
+                                      NSApplicationPresentationAutoHideMenuBar];
+    } else {
+        [NSApp setPresentationOptions:NSApplicationPresentationDefault];
+        [s_window setStyleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+                               NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable];
+        [s_window setContentSize:NSMakeSize((CGFloat)ww, (CGFloat)wh)];
+        [s_window center];
+        if (s_display_mode == DISP_FULLSCREEN) [s_window toggleFullScreen:nil];
+    }
+    [s_window makeKeyAndOrderFront:nil];
+    note_view_size();
+    fprintf(stderr, "[RSX metal] display: %s, window %ux%u, vsync %d\n", name, ww, wh, s_vsync);
+    return 1;
+}
+
 static int pump_messages_impl(void)
 {
 #if !TARGET_OS_IPHONE
@@ -4520,6 +4737,7 @@ static int pump_messages_impl(void)
             if (!ev) break;
             [NSApp sendEvent:ev];
         }
+        if (s_disp_window_pending && display_apply()) s_disp_window_pending = 0;
         if (s_window && ![s_window isVisible]) s_closed = 1;
     }
 #endif
