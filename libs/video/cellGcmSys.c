@@ -276,6 +276,7 @@ static atomic_uint s_user_command = 0;
  * waiting forever. Each entry is (1 << 32) | cmd, 0 = empty. */
 #define GCM_USER_QLEN 64u
 static u64 s_user_q[GCM_USER_QLEN];
+static u64 s_user_qt[GCM_USER_QLEN];      /* when each was queued (ns) */
 static u32 s_user_qhead = 0, s_user_qtail = 0;
 static SRWLOCK s_user_qlock = SRWLOCK_INIT;
 static void GCM_USER_PENDING_STORE(u64 value)
@@ -285,6 +286,7 @@ static void GCM_USER_PENDING_STORE(u64 value)
         s_user_qhead++;                        /* full: drop the oldest */
         static int n = 0; if (n++ < 4) fprintf(stderr, "[cellGcmSys] user command queue overflow\n");
     }
+    s_user_qt[s_user_qtail % GCM_USER_QLEN] = get_timestamp_ns();
     s_user_q[s_user_qtail++ % GCM_USER_QLEN] = value;
     ReleaseSRWLockExclusive(&s_user_qlock);
 }
@@ -302,11 +304,14 @@ static void GCM_USER_PENDING_RESET(void)
     s_user_qhead = s_user_qtail = 0;
     ReleaseSRWLockExclusive(&s_user_qlock);
 }
-static u64 GCM_USER_PENDING_TAKE(void)
+static u64 GCM_USER_PENDING_TAKE(u64* queued_ns)
 {
     u64 v = 0;
     AcquireSRWLockExclusive(&s_user_qlock);
-    if (s_user_qhead != s_user_qtail) v = s_user_q[s_user_qhead++ % GCM_USER_QLEN];
+    if (s_user_qhead != s_user_qtail) {
+        *queued_ns = s_user_qt[s_user_qhead % GCM_USER_QLEN];
+        v = s_user_q[s_user_qhead++ % GCM_USER_QLEN];
+    }
     ReleaseSRWLockExclusive(&s_user_qlock);
     return v;
 }
@@ -756,7 +761,8 @@ void ppu_gcm_pump(void)
 {
     if (!GCM_PUMP_TRY_ENTER()) return;
     long p = (long)GCM_PENDING_TAKE();
-    u64 user = GCM_USER_PENDING_TAKE();
+    u64 user_t = 0;
+    u64 user = GCM_USER_PENDING_TAKE(&user_t);
     /* GCM_PUMP_DBG=1: how often each guest handler is actually delivered. */
     { static int d = -1; static unsigned nv, nf, calls;
       if (d < 0) d = getenv("GCM_PUMP_DBG") ? 1 : 0;
@@ -776,8 +782,22 @@ void ppu_gcm_pump(void)
             g_ps3_guest_caller(s_flip_handler_opd, 1, 0, 0, 0, 0, 0, 0, 0);
         }
     }
-    for (; user; user = GCM_USER_PENDING_TAKE()) {
+    for (; user; user = GCM_USER_PENDING_TAKE(&user_t)) {
         u32 cmd = (u32)user;
+        /* GCM_USER_DELAY_LOG=<ms>: a user command delivered that long after
+         * the walker queued it. The FIFO waits at the park the handler
+         * patches, so this is time the GPU side stood still. */
+        { static long ul = -1;
+          if (ul < 0) { const char* e = getenv("GCM_USER_DELAY_LOG"); ul = e ? atol(e) : 0; }
+          if (ul > 0) {
+              const double ms = (double)(get_timestamp_ns() - user_t) / 1e6;
+              if (ms > (double)ul) {
+                  extern u32 g_rsx_engine_frame;
+                  extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
+                  fprintf(stderr, "[gcm-user] cmd 0x%X delivered %.2f ms after it was queued (frame %u, thread %u)\n",
+                          cmd, ms, g_rsx_engine_frame, g_active_ctx ? (unsigned)g_active_ctx->thread_id : 0u);
+              }
+          } }
         if (s_user_handler_opd && g_ps3_guest_caller)
             g_ps3_guest_caller(s_user_handler_opd, (uint64_t)cmd, 0, 0, 0, 0, 0, 0, 0);
     }
@@ -1704,6 +1724,60 @@ void cellGcm_rsx_process_fifo(void)
     ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
 }
 
+/* A flip or prepare-flip whose marker did not fit before the ring's end (the
+ * last GCM_RECYCLE_SLACK bytes are the title's, see gcm_word_into_fifo): its
+ * position, the IO offset of the write head when the title asked for it, and
+ * the buffer. The drain does what the marker would have done when `get`
+ * reaches that offset -- after every command queued before it.
+ *
+ * It used to be a host flip on the spot, which the draw engine ignores once
+ * a title flips through its FIFO, so that frame was never shown: Drakengard
+ * 3 prepares about one flip in 30 within the last 4 KB of its 3 MB ring, and
+ * each was a 33-35 ms frame (the previous one held for two) every 10-20 s at
+ * 60 fps. GCM_POS_FLIP=0: the old host flip. */
+static u32 gcm_ea2io(u32 ea);
+#define GCM_NO_POS_FLIP 0xFFFFFFFFu
+static volatile u32 s_pos_flip_io = GCM_NO_POS_FLIP;
+static volatile u32 s_pos_flip_id = 0;
+static volatile int s_pos_flip_prepare = 0;
+extern void (*g_gcm_trace_hook)(u32 type, u32 a, u32 b);
+static int gcm_pos_flip_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("GCM_POS_FLIP"); on = e ? atoi(e) : 1; }
+    return on;
+}
+/* Queue a flip (prepare = 0) or prepare-flip at ctx->current; 0 if it cannot. */
+static int gcm_pos_flip_set(u32 ctx, u32 bufferId, int prepare)
+{
+    if (!gcm_pos_flip_on() || !ctx || bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM || !s_display_buffer_set[bufferId])
+        return 0;
+    const u32 io = gcm_ea2io(vm_read32(ctx + 8));
+    if (io == 0xFFFFFFFFu) return 0;
+    s_pos_flip_id = bufferId;
+    s_pos_flip_prepare = prepare;
+    atomic_thread_fence(memory_order_seq_cst);
+    s_pos_flip_io = io;
+    if (g_gcm_trace_hook) g_gcm_trace_hook(9, io, bufferId | (prepare ? 0x100u : 0u));
+    return 1;
+}
+static void gcm_fire_pos_flip(void)
+{
+    const u32 id = s_pos_flip_id;
+    s_pos_flip_io = GCM_NO_POS_FLIP;
+    if (g_gcm_trace_hook) g_gcm_trace_hook(10, s_fifo_getoff, id);
+    s_current_display_buffer_id = id & 7u;
+    s_flip_pending = 1;
+    s_flip_request_count++;
+    if (s_pos_flip_prepare) {                       /* as the GCM_PREPARE_MARKER case */
+        s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
+        s_last_flip_time = get_timestamp_ns();
+        s_prepared_id = (int)(id & 7u);
+    }
+    gcm_report_copies_flush();
+    rsx_draw_engine_fifo_flip(s_current_display_buffer_id);
+}
+
 static void gcm_rsx_process_fifo_unlocked(void)
 {
     { static unsigned _n = 0; static unsigned long long _t0 = 0;
@@ -1827,7 +1901,13 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * short of `put` every tick is the signature of a FIFO that can never
      * catch up, and the reason is the whole diagnosis. */
     const char* why = "caught-up";
+    if (s_fifo_getoff == s_pos_flip_io) gcm_fire_pos_flip();
     while (s_fifo_getoff != put && budget-- > 0) {
+        if (s_fifo_getoff == s_pos_flip_io) {
+            gcm_fire_pos_flip();
+            if (put < s_fifo_getoff || put - s_fifo_getoff < GCM_FIFO_CATCHUP_BYTES)
+                { why = "flip"; break; }
+        }
         u32 ea = gcm_io2ea(s_fifo_getoff);
         if (!ea) {
             /* get is sitting on an IO offset with no mapping -- the title
@@ -1886,11 +1966,15 @@ static void gcm_rsx_process_fifo_unlocked(void)
                           flips, 10); }
             if ((w & 0xFFFFFF00u) == GCM_FLIP_MARKER) {
                 /* Queued by _cellGcmSetFlipCommand, which already did the
-                 * guest-visible half of the request. */
+                 * guest-visible half of the request. A position flip still
+                 * waiting is one the walker skipped past (a resync): this
+                 * later frame replaces it. */
+                s_pos_flip_io = GCM_NO_POS_FLIP;
                 s_current_display_buffer_id = w & 7u;
                 s_flip_pending = 1;
                 s_flip_request_count++;
             } else if ((w & 0xFFFFFF00u) == GCM_PREPARE_MARKER) {
+                s_pos_flip_io = GCM_NO_POS_FLIP;
                 /* Queued by cellGcmSetPrepareFlip: the frame in this buffer
                  * is complete here, so flip now, and let
                  * cellGcmSetFlipImmediate(id) succeed from here on.
@@ -2522,9 +2606,13 @@ static u32 gcm_ea2io(u32 ea)
  * between writing its JUMP-to-begin and handing the ring back. The drain must
  * not take that window for an overrun: `current` sits exactly at `end` with
  * the jump written there, and the callback is waiting for this drain. */
+/* A host's event trace (dod3: DOD3_TRACE_HITCH): type, two words. */
+void (*g_gcm_trace_hook)(u32 type, u32 a, u32 b) = 0;
+
 void cellGcm_fifo_recycle(u32 ctx_ea)
 {
     if (!ctx_ea) return;
+    if (g_gcm_trace_hook) g_gcm_trace_hook(6, vm_read32(ctx_ea + 0x8), vm_read32(GCM_CONTROL_GUEST_ADDR + 0));
     u32 begin   = vm_read32(ctx_ea + 0x0);
     u32 current = vm_read32(ctx_ea + 0x8);
     if (current <= begin) return;                       /* nothing to recycle */
@@ -2609,6 +2697,7 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
     vm_write32(ctx_ea + 0x8, begin);                    /* recycle ring to base */
     atomic_thread_fence(memory_order_seq_cst);
     s_recycle_in_progress = 0;
+    if (g_gcm_trace_hook) g_gcm_trace_hook(7, (u32)spins, 0);
 
     if (s_recdbg)
         fprintf(stderr, "[REC<] tid=%lu cur-now=%08X put=%08X get=%08X drained=%08X spins=%d\n",
@@ -2846,6 +2935,12 @@ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
         printf("[cellGcmSys] SetPrepareFlip(bufferId=%u) -> queued in the FIFO\n", bufferId); }
 
     if (gcm_word_into_fifo((u32)(uintptr_t)ctx, GCM_PREPARE_MARKER | bufferId, 0)) {
+        s_prepare_used = 1;
+        return (s32)bufferId;
+    }
+    /* No room for the marker before the ring's end: the drain prepares the
+     * flip at this position instead (see s_pos_flip_io). */
+    if (gcm_pos_flip_set((u32)(uintptr_t)ctx, bufferId, 1)) {
         s_prepare_used = 1;
         return (s32)bufferId;
     }
@@ -3553,6 +3648,10 @@ s32 cellGcmSetDefaultFifoSize(u32 size)
 s32 _cellGcmSetFlipCommand(void* ctx, u32 bufferId)
 {
     if (gcm_flip_into_fifo((u32)(uintptr_t)ctx, bufferId))
+        return gcm_flip_request(bufferId, 1);
+    /* No room for the marker: the drain flips at this position instead (see
+     * s_pos_flip_io). */
+    if (gcm_pos_flip_set((u32)(uintptr_t)ctx, bufferId, 0))
         return gcm_flip_request(bufferId, 1);
     return cellGcmSetFlipCommand(bufferId);
 }

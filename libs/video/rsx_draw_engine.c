@@ -3772,6 +3772,8 @@ void rsx_draw_engine_present_buffer(u32 buffer_id)
 
 int rsx_draw_engine_fifo_flip(u32 buffer_id)
 {
+    extern void (*g_gcm_trace_hook)(u32 type, u32 a, u32 b);
+    if (g_gcm_trace_hook) g_gcm_trace_hook(8, buffer_id, g.frames);
     if (!g.ready) return 0;
     g.last_flip_buffer = buffer_id & 7u;
     g.sink_flips++;
