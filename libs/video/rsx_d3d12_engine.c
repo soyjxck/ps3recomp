@@ -150,7 +150,20 @@ typedef struct {
     ID3D12PipelineState* pso[3];               /* by topology class: point, line, triangle */
     int failed[3];
     int live;
+    /* The same geometry with the snapshot-copy pixel shader (see
+     * eng_encode_copy_draw), by topology class, for one target format. */
+    ID3D12PipelineState* copy_pso[3];
+    DXGI_FORMAT copy_fmt[3];
+    int copy_failed[3];
 } EngPipeline;
+static const char kSnapCopyHLSL[] =
+    "Texture2D rsx_tex[16] : register(t0);\n"
+    "struct PSInput { float4 position : SV_POSITION; };\n"
+    "float4 main(PSInput input) : SV_Target0 { return rsx_tex[0].Load(int3((int2)input.position.xy, 0)); }\n";
+static ID3DBlob* s_snap_copy_ps;
+static u64 s_snap_incr_n, s_snap_full_n, s_snap_copy_draws;   /* RSX_GPU_TIME */
+int g_rsx_snap_incr = -1;   /* RSX_SNAP_INCR (see eng_encode_records) */
+
 
 typedef struct { u64 hash; ID3DBlob* blob; } EngBlob;
 typedef struct { u64 key; } EngSampler;   /* the descriptor lives at CPU sampler slot i+1 */
@@ -1141,6 +1154,7 @@ static int eng_init_device(u32 width, u32 height)
         }
     }
     if (eng_make_root_signatures() != 0) return -1;
+    s_snap_copy_ps = eng_compile(kSnapCopyHLSL, sizeof kSnapCopyHLSL - 1, "main", "ps_5_0", "snapshot copy ps");
     {
         ID3DBlob* vs = eng_compile(kHelperHLSL, sizeof kHelperHLSL - 1, "vs_main", "vs_5_0", "helper vs");
         ID3DBlob* pb = eng_compile(kHelperHLSL, sizeof kHelperHLSL - 1, "ps_blit", "ps_5_0", "helper blit");
@@ -1350,11 +1364,16 @@ static u32 eng_color_snapshot(void* user, u32 surface)
         if (d && d->res && d->w == t->w && d->h == t->h && d->fmt == t->fmt) dst = pool[slot].snap;
     }
     if (!dst) {
-        ID3D12Resource* r = make_texture(t->fmt, t->w, t->h, 1, 1, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, NULL);
+        /* A render target as well, so the snapshot can be brought up to date
+         * by drawing into it (eng_encode_copy_draw) rather than copied whole. */
+        ID3D12Resource* r = make_texture(t->fmt, t->w, t->h, 1, 1, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                                         D3D12_RESOURCE_STATE_COPY_DEST, NULL);
         dst = eng_obj_add(r, OBJ_SNAPSHOT, t->fmt, t->w, t->h, 1, 1, D3D12_RESOURCE_STATE_COPY_DEST);
         if (!dst) return 0;
         s_obj[dst - 1].gw = t->gw; s_obj[dst - 1].gh = t->gh;
         eng_write_srv(dst, r, t->fmt, 1, 1, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+        CALL(s_dev, CreateRenderTargetView, r, NULL, obj_rtv(dst));
+        s_obj[dst - 1].has_rtv = 1;
         if (slot == npool) { if (npool >= 32) return 0; npool++; }
         pool[slot].surface = surface; pool[slot].snap = dst;
     }
@@ -1950,6 +1969,9 @@ static void eng_gpu_time_collect(u32 slot)
                 n_other / secs, n_other ? other_ms / n_other : 0.0, n ? queue_ms / n : 0.0);
         fprintf(stderr, "[gpu-time] per second: %.0f draws, %.0f PSO changes, %.0f ResourceBarrier calls (%.0f transitions), %.0f occlusion queries, %.0f texture uploads\n",
                 s_gt_draws / secs, s_gt_pso / secs, s_gt_bar_calls / secs, s_gt_bars / secs, s_gt_queries / secs, s_gt_copies / secs);
+        fprintf(stderr, "[gpu-time] own-target snapshots: %.0f/s brought up to date by %.0f copy draws/s, %.0f/s copied whole\n",
+                s_snap_incr_n / secs, s_snap_copy_draws / secs, s_snap_full_n / secs);
+        s_snap_incr_n = s_snap_full_n = s_snap_copy_draws = 0;
         s_gt_draws = s_gt_pso = s_gt_bar_calls = s_gt_bars = s_gt_queries = s_gt_copies = 0;
         eng_pass_collect(slot, 1);
         busy_ms = wait_ms = other_ms = queue_ms = 0; n = n_wait = n_other = 0; last = now;
@@ -2195,6 +2217,195 @@ static void eng_encode_draw(const EngRecord* r, ID3D12Resource* stage, D3D12_GPU
     if (query) { CALL(s_list, EndQuery, s_qheap, D3D12_QUERY_TYPE_OCCLUSION, qi); s_q_vis[s_q_used++] = r->vis - 1; }
 }
 
+/* ---- incremental own-target snapshots --------------------------------------
+ *
+ * A draw that samples the colour target it renders into samples a snapshot
+ * of it (eng_color_snapshot), refreshed at that point in the stream by a full
+ * copy -- ~0.1 ms of GPU for a 4K RGBA16F target, and Drakengard 3's heat-haze
+ * particles ask for ~95 a frame. Between two refreshes the target only
+ * changes where the draws into it in between wrote, and those are recorded:
+ * draw each of them again, same vertex shader and geometry, viewport and
+ * scissor, with a pixel shader that copies the target's pixel into the
+ * snapshot, and the snapshot equals the target everywhere again -- exactly,
+ * at the cost of the draws' own footprints. Culling and depth are off in the
+ * copy, so it covers at least every pixel the draw could have written; more
+ * is harmless, those pixels are copies of an unchanged target. Anything else
+ * that writes the target (a clear, a copy, an upload, a resolve, a draw with
+ * it as a second attachment), more than 16 draws, or a refresh with no
+ * earlier one in the same submit takes the full copy. RSX_SNAP_INCR=0: full
+ * copies always. */
+
+static ID3D12PipelineState* eng_copy_pso_build(u32 pipeline, int cls, DXGI_FORMAT fmt)
+{
+    if (!s_snap_copy_ps || !pipeline || pipeline > s_pipe_count) return NULL;
+    EngPipeline* p = &s_pipe[pipeline - 1];
+    if (!p->vs || p->copy_failed[cls]) return NULL;
+    if (p->copy_pso[cls] && p->copy_fmt[cls] == fmt) return p->copy_pso[cls];
+    ID3D12PipelineState* pso = NULL;
+    AcquireSRWLockExclusive(&s_pipe_lock);
+    if (p->copy_pso[cls] && p->copy_fmt[cls] == fmt) pso = p->copy_pso[cls];
+    else if (!p->copy_failed[cls]) {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = p->desc;
+        pd.InputLayout.pInputElementDescs = pd.InputLayout.NumElements ? p->il : NULL;
+        pd.PS.pShaderBytecode = CALL0(s_snap_copy_ps, GetBufferPointer);
+        pd.PS.BytecodeLength = CALL0(s_snap_copy_ps, GetBufferSize);
+        pd.NumRenderTargets = 1;
+        for (u32 r = 0; r < 8; r++) pd.RTVFormats[r] = DXGI_FORMAT_UNKNOWN;
+        pd.RTVFormats[0] = fmt;
+        memset(&pd.BlendState, 0, sizeof pd.BlendState);
+        D3D12_RENDER_TARGET_BLEND_DESC* b = &pd.BlendState.RenderTarget[0];
+        b->SrcBlend = D3D12_BLEND_ONE; b->DestBlend = D3D12_BLEND_ZERO; b->BlendOp = D3D12_BLEND_OP_ADD;
+        b->SrcBlendAlpha = D3D12_BLEND_ONE; b->DestBlendAlpha = D3D12_BLEND_ZERO; b->BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        b->LogicOp = D3D12_LOGIC_OP_NOOP;
+        b->RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        memset(&pd.DepthStencilState, 0, sizeof pd.DepthStencilState);
+        pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        const D3D12_DEPTH_STENCILOP_DESC keep = { D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP,
+                                                  D3D12_STENCIL_OP_KEEP, D3D12_COMPARISON_FUNC_ALWAYS };
+        pd.DepthStencilState.FrontFace = keep; pd.DepthStencilState.BackFace = keep;
+        pd.DSVFormat = DXGI_FORMAT_UNKNOWN;
+        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pd.PrimitiveTopologyType = cls == 0 ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT
+                                 : cls == 1 ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE
+                                            : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        HRESULT hr = CALL(s_dev, CreateGraphicsPipelineState, &pd, &IID_ID3D12PipelineState, (void**)&pso);
+        if (FAILED(hr)) {
+            static int n = 0;
+            if (n++ < 8) fprintf(stderr, "[rsx engine/d3d12] snapshot-copy pipeline failed: 0x%08lX\n", (long)hr);
+            p->copy_failed[cls] = 1; pso = NULL;
+        } else {
+            /* A format change leaves the old one to any list still naming it. */
+            p->copy_pso[cls] = pso; p->copy_fmt[cls] = fmt;
+        }
+    }
+    ReleaseSRWLockExclusive(&s_pipe_lock);
+    return pso;
+}
+
+/* Copy pipelines are built on a thread of their own: a pipeline state is
+ * milliseconds of driver compile, and on the walker each first use was a
+ * hitch. Until one is ready its refreshes take the full copy. With
+ * RSX_ASYNC_SHADERS=0 (the replays) they are built in place. */
+static SRWLOCK s_cp_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE s_cp_cv = CONDITION_VARIABLE_INIT;
+static struct { u32 pipeline; int cls; DXGI_FORMAT fmt; } s_cp_req[256];
+static u32 s_cp_head, s_cp_tail;      /* ring of requests */
+static int s_cp_thread_started;
+static DWORD WINAPI eng_copy_pso_worker(LPVOID arg)
+{
+    (void)arg;
+    for (;;) {
+        AcquireSRWLockExclusive(&s_cp_lock);
+        while (s_cp_head == s_cp_tail) SleepConditionVariableSRW(&s_cp_cv, &s_cp_lock, INFINITE, 0);
+        const u32 i = s_cp_head++ % 256u;
+        const u32 pl = s_cp_req[i].pipeline; const int cls = s_cp_req[i].cls; const DXGI_FORMAT fmt = s_cp_req[i].fmt;
+        ReleaseSRWLockExclusive(&s_cp_lock);
+        eng_copy_pso_build(pl, cls, fmt);
+    }
+    return 0;
+}
+static ID3D12PipelineState* eng_copy_pso(u32 pipeline, int cls, DXGI_FORMAT fmt)
+{
+    if (!s_snap_copy_ps || !pipeline || pipeline > s_pipe_count) return NULL;
+    EngPipeline* p = &s_pipe[pipeline - 1];
+    if (!p->vs || p->copy_failed[cls]) return NULL;
+    if (p->copy_pso[cls] && p->copy_fmt[cls] == fmt) return p->copy_pso[cls];
+    static int async = -1;
+    if (async < 0) { const char* e = getenv("RSX_ASYNC_SHADERS"); async = !(e && e[0] == '0'); }
+    if (!async) return eng_copy_pso_build(pipeline, cls, fmt);
+    /* Ask once per (pipeline, class, format): requests[] remembers. */
+    static struct { u32 pipeline; int cls; DXGI_FORMAT fmt; } asked[1024];
+    static u32 nasked;
+    for (u32 i = 0; i < nasked; i++)
+        if (asked[i].pipeline == pipeline && asked[i].cls == cls && asked[i].fmt == fmt) return NULL;
+    if (nasked < 1024) { asked[nasked].pipeline = pipeline; asked[nasked].cls = cls; asked[nasked].fmt = fmt; nasked++; }
+    AcquireSRWLockExclusive(&s_cp_lock);
+    if (!s_cp_thread_started) {
+        HANDLE th = CreateThread(NULL, 1u << 20, eng_copy_pso_worker, NULL, 0, NULL);
+        if (th) { SetThreadDescription(th, L"rsx copy pipelines"); CloseHandle(th); s_cp_thread_started = 1; }
+    }
+    if (s_cp_thread_started && s_cp_tail - s_cp_head < 256u) {
+        const u32 i = s_cp_tail++ % 256u;
+        s_cp_req[i].pipeline = pipeline; s_cp_req[i].cls = cls; s_cp_req[i].fmt = fmt;
+        WakeConditionVariable(&s_cp_cv);
+    }
+    ReleaseSRWLockExclusive(&s_cp_lock);
+    return NULL;
+}
+
+/* Draw r's geometry into snapshot S with the copy shader reading target T. */
+static int eng_encode_copy_draw(const EngRecord* r, u32 T, u32 S, ID3D12Resource* stage, D3D12_GPU_VIRTUAL_ADDRESS stage_va)
+{
+    EngObj* t = eng_owner(T); EngObj* sn = eng_owner(S);
+    if (!t || !sn || !sn->has_rtv) return 0;
+    ID3D12PipelineState* pso = eng_copy_pso(r->pipeline, topo_class(r->topology), sn->fmt);
+    if (!pso) return 0;
+    ID3D12Resource* vres = r->vbuf ? s_buf[r->vbuf - 1] : stage;
+    if (!vres) return 0;
+    /* Tables first: a full descriptor ring flushes the list and rebinds. */
+    D3D12_CPU_DESCRIPTOR_HANDLE srv[ENG_SRV_TABLE];
+    for (u32 u = 0; u < ENG_SRV_TABLE; u++) srv[u] = obj_srv(0);
+    srv[0] = obj_srv(T);
+    u32 vt_h[RSX_BE_MAX_VERTEX_TEXTURES] = {0};
+    for (u32 u = 0; u < RSX_BE_MAX_VERTEX_TEXTURES; u++) {
+        EngObj* o = eng_owner(r->vtex[u]);
+        if (o && o != t && o != sn) { srv[RSX_BE_MAX_TEXTURES + u] = obj_srv(r->vtex[u]); vt_h[u] = r->vtex[u]; }
+    }
+    const D3D12_GPU_DESCRIPTOR_HANDLE st = eng_srv_table(srv, ENG_SRV_TABLE);
+    int smp[ENG_SRV_TABLE];
+    for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) smp[u] = r->samp[u];
+    for (u32 u = 0; u < RSX_BE_MAX_VERTEX_TEXTURES; u++) smp[RSX_BE_MAX_TEXTURES + u] = r->vsamp[u];
+    const D3D12_GPU_DESCRIPTOR_HANDLE sm = eng_smp_table(smp);
+
+    res_transition(t->res, &t->state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    res_transition(sn->res, &sn->state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    for (u32 u = 0; u < RSX_BE_MAX_VERTEX_TEXTURES; u++) if (vt_h[u]) obj_transition(vt_h[u], ENG_SHADER_READ);
+    bar_flush();
+    eng_use_main_rootsig();
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtv = obj_rtv(S);
+    CALL(s_list, OMSetRenderTargets, 1, &rtv, FALSE, NULL);
+    CALL(s_list, SetPipelineState, pso);
+    CALL(s_list, IASetPrimitiveTopology, topo_d3d(r->topology));
+    D3D12_VIEWPORT vp = { r->vp[0], r->vp[1], r->vp[2], r->vp[3], 0.0f, 1.0f };
+    if (vp.Width <= 0.0f || vp.Height <= 0.0f) { vp.TopLeftX = vp.TopLeftY = 0.0f; vp.Width = (float)t->w; vp.Height = (float)t->h; }
+    CALL(s_list, RSSetViewports, 1, &vp);
+    D3D12_RECT sc;
+    if (r->sc[2] && r->sc[3]) { sc.left = (LONG)r->sc[0]; sc.top = (LONG)r->sc[1]; sc.right = (LONG)(r->sc[0] + r->sc[2]); sc.bottom = (LONG)(r->sc[1] + r->sc[3]); }
+    else { sc.left = 0; sc.top = 0; sc.right = (LONG)t->w; sc.bottom = (LONG)t->h; }
+    CALL(s_list, RSSetScissorRects, 1, &sc);
+    const D3D12_GPU_VIRTUAL_ADDRESS vva = r->vbuf ? CALL0(vres, GetGPUVirtualAddress) : stage_va;
+    const u32 vbytes = r->vbuf ? s_buf_bytes[r->vbuf - 1] : s_stage_used;
+    D3D12_VERTEX_BUFFER_VIEW vbv = { vva + r->vb_off, r->vb_off < vbytes ? vbytes - r->vb_off : 0, r->stride };
+    if (vbv.SizeInBytes > (u64)r->vertex_count * r->stride && !r->index_count) vbv.SizeInBytes = r->vertex_count * r->stride;
+    CALL(s_list, IASetVertexBuffers, 0, 1, &vbv);
+    if (r->index_count) {
+        D3D12_INDEX_BUFFER_VIEW ibv = { vva + r->ib_off, r->index_count * 4u, DXGI_FORMAT_R32_UINT };
+        CALL(s_list, IASetIndexBuffer, &ibv);
+    }
+    const D3D12_GPU_VIRTUAL_ADDRESS zero_va = CALL0(s_zero_cb, GetGPUVirtualAddress);
+    CALL(s_list, SetGraphicsRootConstantBufferView, 0, r->vs_cb_bytes ? stage_va + r->vs_cb_off : zero_va);
+    CALL(s_list, SetGraphicsRootConstantBufferView, 4, zero_va);
+    D3D12_GPU_DESCRIPTOR_HANDLE vt = st; vt.ptr += (UINT64)RSX_BE_MAX_TEXTURES * s_srv_step;
+    D3D12_GPU_DESCRIPTOR_HANDLE vsm = sm; vsm.ptr += (UINT64)RSX_BE_MAX_TEXTURES * s_smp_step;
+    CALL(s_list, SetGraphicsRootDescriptorTable, 1, st);
+    CALL(s_list, SetGraphicsRootDescriptorTable, 3, vt);
+    CALL(s_list, SetGraphicsRootDescriptorTable, 2, sm);
+    CALL(s_list, SetGraphicsRootDescriptorTable, 5, vsm);
+    if (r->index_count) CALL(s_list, DrawIndexedInstanced, r->index_count, 1, 0, 0, 0);
+    else                CALL(s_list, DrawInstanced, r->vertex_count, 1, 0, 0);
+    /* Everything the draw path caches is stale now. */
+    s_cur_pso = NULL; s_cur_targets_valid = 0; s_srv_last_valid = 0;
+    s_cur_topo = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    s_snap_copy_draws++;
+    return 1;
+}
+
+static int src_ok_for_sync(u32 T, u32 S)
+{
+    EngObj* t = eng_owner(T); EngObj* sn = eng_owner(S);
+    return t && sn && sn->has_rtv && t->w == sn->w && t->h == sn->h && t->fmt == sn->fmt;
+}
+
 static void eng_pass_mark(const EngRecord* r, u64* cur_key)
 {
     int kind; u32 h1, h2 = 0;
@@ -2225,9 +2436,88 @@ static void eng_pass_mark(const EngRecord* r, u64* cur_key)
 static void eng_encode_records(ID3D12Resource* stage, D3D12_GPU_VIRTUAL_ADDRESS stage_va)
 {
     u64 pass_key = ~0ull;
+    /* g_rsx_snap_incr: -1 until read from RSX_SNAP_INCR; the host A/B (DOD3_AB=snapincr) flips it. */
+    if (g_rsx_snap_incr < 0) { const char* e = getenv("RSX_SNAP_INCR"); g_rsx_snap_incr = !(e && e[0] == '0'); }
+    const int incr = g_rsx_snap_incr;
+    /* Per target with a snapshot: whether the snapshot was brought up to date
+     * earlier in this submit, and the draws into the target since. */
+    enum { SY_MAX = 8, SY_DRAWS = 16 };
+    struct { u32 surf, snap, n; int valid; u32 idx[SY_DRAWS]; } sy[SY_MAX];
+    u32 nsy = 0;
     for (u32 i = 0; i < s_rec_count; i++) {
         const EngRecord* r = &s_rec[i];
         if (s_pheap) eng_pass_mark(r, &pass_key);
+        if (r->kind == ENG_REC_COLOR_COPY) {
+            const u32 T = r->depth, S = r->resolve_dst;
+            u32 k = 0;
+            while (k < nsy && sy[k].surf != T) k++;
+            int done = 0;
+            EngObj* sobj = eng_owner(S);
+            { static int dbg = -1; if (dbg < 0) dbg = getenv("RSX_SNAP_DEBUG") ? 1 : 0;
+              static unsigned nd = 0;
+              if (dbg && nd++ < 60)
+                  fprintf(stderr, "[snap-debug] rec %u T=%u S=%u: entry %s valid %d snap-match %d rtv %d pending %u\n",
+                          i, T, S, k < nsy ? "yes" : "no", k < nsy ? sy[k].valid : -1, k < nsy ? (sy[k].snap == S) : -1,
+                          sobj ? sobj->has_rtv : -1, k < nsy ? sy[k].n : 0); }
+            int ready = 1;
+            if (incr && k < nsy && sy[k].valid && sy[k].snap == S && sobj && sobj->has_rtv) {
+                /* Every copy pipeline ready, or the full copy this time. */
+                for (u32 j = 0; j < sy[k].n; j++)
+                    if (!eng_copy_pso(s_rec[sy[k].idx[j]].pipeline, topo_class(s_rec[sy[k].idx[j]].topology), sobj->fmt)) { ready = 0; break; }
+            }
+            if (incr && ready && k < nsy && sy[k].valid && sy[k].snap == S && sobj && sobj->has_rtv) {
+                done = 1;
+                for (u32 j = 0; j < sy[k].n; j++)
+                    if (!eng_encode_copy_draw(&s_rec[sy[k].idx[j]], T, S, stage, stage_va)) { done = 0; break; }
+            }
+            if (done) {
+                s_snap_incr_n++;
+                static int said = 0;
+                if (said++ < 2)
+                    fprintf(stderr, "[rsx engine/d3d12] own-target snapshot brought up to date by %u copy draw(s) instead of a full copy\n",
+                            sy[k].n);
+            }
+            else {
+                EngObj* src = eng_owner(T); EngObj* dst = sobj;
+                if (src && dst) {
+                    res_transition(src->res, &src->state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    res_transition(dst->res, &dst->state, D3D12_RESOURCE_STATE_COPY_DEST);
+                    bar_flush();
+                    CALL(s_list, CopyResource, dst->res, src->res);
+                    s_snap_full_n++;
+                }
+            }
+            if (k == nsy && nsy < SY_MAX) nsy++;
+            if (k < nsy) { sy[k].surf = T; sy[k].snap = S; sy[k].n = 0; sy[k].valid = (src_ok_for_sync(T, S)); }
+            continue;
+        }
+        /* Writes to a tracked target: a draw as attachment A is replayable,
+         * anything else is not. */
+        for (u32 k = 0; k < nsy; k++) {
+            if (!sy[k].valid) continue;
+            const u32 T = sy[k].surf, S = sy[k].snap;
+            switch (r->kind) {
+            case ENG_REC_DRAW:
+                for (u32 a = 0; a < r->nrt && a < RSX_BE_MAX_COLOR_TARGETS; a++) {
+                    if (r->rt[a] == S) sy[k].valid = 0;
+                    if (r->rt[a] != T) continue;
+                    if (a == 0 && sy[k].n < SY_DRAWS) sy[k].idx[sy[k].n++] = i;
+                    else sy[k].valid = 0;
+                }
+                break;
+            case ENG_REC_CLEAR_COLOR:
+                if (r->rt[0] == T || r->rt[0] == S) sy[k].valid = 0;
+                break;
+            case ENG_REC_DEPTH_RESOLVE:
+                if (r->resolve_dst == T || r->resolve_dst == S) sy[k].valid = 0;
+                break;
+            case ENG_REC_UPLOAD:
+                if (r->depth == T || r->depth == S) sy[k].valid = 0;
+                break;
+            default:
+                break;
+            }
+        }
         switch (r->kind) {
         case ENG_REC_DRAW:
             eng_encode_draw(r, stage, stage_va);
