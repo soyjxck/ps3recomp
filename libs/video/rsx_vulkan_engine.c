@@ -119,6 +119,15 @@ static PFN_vkDestroyDebugUtilsMessengerEXT vkDestroyDebugUtilsMessengerEXT;
 
 static float s_scale = 1.0f;
 extern volatile int g_rsx_display_reload;   /* rsx_draw_engine.c */
+/* Colour and depth targets made without a seed, zeroed before anything else
+ * in the next list (eng_encode_records). A D3D12 committed resource arrives
+ * zeroed and the title relies on it: its 322x182 bloom targets have a
+ * one-pixel border it never draws, which the blur passes then sample. Here
+ * the memory is a recycled sub-allocation; its leftovers (NaNs, 59328.0)
+ * spread through the blur into coloured blocks at the bottom-left of the
+ * frame and a wrong top row -- the 'shadows' capture's 12 differing frames. */
+static u32 s_clear_new[ENG_MAX_OBJECTS]; static u32 s_clear_new_n;
+static void eng_clear_new(u32 handle) { if (handle && s_clear_new_n < ENG_MAX_OBJECTS) s_clear_new[s_clear_new_n++] = handle; }
 static u32 s_scale_min = 64;
 static u32 sc_dim(u32 v) { u32 r = (u32)((float)v * s_scale + 0.5f); return v && !r ? 1u : r; }
 static u32 sc_pos(u32 v) { return (u32)((float)v * s_scale + 0.5f); }
@@ -1290,6 +1299,7 @@ static u32 eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 h, 
     o->gw = w; o->gh = h;
     o->view = make_view(o->img, vf, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, k_identity);
     o->att = make_view(o->img, vf, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, k_identity);
+    if (!seed || !seed_row_bytes) eng_clear_new(handle);
     if (seed && seed_row_bytes) {
         if (sw == w && sh == h) eng_upload_rows(handle, 0, 0, w, h, seed, seed_row_bytes, h);
         else {
@@ -1341,6 +1351,7 @@ static u32 eng_depth_target_create_host(u32 w, u32 h, u32 gw, u32 gh)
     o->gw = gw; o->gh = gh;
     o->view = make_view(o->img, ENG_DEPTH_FMT, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_DEPTH_BIT, 1, 1, k_identity);
     o->att = make_view(o->img, ENG_DEPTH_FMT, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 1, 1, k_identity);
+    eng_clear_new(handle);
     return handle;
 }
 static u32 eng_depth_target_create(void* user, u32 w, u32 h)

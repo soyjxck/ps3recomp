@@ -45,10 +45,7 @@ static u32 s_cur_rt[RSX_BE_MAX_COLOR_TARGETS], s_cur_nrt, s_cur_depth, s_cur_tw,
 static VkPipeline s_cur_pso;
 static VkDescriptorSet s_cur_set;
 static u64 s_cur_set_key;
-/* Targets eng_rescale made again, cleared before anything else in the next
- * list: their memory is a recycled sub-allocation, and the title does not
- * draw every pixel of every target (garbage showed at the frame's edges). */
-static u32 s_clear_new[ENG_MAX_OBJECTS]; static u32 s_clear_new_n;
+
 static VkPrimitiveTopology s_cur_topo;
 
 static void render_end(void)
@@ -299,7 +296,7 @@ static void eng_encode_records(EngStage* stage)
         obj_layout(o, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         bar_flush();
         if (o->kind == OBJ_DEPTH) {
-            const VkClearDepthStencilValue dv = { 1.0f, 0 };
+            const VkClearDepthStencilValue dv = { 0.0f, 0 };
             VkImageSubresourceRange rg = { VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 0, 1, 0, 1 };
             vkCmdClearDepthStencilImage(s_cmd, o->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &dv, 1, &rg);
         } else {
@@ -1223,7 +1220,7 @@ int rsx_vulkan_engine_active(void) { return s_active; }
  * the device idle, each colour and depth target at the internal resolution
  * is made again at the new one under the same handle (views included), the
  * WPOS-reading pipelines get their fragment program rebuilt, and the
- * fallback depths are dropped. The targets come back empty. */
+ * fallback depths are dropped. The targets come back zeroed. */
 static void eng_rescale(void)
 {
     vkDeviceWaitIdle(s_dev);
@@ -1293,7 +1290,7 @@ static void eng_rescale(void)
                                      eng_mapping(s_view[v].remap, s_view[v].format));
                 vo->w = nw; vo->h = nh;
             }
-        if (s_clear_new_n < ENG_MAX_OBJECTS) s_clear_new[s_clear_new_n++] = h;
+        eng_clear_new(h);
         nt++;
     }
     s_cur_set = VK_NULL_HANDLE;
