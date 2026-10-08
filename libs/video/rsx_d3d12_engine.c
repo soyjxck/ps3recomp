@@ -494,12 +494,47 @@ static ID3D12Resource* make_texture(DXGI_FORMAT fmt, u32 w, u32 h, u32 mips, u32
 /* Bounded fence wait: a device removal leaves the fence unsignaled forever,
  * and an INFINITE wait here would freeze the whole emulation (see
  * rsx_d3d12_backend.c's wait_for_gpu). */
-static void fence_wait(u64 v)
+/* RSX_SYNC_STATS=1: every 5 s, the waits for the GPU that actually blocked,
+ * by the source line that waited, with their count and time -- the walker's
+ * stalls on the real GPU, which the render thread waits behind. */
+static int s_sync_stats = -1;
+static struct { int line; unsigned long long n; double ms; } s_sync_rec[32];
+static void sync_stats_add(int line, double ms)
+{
+    int i;
+    for (i = 0; i < 32 && s_sync_rec[i].line && s_sync_rec[i].line != line; i++) {}
+    if (i == 32) return;
+    s_sync_rec[i].line = line; s_sync_rec[i].n++; s_sync_rec[i].ms += ms;
+    static ULONGLONG last;
+    const ULONGLONG now = GetTickCount64();
+    if (!last) last = now;
+    if (now - last >= 5000) {
+        const double secs = (now - last) / 1000.0;
+        last = now;
+        fprintf(stderr, "[sync-stats] GPU waits that blocked, per second:");
+        for (int k = 0; k < 32 && s_sync_rec[k].line; k++) {
+            if (s_sync_rec[k].n)
+                fprintf(stderr, " line %d %.0f/s %.1f ms/s;", s_sync_rec[k].line,
+                        s_sync_rec[k].n / secs, s_sync_rec[k].ms / secs);
+            s_sync_rec[k].n = 0; s_sync_rec[k].ms = 0;
+        }
+        fputc('\n', stderr);
+    }
+}
+
+static void fence_wait_at(u64 v, int line)
 {
     if (!v || CALL0(s_fence, GetCompletedValue) >= v) return;
+    if (s_sync_stats < 0) s_sync_stats = getenv("RSX_SYNC_STATS") ? 1 : 0;
+    LARGE_INTEGER qf, q0, q1;
+    if (s_sync_stats) { QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&q0); }
     CALL(s_fence, SetEventOnCompletion, v, s_fence_event);
     for (int tries = 0; tries < 5; tries++) {
-        if (WaitForSingleObject(s_fence_event, 2000) != WAIT_TIMEOUT) return;
+        if (WaitForSingleObject(s_fence_event, 2000) != WAIT_TIMEOUT) {
+            if (s_sync_stats) { QueryPerformanceCounter(&q1);
+                sync_stats_add(line, (double)(q1.QuadPart - q0.QuadPart) * 1000.0 / (double)qf.QuadPart); }
+            return;
+        }
         HRESULT rr = CALL0(s_dev, GetDeviceRemovedReason);
         fprintf(stderr, "[rsx engine/d3d12] fence %llu stuck %ds (completed %llu, removed=0x%08lX)\n",
                 (unsigned long long)v, 2 * (tries + 1),
@@ -507,6 +542,7 @@ static void fence_wait(u64 v)
         if (rr != S_OK) { s_ready = 0; return; }
     }
 }
+#define fence_wait(v) fence_wait_at((v), __LINE__)
 static int fence_done(u64 v) { return !v || CALL0(s_fence, GetCompletedValue) >= v; }
 static u64 fence_signal(void)
 {
