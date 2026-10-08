@@ -17,6 +17,7 @@
 #include "spu_interp.h"
 #include "spu_coherency.h"        /* spu_interp_run — un-lifted SPU images */
 #include <string.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -151,6 +152,17 @@ typedef struct spu_run_opts {
     uint32_t group_id;
 } spu_run_opts;
 
+/* Set by a caller that discards the local store after the run (spu_workload.c,
+ * a SPURS task with no persistent LS): the 256 KB copy back out is skipped.
+ * Thread-local, read once per run; every other caller leaves it 0. */
+extern
+#ifdef _MSC_VER
+__declspec(thread)
+#else
+_Thread_local
+#endif
+int g_spu_job_ls_discard;
+
 static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
                                              uint8_t* local_store,
                                              uint32_t args_ea,
@@ -161,7 +173,18 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
 {
     if (!entry) return -1;
     spu_context ctx;
-    spu_context_init(&ctx, 0);
+    /* With a local store to copy in, its 256 KB is overwritten right below:
+     * clear everything but it (the init's memset was a quarter of a MB a
+     * task, ~1000 Havok tasks a second in Drakengard 3's destruction scene). */
+    if (local_store) {
+        memset(&ctx, 0, offsetof(spu_context, ls_store));
+        memset((char*)&ctx + offsetof(spu_context, ls), 0, sizeof ctx - offsetof(spu_context, ls));
+        ctx.ls     = ctx.ls_store;
+        ctx.spu_id = 0;
+        ctx.status = SPU_STATUS_STOPPED;
+    } else {
+        spu_context_init(&ctx, 0);
+    }
     { static int s_cl = -1;
       if (s_cl < 0) s_cl = getenv("SPU_CTX_LOG") ? 1 : 0;
       if (s_cl) { fprintf(stderr, "[spu-ctx] new job context %p image=%d\n",
@@ -338,7 +361,7 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
      * job context never gave it back, so slots were only reused by the next
      * job whose context happened to land at the same stack address. */
     { extern void spu_mfc_release(spu_context*); spu_mfc_release(&ctx); }
-    if (local_store) memcpy(local_store, ctx.ls, SPU_LS_SIZE);  /* LS back out */
+    if (local_store && !g_spu_job_ls_discard) memcpy(local_store, ctx.ls, SPU_LS_SIZE);  /* LS back out */
     return 0;
 }
 

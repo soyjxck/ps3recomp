@@ -777,6 +777,45 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
     ts_unlock();
 }
 
+/* spu_lifted_job.h: a run whose local store is thrown away afterwards skips
+ * the 256 KB copy back out. */
+#ifdef _WIN32
+__declspec(thread) int g_spu_job_ls_discard;
+#else
+_Thread_local int g_spu_job_ls_discard;
+#endif
+
+/* A pool thread keeps one local store for every task it runs, cleared per
+ * task: calloc's fresh pages cost a page fault per 16 KiB on first touch, on
+ * ~1000 Havok tasks a second in Drakengard 3's destruction scene. A thread
+ * per task (SPU_TASK_POOL=0) still callocs and frees. */
+#ifdef _WIN32
+static __declspec(thread) int t_spu_pool_thread;
+static __declspec(thread) uint8_t* t_spu_ls_scratch;
+#else
+static _Thread_local int t_spu_pool_thread;
+static _Thread_local uint8_t* t_spu_ls_scratch;
+#endif
+static uint8_t* spu_task_ls_get(void)
+{
+    if (t_spu_pool_thread) {
+        if (!t_spu_ls_scratch) {
+#ifdef _WIN32
+            t_spu_ls_scratch = (uint8_t*)_aligned_malloc(SPU_LS_SIZE, 128);
+#else
+            void* p = NULL;
+            if (posix_memalign(&p, 128, SPU_LS_SIZE) == 0) t_spu_ls_scratch = (uint8_t*)p;
+#endif
+        }
+        if (t_spu_ls_scratch) { memset(t_spu_ls_scratch, 0, SPU_LS_SIZE); return t_spu_ls_scratch; }
+    }
+    return (uint8_t*)calloc(1, SPU_LS_SIZE);
+}
+static void spu_task_ls_put(uint8_t* ls)
+{
+    if (ls && ls != t_spu_ls_scratch) free(ls);
+}
+
 static void spu_async_run(spu_async_job* j)
 {
     const uint64_t t_begin = j->t_submit ? spu_wl_now_ns() : 0;
@@ -801,7 +840,7 @@ static void spu_async_run(spu_async_job* j)
                     j->taskset_ea, j->taskid, j->image_id,
                     ts_slot->loaded ? "REUSE (state retained)" : "first load"); fflush(stderr); }
     } else {
-        ls = (uint8_t*)calloc(1, SPU_LS_SIZE);
+        ls = spu_task_ls_get();
     }
     if (ls) {
         uint32_t entry = 0;
@@ -1071,8 +1110,12 @@ static void spu_async_run(spu_async_job* j)
             const int took_turn = serial_ts_wait_turn(j->taskset_ea, j->ticket);   /* my turn? */
             spu_serial_acquire();       /* one SPU task runs at a time (LBP_SPU_SERIAL) */
             const uint64_t t_entry = j->t_submit ? spu_wl_now_ns() : 0;
+            /* The local store is not read after this run (no persistent slot,
+             * no dump, not the cri task's resume loop): skip copying it out. */
+            g_spu_job_ls_discard = !ts_slot && j->image_id != spu_cri_image() && !getenv("SPU_LS_DUMP");
             int32_t rc = spu_run_lifted_job_abi(j->fn, ls, j->args_ea, j->image_id,
                                                 1, j->have_r3 ? j->r3 : 0, 0);
+            g_spu_job_ls_discard = 0;
             if (j->t_submit) spu_task_stats_add(j->image_id, j->taskset_ea, j->t_submit, t_begin, t_loaded, t_turn,
                                                 t_entry, spu_wl_now_ns());
             /* YDKJ_CRI_RESUME: a real SPURS task is PERSISTENT -- on yield (num=0)
@@ -1134,7 +1177,7 @@ static void spu_async_run(spu_async_job* j)
         }
         /* Persistent LS is retained in its taskset slot for the next task; a
          * per-dispatch LS is freed. */
-        if (!ts_slot) free(ls);
+        if (!ts_slot) spu_task_ls_put(ls);
     }
     if (ts_slot) {
 #ifdef _WIN32
@@ -1233,6 +1276,7 @@ static DWORD WINAPI spu_pool_thread(LPVOID p)
 {
     spu_pool_worker* w = (spu_pool_worker*)p;
     int named_image = -1;
+    t_spu_pool_thread = 1;
     /* Handler headroom for a stack overflow in lifted SPU code, as in
      * spu_async_thread. */
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
@@ -1347,6 +1391,7 @@ static void spu_forget_own_stack(void)
 static void* spu_pool_thread(void* p)
 {
     spu_pool_worker* w = (spu_pool_worker*)p;
+    t_spu_pool_thread = 1;
     for (;;) {
         pthread_mutex_lock(&w->mu);
         while (!w->job) pthread_cond_wait(&w->cv, &w->mu);
