@@ -1714,7 +1714,8 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                         " %u constants -> %s handle=%u fp-hash=%016llx fp-size=%u blend=%u(%X/%X) vp-hlsl=%016llx fp-hlsl=%016llx vp-start=%u vp-instrs=%u"
                         " prec(h/x12/x9)=%u/%u/%u exptex=%u fp-struct=%016llx\n",
                 (unsigned long long)key, fixed ? "built-in" : "guest",
-                vi, fi, nconst, handle ? "ok" : "FAILED (draw dropped)", handle, fh, fp_size,
+                vi, fi, nconst, handle ? "ok" : job ? "compiling (draw skipped until it is)" : "FAILED (draw dropped)",
+                handle, fh, fp_size,
                 rs->blend_enable, rs->sf_rgb, rs->df_rgb, vh, ph, rsx_dsp_vp_start(&g.rsx), vp_instrs,
                 g_rsx_fp_stats.prec[1], g_rsx_fp_stats.prec[2], g_rsx_fp_stats.prec[3], g_rsx_fp_stats.exp_tex,
                 (unsigned long long)eng_fp_struct_id(fp_uc, fp_size));
