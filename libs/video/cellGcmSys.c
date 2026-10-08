@@ -2769,7 +2769,15 @@ u32 cellGcmResolveLocated(int local, u32 offset)
 {
     if (local)
         return s_config.localAddress + offset;
-    return cellGcmResolveOffset(offset);
+    /* An explicit MAIN location is the register saying "the IO context", so
+     * ask the IO table first and let cellGcmResolveOffset's guess (which
+     * prefers VRAM for any page the title once derived from a LOCAL EA) only
+     * decide pages the table does not cover. Drakengard 3's VRAM texture pool
+     * and the Bink planes it maps per movie at the next free IO pages share
+     * page numbers from 0x10 up: every movie after the first was sampled out
+     * of VRAM and played as audio over a black picture. */
+    u32 ea = cellGcmResolveIO(offset);
+    return ea ? ea : cellGcmResolveOffset(offset);
 }
 
 /* ---------------------------------------------------------------------------
