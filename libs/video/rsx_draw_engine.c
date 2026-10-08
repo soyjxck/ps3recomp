@@ -142,6 +142,7 @@ static struct {
     u32 last_guest_draws;
     u32 last_present_surface;
     u32 last_flip_buffer;
+    u32 sink_flips;          /* flips taken from the FIFO, in order with the draws */
 
     /* staging: decoded texture levels, the constant blocks, the index list */
     u8* tex_staging;
@@ -1620,7 +1621,26 @@ static void sink_flip(void* user, const rsx_dispatch* r, u32 arg)
 {
     (void)user; (void)r;
     g.last_flip_buffer = arg & 7u;
+    g.sink_flips++;
     eng_present(g.last_flip_buffer);
+}
+
+/* A title whose FIFO carries its flips -- the 0xE944 method, or the
+ * 0xFEADxxxx word libgcm's flip and prepare-flip commands write -- presents
+ * through sink_flip or rsx_draw_engine_fifo_flip, in order with its draws.
+ * Once that has happened the host clock's presents are not harmless repeats:
+ * by the time the clock runs, the drain may have gone through several more
+ * frames of commands, and the buffer it names then holds a later frame's
+ * clear. Drakengard 3 clears each display buffer to white for its
+ * light-attenuation pass before drawing into it, so those late presents
+ * flashed white, cyan (a shadow mask) and half-built frames between the
+ * real ones. */
+static int eng_host_present_allowed(void)
+{
+    if (!g.sink_flips) return 1;
+    static int said = 0;
+    if (!said++) fprintf(stderr, "[rsx engine] host presents ignored from now on: this title flips through its FIFO\n");
+    return 0;
 }
 
 /* ---- public API ---------------------------------------------------------- */
@@ -1746,13 +1766,24 @@ void rsx_draw_engine_present(void)
      * re-present a double-buffered title's OTHER scanout. Presenting twice is
      * harmless either way -- the engine never clears the surface, so a second
      * present just blits the same image again. */
+    if (!eng_host_present_allowed()) return;
     eng_present(g.last_flip_buffer);
 }
 
 void rsx_draw_engine_present_buffer(u32 buffer_id)
 {
+    if (!eng_host_present_allowed()) return;
     g.last_flip_buffer = buffer_id & 7u;
     eng_present(g.last_flip_buffer);
+}
+
+int rsx_draw_engine_fifo_flip(u32 buffer_id)
+{
+    if (!g.ready) return 0;
+    g.last_flip_buffer = buffer_id & 7u;
+    g.sink_flips++;
+    eng_present(g.last_flip_buffer);
+    return 1;
 }
 
 u32 rsx_draw_engine_guest_draws(void)
