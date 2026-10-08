@@ -132,3 +132,10 @@ struct host_stub_fentry { uint64_t addr; void* func; const char* name; };
 const struct host_stub_fentry function_table[1] = { { 0, 0, 0 } };
 const uint64_t function_table_count = 0;
 #endif
+
+/* ppu_loader.cpp - the run-time armed store-watch word, and the re-check of
+ * the slow-path flags, that cellGcmSys's FIFO walker and its park
+ * diagnostics reach. Neither host here runs a lifted title, so nothing ever
+ * arms a watch. (rsx_replay links this file for them too.) */
+uint32_t g_ww_dyn = 0;
+void ppu_vm_slow_any_update(void) { }
