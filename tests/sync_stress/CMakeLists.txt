@@ -58,6 +58,9 @@ add_executable(sync_stress
     "${RUNTIME_SYNC_DIR}/sys_semaphore.c"
     "${RUNTIME_SYNC_DIR}/sys_event.c"
     "${RUNTIME_SYNC_DIR}/sys_rwlock.c"
+    # the cached getenv (ps3_getenv_cached, include/ps3emu/env_cache.h) the
+    # sync sources read their knobs through; its table lives here
+    "${PS3RECOMP_TREE_ROOT}/runtime/platform/env_cache.c"
 )
 if(NOT WIN32)
     # The Win32 handle, wait and thread API the harness drives.
