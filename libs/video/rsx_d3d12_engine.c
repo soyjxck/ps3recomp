@@ -100,6 +100,17 @@ typedef struct {
     D3D12_RESOURCE_STATES state;
     int has_rtv, has_dsv;       /* RTV/DSV written at slot handle-1      */
     int retired;
+    /* MSAA (see eng_ms_*): the multisampled twin a 3D pass draws into, made
+     * at the pass's first use; `res` stays the single-sampled one that every
+     * read uses. ms_dirty: the twin has draws `res` lacks, in host pixels
+     * [ms_x0,ms_x1) x [ms_y0,ms_y1). ms_stale: `res` was written another
+     * way (a pass without depth, an upload), so the twin is refreshed from
+     * it (a depth twin: cleared) before its next pass. */
+    ID3D12Resource* ms;
+    D3D12_RESOURCE_STATES ms_state;
+    int ms_dirty, ms_stale;
+    int ms_znewer;              /* a depth twin has passes `res` lacks */
+    u32 ms_x0, ms_y0, ms_x1, ms_y1;
 } EngObj;
 
 /* ---- internal resolution --------------------------------------------------
@@ -180,6 +191,9 @@ typedef struct {
     ID3D12PipelineState* copy_pso[3];
     DXGI_FORMAT copy_fmt[3];
     int copy_failed[3];
+    /* The MSAA build (s_ms_n samples), for passes into MSAA twins. */
+    ID3D12PipelineState* psoms[3];
+    int failedms[3];
 } EngPipeline;
 static const char kSnapCopyHLSL[] =
     "Texture2D rsx_tex[16] : register(t0);\n"
@@ -304,6 +318,9 @@ static ID3D12QueryHeap* s_pheap; static ID3D12Resource* s_pread;
 static ID3D12RootSignature* s_rootsig;
 static ID3D12RootSignature* s_helper_rootsig;
 static ID3D12PipelineState* s_blit_pso, *s_depth_pso, *s_depth_pack_pso;
+static ID3D12PipelineState* s_depth_ms_pso, *s_depth_pack_ms_pso;   /* MSAA depth reads */
+static ID3DBlob* s_helper_vs_blob; static ID3DBlob* s_helper_blit_blob; /* kept: MSAA refresh pipelines */
+static ID3D12PipelineState* s_zcopy_ms_pso;   /* MSAA depth twin -> its single-sampled target */
 static ID3D12PipelineState* s_present_pso, *s_fxaa_pso;   /* rsx_present_passes.h */
 int rsx_aa_mode(void);                                    /* rsx_draw_engine.c */
 static ID3D12Resource* s_null_tex;
@@ -338,9 +355,15 @@ static u32 s_q_vis[ENG_QUERIES_PER_SLOT];     /* vis counter per query of the li
 /* Set on a query whose pass drew into a scaled target: its count is in host
  * pixels and is divided by the scale squared when read. */
 #define ENG_Q_SCALED 0x80000000u
+/* ... and in an MSAA pass a count is of samples: log2 of the sample count
+ * in bits 28-29, divided out when read. */
+#define ENG_Q_MS_SHIFT 28
+#define ENG_Q_INDEX 0x0FFFFFFFu
 static u64 eng_q_count(u32 qv, u64 c)
 {
     if ((qv & ENG_Q_SCALED) && s_scale != 1.0f) c = (u64)((double)c / ((double)s_scale * (double)s_scale) + 0.5);
+    const u32 ms = (qv >> ENG_Q_MS_SHIFT) & 3u;
+    if (ms) c = (c + (1u << ms) / 2) >> ms;
     return c;
 }
 static u32 s_clear_argb;
@@ -509,6 +532,11 @@ static D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle(ID3D12DescriptorHeap* heap, u32 st
 static D3D12_CPU_DESCRIPTOR_HANDLE obj_srv(u32 handle) { return cpu_handle(s_srv_cpu, s_srv_step, handle ? handle - 1 : ENG_SRV_NULL); }
 static D3D12_CPU_DESCRIPTOR_HANDLE obj_rtv(u32 handle) { return cpu_handle(s_rtv_cpu, s_rtv_step, handle - 1); }
 static D3D12_CPU_DESCRIPTOR_HANDLE obj_dsv(u32 handle) { return cpu_handle(s_dsv_cpu, s_dsv_step, handle - 1); }
+/* The MSAA twins' views, at the same slots in heaps of their own. */
+static ID3D12DescriptorHeap* s_rtv_ms; static ID3D12DescriptorHeap* s_dsv_ms; static ID3D12DescriptorHeap* s_srv_ms;
+static D3D12_CPU_DESCRIPTOR_HANDLE obj_rtv_ms(u32 handle) { return cpu_handle(s_rtv_ms, s_rtv_step, handle - 1); }
+static D3D12_CPU_DESCRIPTOR_HANDLE obj_dsv_ms(u32 handle) { return cpu_handle(s_dsv_ms, s_dsv_step, handle - 1); }
+static D3D12_CPU_DESCRIPTOR_HANDLE obj_srv_ms(u32 handle) { return cpu_handle(s_srv_ms, s_srv_step, handle - 1); }
 
 static EngObj* eng_obj(u32 handle)
 {
@@ -681,6 +709,7 @@ static void eng_collect_retired(void)
             o->res = NULL;
         }
         RELEASE(o->res);
+        RELEASE(o->ms);
         memset(o, 0, sizeof *o);
         s_obj_free[s_obj_free_count++] = h - 1;
     }
@@ -941,6 +970,16 @@ static const char kHelperHLSL[] =
     "float4 ps_pack(VSOut i) : SV_Target {\n"
     "    uint v = uint(saturate(dsrc.Load(int3(i.pos.xy, 0))) * 16777215.0 + 0.5);\n"
     "    return float4(float((v >> 8) & 255u), float(v & 255u), 0.0, float((v >> 16) & 255u)) / 255.0;\n"
+    "}\n"
+    /* The same from an MSAA depth twin: its first sample. */
+    "Texture2DMS<float> dms : register(t0);\n"
+    "float ps_depth_ms(VSOut i) : SV_Target { return dms.Load(int2(i.pos.xy), 0); }\n"
+    /* ... and as depth: the twin's first sample into the single-sampled
+     * depth target, for a pass that is not multisampled. */
+    "float ps_zcopy_ms(VSOut i) : SV_Depth { return dms.Load(int2(i.pos.xy), 0); }\n"
+    "float4 ps_pack_ms(VSOut i) : SV_Target {\n"
+    "    uint v = uint(saturate(dms.Load(int2(i.pos.xy), 0)) * 16777215.0 + 0.5);\n"
+    "    return float4(float((v >> 8) & 255u), float(v & 255u), 0.0, float((v >> 16) & 255u)) / 255.0;\n"
     "}\n";
 
 static ID3DBlob* eng_compile(const char* src, u32 len, const char* entry, const char* target, const char* what)
@@ -1166,6 +1205,9 @@ static int eng_init_device(u32 width, u32 height)
     s_srv_cpu = eng_make_heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, ENG_MAX_OBJECTS + 1, 0);
     s_rtv_cpu = eng_make_heap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, ENG_MAX_OBJECTS, 0);
     s_dsv_cpu = eng_make_heap(D3D12_DESCRIPTOR_HEAP_TYPE_DSV, ENG_MAX_OBJECTS, 0);
+    s_rtv_ms = eng_make_heap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, ENG_MAX_OBJECTS, 0);
+    s_dsv_ms = eng_make_heap(D3D12_DESCRIPTOR_HEAP_TYPE_DSV, ENG_MAX_OBJECTS, 0);
+    s_srv_ms = eng_make_heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, ENG_MAX_OBJECTS, 0);
     s_smp_cpu = eng_make_heap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, ENG_MAX_SAMPLERS + 1, 0);
     s_srv_gpu = eng_make_heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, ENG_FRAMES * ENG_SRV_PER_SLOT, 1);
     if (!s_srv_cpu || !s_rtv_cpu || !s_dsv_cpu || !s_smp_cpu || !s_srv_gpu) return -1;
@@ -1226,7 +1268,32 @@ static int eng_init_device(u32 width, u32 height)
           RELEASE(pvs); RELEASE(pa); RELEASE(pf); }
         if (vs && pd) s_depth_pso = eng_helper_pso(vs, pd, DXGI_FORMAT_R32_FLOAT);
         if (vs && pp) s_depth_pack_pso = eng_helper_pso(vs, pp, DXGI_FORMAT_R8G8B8A8_UNORM);
-        RELEASE(vs); RELEASE(pb); RELEASE(pd); RELEASE(pp);
+        { ID3DBlob* pdm = eng_compile(kHelperHLSL, sizeof kHelperHLSL - 1, "ps_depth_ms", "ps_5_0", "helper depth ms");
+          ID3DBlob* ppm = eng_compile(kHelperHLSL, sizeof kHelperHLSL - 1, "ps_pack_ms", "ps_5_0", "helper pack ms");
+          if (vs && pdm) s_depth_ms_pso = eng_helper_pso(vs, pdm, DXGI_FORMAT_R32_FLOAT);
+          if (vs && ppm) s_depth_pack_ms_pso = eng_helper_pso(vs, ppm, DXGI_FORMAT_R8G8B8A8_UNORM);
+          ID3DBlob* pz = eng_compile(kHelperHLSL, sizeof kHelperHLSL - 1, "ps_zcopy_ms", "ps_5_0", "helper zcopy ms");
+          if (vs && pz) {
+              D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
+              pd.pRootSignature = s_helper_rootsig;
+              pd.VS.pShaderBytecode = CALL0(vs, GetBufferPointer); pd.VS.BytecodeLength = CALL0(vs, GetBufferSize);
+              pd.PS.pShaderBytecode = CALL0(pz, GetBufferPointer); pd.PS.BytecodeLength = CALL0(pz, GetBufferSize);
+              pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+              pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+              pd.SampleMask = UINT_MAX;
+              pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+              pd.NumRenderTargets = 0;
+              pd.DSVFormat = ENG_DEPTH_FMT;
+              pd.DepthStencilState.DepthEnable = TRUE;
+              pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+              pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+              pd.SampleDesc.Count = 1;
+              if (FAILED(CALL(s_dev, CreateGraphicsPipelineState, &pd, &IID_ID3D12PipelineState, (void**)&s_zcopy_ms_pso)))
+                  s_zcopy_ms_pso = NULL;
+          }
+          RELEASE(pdm); RELEASE(ppm); RELEASE(pz); }
+        s_helper_vs_blob = vs; s_helper_blit_blob = pb;   /* kept */
+        RELEASE(pd); RELEASE(pp);
         if (!s_blit_pso) return -1;
     }
     if (s_headless) {
@@ -2181,7 +2248,7 @@ static void eng_hard_flush(void)
         D3D12_RANGE rg = { (SIZE_T)s_slot * ENG_QUERIES_PER_SLOT * 8u, ((SIZE_T)s_slot * ENG_QUERIES_PER_SLOT + s_q_used) * 8u };
         u64* p = NULL;
         if (SUCCEEDED(CALL(s_qread, Map, 0, &rg, (void**)&p))) {
-            for (u32 i = 0; i < s_q_used; i++) s_vis_count[s_q_vis[i] & ~ENG_Q_SCALED] += eng_q_count(s_q_vis[i], p[s_slot * ENG_QUERIES_PER_SLOT + i]);
+            for (u32 i = 0; i < s_q_used; i++) s_vis_count[s_q_vis[i] & ENG_Q_INDEX] += eng_q_count(s_q_vis[i], p[s_slot * ENG_QUERIES_PER_SLOT + i]);
             D3D12_RANGE wr = {0, 0}; CALL(s_qread, Unmap, 0, &wr);
         }
     }
@@ -2277,6 +2344,242 @@ static void eng_encode_upload(const EngRecord* r, ID3D12Resource* stage)
     s_gt_copies++;
 }
 
+/* ---- MSAA ----------------------------------------------------------------------
+ *
+ * RSX_AA=msaa2|msaa4|msaa8 (the Graphics Settings page's Anti-Aliasing). A
+ * pass is drawn multisampled when it has a real depth target and every
+ * attachment is a full-size target (guest 960x540 or more): the 3D scene,
+ * not the post-process chain or the UI. Its attachments get multisampled
+ * twins at that first pass (EngObj.ms); every read of a target -- a texture,
+ * a snapshot, a copy, the present, a readback -- still reads the
+ * single-sampled resource, which the twin is resolved into (only the region
+ * its draws touched) before anything reads it: when a pass reads it as a
+ * texture, before any other record touches it, and at the end of a list.
+ * Depth is not resolved: the depth-to-colour copies read a twin's first
+ * sample (ps_depth_ms). A pass without depth into a target with a twin
+ * draws single-sampled and marks the twin stale; the next 3D pass refreshes
+ * it from the resolved one. Occlusion counts are divided by the samples. */
+static u32 s_ms_n = 1;          /* samples in use: 1, 2, 4, 8 */
+static ID3D12GraphicsCommandList1* s_list1;   /* ResolveSubresourceRegion */
+static u32 s_ms_open[64]; static u32 s_ms_open_n;   /* twins with draws not yet resolved */
+static int eng_ms_want(void)
+{
+    const int m = rsx_aa_mode();
+    return m == 2 || m == 4 || m == 8 ? m : 1;
+}
+static int eng_ms_format_ok(DXGI_FORMAT f, u32 n)
+{
+    D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS q = {0};
+    q.Format = f; q.SampleCount = n;
+    return SUCCEEDED(CALL(s_dev, CheckFeatureSupport, D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &q, sizeof q)) && q.NumQualityLevels > 0;
+}
+static int eng_ms_ok(const EngObj* o)
+{
+    if (s_ms_n < 2 || !o || o->retired || !o->res) return 0;
+    if (o->kind != OBJ_COLOR && o->kind != OBJ_DEPTH) return 0;
+    if (o->gw < 960 || o->gh < 540) return 0;
+    static struct { DXGI_FORMAT f; u32 n; int ok; } cache[16]; static u32 nc;
+    const DXGI_FORMAT f = o->kind == OBJ_DEPTH ? ENG_DEPTH_FMT : o->fmt;
+    for (u32 i = 0; i < nc; i++) if (cache[i].f == f && cache[i].n == s_ms_n) return cache[i].ok;
+    const int ok = eng_ms_format_ok(f, s_ms_n);
+    if (nc < 16) { cache[nc].f = f; cache[nc].n = s_ms_n; cache[nc].ok = ok; nc++; }
+    return ok;
+}
+/* The twin and its views. A colour twin starts stale (refreshed from the
+ * resolved target), a depth twin cleared, before its first pass. */
+static int eng_ms_make(u32 h)
+{
+    EngObj* o = eng_obj(h);
+    if (!o) return 0;
+    if (o->ms) return 1;
+    const int depth = o->kind == OBJ_DEPTH;
+    D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC td = {0};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = o->w; td.Height = o->h; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = depth ? ENG_DEPTH_RES_FMT : o->fmt; td.SampleDesc.Count = s_ms_n;
+    td.Flags = depth ? D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL : D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    D3D12_CLEAR_VALUE cv = {0};
+    cv.Format = depth ? ENG_DEPTH_FMT : o->fmt;
+    if (depth) cv.DepthStencil.Depth = 1.0f;
+    const D3D12_RESOURCE_STATES st = depth ? D3D12_RESOURCE_STATE_DEPTH_WRITE : D3D12_RESOURCE_STATE_RENDER_TARGET;
+    if (FAILED(CALL(s_dev, CreateCommittedResource, &hp, D3D12_HEAP_FLAG_NONE, &td, st, &cv,
+                    &IID_ID3D12Resource, (void**)&o->ms))) {
+        static int n = 0;
+        if (n++ < 4) fprintf(stderr, "[rsx engine/d3d12] MSAA x%u target %ux%u failed\n", s_ms_n, o->w, o->h);
+        o->ms = NULL;
+        return 0;
+    }
+    o->ms_state = st;
+    if (depth) {
+        D3D12_DEPTH_STENCIL_VIEW_DESC dd = {0};
+        dd.Format = ENG_DEPTH_FMT; dd.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DMS;
+        CALL(s_dev, CreateDepthStencilView, o->ms, &dd, obj_dsv_ms(h));
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd = {0};
+        sd.Format = ENG_DEPTH_SRV_FMT; sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        CALL(s_dev, CreateShaderResourceView, o->ms, &sd, obj_srv_ms(h));
+    } else {
+        D3D12_RENDER_TARGET_VIEW_DESC rd = {0};
+        rd.Format = o->fmt; rd.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMS;
+        CALL(s_dev, CreateRenderTargetView, o->ms, &rd, obj_rtv_ms(h));
+    }
+    o->ms_dirty = 0; o->ms_stale = 1;
+    return 1;
+}
+/* The twin's draws into the single-sampled target: the region they touched. */
+static void eng_ms_resolve(u32 h)
+{
+    EngObj* o = eng_obj(h);
+    if (!o || !o->ms || !o->ms_dirty || o->kind != OBJ_COLOR) { if (o) o->ms_dirty = 0; return; }
+    u32 x0 = o->ms_x0, y0 = o->ms_y0, x1 = o->ms_x1 < o->w ? o->ms_x1 : o->w, y1 = o->ms_y1 < o->h ? o->ms_y1 : o->h;
+    o->ms_dirty = 0;
+    if (x0 >= x1 || y0 >= y1) return;
+    res_transition(o->ms, &o->ms_state, D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+    res_transition(o->res, &o->state, D3D12_RESOURCE_STATE_RESOLVE_DEST);
+    bar_flush();
+    if (!s_list1) CALL(s_list, QueryInterface, &IID_ID3D12GraphicsCommandList1, (void**)&s_list1);
+    if (s_list1 && (x0 || y0 || x1 < o->w || y1 < o->h)) {
+        D3D12_RECT rc = { (LONG)x0, (LONG)y0, (LONG)x1, (LONG)y1 };
+        CALL(s_list1, ResolveSubresourceRegion, o->res, 0, x0, y0, o->ms, 0, &rc, o->fmt, D3D12_RESOLVE_MODE_AVERAGE);
+    } else {
+        CALL(s_list, ResolveSubresource, o->res, 0, o->ms, 0, o->fmt);
+    }
+}
+static void eng_ms_resolve_all(void)
+{
+    for (u32 i = 0; i < s_ms_open_n; i++) eng_ms_resolve(s_ms_open[i]);
+    s_ms_open_n = 0;
+}
+static void eng_ms_touch(u32 h, const D3D12_RECT* sc)
+{
+    EngObj* o = eng_obj(h);
+    if (!o || !o->ms) return;
+    const u32 x0 = sc->left > 0 ? (u32)sc->left : 0, y0 = sc->top > 0 ? (u32)sc->top : 0;
+    const u32 x1 = (u32)sc->right, y1 = (u32)sc->bottom;
+    if (!o->ms_dirty) {
+        o->ms_x0 = x0; o->ms_y0 = y0; o->ms_x1 = x1; o->ms_y1 = y1; o->ms_dirty = 1;
+        if (s_ms_open_n < 64) s_ms_open[s_ms_open_n++] = h; else eng_ms_resolve(h);
+    } else {
+        if (x0 < o->ms_x0) o->ms_x0 = x0;
+        if (y0 < o->ms_y0) o->ms_y0 = y0;
+        if (x1 > o->ms_x1) o->ms_x1 = x1;
+        if (y1 > o->ms_y1) o->ms_y1 = y1;
+    }
+}
+/* A stale colour twin is drawn over with its resolved target (a blit per
+ * format and sample count); a stale depth twin cleared. */
+static ID3D12PipelineState* eng_ms_refresh_pso(DXGI_FORMAT f)
+{
+    static struct { DXGI_FORMAT f; u32 n; ID3D12PipelineState* pso; } cache[16]; static u32 nc;
+    for (u32 i = 0; i < nc; i++) if (cache[i].f == f && cache[i].n == s_ms_n) return cache[i].pso;
+    if (!s_helper_vs_blob || !s_helper_blit_blob) return NULL;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
+    pd.pRootSignature = s_helper_rootsig;
+    pd.VS.pShaderBytecode = CALL0(s_helper_vs_blob, GetBufferPointer); pd.VS.BytecodeLength = CALL0(s_helper_vs_blob, GetBufferSize);
+    pd.PS.pShaderBytecode = CALL0(s_helper_blit_blob, GetBufferPointer); pd.PS.BytecodeLength = CALL0(s_helper_blit_blob, GetBufferSize);
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = UINT_MAX;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1; pd.RTVFormats[0] = f;
+    pd.SampleDesc.Count = s_ms_n;
+    ID3D12PipelineState* pso = NULL;
+    if (FAILED(CALL(s_dev, CreateGraphicsPipelineState, &pd, &IID_ID3D12PipelineState, (void**)&pso))) pso = NULL;
+    if (nc < 16) { cache[nc].f = f; cache[nc].n = s_ms_n; cache[nc].pso = pso; nc++; }
+    return pso;
+}
+static void eng_ms_refresh(u32 h)
+{
+    EngObj* o = eng_obj(h);
+    if (!o || !o->ms || !o->ms_stale) return;
+    o->ms_stale = 0;
+    if (o->kind == OBJ_DEPTH) {
+        res_transition(o->ms, &o->ms_state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        bar_flush();
+        CALL(s_list, ClearDepthStencilView, obj_dsv_ms(h), D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, NULL);
+        return;
+    }
+    ID3D12PipelineState* pso = eng_ms_refresh_pso(o->fmt);
+    if (!pso) return;
+    res_transition(o->res, &o->state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    res_transition(o->ms, &o->ms_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    bar_flush();
+    eng_fullscreen_pass(pso, obj_rtv_ms(h), o->w, o->h, obj_srv(h));
+}
+/* A single-sampled pass bound to a depth target whose twin has the 3D
+ * passes' depth -- Drakengard 3 draws a 640x360 pass against its 1280x720
+ * depth -- gets the twin's first sample in the target first (depth only:
+ * the stencil the target has stays). */
+static void eng_ms_depth_sync(u32 h)
+{
+    EngObj* o = eng_obj(h);
+    if (!o || !o->ms || !o->ms_znewer || !s_zcopy_ms_pso) return;
+    o->ms_znewer = 0;
+    res_transition(o->ms, &o->ms_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    res_transition(o->res, &o->state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    bar_flush();
+    eng_use_helper_rootsig();
+    const D3D12_CPU_DESCRIPTOR_HANDLE dsv = obj_dsv(h);
+    CALL(s_list, OMSetRenderTargets, 0, NULL, FALSE, &dsv);
+    D3D12_VIEWPORT vp = { 0.0f, 0.0f, (float)o->w, (float)o->h, 0.0f, 1.0f };
+    D3D12_RECT sc = { 0, 0, (LONG)o->w, (LONG)o->h };
+    CALL(s_list, RSSetViewports, 1, &vp);
+    CALL(s_list, RSSetScissorRects, 1, &sc);
+    CALL(s_list, SetPipelineState, s_zcopy_ms_pso);
+    CALL(s_list, IASetPrimitiveTopology, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    s_cur_topo = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    const D3D12_CPU_DESCRIPTOR_HANDLE srv = obj_srv_ms(h);
+    CALL(s_list, SetGraphicsRootDescriptorTable, 0, eng_srv_table(&srv, 1));
+    CALL(s_list, DrawInstanced, 3, 1, 0, 0);
+    s_cur_pso = NULL; s_cur_targets_valid = 0;
+}
+
+static ID3D12PipelineState* eng_pso_ms(u32 pipeline, int cls)
+{
+    if (!pipeline || pipeline > s_pipe_count) return NULL;
+    EngPipeline* p = &s_pipe[pipeline - 1];
+    if (!p->vs || p->failedms[cls]) return NULL;
+    if (p->psoms[cls]) return p->psoms[cls];
+    AcquireSRWLockExclusive(&s_pipe_lock);
+    if (!p->psoms[cls] && !p->failedms[cls]) {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = p->desc;
+        pd.InputLayout.pInputElementDescs = pd.InputLayout.NumElements ? p->il : NULL;
+        pd.PrimitiveTopologyType = cls == 0 ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT
+                                 : cls == 1 ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE
+                                            : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pd.SampleDesc.Count = s_ms_n; pd.SampleDesc.Quality = 0;
+        pd.RasterizerState.MultisampleEnable = TRUE;
+        if (FAILED(CALL(s_dev, CreateGraphicsPipelineState, &pd, &IID_ID3D12PipelineState, (void**)&p->psoms[cls]))) {
+            p->failedms[cls] = 1; p->psoms[cls] = NULL;
+        }
+    }
+    ReleaseSRWLockExclusive(&s_pipe_lock);
+    return p->psoms[cls];
+}
+/* A new sample count (or off): the twins and the MSAA builds dropped; twins
+ * are made again at their next MSAA pass. Lists are drained first. */
+static void eng_ms_apply(int want)
+{
+    fence_wait(fence_signal());
+    for (u32 i = 0; i < s_obj_count; i++) {
+        EngObj* o = &s_obj[i];
+        RELEASE(o->ms);
+        o->ms_dirty = o->ms_stale = o->ms_znewer = 0;
+    }
+    s_ms_open_n = 0;
+    AcquireSRWLockExclusive(&s_pipe_lock);
+    for (u32 i = 0; i < s_pipe_count; i++)
+        for (int c = 0; c < 3; c++) { RELEASE(s_pipe[i].psoms[c]); s_pipe[i].failedms[c] = 0; }
+    ReleaseSRWLockExclusive(&s_pipe_lock);
+    u32 n = (u32)want;
+    while (n > 1 && !(eng_ms_format_ok(DXGI_FORMAT_R8G8B8A8_UNORM, n) && eng_ms_format_ok(DXGI_FORMAT_R16G16B16A16_FLOAT, n) &&
+                      eng_ms_format_ok(ENG_DEPTH_FMT, n))) n >>= 1;
+    s_ms_n = n ? n : 1;
+    fprintf(stderr, "[RSX d3d12] MSAA %s\n", s_ms_n > 1 ? (s_ms_n == 2 ? "x2" : s_ms_n == 4 ? "x4" : "x8") : "off");
+}
+
 static void eng_encode_draw(const EngRecord* r, ID3D12Resource* stage, D3D12_GPU_VIRTUAL_ADDRESS stage_va)
 {
     /* Attachments: target A's size rules, as the Metal engine. */
@@ -2294,15 +2597,43 @@ static void eng_encode_draw(const EngRecord* r, ID3D12Resource* stage, D3D12_GPU
     EngObj* z = eng_owner(depth);
     if (z && !z->has_dsv) { z = NULL; depth = 0; }
     if (!nrt && !z) return;
+    const int real_depth = z != NULL;
     if (!z) { depth = eng_fallback_depth(tw, th); z = eng_owner(depth); if (!z) return; }
     if (!nrt) { tw = z->w; th = z->h; }
     /* The pass's scale is its first colour target's, else its depth's. */
     const int scaled = eng_obj_scaled(nrt ? r->rt[0] : depth);
-    ID3D12PipelineState* pso = eng_pso_for(r->pipeline, topo_class(r->topology), !scaled);
-    if (!pso) return;
 
-    for (u32 k = 0; k < nrt; k++) obj_transition(r->rt[k], D3D12_RESOURCE_STATE_RENDER_TARGET);
-    obj_transition(depth, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    /* MSAA: a 3D pass (a real depth target) whose attachments are all
+     * full-size targets draws into their multisampled twins. */
+    int ms = s_ms_n > 1 && real_depth && eng_ms_ok(z);
+    for (u32 k = 0; ms && k < nrt; k++) ms = eng_ms_ok(eng_owner(r->rt[k]));
+    if (ms) {
+        ms = eng_ms_make(depth);
+        for (u32 k = 0; ms && k < nrt; k++) ms = eng_ms_make(r->rt[k]);
+    }
+    ID3D12PipelineState* pso = ms ? eng_pso_ms(r->pipeline, topo_class(r->topology))
+                                  : eng_pso_for(r->pipeline, topo_class(r->topology), !scaled);
+    if (!pso) return;
+    if (ms) {
+        for (u32 k = 0; k < nrt; k++) {
+            if (eng_obj(r->rt[k])->ms_stale) eng_ms_refresh(r->rt[k]);
+            rtv[k] = obj_rtv_ms(r->rt[k]);
+        }
+        if (z->ms_stale) eng_ms_refresh(depth);
+        z->ms_znewer = 1;
+        for (u32 k = 0; k < nrt; k++) { EngObj* o = eng_obj(r->rt[k]); res_transition(o->ms, &o->ms_state, D3D12_RESOURCE_STATE_RENDER_TARGET); }
+        res_transition(z->ms, &z->ms_state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    } else {
+        /* Drawn single-sampled into a target with a twin: the target must
+         * have the twin's draws first, and the twin is stale after. */
+        for (u32 k = 0; k < nrt; k++) {
+            EngObj* o = eng_owner(r->rt[k]);
+            if (o && o->ms) { if (o->ms_dirty) eng_ms_resolve(r->rt[k]); o->ms_stale = 1; }
+        }
+        if (z->ms && z->ms_znewer) eng_ms_depth_sync(depth);
+        for (u32 k = 0; k < nrt; k++) obj_transition(r->rt[k], D3D12_RESOURCE_STATE_RENDER_TARGET);
+        obj_transition(depth, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    }
 
     /* Textures, with a unit that names one of this draw's own targets bound
      * to the null texture rather than left in a read/write hazard. */
@@ -2316,16 +2647,19 @@ static void eng_encode_draw(const EngRecord* r, ID3D12Resource* stage, D3D12_GPU
             if (z == o) hazard = 1;
         }
         if (!o || hazard) { srv[u] = obj_srv(0); continue; }
+        if (o->ms && o->ms_dirty) eng_ms_resolve((u32)(o - s_obj) + 1);
         obj_transition(h, ENG_SHADER_READ);
         srv[u] = obj_srv(h);
     }
     bar_flush();
     eng_use_main_rootsig();
 
-    int same_targets = s_cur_targets_valid && s_cur_nrt == nrt && s_cur_depth == depth;
+    static int s_cur_ms;
+    int same_targets = s_cur_targets_valid && s_cur_nrt == nrt && s_cur_depth == depth && s_cur_ms == ms;
     for (u32 k = 0; same_targets && k < nrt; k++) same_targets = s_cur_rt[k] == r->rt[k];
     if (!same_targets) {
-        D3D12_CPU_DESCRIPTOR_HANDLE dsv = obj_dsv(depth);
+        s_cur_ms = ms;
+        D3D12_CPU_DESCRIPTOR_HANDLE dsv = ms ? obj_dsv_ms(depth) : obj_dsv(depth);
         CALL(s_list, OMSetRenderTargets, nrt, nrt ? rtv : NULL, FALSE, &dsv);
         for (u32 k = 0; k < RSX_BE_MAX_COLOR_TARGETS; k++) s_cur_rt[k] = k < nrt ? r->rt[k] : 0;
         s_cur_nrt = nrt; s_cur_depth = depth; s_cur_targets_valid = 1;
@@ -2363,7 +2697,7 @@ static void eng_encode_draw(const EngRecord* r, ID3D12Resource* stage, D3D12_GPU
         /* A hard flush inside eng_srv_table rebound everything. */
         if (s_cur_pso != pso) {
             CALL(s_list, SetPipelineState, pso); s_cur_pso = pso;
-            D3D12_CPU_DESCRIPTOR_HANDLE dsv = obj_dsv(depth);
+            D3D12_CPU_DESCRIPTOR_HANDLE dsv = ms ? obj_dsv_ms(depth) : obj_dsv(depth);
             CALL(s_list, OMSetRenderTargets, nrt, nrt ? rtv : NULL, FALSE, &dsv);
             for (u32 k = 0; k < RSX_BE_MAX_COLOR_TARGETS; k++) s_cur_rt[k] = k < nrt ? r->rt[k] : 0;
             s_cur_nrt = nrt; s_cur_depth = depth; s_cur_targets_valid = 1;
@@ -2393,7 +2727,12 @@ static void eng_encode_draw(const EngRecord* r, ID3D12Resource* stage, D3D12_GPU
     s_gt_draws++;
     if (r->index_count) CALL(s_list, DrawIndexedInstanced, r->index_count, 1, 0, 0, 0);
     else                CALL(s_list, DrawInstanced, r->vertex_count, 1, 0, 0);
-    if (query) { CALL(s_list, EndQuery, s_qheap, D3D12_QUERY_TYPE_OCCLUSION, qi); s_q_vis[s_q_used++] = (r->vis - 1) | (scaled ? ENG_Q_SCALED : 0u); }
+    if (query) {
+        CALL(s_list, EndQuery, s_qheap, D3D12_QUERY_TYPE_OCCLUSION, qi);
+        const u32 lg = !ms ? 0u : s_ms_n == 2 ? 1u : s_ms_n == 4 ? 2u : 3u;
+        s_q_vis[s_q_used++] = (r->vis - 1) | (scaled ? ENG_Q_SCALED : 0u) | (lg << ENG_Q_MS_SHIFT);
+    }
+    if (ms) for (u32 k = 0; k < nrt; k++) eng_ms_touch(r->rt[k], &sc);
 }
 
 /* ---- incremental own-target snapshots --------------------------------------
@@ -2625,6 +2964,7 @@ static void eng_encode_records(ID3D12Resource* stage, D3D12_GPU_VIRTUAL_ADDRESS 
         if (s_pheap) eng_pass_mark(r, &pass_key);
         if (r->kind == ENG_REC_COLOR_COPY) {
             const u32 T = r->depth, S = r->resolve_dst;
+            { EngObj* t = eng_owner(T); if (t && t->ms && t->ms_dirty) eng_ms_resolve((u32)(t - s_obj) + 1); }
             u32 k = 0;
             while (k < nsy && sy[k].surf != T) k++;
             int done = 0;
@@ -2698,15 +3038,23 @@ static void eng_encode_records(ID3D12Resource* stage, D3D12_GPU_VIRTUAL_ADDRESS 
         case ENG_REC_DRAW:
             eng_encode_draw(r, stage, stage_va);
             break;
-        case ENG_REC_UPLOAD:
+        case ENG_REC_UPLOAD: {
+            EngObj* o = eng_owner(r->depth);
+            if (o && o->ms) { if (o->ms_dirty) eng_ms_resolve((u32)(o - s_obj) + 1); o->ms_stale = 1; }
             eng_encode_upload(r, stage);
-            break;
+            break; }
         case ENG_REC_CLEAR_COLOR: {
             EngObj* o = eng_owner(r->rt[0]);
             if (!o || !o->has_rtv) break;
             obj_transition(r->rt[0], D3D12_RESOURCE_STATE_RENDER_TARGET);
+            if (o->ms) res_transition(o->ms, &o->ms_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
             bar_flush();
             CALL(s_list, ClearRenderTargetView, obj_rtv(r->rt[0]), r->clear_rgba, 0, NULL);
+            if (o->ms) {   /* both cleared: nothing to resolve or refresh */
+                const u32 oh = (u32)(o - s_obj) + 1;
+                CALL(s_list, ClearRenderTargetView, obj_rtv_ms(oh), r->clear_rgba, 0, NULL);
+                o->ms_dirty = 0; o->ms_stale = 0;
+            }
             break; }
         case ENG_REC_CLEAR_DS:
         case ENG_REC_CLEAR_DS_RECT: {
@@ -2717,7 +3065,9 @@ static void eng_encode_records(ID3D12Resource* stage, D3D12_GPU_VIRTUAL_ADDRESS 
             if (r->clear_flags & RSX_BE_CLEAR_STENCIL) f |= D3D12_CLEAR_FLAG_STENCIL;
             if (!f) break;
             obj_transition(r->depth, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+            if (z->ms) res_transition(z->ms, &z->ms_state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
             bar_flush();
+            const u32 zh = (u32)(z - s_obj) + 1;
             if (r->kind == ENG_REC_CLEAR_DS_RECT) {
                 u32 x = r->clear_rect[0], y = r->clear_rect[1], w = r->clear_rect[2], h = r->clear_rect[3];
                 if (x >= z->w || y >= z->h) break;
@@ -2725,13 +3075,20 @@ static void eng_encode_records(ID3D12Resource* stage, D3D12_GPU_VIRTUAL_ADDRESS 
                 if (y + h > z->h) h = z->h - y;
                 D3D12_RECT rc = { (LONG)x, (LONG)y, (LONG)(x + w), (LONG)(y + h) };
                 CALL(s_list, ClearDepthStencilView, obj_dsv(r->depth), f, r->clear_depth, r->clear_stencil, 1, &rc);
+                if (z->ms) CALL(s_list, ClearDepthStencilView, obj_dsv_ms(zh), f, r->clear_depth, r->clear_stencil, 1, &rc);
             } else {
                 CALL(s_list, ClearDepthStencilView, obj_dsv(r->depth), f, r->clear_depth, r->clear_stencil, 0, NULL);
+                if (z->ms) {
+                    CALL(s_list, ClearDepthStencilView, obj_dsv_ms(zh), f, r->clear_depth, r->clear_stencil, 0, NULL);
+                    if (f == (D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL)) z->ms_stale = 0;
+                    if (f & D3D12_CLEAR_FLAG_DEPTH) z->ms_znewer = 0;
+                }
             }
             break; }
         case ENG_REC_COLOR_COPY: {
             EngObj* src = eng_owner(r->depth); EngObj* dst = eng_owner(r->resolve_dst);
             if (!src || !dst) break;
+            if (src->ms && src->ms_dirty) eng_ms_resolve((u32)(src - s_obj) + 1);
             res_transition(src->res, &src->state, D3D12_RESOURCE_STATE_COPY_SOURCE);
             res_transition(dst->res, &dst->state, D3D12_RESOURCE_STATE_COPY_DEST);
             bar_flush();
@@ -2741,6 +3098,15 @@ static void eng_encode_records(ID3D12Resource* stage, D3D12_GPU_VIRTUAL_ADDRESS 
             EngObj* src = eng_owner(r->depth); EngObj* dst = eng_owner(r->resolve_dst);
             ID3D12PipelineState* pso = r->resolve_packed ? s_depth_pack_pso : s_depth_pso;
             if (!src || !dst || !dst->has_rtv || !pso) break;
+            /* An MSAA depth twin holds the depth: its first sample. */
+            ID3D12PipelineState* pms = r->resolve_packed ? s_depth_pack_ms_pso : s_depth_ms_pso;
+            if (src->ms && pms && src->w == dst->w && src->h == dst->h) {
+                res_transition(src->ms, &src->ms_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                res_transition(dst->res, &dst->state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                bar_flush();
+                eng_fullscreen_pass(pms, obj_rtv(r->resolve_dst), dst->w, dst->h, obj_srv_ms((u32)(src - s_obj) + 1));
+                break;
+            }
             res_transition(src->res, &src->state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             res_transition(dst->res, &dst->state, D3D12_RESOURCE_STATE_RENDER_TARGET);
             bar_flush();
@@ -2748,6 +3114,9 @@ static void eng_encode_records(ID3D12Resource* stage, D3D12_GPU_VIRTUAL_ADDRESS 
             break; }
         }
     }
+    /* Every twin's draws into its target before the list ends: the present,
+     * readbacks and the next list read the targets. */
+    eng_ms_resolve_all();
     /* Close the last pass. */
     if (s_pheap && s_pass_n[s_slot])
         CALL(s_list, EndQuery, s_pheap, D3D12_QUERY_TYPE_TIMESTAMP, s_slot * (ENG_PASS_MAX + 1u) + s_pass_n[s_slot]);
@@ -2803,7 +3172,7 @@ static void eng_poll_submits(void)
             D3D12_RANGE rg = { (SIZE_T)s->q_slot * ENG_QUERIES_PER_SLOT * 8u, ((SIZE_T)s->q_slot * ENG_QUERIES_PER_SLOT + s->q_count) * 8u };
             u64* p = NULL;
             if (SUCCEEDED(CALL(s_qread, Map, 0, &rg, (void**)&p))) {
-                for (u32 k = 0; k < s->q_count; k++) s_vis_count[s->q_vis[k] & ~ENG_Q_SCALED] += eng_q_count(s->q_vis[k], p[s->q_slot * ENG_QUERIES_PER_SLOT + k]);
+                for (u32 k = 0; k < s->q_count; k++) s_vis_count[s->q_vis[k] & ENG_Q_INDEX] += eng_q_count(s->q_vis[k], p[s->q_slot * ENG_QUERIES_PER_SLOT + k]);
                 D3D12_RANGE wr = {0, 0}; CALL(s_qread, Unmap, 0, &wr);
             }
         }
@@ -2871,6 +3240,7 @@ static void eng_display_reload(void)
     eng_read_display();
     eng_read_scale();
     if (s_scale != os) eng_rescale();
+    if ((u32)eng_ms_want() != s_ms_n) eng_ms_apply(eng_ms_want());
     if (s_vsync != ov) fprintf(stderr, "[RSX d3d12] vsync %d\n", s_vsync);
     if (s_display == od && s_win_w == ow && s_win_h == oh) return;
     fence_wait(fence_signal());
@@ -2940,6 +3310,8 @@ static void eng_rescale(void)
         const u32 nw = now ? sc_dim(o->gw) : o->gw, nh = now ? sc_dim(o->gh) : o->gh;
         if (nw == o->w && nh == o->h) continue;
         RELEASE(o->res);
+        RELEASE(o->ms);   /* made again at its next MSAA pass */
+        o->ms_dirty = o->ms_stale = 0;
         D3D12_CLEAR_VALUE cv = {0};
         if (o->kind == OBJ_COLOR) {
             cv.Format = o->fmt;
@@ -3337,10 +3709,13 @@ static void eng_release_device(void)
     RELEASE(s_zero_cb); RELEASE(s_readback); s_readback_cap = 0; RELEASE(s_aux_alloc);
     RELEASE(s_null_tex); RELEASE(s_blit_pso); RELEASE(s_depth_pso); RELEASE(s_depth_pack_pso);
     RELEASE(s_present_pso); RELEASE(s_fxaa_pso);
+    RELEASE(s_depth_ms_pso); RELEASE(s_depth_pack_ms_pso); RELEASE(s_zcopy_ms_pso);
+    RELEASE(s_helper_vs_blob); RELEASE(s_helper_blit_blob);
     RELEASE(s_rootsig); RELEASE(s_helper_rootsig);
     RELEASE(s_qheap); RELEASE(s_qread); RELEASE(s_tsheap); RELEASE(s_tsread); RELEASE(s_pheap); RELEASE(s_pread);
     for (u32 i = 0; i < ENG_FRAMES; i++) { RELEASE(s_smp_gpu[i]); RELEASE(s_alloc[i]); s_alloc_fence[i] = 0; }
     RELEASE(s_srv_gpu); RELEASE(s_srv_cpu); RELEASE(s_rtv_cpu); RELEASE(s_dsv_cpu); RELEASE(s_smp_cpu);
+    RELEASE(s_rtv_ms); RELEASE(s_dsv_ms); RELEASE(s_srv_ms);
     RELEASE(s_list);
     if (s_fence_event) { CloseHandle(s_fence_event); s_fence_event = NULL; }
     RELEASE(s_fence); s_fence_value = 0;
@@ -3386,6 +3761,7 @@ int rsx_d3d12_engine_init(u32 width, u32 height, const char* title)
         rsx_draw_engine_set_backend(NULL);
         return -1;
     }
+    if (eng_ms_want() > 1) eng_ms_apply(eng_ms_want());
     s_zero_cb = make_buffer(D3D12_HEAP_TYPE_UPLOAD, 16384, D3D12_RESOURCE_STATE_GENERIC_READ);
     if (s_zero_cb) { void* m = NULL; D3D12_RANGE nr = {0, 0}; if (SUCCEEDED(CALL(s_zero_cb, Map, 0, &nr, &m))) { memset(m, 0, 16384); CALL(s_zero_cb, Unmap, 0, NULL); } }
     s_ready = 1;

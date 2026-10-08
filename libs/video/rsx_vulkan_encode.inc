@@ -56,8 +56,12 @@ static void render_end(void)
     s_bar_global = 1;     /* the next pass may read or write what this one wrote */
 }
 
-/* Begin rendering into the given (already transitioned) attachments. */
-static void render_begin(const u32* rt, u32 nrt, u32 depth, u32 tw, u32 th)
+/* Begin rendering into the given (already transitioned) attachments. ms:
+ * into their MSAA twins (transitioned too), each resolved into the target
+ * when the pass ends -- colour averaged, depth and stencil sample 0 -- so
+ * the targets are always what every read sees. */
+static int s_cur_ms;
+static void render_begin(const u32* rt, u32 nrt, u32 depth, u32 tw, u32 th, int ms)
 {
     bar_flush();
     VkRenderingAttachmentInfo ca[RSX_BE_MAX_COLOR_TARGETS];
@@ -68,13 +72,26 @@ static void render_begin(const u32* rt, u32 nrt, u32 depth, u32 tw, u32 th)
         ca[k].imageView = o->att ? o->att : o->view;
         ca[k].imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         ca[k].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; ca[k].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        if (ms && o->ms_att) {
+            ca[k].resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT;
+            ca[k].resolveImageView = ca[k].imageView;
+            ca[k].resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            ca[k].imageView = o->ms_att;
+        }
     }
     VkRenderingAttachmentInfo da = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
     EngObj* z = eng_owner(depth);
     if (z) {
         da.imageView = z->att; da.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         da.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; da.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        if (ms && z->ms_att) {
+            da.resolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
+            da.resolveImageView = z->att;
+            da.resolveImageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+            da.imageView = z->ms_att;
+        }
     }
+    s_cur_ms = ms;
     VkRenderingInfo ri = { VK_STRUCTURE_TYPE_RENDERING_INFO };
     ri.renderArea.extent.width = tw; ri.renderArea.extent.height = th;
     ri.layerCount = 1;
@@ -158,6 +175,160 @@ static void eng_vp_sc(const EngRecord* r, int scaled, u32 tw, u32 th, VkViewport
 
 static VkImageView null_view(int cube) { EngObj* o = eng_obj(cube ? s_null_cube : s_null_tex); return o ? o->view : VK_NULL_HANDLE; }
 
+/* ---- MSAA --------------------------------------------------------------------------
+ *
+ * RSX_AA=msaa2|msaa4|msaa8, as the D3D12 engine: a pass with a real depth
+ * target whose attachments are all full-size targets (guest 960x540 or
+ * more) draws into multisampled twins of them, made at that first pass.
+ * Here the pass resolves them itself as it ends (render_begin), so every
+ * read keeps reading the targets. A target written outside such a pass has
+ * a stale twin: refreshed from it (a depth twin cleared) before its next. */
+static VkPipeline eng_helper_pso(VkShaderModule ps, VkFormat rt);   /* below */
+static int eng_ms_want(void)
+{
+    const int m = rsx_aa_mode();
+    return m == 2 || m == 4 || m == 8 ? m : 1;
+}
+static int eng_ms_ok(const EngObj* o)
+{
+    return s_ms_n > 1 && o && !o->retired && o->img && (o->kind == OBJ_COLOR || o->kind == OBJ_DEPTH) &&
+           o->gw >= 960 && o->gh >= 540;
+}
+static int eng_ms_make(u32 h)
+{
+    EngObj* o = eng_obj(h);
+    if (!o) return 0;
+    if (o->ms_img) return 1;
+    const int depth = o->kind == OBJ_DEPTH;
+    VkImageCreateInfo ii = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+    ii.imageType = VK_IMAGE_TYPE_2D; ii.format = o->fmt;
+    ii.extent.width = o->w; ii.extent.height = o->h; ii.extent.depth = 1;
+    ii.mipLevels = 1; ii.arrayLayers = 1; ii.samples = (VkSampleCountFlagBits)s_ms_n;
+    ii.tiling = VK_IMAGE_TILING_OPTIMAL; ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    ii.usage = (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) |
+               VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    VkImage img = VK_NULL_HANDLE;
+    if (vkCreateImage(s_dev, &ii, NULL, &img) != VK_SUCCESS) return 0;
+    VkMemoryRequirements req; vkGetImageMemoryRequirements(s_dev, img, &req);
+    MemAlloc mem;
+    if (!mem_alloc(&req, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 1, &mem)) { vkDestroyImage(s_dev, img, NULL); return 0; }
+    vkBindImageMemory(s_dev, img, s_blk[mem.block].mem, mem.off);
+    o->ms_img = img; o->ms_mem = mem; o->ms_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    o->ms_att = make_view(img, o->fmt, VK_IMAGE_VIEW_TYPE_2D,
+                          depth ? VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_COLOR_BIT,
+                          1, 1, k_identity);
+    o->ms_stale = 1;
+    return 1;
+}
+static void eng_ms_drop(EngObj* o)
+{
+    if (o->ms_att) vkDestroyImageView(s_dev, o->ms_att, NULL);
+    if (o->ms_img) { vkDestroyImage(s_dev, o->ms_img, NULL); mem_free(&o->ms_mem); }
+    o->ms_att = VK_NULL_HANDLE; o->ms_img = VK_NULL_HANDLE; o->ms_stale = 0;
+    memset(&o->ms_mem, 0, sizeof o->ms_mem);
+}
+static VkImageAspectFlags eng_ms_aspect(const EngObj* o)
+{
+    return o->kind == OBJ_DEPTH ? VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+}
+static VkPipeline eng_ms_refresh_pso(VkFormat f)
+{
+    static struct { VkFormat f; u32 n; VkPipeline pso; } cache[16]; static u32 nc;
+    for (u32 i = 0; i < nc; i++) if (cache[i].f == f && cache[i].n == s_ms_n) return cache[i].pso;
+    AcquireSRWLockExclusive(&s_pipe_lock);
+    s_build_samples = (VkSampleCountFlagBits)s_ms_n;
+    const VkPipeline pso = eng_helper_pso(s_helper_ps_copy, f);
+    s_build_samples = VK_SAMPLE_COUNT_1_BIT;
+    ReleaseSRWLockExclusive(&s_pipe_lock);
+    if (nc < 16) { cache[nc].f = f; cache[nc].n = s_ms_n; cache[nc].pso = pso; nc++; }
+    return pso;
+}
+/* A stale twin: a colour one drawn over with its target, a depth one cleared. */
+static void eng_ms_refresh(u32 h)
+{
+    EngObj* o = eng_obj(h);
+    if (!o || !o->ms_img || !o->ms_stale) return;
+    o->ms_stale = 0;
+    render_end();
+    if (o->kind == OBJ_DEPTH) {
+        img_layout(o->ms_img, &o->ms_layout, eng_ms_aspect(o), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        bar_flush();
+        const VkClearDepthStencilValue dv = { 1.0f, 0 };
+        VkImageSubresourceRange rg = { eng_ms_aspect(o), 0, 1, 0, 1 };
+        vkCmdClearDepthStencilImage(s_cmd, o->ms_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &dv, 1, &rg);
+        s_bar_global = 1;
+        return;
+    }
+    const VkPipeline pso = eng_ms_refresh_pso(o->fmt);
+    if (!pso) return;
+    obj_layout(o, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    img_layout(o->ms_img, &o->ms_layout, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    bar_flush();
+    VkRenderingAttachmentInfo ca = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
+    ca.imageView = o->ms_att; ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    ca.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingInfo ri = { VK_STRUCTURE_TYPE_RENDERING_INFO };
+    ri.renderArea.extent.width = o->w; ri.renderArea.extent.height = o->h;
+    ri.layerCount = 1; ri.colorAttachmentCount = 1; ri.pColorAttachments = &ca;
+    vkCmdBeginRendering(s_cmd, &ri);
+    vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pso);
+    VkViewport vp = { 0.0f, (float)o->h, (float)o->w, -(float)o->h, 0.0f, 1.0f };
+    VkRect2D sc = { { 0, 0 }, { o->w, o->h } };
+    vkCmdSetViewport(s_cmd, 0, 1, &vp);
+    vkCmdSetScissor(s_cmd, 0, 1, &sc);
+    vkCmdSetStencilReference(s_cmd, VK_STENCIL_FACE_FRONT_AND_BACK, 0);
+    vkCmdSetPrimitiveTopology(s_cmd, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
+    EngSetDesc d; memset(&d, 0, sizeof d);
+    for (u32 u = 0; u < 16; u++) { d.fs_view[u] = null_view(0); d.fs_smp[u] = s_point_sampler; }
+    for (u32 u = 0; u < 4; u++) { d.vs_view[u] = null_view(0); d.vs_smp[u] = s_point_sampler; }
+    d.fs_view[0] = o->view;
+    d.vs_buf = d.fs_buf = s_zero_buf;
+    const VkDescriptorSet set = eng_set(&d);
+    if (set) {
+        const u32 dyn[2] = { 0, 0 };
+        vkCmdBindDescriptorSets(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pl, 0, 1, &set, 2, dyn);
+        vkCmdDraw(s_cmd, 3, 1, 0, 0);
+    }
+    vkCmdEndRendering(s_cmd);
+    s_bar_global = 1;
+    s_cur_pso = VK_NULL_HANDLE; s_cur_topo = VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
+}
+static VkPipeline eng_pso_ms(u32 pipeline, int cls)
+{
+    if (!pipeline || pipeline > s_pipe_count) return VK_NULL_HANDLE;
+    EngPipeline* p = &s_pipe[pipeline - 1];
+    if (p->psoms[cls]) return p->psoms[cls];
+    if (p->failedms[cls] || !p->vs) return VK_NULL_HANDLE;
+    AcquireSRWLockExclusive(&s_pipe_lock);
+    if (!p->psoms[cls] && !p->failedms[cls]) {
+        s_build_samples = (VkSampleCountFlagBits)s_ms_n;
+        p->psoms[cls] = p->fs ? eng_build_pso(p, cls, p->fs) : VK_NULL_HANDLE;
+        s_build_samples = VK_SAMPLE_COUNT_1_BIT;
+        if (!p->psoms[cls]) p->failedms[cls] = 1;
+    }
+    ReleaseSRWLockExclusive(&s_pipe_lock);
+    return p->psoms[cls];
+}
+/* A new sample count (or off): twins and MSAA builds dropped, the device idle. */
+static void eng_ms_apply(int want)
+{
+    vkDeviceWaitIdle(s_dev);
+    for (u32 i = 0; i < s_obj_count; i++) eng_ms_drop(&s_obj[i]);
+    AcquireSRWLockExclusive(&s_pipe_lock);
+    for (u32 i = 0; i < s_pipe_count; i++)
+        for (int k = 0; k < 3; k++) {
+            if (s_pipe[i].psoms[k]) vkDestroyPipeline(s_dev, s_pipe[i].psoms[k], NULL);
+            s_pipe[i].psoms[k] = VK_NULL_HANDLE; s_pipe[i].failedms[k] = 0;
+        }
+    ReleaseSRWLockExclusive(&s_pipe_lock);
+    const VkSampleCountFlags ok = s_props.limits.framebufferColorSampleCounts & s_props.limits.framebufferDepthSampleCounts &
+                                  s_props.limits.framebufferStencilSampleCounts;
+    u32 n = (u32)want;
+    while (n > 1 && !(ok & n)) n >>= 1;
+    s_ms_n = n ? n : 1;
+    fprintf(stderr, "[RSX vulkan] MSAA %s\n", s_ms_n > 1 ? (s_ms_n == 2 ? "x2" : s_ms_n == 4 ? "x4" : "x8") : "off");
+}
+
 static void eng_encode_draw(const EngRecord* r, EngStage* stage)
 {
     /* Attachments: target A's size rules, as the D3D12 backend. */
@@ -174,13 +345,32 @@ static void eng_encode_draw(const EngRecord* r, EngStage* stage)
     EngObj* z = eng_owner(depth);
     if (z && z->kind != OBJ_DEPTH) { z = NULL; depth = 0; }
     if (!nrt && !z) return;
+    const int real_depth = z != NULL;
     if (!z) { depth = eng_fallback_depth(tw, th); z = eng_owner(depth); if (!z) return; }
     if (!nrt) { tw = z->w; th = z->h; }
     else { if (z->w < tw) tw = z->w; if (z->h < th) th = z->h; }
 
     const int scaled = eng_obj_scaled(nrt ? r->rt[0] : depth);
-    const VkPipeline pso = eng_pso_for(r->pipeline, topo_class(r->topology), !scaled);
+    /* MSAA: a 3D pass whose attachments are all full-size, with equal sizes. */
+    int ms = s_ms_n > 1 && real_depth && eng_ms_ok(z) && z->w == tw && z->h == th;
+    for (u32 k = 0; ms && k < nrt; k++) ms = eng_ms_ok(eng_owner(r->rt[k]));
+    if (ms) {
+        ms = eng_ms_make(depth);
+        for (u32 k = 0; ms && k < nrt; k++) ms = eng_ms_make(r->rt[k]);
+    }
+    const VkPipeline pso = ms ? eng_pso_ms(r->pipeline, topo_class(r->topology))
+                              : eng_pso_for(r->pipeline, topo_class(r->topology), !scaled);
     if (!pso) return;
+    if (ms) {
+        int st = z->ms_stale;
+        for (u32 k = 0; k < nrt; k++) st |= eng_obj(r->rt[k])->ms_stale;
+        if (st) {
+            for (u32 k = 0; k < nrt; k++) eng_ms_refresh(r->rt[k]);
+            eng_ms_refresh(depth);
+        }
+    } else {
+        for (u32 k = 0; k < nrt; k++) { EngObj* o = eng_owner(r->rt[k]); if (o && o->ms_img) o->ms_stale = 1; }
+    }
     const EngPipeline* pp = &s_pipe[r->pipeline - 1];
 
     /* Textures; a unit naming one of this draw's targets reads the null. */
@@ -208,20 +398,29 @@ static void eng_encode_draw(const EngRecord* r, EngStage* stage)
     d.fs_buf = (r->ps_cb_bytes && sbuf) ? sbuf : s_zero_buf;
 
     /* Layouts: anything to change ends the pass. */
-    int same = s_in_render && s_cur_nrt == nrt && s_cur_depth == depth && s_cur_tw == tw && s_cur_th == th;
+    int same = s_in_render && s_cur_nrt == nrt && s_cur_depth == depth && s_cur_tw == tw && s_cur_th == th && s_cur_ms == ms;
     for (u32 k = 0; same && k < nrt; k++) same = s_cur_rt[k] == r->rt[k];
     int change = 0;
     for (u32 k = 0; k < nrt; k++) change |= obj_needs(eng_owner(r->rt[k]), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     change |= obj_needs(z, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
     for (u32 u = 0; u < 20; u++) change |= obj_needs(tex_obj[u], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    if (ms) {
+        for (u32 k = 0; k < nrt; k++) change |= eng_obj(r->rt[k])->ms_layout != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        change |= z->ms_layout != VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    }
     if (!same || change) {
         render_end();
         for (u32 k = 0; k < nrt; k++) obj_layout(eng_owner(r->rt[k]), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
         obj_layout(z, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+        if (ms) {
+            for (u32 k = 0; k < nrt; k++) { EngObj* o = eng_obj(r->rt[k]);
+                img_layout(o->ms_img, &o->ms_layout, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL); }
+            img_layout(z->ms_img, &z->ms_layout, eng_ms_aspect(z), VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+        }
         for (u32 u = 0; u < 20; u++) obj_layout(tex_obj[u], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         u32 rts[RSX_BE_MAX_COLOR_TARGETS];
         for (u32 k = 0; k < nrt; k++) rts[k] = r->rt[k];
-        render_begin(rts, nrt, depth, tw, th);
+        render_begin(rts, nrt, depth, tw, th, ms);
         s_cur_pso = VK_NULL_HANDLE;
     }
 
@@ -251,7 +450,11 @@ static void eng_encode_draw(const EngRecord* r, EngStage* stage)
     } else {
         vkCmdDraw(s_cmd, r->vertex_count, 1, 0, 0);
     }
-    if (query) { vkCmdEndQuery(s_cmd, s_qpool[s_slot], s_q_used); s_q_vis[s_q_used++] = (r->vis - 1) | (scaled ? ENG_Q_SCALED : 0u); }
+    if (query) {
+        vkCmdEndQuery(s_cmd, s_qpool[s_slot], s_q_used);
+        const u32 lg = !ms ? 0u : s_ms_n == 2 ? 1u : s_ms_n == 4 ? 2u : 3u;
+        s_q_vis[s_q_used++] = (r->vis - 1) | (scaled ? ENG_Q_SCALED : 0u) | (lg << ENG_Q_MS_SHIFT);
+    }
 }
 
 /* A present pass: the whole of `src` through `pso` into `dst` (both RGBA8
@@ -264,7 +467,7 @@ static void eng_present_pass(VkPipeline pso, u32 src_h, u32 dst_h)
     obj_layout(src, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     obj_layout(dst, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     const u32 rt[1] = { dst_h };
-    render_begin(rt, 1, 0, dst->w, dst->h);
+    render_begin(rt, 1, 0, dst->w, dst->h, 0);
     vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pso);
     s_cur_pso = pso;
     VkViewport vp = { 0.0f, (float)dst->h, (float)dst->w, -(float)dst->h, 0.0f, 1.0f };
@@ -313,7 +516,7 @@ static void eng_encode_depth_resolve(const EngRecord* r)
     obj_layout(src, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     obj_layout(dst, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     const u32 rt[1] = { r->resolve_dst };
-    render_begin(rt, 1, 0, dst->w, dst->h);
+    render_begin(rt, 1, 0, dst->w, dst->h, 0);
     vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pso);
     s_cur_pso = pso;
     VkViewport vp = { 0.0f, (float)dst->h, (float)dst->w, -(float)dst->h, 0.0f, 1.0f };
@@ -364,6 +567,7 @@ static void eng_encode_records(EngStage* stage)
             break;
         case ENG_REC_UPLOAD: {
             EngObj* o = eng_owner(r->depth);
+            if (o && o->ms_img) o->ms_stale = 1;
             if (!o || !stage || !stage->buf) break;
             render_end();
             obj_layout(o, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
@@ -388,9 +592,17 @@ static void eng_encode_records(EngStage* stage)
                 ca.clearValue.color = cv;
                 VkClearRect rc = { { { 0, 0 }, { s_cur_tw, s_cur_th } }, 0, 1 };
                 vkCmdClearAttachments(s_cmd, 1, &ca, 1, &rc);
+                if (o->ms_img && !s_cur_ms) o->ms_stale = 1;
                 break;
             }
             render_end();
+            if (o->ms_img) {   /* the twin too: both cleared */
+                img_layout(o->ms_img, &o->ms_layout, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                bar_flush();
+                VkImageSubresourceRange mrg = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+                vkCmdClearColorImage(s_cmd, o->ms_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &cv, 1, &mrg);
+                o->ms_stale = 0;
+            }
             obj_layout(o, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
             bar_flush();
             VkImageSubresourceRange rg = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
@@ -417,9 +629,14 @@ static void eng_encode_records(EngStage* stage)
                 if (!(s_in_render && eng_owner(s_cur_depth) == z)) {
                     render_end();
                     obj_layout(z, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-                    render_begin(NULL, 0, r->depth, z->w, z->h);
+                    /* With a twin: a pass on the twin, whose end resolves the
+                     * clear into the target as well. */
+                    const int zms = z->ms_img && !z->ms_stale;
+                    if (zms) img_layout(z->ms_img, &z->ms_layout, eng_ms_aspect(z), VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+                    render_begin(NULL, 0, r->depth, z->w, z->h, zms);
                     s_cur_pso = VK_NULL_HANDLE;
                 }
+                if (z->ms_img && !s_cur_ms) z->ms_stale = 1;
                 if (x + w > s_cur_tw) w = s_cur_tw > x ? s_cur_tw - x : 0;
                 if (y + h > s_cur_th) h = s_cur_th > y ? s_cur_th - y : 0;
                 if (!w || !h) break;
@@ -434,6 +651,11 @@ static void eng_encode_records(EngStage* stage)
             bar_flush();
             VkImageSubresourceRange rg = { asp, 0, 1, 0, 1 };
             vkCmdClearDepthStencilImage(s_cmd, z->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &dv, 1, &rg);
+            if (z->ms_img) {
+                img_layout(z->ms_img, &z->ms_layout, eng_ms_aspect(z), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                bar_flush();
+                vkCmdClearDepthStencilImage(s_cmd, z->ms_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &dv, 1, &rg);
+            }
             s_bar_global = 1;
             break; }
         case ENG_REC_COLOR_COPY: {
@@ -473,7 +695,7 @@ static void eng_poll_submits(void)
         if (s->q_count) {
             const u64* p = s_qmap[s->q_slot];
             for (u32 k = 0; k < s->q_count; k++)
-                s_vis_count[s->q_vis[k] & ~ENG_Q_SCALED] += eng_q_count(s->q_vis[k], p[k]);
+                s_vis_count[s->q_vis[k] & ENG_Q_INDEX] += eng_q_count(s->q_vis[k], p[k]);
         }
         for (u32 k = 0; k < s->n_reports; k++)
             rsx_draw_engine_query_result(s->reports[k].index, s_vis_count[s->reports[k].slot]);
@@ -906,6 +1128,11 @@ static const char kHelperPackPS[] =
     "    return float4(float((v >> 8) & 255u), float(v & 255u), 0.0, float((v >> 16) & 255u)) / 255.0;\n"
     "}\n";
 
+static const char kHelperCopyPS[] =
+    "Texture2D<float4> src : register(t0);\n"
+    "struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
+    "float4 main(VSOut i) : SV_Target { return src.Load(int3(i.pos.xy, 0)); }\n";
+
 static VkPipeline eng_helper_pso(VkShaderModule ps, VkFormat rt)
 {
     if (!s_helper_vs || !ps) return VK_NULL_HANDLE;
@@ -1140,6 +1367,7 @@ static int eng_init_device(void)
     s_helper_vs = eng_module(kHelperVS, RSX_SPV_STAGE_VERTEX, "helper vs");
     s_helper_ps_depth = eng_module(kHelperDepthPS, RSX_SPV_STAGE_FRAGMENT, "helper depth");
     s_helper_ps_pack = eng_module(kHelperPackPS, RSX_SPV_STAGE_FRAGMENT, "helper pack");
+    s_helper_ps_copy = eng_module(kHelperCopyPS, RSX_SPV_STAGE_FRAGMENT, "helper copy");
     s_depth_pso = eng_helper_pso(s_helper_ps_depth, VK_FORMAT_R32_SFLOAT);
     s_depth_pack_pso = eng_helper_pso(s_helper_ps_pack, VK_FORMAT_R8G8B8A8_UNORM);
     /* The present passes (rsx_present_passes.h), each with its entry renamed
@@ -1279,6 +1507,7 @@ int rsx_vulkan_engine_init(u32 width, u32 height, const char* title)
         rsx_draw_engine_set_backend(NULL);
         return -1;
     }
+    if (eng_ms_want() > 1) eng_ms_apply(eng_ms_want());
     s_ready = 1;
     if (rsx_draw_engine_init(s_width, s_height) != 0) {
         fprintf(stderr, "[RSX vulkan] draw engine init failed\n");
@@ -1362,6 +1591,7 @@ static void eng_rescale(void)
         if (o->att) vkDestroyImageView(s_dev, o->att, NULL);
         vkDestroyImage(s_dev, o->img, NULL);
         mem_free(&o->mem);
+        eng_ms_drop(o);   /* made again at its next MSAA pass */
         o->img = img; o->mem = mem; o->w = nw; o->h = nh; o->layout = VK_IMAGE_LAYOUT_UNDEFINED;
         if (depth) {
             o->view = make_view(img, o->fmt, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_DEPTH_BIT, 1, 1, k_identity);
@@ -1411,6 +1641,7 @@ static void eng_display_reload(void)
       if (s_display == DISP_WINDOWED) { if (have_ws) { s_win_w = ww; s_win_h = wh; } }
       else { s_win_w = (u32)GetSystemMetrics(SM_CXSCREEN); s_win_h = (u32)GetSystemMetrics(SM_CYSCREEN); } }
     if (s_scale != os) eng_rescale();
+    if ((u32)eng_ms_want() != s_ms_n) eng_ms_apply(eng_ms_want());
     if (s_display == od && s_win_w == ow && s_win_h == oh && s_vsync == ov) return;
     vkDeviceWaitIdle(s_dev);
     if (s_display != od || s_win_w != ow || s_win_h != oh) {

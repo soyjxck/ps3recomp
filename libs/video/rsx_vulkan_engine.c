@@ -170,12 +170,21 @@ typedef struct {
     u32 gw, gh;                /* guest pixels */
     VkImageLayout layout;      /* the owner's */
     int retired;
+    /* MSAA: the multisampled twin a 3D pass draws into (eng_ms_*), resolved
+     * into this image at the end of every such pass. ms_stale: this image
+     * was written another way, so the twin is refreshed before its next pass. */
+    VkImage ms_img;
+    MemAlloc ms_mem;
+    VkImageView ms_att;
+    VkImageLayout ms_layout;
+    int ms_stale;
 } EngObj;
 
 typedef struct {
     VkShaderModule vs, fs, fs1;           /* fs1: WPOS undivided (see eng_pso_for) */
     char* ps_plain;
     VkPipeline pso[3], pso1[3];
+    VkPipeline psoms[3]; int failedms[3];   /* the MSAA build (s_ms_n samples) */
     int failed[3], failed1[3];
     rsx_be_render_state rs;
     u32 nattr, stride, rt_count;
@@ -283,6 +292,8 @@ static EngPipeline s_pipe[ENG_MAX_PIPES]; static u32 s_pipe_count;
 static EngModule s_mod[ENG_MAX_MODULES]; static u32 s_mod_count;
 static EngSampler s_samp[ENG_MAX_SAMPLERS]; static u32 s_samp_count;
 static VkSampler s_point_sampler, s_linear_sampler;
+static u32 s_ms_n = 1;                      /* MSAA samples in use */
+static VkShaderModule s_helper_ps_copy;     /* a target into its MSAA twin */
 static VkPipeline s_fxaa_pso, s_area_pso;   /* rsx_present_passes.h */
 static u32 s_aa_obj, s_area_obj;            /* their targets: frame-sized, window-sized */
 int rsx_aa_mode(void);                      /* rsx_draw_engine.c */
@@ -301,12 +312,15 @@ static u64 s_vis_count[ENG_VIS_SLOTS]; static u32 s_vis_next, s_vis_cur;
 static EngVisReport s_vis_pending[ENG_MAX_REPORTS]; static u32 s_vis_npending;
 static u32 s_q_vis[ENG_QUERIES_PER_SLOT]; static u32 s_q_used;
 #define ENG_Q_SCALED 0x80000000u
+#define ENG_Q_MS_SHIFT 28          /* log2 of an MSAA pass's samples: its count is of samples */
+#define ENG_Q_INDEX 0x0FFFFFFFu
 static u32 s_fallback_depth[8]; static u32 s_fallback_n;
 static u32 s_retired[ENG_MAX_OBJECTS]; static u32 s_retired_count; static u64 s_retired_fence[ENG_MAX_OBJECTS];
 
 static u64 eng_q_count(u32 qv, u64 c)
 {
     if ((qv & ENG_Q_SCALED) && s_scale != 1.0f) c = (u64)((double)c / ((double)s_scale * (double)s_scale) + 0.5);
+    { const u32 ms = (qv >> ENG_Q_MS_SHIFT) & 3u; if (ms) c = (c + (1u << ms) / 2) >> ms; }
     return c;
 }
 
@@ -723,6 +737,8 @@ static u32 eng_image(EngObjKind kind, VkFormat fmt, u32 w, u32 h, u32 mips, u32 
 
 static void eng_obj_destroy(EngObj* o)
 {
+    if (o->ms_att) vkDestroyImageView(s_dev, o->ms_att, NULL);
+    if (o->ms_img) { vkDestroyImage(s_dev, o->ms_img, NULL); mem_free(&o->ms_mem); }
     if (o->view) vkDestroyImageView(s_dev, o->view, NULL);
     if (o->att) vkDestroyImageView(s_dev, o->att, NULL);
     if (o->img) vkDestroyImage(s_dev, o->img, NULL);
@@ -965,6 +981,9 @@ static u32 eng_cube_mask(const char* ps)
     return m;
 }
 
+/* The sample count eng_build_pso builds with: 1, or s_ms_n for the MSAA
+ * builds -- set under s_pipe_lock, which every build holds. */
+static VkSampleCountFlagBits s_build_samples = VK_SAMPLE_COUNT_1_BIT;
 static VkPipeline eng_build_pso(EngPipeline* p, int cls, VkShaderModule fs)
 {
     VkPipelineShaderStageCreateInfo st[2] = { { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO },
@@ -999,7 +1018,7 @@ static VkPipeline eng_build_pso(EngPipeline* p, int cls, VkShaderModule fs)
     rz.frontFace = rs->front_face == 0x0901u ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
 
     VkPipelineMultisampleStateCreateInfo ms = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    ms.rasterizationSamples = s_build_samples;
 
     VkPipelineDepthStencilStateCreateInfo ds = { VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
     ds.depthTestEnable = rs->depth_test ? VK_TRUE : VK_FALSE;
