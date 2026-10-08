@@ -22,7 +22,11 @@ extern "C" {
 #define SYS_MEMORY_PAGE_SIZE_64K  0x200
 
 /* Maximum tracked allocations */
-#define SYS_MEMORY_ALLOC_MAX      1024
+/* One slot per live allocation. Allocations are at least 64 KB, so the
+ * two 256 MB windows can hold 8192 of them; fewer slots than that runs out of
+ * bookkeeping before memory. UE3's FMallocPS3DL grows its heap 64 KB at a time
+ * and passed 1024 live allocations early in Drakengard 3's boot. */
+#define SYS_MEMORY_ALLOC_MAX      8192   /* both windows (see sys_memory.c) */
 #define SYS_MEMORY_CONTAINER_MAX  16
 #define SYS_MMAPPER_SHARED_MAX    64
 
