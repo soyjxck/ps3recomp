@@ -70,6 +70,8 @@ typedef struct {
     int n_depth_create, n_depth_snapshot;
     int n_pipeline_create;
     int n_draw, n_clear_color, n_clear_ds, n_present;
+    int n_clear_ds_rect;
+    u32 clear_rect[4];
     u32 cleared[STUB_MAX_CLEARED];
 
     /* the last draw's bindings */
@@ -229,6 +231,15 @@ static void stub_clear_color(void* u, u32 s, const float rgba[4])
 static void stub_clear_ds(void* u, u32 d, u32 f, float z, u8 s)
 { (void)u; (void)d; (void)f; (void)z; (void)s; stub.n_clear_ds++; }
 
+static void stub_clear_ds_rect(void* u, u32 d, u32 f, float z, u8 s,
+                               u32 x, u32 y, u32 w, u32 h)
+{
+    (void)u; (void)d; (void)f; (void)z; (void)s;
+    stub.n_clear_ds_rect++;
+    stub.clear_rect[0] = x; stub.clear_rect[1] = y;
+    stub.clear_rect[2] = w; stub.clear_rect[3] = h;
+}
+
 static u32 presented_surface;
 static void stub_present(void* u, u32 s) { (void)u; presented_surface = s; stub.n_present++; }
 
@@ -271,6 +282,7 @@ static const rsx_draw_backend g_stub_backend = {
     .draw = stub_draw,
     .clear_color = stub_clear_color,
     .clear_depth_stencil = stub_clear_ds,
+    .clear_depth_stencil_rect = stub_clear_ds_rect,
     .present = stub_present,
     .readback = stub_readback,
 };
@@ -286,6 +298,7 @@ static const rsx_draw_backend g_stub_backend = {
 #define M_SURFACE_FORMAT      0x0208
 #define M_COLOR_A_OFFSET      0x0210
 #define M_ZETA_OFFSET         0x0214
+#define M_DMA_ZETA            0x0198
 #define M_COLOR_B_OFFSET      0x0218
 #define M_COLOR_TARGET        0x0220
 #define M_COLOR_C_OFFSET      0x0288
@@ -863,6 +876,40 @@ static void test_scissor(void)
     engine_down();
 }
 
+/* ---- 7b. a scissored depth clear ------------------------------------------
+ * CLEAR_SURFACE honours the scissor: a title that packs several shadow maps
+ * into one depth target clears each region before drawing it, and a clear
+ * of the whole target would wipe the regions drawn before. */
+static void test_scissored_depth_clear(void)
+{
+    printf("-- scissored depth clear\n");
+    engine_up();
+    m(M_DMA_ZETA, DMA_LOCAL);
+    m(M_ZETA_OFFSET, 0x80000u);
+
+    m(M_CLEAR_BUFFERS, 0x03u);   /* depth | stencil */
+    CHECK(stub.n_clear_ds == 1 && stub.n_clear_ds_rect == 0,
+          "with no scissor, a depth clear covers the whole target (%d whole, %d rect)",
+          stub.n_clear_ds, stub.n_clear_ds_rect);
+
+    m(M_SCISSOR_H, (64u << 16) | 16u);
+    m(M_SCISSOR_V, (32u << 16) | 8u);
+    m(M_CLEAR_BUFFERS, 0x03u);
+    CHECK(stub.n_clear_ds == 1 && stub.n_clear_ds_rect == 1 &&
+          stub.clear_rect[0] == 16 && stub.clear_rect[1] == 8 &&
+          stub.clear_rect[2] == 64 && stub.clear_rect[3] == 32,
+          "a scissored depth clear is limited to the scissor (%u,%u %ux%u)",
+          stub.clear_rect[0], stub.clear_rect[1], stub.clear_rect[2], stub.clear_rect[3]);
+
+    m(M_SCISSOR_H, (4096u << 16) | 0u);
+    m(M_SCISSOR_V, (4096u << 16) | 0u);
+    m(M_CLEAR_BUFFERS, 0x03u);
+    CHECK(stub.n_clear_ds == 2 && stub.n_clear_ds_rect == 1,
+          "a scissor covering the target keeps the whole-target clear");
+
+    engine_down();
+}
+
 /* ---- 8. the presented pixel ---------------------------------------------- */
 
 static void test_readback(void)
@@ -983,6 +1030,7 @@ int main(void)
     test_restart_expansion();
     test_indexed_draws();
     test_scissor();
+    test_scissored_depth_clear();
     test_readback();
     test_custom_guest_mapping();
     test_queued_flip_buffer();

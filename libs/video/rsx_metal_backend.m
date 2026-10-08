@@ -2086,7 +2086,8 @@ static EngView s_eng_view[ENG_MAX_VIEWS];
 static u32 s_eng_view_count;
 
 typedef enum {
-    ENG_REC_DRAW, ENG_REC_CLEAR_COLOR, ENG_REC_CLEAR_DS, ENG_REC_DEPTH_RESOLVE
+    ENG_REC_DRAW, ENG_REC_CLEAR_COLOR, ENG_REC_CLEAR_DS, ENG_REC_DEPTH_RESOLVE,
+    ENG_REC_CLEAR_DS_RECT   /* a depth/stencil clear limited to clear_rect */
 } EngRecKind;
 
 typedef struct {
@@ -2114,6 +2115,7 @@ typedef struct {
     float clear_depth;
     u8    clear_stencil;
     u32   resolve_dst;          /* ENG_REC_DEPTH_RESOLVE target texture */
+    u32   clear_rect[4];        /* ENG_REC_CLEAR_DS_RECT: x, y, w, h        */
 } EngRecord;
 
 static EngRecord s_eng_rec[ENG_MAX_RECORDS];
@@ -2132,6 +2134,8 @@ static id<MTLRenderPipelineState> s_eng_blit_pso;
 static MTLPixelFormat             s_eng_blit_pso_fmt;
 static id<MTLRenderPipelineState> s_eng_depth_pso;
 static id<MTLSamplerState>        s_eng_point_sampler;
+static id<MTLRenderPipelineState> s_eng_zclear_pso;
+static id<MTLDepthStencilState>   s_eng_zclear_ds[4];   /* [depth write | stencil << 1] */
 
 static NSString* const kEngHelperMSL = @
 "#include <metal_stdlib>\n"
@@ -2152,6 +2156,11 @@ static NSString* const kEngHelperMSL = @
 "                            depth2d<float> src [[texture(0)]],\n"
 "                            sampler s [[sampler(0)]]) {\n"
 "    return src.sample(s, i.uv);\n"
+"}\n"
+"/* A scissored depth clear: the clear value as the fragment's depth. */\n"
+"struct ZOut { float d [[depth(any)]]; };\n"
+"fragment ZOut eng_zclear_fs(BOut i [[stage_in]], constant float& z [[buffer(0)]]) {\n"
+"    ZOut o; o.d = z; return o;\n"
 "}\n";
 
 static u32 eng_obj_add(id<MTLTexture> t)
@@ -2298,6 +2307,8 @@ static void eng_shutdown(void* user)
     s_eng_blit_pso = nil;
     s_eng_depth_pso = nil;
     s_eng_point_sampler = nil;
+    s_eng_zclear_pso = nil;
+    for (int k = 0; k < 4; k++) s_eng_zclear_ds[k] = nil;
     s_eng_active = 0;
 }
 
@@ -2765,6 +2776,90 @@ static void eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
     r->clear_stencil = stencil;
 }
 
+static void eng_clear_depth_stencil_rect(void* user, u32 depth, u32 flags,
+                                         float depth_value, u8 stencil,
+                                         u32 x, u32 y, u32 w, u32 h)
+{
+    (void)user;
+    if (!w || !h) return;
+    if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return; }
+    EngRecord* r = &s_eng_rec[s_eng_rec_count++];
+    memset(r, 0, sizeof *r);
+    r->kind = ENG_REC_CLEAR_DS_RECT;
+    r->depth = depth;
+    r->clear_flags = flags;
+    r->clear_depth = depth_value;
+    r->clear_stencil = stencil;
+    r->clear_rect[0] = x; r->clear_rect[1] = y; r->clear_rect[2] = w; r->clear_rect[3] = h;
+}
+
+/* A depth/stencil clear of a rectangle: a pass over the target alone that
+ * writes the clear value (and the stencil, by REPLACE) inside the scissor. */
+static void eng_encode_clear_rect(id<MTLCommandBuffer> cb, const EngRecord* r)
+{
+    id<MTLTexture> zbuf = eng_obj(r->depth);
+    if (!zbuf || !s_eng_helper_lib) return;
+    if (!s_eng_zclear_pso) {
+        MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
+        pd.vertexFunction   = [s_eng_helper_lib newFunctionWithName:@"eng_fullscreen_vs"];
+        pd.fragmentFunction = [s_eng_helper_lib newFunctionWithName:@"eng_zclear_fs"];
+        pd.depthAttachmentPixelFormat   = MTL_DEPTH_FORMAT;
+        pd.stencilAttachmentPixelFormat = MTL_DEPTH_FORMAT;
+        NSError* err = nil;
+        s_eng_zclear_pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+        if (!s_eng_zclear_pso) {
+            fprintf(stderr, "[rsx engine/metal] depth clear pipeline failed: %s\n",
+                    [[err localizedDescription] UTF8String]);
+            return;
+        }
+    }
+    const int dw = (r->clear_flags & RSX_BE_CLEAR_DEPTH) ? 1 : 0;
+    const int st = (r->clear_flags & RSX_BE_CLEAR_STENCIL) ? 1 : 0;
+    if (!dw && !st) return;
+    const int dsi = dw | (st << 1);
+    if (!s_eng_zclear_ds[dsi]) {
+        MTLDepthStencilDescriptor* dd = [MTLDepthStencilDescriptor new];
+        dd.depthCompareFunction = MTLCompareFunctionAlways;
+        dd.depthWriteEnabled    = dw ? YES : NO;
+        if (st) {
+            MTLStencilDescriptor* sd = [MTLStencilDescriptor new];
+            sd.stencilCompareFunction    = MTLCompareFunctionAlways;
+            sd.stencilFailureOperation   = MTLStencilOperationReplace;
+            sd.depthFailureOperation     = MTLStencilOperationReplace;
+            sd.depthStencilPassOperation = MTLStencilOperationReplace;
+            sd.readMask = 0xFF; sd.writeMask = 0xFF;
+            dd.frontFaceStencil = sd;
+            dd.backFaceStencil  = sd;
+        }
+        s_eng_zclear_ds[dsi] = [s_dev newDepthStencilStateWithDescriptor:dd];
+    }
+    const NSUInteger tw = [zbuf width], th = [zbuf height];
+    NSUInteger x = r->clear_rect[0], y = r->clear_rect[1];
+    if (x >= tw || y >= th) return;
+    NSUInteger w = r->clear_rect[2], h = r->clear_rect[3];
+    if (x + w > tw) w = tw - x;
+    if (y + h > th) h = th - y;
+    MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.depthAttachment.texture       = zbuf;
+    rp.depthAttachment.loadAction    = MTLLoadActionLoad;
+    rp.depthAttachment.storeAction   = MTLStoreActionStore;
+    rp.stencilAttachment.texture     = zbuf;
+    rp.stencilAttachment.loadAction  = MTLLoadActionLoad;
+    rp.stencilAttachment.storeAction = MTLStoreActionStore;
+    rp.renderTargetWidth  = tw;
+    rp.renderTargetHeight = th;
+    id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+    if (!e) return;
+    [e setRenderPipelineState:s_eng_zclear_pso];
+    [e setDepthStencilState:s_eng_zclear_ds[dsi]];
+    [e setStencilReferenceValue:r->clear_stencil];
+    [e setScissorRect:(MTLScissorRect){ x, y, w, h }];
+    const float z = r->clear_depth;
+    [e setFragmentBytes:&z length:sizeof z atIndex:0];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [e endEncoding];
+}
+
 /* ---- replay -------------------------------------------------------------- */
 
 static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
@@ -2830,6 +2925,10 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
 {
     u32 i = 0;
     while (i < s_eng_rec_count) {
+        if (s_eng_rec[i].kind == ENG_REC_CLEAR_DS_RECT) {
+            eng_encode_clear_rect(cb, &s_eng_rec[i++]);
+            continue;
+        }
         if (s_eng_rec[i].kind == ENG_REC_DEPTH_RESOLVE) {
             const EngRecord* r = &s_eng_rec[i++];
             id<MTLTexture> src = eng_obj(r->depth);
@@ -2861,7 +2960,8 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
         float cdepth = 1.0f;
         u8 cstencil = 0;
         while (i < s_eng_rec_count && s_eng_rec[i].kind != ENG_REC_DRAW &&
-               s_eng_rec[i].kind != ENG_REC_DEPTH_RESOLVE) {
+               s_eng_rec[i].kind != ENG_REC_DEPTH_RESOLVE &&
+               s_eng_rec[i].kind != ENG_REC_CLEAR_DS_RECT) {
             const EngRecord* r = &s_eng_rec[i];
             if (r->kind == ENG_REC_CLEAR_COLOR) {
                 u32 k = 0;
@@ -3162,6 +3262,7 @@ static const rsx_draw_backend s_engine_backend = {
     .draw                 = eng_draw,
     .clear_color          = eng_clear_color,
     .clear_depth_stencil  = eng_clear_depth_stencil,
+    .clear_depth_stencil_rect = eng_clear_depth_stencil_rect,
     .present              = eng_present,
     .readback             = eng_readback,
 };
