@@ -95,6 +95,11 @@ static u32 s_current_display_buffer_id = 0;
  * presenting on a raw flip-count change raced the drain and showed empty or
  * mixed batches (wave: black flashes, layout flicker). */
 static volatile int s_flip_pending = 0;
+/* Set while the title's command-buffer callback (cellGcm_fifo_recycle) is
+ * between writing its JUMP-to-begin and handing the ring back. The drain must
+ * not take that window for an overrun: `current` sits exactly at `end` with
+ * the jump written there, and the callback is waiting for this drain. */
+static volatile int s_recycle_in_progress = 0;
 /* A flip _cellGcmSetFlipCommand queued in the FIFO: | bufferId, bit 8 = ours. */
 #define GCM_FLIP_MARKER 0xFEAD0100u
 /* ponytail: fixed headroom, far above one frame's commands (Simpsons ~10 KB);
@@ -2028,7 +2033,20 @@ static void gcm_rsx_process_fifo_unlocked(void)
          * overruns first, so the first overrun is recycled by the path above
          * and near-end recycling is enabled from then on. */
         static int s_title_overran = 0;
-        if (begin && end > begin && cur >= end) { head_consumed = 1; s_title_overran = 1; }
+        /* An overrun is `current` PAST `end`, outside the title's own
+         * callback. At exactly `end` with the callback running, the title is
+         * wrapping correctly and waiting for this drain: Drakengard 3 was
+         * flagged as overrunning right there, which armed the near-end
+         * recycling below for the rest of the run, and that then rewound
+         * put/get/current under the title's normal wraps -- the walker read
+         * half-overwritten laps as commands. */
+        if (s_recycle_in_progress) head_consumed = 0;
+        if (begin && end > begin && cur > end && !s_recycle_in_progress) {
+            if (!s_title_overran)
+                fprintf(stderr, "[cellGcmSys] title overran its ring: ctx=0x%08X begin=0x%08X end=0x%08X current=0x%08X\n",
+                        ctx, begin, end, cur);
+            head_consumed = 1; s_title_overran = 1;
+        }
         if (begin && end > begin && cur >= begin && cur + GCM_RECYCLE_SLACK >= end
                 && head_consumed && s_title_overran) {
             u32 io_begin = gcm_ea2io(begin);
@@ -2106,6 +2124,8 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
      * consumes the tail, follows the jump, and idles at begin; then it's safe
      * for the guest to write from begin (that region was consumed long ago). */
     u32 io_begin = gcm_ea2io(begin);
+    s_recycle_in_progress = 1;
+    atomic_thread_fence(memory_order_seq_cst);
     if (io_begin != 0xFFFFFFFFu) {
         vm_write32(current, 0x20000000u | io_begin);            /* JUMP begin  */
         /* The jump has to be in guest memory before `put` moves behind the
@@ -2116,11 +2136,22 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
         vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_begin);        /* put = begin */
     }
 
-    /* Wait (bounded ~2s) for the walker to consume the tail + take the jump so
-     * no commands are lost; a stalled ticker degrades to dropped commands. */
-    int spins = 0;
-    while (g_gcm_fifo_drained_ea != begin && spins < 2000) { Sleep(1); spins++; }
-    if (spins >= 2000) {
+    /* Wait for the walker to consume the tail + take the jump so no commands
+     * are lost; a stalled ticker degrades to dropped commands. The bound is
+     * on the walker making NO progress for 20 s (and 120 s in all), not on
+     * the wait as a whole: a title can run a megabyte or two of commands
+     * ahead of a drain that is decoding and presenting them (Drakengard 3 in
+     * a busy scene sat 0.5-2 MB ahead), and the walker also translates every
+     * new shader synchronously -- a burst held it for 8 s. A flat 2 s limit
+     * handed back a ring the walker was still reading, for the title to
+     * overwrite. On hardware the title would simply wait for the RSX here. */
+    int spins = 0, total = 0;
+    u32 seen = g_gcm_fifo_drained_ea;
+    while (g_gcm_fifo_drained_ea != begin && spins < 20000 && total < 120000) {
+        Sleep(1); spins++; total++;
+        if (g_gcm_fifo_drained_ea != seen) { seen = g_gcm_fifo_drained_ea; spins = 0; }
+    }
+    if (g_gcm_fifo_drained_ea != begin) {
         static int warned = 0;
         if (warned++ < 4)
             printf("[cellGcmSys] fifo recycle: drain stalled (drained=0x%08X begin=0x%08X)\n",
@@ -2128,6 +2159,8 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
     }
 
     vm_write32(ctx_ea + 0x8, begin);                    /* recycle ring to base */
+    atomic_thread_fence(memory_order_seq_cst);
+    s_recycle_in_progress = 0;
 
     if (s_recdbg)
         fprintf(stderr, "[REC<] tid=%lu cur-now=%08X put=%08X get=%08X drained=%08X spins=%d\n",
