@@ -2640,6 +2640,62 @@ static u64 eng_vis_count(u32 slot, u64 c)
     return (u64)((double)c / (double)f2 + 0.5);
 }
 
+/* A query's draws can land in more than one render pass. From macOS 26 a
+ * pass adds to what earlier passes counted (MTLVisibilityResultType-
+ * Accumulate); before that each new encoder starts its offsets from zero.
+ * There a query keeps one counter per pass instead -- its own slot, then an
+ * extra slot from the same ring for each later pass, chained through
+ * s_vis_more -- and its result is their sum. RSX_VIS_ACCUM=0 takes this path
+ * on any macOS. */
+static u32 s_vis_more[ENG_VIS_SLOTS];   /* the next counter of the same query + 1; 0: none */
+static u32 s_vis_pass[ENG_VIS_SLOTS];   /* the pass that last counted the query; 0: none yet */
+static u32 s_vis_phys[ENG_VIS_SLOTS];   /* that pass's counter */
+static u32 s_vis_serial;                /* render passes encoded */
+static int eng_vis_accumulates(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = 0;
+        if (@available(macOS 26.0, *)) on = 1;
+        const char* e = getenv("RSX_VIS_ACCUM");
+        if (e && e[0] == '0') on = 0;
+    }
+    return on;
+}
+/* The counter this pass counts a query into. */
+static u32 eng_vis_counter(u32 slot, u32 pass)
+{
+    slot %= ENG_VIS_SLOTS;
+    if (eng_vis_accumulates()) return slot;
+    if (!s_vis_pass[slot]) {
+        s_vis_pass[slot] = pass;
+        s_vis_phys[slot] = slot;
+    } else if (s_vis_pass[slot] != pass) {
+        const u32 x = s_vis_next++ % ENG_VIS_SLOTS;
+        ((u64*)[s_vis_buf contents])[x] = 0;
+        s_vis_more[x] = s_vis_more[slot];
+        s_vis_pass[x] = 0;
+        s_vis_more[slot] = x + 1;
+        s_vis_pass[slot] = pass;
+        s_vis_phys[slot] = x;
+    }
+    return s_vis_phys[slot];
+}
+/* A query's count: its counters summed, each in guest pixels.
+ * RSX_QUERY_LOG=1 prints each (for comparing the two paths on a replay). */
+static u64 eng_vis_total(u32 slot, const u64* c)
+{
+    static int log = -1;
+    if (log < 0) log = getenv("RSX_QUERY_LOG") ? 1 : 0;
+    slot %= ENG_VIS_SLOTS;
+    u64 n = eng_vis_count(slot, c[slot]);
+    u32 parts = 1;
+    for (u32 x = s_vis_more[slot], k = 0; x && k < 256; x = s_vis_more[x - 1], k++, parts++)
+        n += eng_vis_count(x - 1, c[x - 1]);
+    if (log) fprintf(stderr, "[vis] %llu (%u counter%s)\n", (unsigned long long)n, parts, parts > 1 ? "s" : "");
+    return n;
+}
+
 static u32 eng_query_begin(void* user)
 {
     (void)user;
@@ -2647,6 +2703,8 @@ static u32 eng_query_begin(void* user)
     const u32 slot = s_vis_next++ % ENG_VIS_SLOTS;
     ((u64*)[s_vis_buf contents])[slot] = 0;
     s_vis_fx2[slot] = 1.0f;
+    s_vis_more[slot] = 0;
+    s_vis_pass[slot] = 0;
     return slot + 1;
 }
 static void eng_query_set(void* user, u32 query) { (void)user; s_vis_cur = query; }
@@ -3739,9 +3797,12 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
         if (attach && !zbuf) zbuf = zfallback;
 
         MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        const u32 vis_pass = ++s_vis_serial ? s_vis_serial : ++s_vis_serial;
         if (s_vis_buf) {
             rp.visibilityResultBuffer = s_vis_buf;
-            if (@available(macOS 14.0, *)) rp.visibilityResultType = MTLVisibilityResultTypeAccumulate;
+            if (eng_vis_accumulates()) {
+                if (@available(macOS 26.0, *)) rp.visibilityResultType = MTLVisibilityResultTypeAccumulate;
+            }
         }
         for (u32 k = 0; k < attach; k++) {
             rp.colorAttachments[k].texture     = tex[k];
@@ -3798,9 +3859,9 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
             if (s_vis_buf && s_eng_rec[i].vis != cur_vis) {
                 cur_vis = s_eng_rec[i].vis;
                 if (cur_vis) {
-                    [enc setVisibilityResultMode:MTLVisibilityResultModeCounting
-                                          offset:(NSUInteger)(cur_vis - 1) * 8u];
-                    s_vis_fx2[(cur_vis - 1) % ENG_VIS_SLOTS] = pf * pf;
+                    const u32 ctr = eng_vis_counter(cur_vis - 1, vis_pass);
+                    [enc setVisibilityResultMode:MTLVisibilityResultModeCounting offset:(NSUInteger)ctr * 8u];
+                    s_vis_fx2[ctr] = pf * pf;
                 } else
                     [enc setVisibilityResultMode:MTLVisibilityResultModeDisabled offset:0];
             }
@@ -4012,7 +4073,7 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
                         if (prior) [prior waitUntilCompleted];
                         const u64* c = (const u64*)[vb contents];
                         for (u32 k = 0; k < n; k++)
-                            rsx_draw_engine_query_result(reps[k].index, eng_vis_count(reps[k].slot, c[reps[k].slot]));
+                            rsx_draw_engine_query_result(reps[k].index, eng_vis_total(reps[k].slot, c));
                         free(reps);
                     }];
                 } else {
@@ -4039,7 +4100,7 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
             if (sync_reps) {
                 const u64* c = (const u64*)[s_vis_buf contents];
                 for (u32 k = 0; k < sync_n; k++)
-                    rsx_draw_engine_query_result(sync_reps[k].index, eng_vis_count(sync_reps[k].slot, c[sync_reps[k].slot]));
+                    rsx_draw_engine_query_result(sync_reps[k].index, eng_vis_total(sync_reps[k].slot, c));
                 free(sync_reps);
             }
         }
