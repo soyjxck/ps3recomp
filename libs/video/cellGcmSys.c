@@ -757,10 +757,12 @@ void cellGcm_request_tick(void)
  * may both pump, and newer causes must not overtake already claimed callbacks.
  * A nonblocking guard also prevents nested callbacks from reentering. Leave
  * pending notifications untouched when another pump is active. */
+extern void (*g_gcm_trace_hook)(u32 type, u32 a, u32 b);   /* defined with the ring recycle */
 void ppu_gcm_pump(void)
 {
     if (!GCM_PUMP_TRY_ENTER()) return;
     long p = (long)GCM_PENDING_TAKE();
+    if (p && g_gcm_trace_hook) g_gcm_trace_hook(11, (u32)p, s_vblank_count);
     u64 user_t = 0;
     u64 user = GCM_USER_PENDING_TAKE(&user_t);
     /* GCM_PUMP_DBG=1: how often each guest handler is actually delivered. */
