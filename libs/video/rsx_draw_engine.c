@@ -2365,6 +2365,23 @@ static void sink_draw_index(void* user, const rsx_dispatch* r, u32 first, u32 co
 static int s_zeta_alias_log;   /* print the next pipeline's fragment constants */
 static void eng_surface_dump_now(void);   /* every registered surface, now */
 static const char* s_dump_tag = "";        /* file-name suffix for the dumps above */
+/* RSX_SNAP_STATS=1: every 300 frames, how many draws sampled the target they
+ * write (each a full copy of it), how many texture-cache invalidations
+ * (NV4097 0x1FD8) the title sent, and how many of those copies came with no
+ * invalidation since the previous copy of the same target. */
+static int s_snap_stats = -1;
+static unsigned long s_snap_n, s_snap_noinval, s_inval_n[4], s_snap_unused;
+static u32 s_snap_last_surface = ~0u; static unsigned long s_inval_at_last_snap = ~0ul, s_inval_total;
+static void snap_stats_frame(void)
+{
+    static u32 last;
+    if (g.frames - last < 300) return;
+    last = g.frames;
+    fprintf(stderr, "[snap-stats] 300 frames: %lu own-target copies (%lu with no texture-cache invalidation since the last), "
+            "%lu own-target units the program does not sample (no copy); invalidations arg1 %lu arg2 %lu arg3 %lu other %lu\n",
+            s_snap_n, s_snap_noinval, s_snap_unused, s_inval_n[1], s_inval_n[2], s_inval_n[3], s_inval_n[0]);
+    s_snap_n = s_snap_noinval = s_snap_unused = 0; s_inval_n[0] = s_inval_n[1] = s_inval_n[2] = s_inval_n[3] = 0;
+}
 static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                               u32 current_zslot,
                               u32 textures[RSX_BE_MAX_TEXTURES],
@@ -2378,7 +2395,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
         mask |= 1u << u;
         eng_decode_sampler(t.filter, t.wrap, t.control0, &samplers[u]);
 
-        int sampled = -1;
+        int sampled = -1, unused_own = 0;
         for (u32 i = 0; i < g.n_surfaces; i++) {
             if (!g.surfaces[i].handle || g.surfaces[i].location != t.location ||
                 g.surfaces[i].offset != t.offset)
@@ -2389,11 +2406,34 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             int own = 0;
             for (u32 k = 0; k < n_targets; k++) if (target_slots[k] == i) own = 1;
             if (own) {
+                /* A unit left enabled from an earlier pass that this
+                 * program never samples: nothing to copy, and a full copy
+                 * of a 4K target is ~0.1 ms of GPU. (Drakengard 3's ~95
+                 * own-target copies a frame in its destruction scenes are
+                 * not this case -- each of those programs samples the scene
+                 * at an offset, heat haze, and needs the copy.)
+                 * RSX_SNAP_ALL=1 copies regardless. */
+                { static int all = -1; if (all < 0) all = getenv("RSX_SNAP_ALL") ? 1 : 0;
+                  const u8* vpu; u32 vpn; const u8* fpu = NULL; u32 fpn = 0;
+                  const int got = !all && eng_guest_programs(&vpu, &vpn, &fpu, &fpn);
+                  if (got && fpu &&
+                      !((rsx_fp_texture_mask(fpu, fpn) >> u) & 1u)) {
+                      if (s_snap_stats > 0) s_snap_unused++;
+                      unused_own = 1;
+                      break;
+                  } }
                 /* The draw samples the target it writes. Drakengard 3's
                  * post-process runs in place in the back buffer it then
                  * flips; binding the live target is undefined, and the old
                  * fallback -- the guest's stale bytes -- came out white on
                  * every such frame. Sample a copy taken at this point. */
+                if (s_snap_stats < 0) s_snap_stats = getenv("RSX_SNAP_STATS") ? 1 : 0;
+                if (s_snap_stats) {
+                    s_snap_n++;
+                    if (s_snap_last_surface == i && s_inval_at_last_snap == s_inval_total) s_snap_noinval++;
+                    s_snap_last_surface = i; s_inval_at_last_snap = s_inval_total;
+                    snap_stats_frame();
+                }
                 const u32 snap = g.be->color_snapshot
                     ? g.be->color_snapshot(g.be->user, g.surfaces[i].handle) : 0;
                 if (snap) {
@@ -2408,6 +2448,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             sampled = (int)i;
             break;
         }
+        if (unused_own) continue;   /* bound to nothing: the program never reads it */
         if (textures[u]) continue;
         if (sampled >= 0) {
             const u32 view = g.be->surface_view
@@ -3576,6 +3617,7 @@ void rsx_draw_engine_method(u32 method, u32 arg)
      * (0xE9xx, 0xEBxx) encode the subchannel bits as part of the address;
      * preserve them with the wider mask. */
     u32 m = (method >= 0xE000u) ? (method & 0xFFFCu) : (method & 0x1FFCu);
+    if (m == 0x1FD8u && s_snap_stats > 0) { s_inval_n[arg < 4 ? arg : 0]++; s_inval_total++; }
     /* Recorded after the dispatch, behind the pages it read (rsx_capture.c),
      * and only when the capture was already running when it began. */
     const int cap = g_rsx_capture_on;

@@ -1398,6 +1398,29 @@ int rsx_fp_extract_consts(const u8* ucode, u32 max_bytes, float* out, int max_ou
     return n;
 }
 
+u32 rsx_fp_texture_mask(const u8* ucode, u32 max_bytes)
+{
+    if (!ucode) return 0xFFFFu;
+    u32 mask = 0, off = 0;
+    while (off + 16 <= max_bytes) {
+        const u32 w0 = rsx_fp_read_word(ucode + off + 0);
+        const u32 w1 = rsx_fp_read_word(ucode + off + 4);
+        const u32 w2 = rsx_fp_read_word(ucode + off + 8);
+        const u32 w3 = rsx_fp_read_word(ucode + off + 12);
+        off += 16;
+        const int is_branch = (w2 & FP_BRANCH) != 0;
+        if (!is_branch) {
+            const u32 op = (w0 & FP_OPCODE_MASK) >> FP_OPCODE_SHIFT;
+            if (op == OP_TEX || op == OP_TXP || op == OP_TXD || op == OP_TXL || op == OP_TXB ||
+                op == 0x32u || op == 0x33u)
+                mask |= 1u << ((w0 & FP_TEX_UNIT_MASK) >> FP_TEX_UNIT_SHIFT);
+            if (fp_instruction_has_constant(w1, w2, w3)) off += 16;
+        }
+        if (w0 & FP_END) return mask;
+    }
+    return 0xFFFFu;
+}
+
 /* FNV-1a over a program's INSTRUCTION words only, skipping the inline constant
  * slots. With constants hoisted into fp_k[] the compiled shader does not depend
  * on their values, so including them in the pipeline key made it change every

@@ -194,4 +194,7 @@ u32 rsx_fp_program_size(const u8* ucode, u32 max_bytes);
 /* Kept from this tree (see the .c) -- used by rsx_d3d12_backend.c. */
 int rsx_fp_extract_consts(const u8* ucode, u32 max_bytes, float* out, int max_out);
 u32 rsx_fp_code_hash(const u8* ucode, u32 max_bytes);
+/* The texture units a program samples (TEX, TXP, TXD, TXL, TXB, TEXBEM,
+ * TXPBEM), as a bit mask; 0xFFFF if the program does not parse. */
+u32 rsx_fp_texture_mask(const u8* ucode, u32 max_bytes);
 #endif /* PS3RECOMP_RSX_FP_DECOMPILER_H */
