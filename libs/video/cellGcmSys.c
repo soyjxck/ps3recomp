@@ -838,6 +838,10 @@ static u32 s_sema_offset = 0;   /* NV406E semaphore offset (label window) */
  * waiting for the drain pass to end can be milliseconds later: the label is
  * usually in the middle of a frame's commands. */
 void (*g_gcm_label_write_hook)(void) = 0;
+/* Set by the host (main.cpp): wake the FIFO walker now. The ring-full
+ * recycle below waits for the walker to drain the tail; without a wake the
+ * walker slept up to its poll interval first. */
+void (*g_gcm_fifo_kick_hook)(void) = 0;
 /* Backlog past which the drain stops honouring one-flip-per-tick and
  * catches up instead. Sized well above a frame's command list so a
  * title that keeps up never sees this path. */
@@ -2473,6 +2477,10 @@ static void gcm_rsx_process_fifo_unlocked(void)
     }
 
     g_gcm_fifo_drained_ea = gcm_io2ea(s_fifo_getoff);
+#ifdef _WIN32
+    /* A ring-full recycle is waiting on this (WaitOnAddress): let it look now. */
+    if (s_recycle_in_progress) WakeByAddressAll((PVOID)&g_gcm_fifo_drained_ea);
+#endif
     s_last_why = why;
     /* GCM_GET_EQ_PUT=1: publish `get` as having reached `put` rather than where
      * the walker actually is. A probe, not a fix -- it removes the back-pressure
@@ -2546,6 +2554,7 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
         atomic_thread_fence(memory_order_release);
         vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_begin);        /* put = begin */
     }
+    if (g_gcm_fifo_kick_hook) g_gcm_fifo_kick_hook();       /* the tail is waiting: drain it now */
 
     /* Wait (bounded ~2s) for the walker to consume the tail + take the jump so
      * no commands are lost; a stalled ticker degrades to dropped commands. */
@@ -2560,10 +2569,29 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
      * would simply wait for the RSX here. */
     int spins = 0, total = 0;
     u32 seen = g_gcm_fifo_drained_ea;
+#ifdef _WIN32
+    /* Woken by the walker's drain (WakeByAddressAll above) instead of polling
+     * with Sleep(1): each poll cost a millisecond or two of timer granularity,
+     * several times per ring wrap in a busy scene. The limits are kept in real
+     * milliseconds. */
+    {
+        ULONGLONG t_progress = GetTickCount64(), t_start = t_progress;
+        while (g_gcm_fifo_drained_ea != begin) {
+            const ULONGLONG now = GetTickCount64();
+            if (now - t_progress >= 20000 || now - t_start >= 120000) break;
+            u32 cur = g_gcm_fifo_drained_ea;
+            if (cur != seen) { seen = cur; t_progress = now; }
+            if (g_gcm_fifo_kick_hook) g_gcm_fifo_kick_hook();
+            WaitOnAddress((volatile VOID*)&g_gcm_fifo_drained_ea, &cur, sizeof cur, 2);
+        }
+        spins = (int)(GetTickCount64() - t_start); total = spins;
+    }
+#else
     while (g_gcm_fifo_drained_ea != begin && spins < 20000 && total < 120000) {
         Sleep(1); spins++; total++;
         if (g_gcm_fifo_drained_ea != seen) { seen = g_gcm_fifo_drained_ea; spins = 0; }
     }
+#endif
     if (g_gcm_fifo_drained_ea != begin) {
         static int warned = 0;
         if (warned++ < 4)
