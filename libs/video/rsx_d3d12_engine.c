@@ -249,6 +249,13 @@ static ID3D12PipelineState* s_blit_pso, *s_depth_pso, *s_depth_pack_pso;
 static ID3D12Resource* s_null_tex;
 static SRWLOCK s_pipe_lock = SRWLOCK_INIT;
 static int s_vsync = 1;
+/* Windowed and borderless presents go through the compositor, which holds a
+ * flip-model swap chain to the display's refresh even at sync interval 0
+ * unless the chain allows tearing. With vsync off and the system supporting
+ * it (DXGI_FEATURE_PRESENT_ALLOW_TEARING), the chain is created with the
+ * flag and presents carry it, so the frame rate is not capped at the
+ * refresh. Exclusive full screen does not need it. */
+static int s_tearing = 0;
 
 static EngObj s_obj[ENG_MAX_OBJECTS];
 static u32 s_obj_count, s_obj_free[ENG_MAX_OBJECTS], s_obj_free_count;
@@ -955,6 +962,16 @@ static int eng_init_device(u32 width, u32 height)
         sd.Width = width; sd.Height = height; sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         sd.SampleDesc.Count = 1; sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
         sd.BufferCount = 3; sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        if (!s_vsync && s_display != DISP_FULLSCREEN) {
+            IDXGIFactory5* f5 = NULL;
+            if (SUCCEEDED(CALL(factory, QueryInterface, &IID_IDXGIFactory5, (void**)&f5))) {
+                BOOL allow = FALSE;
+                if (SUCCEEDED(CALL(f5, CheckFeatureSupport, DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allow, sizeof allow)) && allow)
+                    s_tearing = 1;
+                RELEASE(f5);
+            }
+            if (s_tearing) sd.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+        }
         IDXGISwapChain1* sc1 = NULL;
         DXGI_SWAP_CHAIN_FULLSCREEN_DESC fsd = {0};
         fsd.Windowed = TRUE;
@@ -975,6 +992,15 @@ static int eng_init_device(u32 width, u32 height)
             fprintf(stderr, "[rsx engine/d3d12] exclusive full screen refused (0x%08lX); borderless instead\n", (long)hr);
             s_display = DISP_BORDERLESS;
             sd.Flags &= ~(UINT)DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
+            if (!s_vsync) {
+                IDXGIFactory5* f5 = NULL; BOOL allow = FALSE;
+                if (SUCCEEDED(CALL(factory, QueryInterface, &IID_IDXGIFactory5, (void**)&f5))) {
+                    if (SUCCEEDED(CALL(f5, CheckFeatureSupport, DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allow, sizeof allow)) && allow)
+                        s_tearing = 1;
+                    RELEASE(f5);
+                }
+                if (s_tearing) sd.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+            }
             hr = CALL(factory, CreateSwapChainForHwnd, (IUnknown*)s_queue, s_hwnd, &sd, NULL, NULL, &sc1);
         }
         if (FAILED(hr)) { fprintf(stderr, "[rsx engine/d3d12] swap chain failed: 0x%08lX\n", (long)hr); RELEASE(factory); return -1; }
@@ -2202,7 +2228,8 @@ static void eng_submit(u32 present_surface, int wait)
     s_submit_seq++;
 
     if (windowed) {
-        HRESULT hr = CALL(s_swap, Present, (UINT)s_vsync, 0);
+        HRESULT hr = CALL(s_swap, Present, (UINT)s_vsync,
+                          (!s_vsync && s_tearing && s_display != DISP_FULLSCREEN) ? DXGI_PRESENT_ALLOW_TEARING : 0);
         if (FAILED(hr)) {
             static int n = 0;
             if (n++ < 8) fprintf(stderr, "[rsx engine/d3d12] Present failed: 0x%08lX (removed 0x%08lX)\n",
