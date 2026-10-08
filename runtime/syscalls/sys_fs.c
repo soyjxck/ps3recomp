@@ -202,6 +202,22 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
         }
     }
 
+    /* A /dev_hdd0 path that exists as such under the root resolves there, as
+     * in the cellFs layer (ppu_fs.cpp). The USRDIR flattening below is for a
+     * title whose own install is held at <root>/USRDIR (flOw); it sent another
+     * title's directory there too -- Drakengard 3's Japanese voice pack streams
+     * its movies through raw sys_fs from /dev_hdd0/game/NPUB31251/USRDIR/
+     * DLC_JPV/..., which became <root>/USRDIR/DLC_JPV/... and failed. */
+    if (strncmp(ps3_path, "/dev_hdd0/", 10) == 0) {
+        struct stat dst;
+        snprintf(host_path, (size_t)host_path_size, "%s/%s", g_sys_fs_root, ps3_path + 10);
+        fs_normalize_sep(host_path);
+        if (stat(host_path, &dst) == 0) {
+            ps3_vfs_ps3game_fallback(host_path, (size_t)host_path_size);
+            return;
+        }
+    }
+
     /* Strip a known mount prefix so this sys_fs layer resolves to the SAME host
      * tree as the cellFs layer (ppu_fs.cpp host_path). Previously /dev_bdvd/X
      * mapped to <root>/dev_bdvd/X -- a directory that doesn't exist -- so a title
@@ -463,8 +479,8 @@ int64_t sys_fs_open(ppu_context* ctx)
 
     if (!fp) {
         { struct stat _s2; int _ex = (stat(host_path,&_s2)==0);
-          fprintf(stderr, "[sys_fs] open FAILED: %s (errno=%d %s, exists=%d, size=%lld)\n",
-                  host_path, errno, strerror(errno), _ex, _ex?(long long)_s2.st_size:-1LL); }
+          fprintf(stderr, "[sys_fs] open FAILED: %s (guest '%s', errno=%d %s, exists=%d, size=%lld)\n",
+                  host_path, ps3_path, errno, strerror(errno), _ex, _ex?(long long)_s2.st_size:-1LL); }
         return (int64_t)(int32_t)CELL_ENOENT;
     }
 
