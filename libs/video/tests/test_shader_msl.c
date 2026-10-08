@@ -16,6 +16,8 @@
  *                                          what the host's --shader mode runs
  *   FP  TEX r0, TC0 unit 0 (END)           texture unit 0 sampled at texcoord0
  *   FP  TEX r0, TC0 unit 0, CUBE (END)     ... with unit 0 a cube map
+ *   FP  TEX r0, TC0 unit 0, texel ops      ... with sRGB gamma on RGB and a
+ *                                          biased-expanded alpha
  *   VP  MOV o0, v0 ; TXL o1, v8 (END)      a vertex texture sampled at t16
  *   FP  MOV r0, COL0 ; MOV r2, COL0.zyxw   two colour targets: what --mrt runs
  *
@@ -167,6 +169,28 @@ int main(int argc, char** argv)
             check("TEX FP MSL", g_msl, "[[sampler(0)]]");
             check("TEX FP MSL", g_msl, "[[user(locn3)]]");    /* TEXCOORD0 */
         }
+    }
+
+    /* ---- the same TEX with texel conversions on unit 0 ---------------------
+     * TEXTURE_ADDRESS gamma on R, G and B and UNSIGNED_REMAP_BIASED expansion
+     * on A (rsx_fp_set_texel_ops: bits 0-3 gamma, 4-7 expand). The sample must
+     * come back through the unit's helper, and the helper has to survive the
+     * HLSL front end. */
+    {
+        u8 fp[16];
+        u32 ops[16] = { 0 };
+        ops[0] = 0x7u | (0x8u << 4);
+        rsx_test_fp_tex_r0_tc0(fp, 0);
+        rsx_fp_set_texel_ops(ops);
+        check_count("TEX texel-op FP", rsx_fp_decompile_buffered_ex(fp, sizeof fp, 0x40u, 0,
+                                                                    g_hlsl, sizeof g_hlsl, NULL), 1);
+        rsx_fp_set_texel_ops(NULL);
+        check("TEX texel-op FP HLSL", g_hlsl, "float4 rsx_texop0(float4 v)");
+        check("TEX texel-op FP HLSL", g_hlsl, "rsx_texop0(rsx_tex[0].Sample(rsx_samp[0]");
+        check("TEX texel-op FP HLSL", g_hlsl, "float4(1.0, 1.0, 1.0, 0.0)");   /* gamma on RGB */
+        check("TEX texel-op FP HLSL", g_hlsl, "float4(0.0, 0.0, 0.0, 1.0)");   /* expand on A */
+        if (translate("TEX texel-op FP", RSX_SHADER_STAGE_FRAGMENT) == 0)
+            check("TEX texel-op FP MSL", g_msl, "[[texture(0)]]");
     }
 
     /* ---- vertex program sampling a VERTEX TEXTURE ------------------------
