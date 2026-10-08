@@ -936,6 +936,7 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
  * since the last hash, the bytes are known unchanged. RSX_TEX_WATCH=0, or a
  * host without it, hashes as before. -1 undecided; a host may switch it. */
 int g_eng_tex_watch = -1;
+static unsigned long long s_tex_skips_total;   /* hashes the watch saved, for [frametime] */
 static int eng_tex_watch_on(void)
 {
     if (g_eng_tex_watch < 0) g_eng_tex_watch = vm_watch_available() && !s_guest_reader ? 1 : 0;
@@ -977,7 +978,27 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                 const int watched = eng_tex_watch_arm(location, offset, span, &st);
                 if (watched && e->watched && st == e->watch_stamp) need_hash = 0;
                 e->watch_stamp = st; e->watched = (u32)watched;
-                if (!need_hash) s_fstat.tex_skipped++;
+                if (!need_hash) { s_fstat.tex_skipped++; s_tex_skips_total++; }
+                /* RSX_TEX_WATCH_CHECK=1: hash anyway, and report a texture
+                 * whose bytes changed while the watch said they had not -- a
+                 * write it missed (a kernel write nobody touched, a page
+                 * re-opened behind its back). The texture is still updated. */
+                { static int chk = -1;
+                  if (chk < 0) chk = getenv("RSX_TEX_WATCH_CHECK") ? 1 : 0;
+                  if (chk && !need_hash) {
+                      int rd = 0;
+                      const u64 h2 = eng_texture_content_hash(location, offset, span, &rd);
+                      static unsigned long long n_chk, n_bad;
+                      n_chk++;
+                      if (rd && h2 != e->content_hash) {
+                          if (n_bad++ < 20)
+                              fprintf(stderr, "[tex-watch] MISSED a write: loc %u off 0x%08X %ux%u fmt 0x%02X span %u (frame %u)\n",
+                                      location, offset, w, h, fmt, span, g.frames);
+                          need_hash = 1;
+                      }
+                      if ((n_chk & 0xFFFFF) == 0)
+                          fprintf(stderr, "[tex-watch] check: %llu skipped hashes verified, %llu missed\n", n_chk, n_bad);
+                  } }
             }
             int readable = 0;
             const u64 hash = need_hash ? eng_texture_content_hash(location, offset, span, &readable) : 0;
@@ -3404,8 +3425,18 @@ static void eng_present(u32 buffer_id)
           last = now;
           if (now - win_start >= 5.0 && n) {
               const double span = now - win_start;
-              fprintf(stderr, "[frametime] t=%.0fs %.1f fps, mean %.1f ms, worst %.1f ms, %u of %u frames over 34 ms\n",
+              fprintf(stderr, "[frametime] t=%.0fs %.1f fps, mean %.1f ms, worst %.1f ms, %u of %u frames over 34 ms",
                       now - first, n / span, span * 1000.0 / n, worst, slow, n);
+              /* The texture write-watch's work in the window, when it runs. */
+              if (eng_tex_watch_on()) {
+                  static unsigned long long f0, s0;
+                  unsigned long long f = 0, pp = 0;
+                  vm_watch_stats(&f, &pp);
+                  fprintf(stderr, "; watch: %llu faults, %llu hashes saved, %llu pages protected in all",
+                          f - f0, s_tex_skips_total - s0, pp);
+                  f0 = f; s0 = s_tex_skips_total;
+              }
+              fputc('\n', stderr);
               win_start = now; worst = 0.0; n = 0; slow = 0;
           }
       } }
