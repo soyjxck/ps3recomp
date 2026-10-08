@@ -571,6 +571,34 @@ static int create_window_impl(const char* title)
     [view setWantsLayer:YES];
     [view setLayer:s_layer];
 
+    /* A menu bar, so the usual keys work: Quit (Cmd-Q) closes the window,
+     * which ends the process the way the close button does (the host's
+     * window pump), Hide, and Enter Full Screen (Ctrl-Cmd-F). The app's name
+     * is the bundle's when there is one. */
+    if (!NSApp.mainMenu) {
+        NSString* name = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleName"];
+        if (!name) name = NSProcessInfo.processInfo.processName;
+        NSMenu* bar = [[NSMenu alloc] init];
+        NSMenuItem* app_item = [[NSMenuItem alloc] init];
+        NSMenu* app_menu = [[NSMenu alloc] initWithTitle:name];
+        [app_menu addItemWithTitle:[@"Hide " stringByAppendingString:name] action:@selector(hide:) keyEquivalent:@"h"];
+        [app_menu addItem:[NSMenuItem separatorItem]];
+        NSMenuItem* quit = [app_menu addItemWithTitle:[@"Quit " stringByAppendingString:name]
+                                               action:@selector(close) keyEquivalent:@"q"];
+        quit.target = s_window;
+        app_item.submenu = app_menu;
+        [bar addItem:app_item];
+        NSMenuItem* view_item = [[NSMenuItem alloc] init];
+        NSMenu* view_menu = [[NSMenu alloc] initWithTitle:@"View"];
+        NSMenuItem* fs = [view_menu addItemWithTitle:@"Enter Full Screen" action:@selector(toggleFullScreen:)
+                                       keyEquivalent:@"f"];
+        fs.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagControl;
+        fs.target = s_window;
+        view_item.submenu = view_menu;
+        [bar addItem:view_item];
+        NSApp.mainMenu = bar;
+    }
+
     [s_window makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
     note_view_size();
