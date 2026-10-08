@@ -897,6 +897,51 @@ static u32 eng_cube_mask(void)
     return mask;
 }
 
+/* Texel conversions per unit for rsx_fp_set_texel_ops: TEXTURE_ADDRESS gamma
+ * (bits 20-23, R G B A) and UNSIGNED_REMAP_BIASED expansion (bits 12-15 == 1),
+ * on the formats the RSX applies them to (RPCS3 get_format_features: gamma
+ * and expansion on the 8-bit and compressed colour formats, expansion alone
+ * on depth, X16, Y16_X16 and HILO8, neither on float formats). Expansion
+ * skips channels the remap fills with a constant and channels gamma already
+ * converts. RSX_NO_TEXEL_OPS=1 turns both off. */
+static u32 eng_texel_ops(u32 ops[16])
+{
+    static int off = -1;
+    if (off < 0) off = getenv("RSX_NO_TEXEL_OPS") ? 1 : 0;
+    u32 mask = 0;
+    memset(ops, 0, 16 * sizeof ops[0]);
+    if (off) return 0;
+    for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES && u < 16; u++) {
+        rsx_dsp_texture t;
+        rsx_dsp_get_texture(&g.rsx, u, &t);
+        if (!t.enabled) continue;
+        const u32 base = t.format & RSX_TEX_FMT_BASE_MASK & ~(u32)RSX_TEX_FMT_UNNORM;
+        int can_gamma = 0, can_expand = 0, wide = 0;
+        switch (base) {
+        case 0x81: case 0x82: case 0x83: case 0x84: case 0x85: case 0x86: case 0x87:
+        case 0x88: case 0x8B: case 0x8D: case 0x8E: case 0x8F: case 0x97: case 0x9D: case 0x9E:
+            can_gamma = can_expand = 1; break;
+        case 0x90: case 0x91: case 0x92: case 0x93: case 0x98:
+            can_expand = 1; break;
+        case 0x94: case 0x95:
+            can_expand = 1; wide = 1; break;
+        default: break;
+        }
+        const u32 gamma = can_gamma ? (t.wrap >> 20) & 0xFu : 0u;
+        u32 expand = 0;
+        if (can_expand && ((t.wrap >> 12) & 0xFu) == 1u) {
+            const u32 r = t.remap & 0xFFFFu;
+            const u32 op_r = (r >> 10) & 3u, op_g = (r >> 12) & 3u, op_b = (r >> 14) & 3u, op_a = (r >> 8) & 3u;
+            expand = (op_r == 2u ? 1u : 0u) | (op_g == 2u ? 2u : 0u) | (op_b == 2u ? 4u : 0u) | (op_a == 2u ? 8u : 0u);
+            expand &= ~gamma;
+        }
+        if (!gamma && !expand) continue;
+        ops[u] = gamma | (expand << 4) | (wide ? 0x100u : 0u);
+        mask |= 1u << u;
+    }
+    return mask;
+}
+
 /* Are both of the guest's own programs resident? One answer, used by the
  * layout and by the pipeline, because they must not disagree: the built-in
  * program declares all sixteen inputs, so narrowing the layout for it would
@@ -1023,6 +1068,8 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     const u32 fp_ctrl  = rsx_dsp_shader_control(&g.rsx);
     const u32 cube_mask = eng_cube_mask();
     const u32 vtex_mask = eng_vtex_mask();
+    u32 texel_ops[16];
+    const u32 texop_mask = fixed ? 0u : eng_texel_ops(texel_ops);
 
     memset(&g.fp_constants, 0, sizeof g.fp_constants);
     if (!fixed && rsx_fp_collect_constants(fp_uc, fp_size, &g.fp_constants) < 0)
@@ -1045,6 +1092,11 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         key = eng_fnv1a(&fp_ctrl_key, sizeof fp_ctrl_key, key);
         key = eng_fnv1a(&cube_mask, sizeof cube_mask, key);
         key = eng_fnv1a(&vtex_mask, sizeof vtex_mask, key);
+        /* The texel conversions are compiled into the fragment program. */
+        if (texop_mask) {
+            key = eng_fnv1a(&texop_mask, sizeof texop_mask, key);
+            key = eng_fnv1a(texel_ops, sizeof texel_ops, key);
+        }
     }
     key = eng_fnv1a(&layout->mask, sizeof layout->mask, key);
     key = eng_fnv1a(&layout->stride, sizeof layout->stride, key);
@@ -1071,8 +1123,10 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         vi = rsx_vp_decompile_compact_ex(vp_uc, vp_instrs * 16u, vtex_mask,
                                          layout->mask, s_vs_hlsl,
                                          sizeof s_vs_hlsl);
+        rsx_fp_set_texel_ops(texop_mask ? texel_ops : NULL);
         fi = rsx_fp_decompile_buffered_ex(fp_uc, fp_size, fp_ctrl, cube_mask,
                                           s_ps_hlsl, sizeof s_ps_hlsl, &nconst);
+        rsx_fp_set_texel_ops(NULL);
         if (fi > 0 && nconst != g.fp_constants.count) fi = -1;
         if (fi > 0 && rs->alpha_test_enable &&
             rsx_fp_apply_alpha_test_buffered(s_ps_hlsl, sizeof s_ps_hlsl,
