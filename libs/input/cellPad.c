@@ -755,8 +755,13 @@ skip_inject: ;
       if (s_pf < 0) { const char* e = getenv("PAD_FILE");
                       s_pf = (e && *e) ? 1 : 0;
                       if (s_pf) { strncpy(pf_path, e, sizeof pf_path - 1); pf_path[sizeof pf_path - 1] = 0; } }
+      /* The file is polled at most every 30 ms: opening it on every pad read
+       * (twice a frame) was 2-3% of the game thread in benchmark runs. */
+      static unsigned long long s_pf_chk = 0;
+      const unsigned long long pf_now = GetTickCount64();
       if (s_pf && port_no == 0) {
-          if (held_n <= 0) {
+          if (held_n <= 0 && pf_now - s_pf_chk >= 30) {
+              s_pf_chk = pf_now;
               FILE* f = fopen(pf_path, "rb");
               if (f) {
                   char buf[64]; buf[0] = 0;
@@ -797,6 +802,26 @@ skip_inject: ;
       if (s_st && (double)(GetTickCount64() - s_t0) / 1000.0 >= s_from && (double)(GetTickCount64() - s_t0) / 1000.0 < s_until) { hs->analog_lx = s_v[0]; hs->analog_ly = s_v[1];
                   hs->analog_rx = s_v[2]; hs->analog_ry = s_v[3];
                   hs->connected = 1; }
+      /* PAD_STICK_FILE=<path>: hold the sticks while that file exists (at the
+       * PAD_STICK position, or the left stick forward), so a script can start
+       * and stop the hold at the moments it cares about -- tools/autoplay_win.sh
+       * holds forward while the battle HUD is up (AUTOPLAY_FORWARD=1), which
+       * is how the first chapter reaches the scene where scenery breaks up. */
+      { static int s_sf = -1; static char sf_path[512];
+        static unsigned long long s_chk = 0; static int s_on = 0;
+        if (s_sf < 0) { const char* e = getenv("PAD_STICK_FILE");
+          s_sf = (e && *e) ? 1 : 0;
+          if (s_sf) { strncpy(sf_path, e, sizeof sf_path - 1); sf_path[sizeof sf_path - 1] = 0;
+                      if (!s_st) { s_v[0] = 128; s_v[1] = 0; s_v[2] = 128; s_v[3] = 128; } } }
+        if (s_sf && port_no == 0) {
+          const unsigned long long now = GetTickCount64();
+          if (now - s_chk >= 200) { s_chk = now;
+            FILE* f = fopen(sf_path, "rb");
+            const int on = f != NULL;
+            if (f) fclose(f);
+            if (on != s_on) { s_on = on; printf("[cellPad] PAD_STICK_FILE hold %s\n", on ? "on" : "off"); fflush(stdout); } }
+          if (s_on) { hs->analog_lx = s_v[0]; hs->analog_ly = s_v[1];
+                      hs->analog_rx = s_v[2]; hs->analog_ry = s_v[3]; hs->connected = 1; } } }
       /* PAD_SWEEP=<seconds per step>: walk the sticks through a fixed set of
        * deflections instead of holding one. Guessing a single stick position and
        * re-running costs ~5 minutes a try; a sweep answers "can input move the
