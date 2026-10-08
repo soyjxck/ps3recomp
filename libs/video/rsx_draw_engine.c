@@ -1566,14 +1566,50 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
          * nv40 reset 0xFFFFFF00 seeded by rsx_dispatch_init, so a stream that
          * never writes it still clears to 1.0 / 0. */
         const u32 zs = rsx_dsp_reg(&g.rsx, M_ZSTENCIL_CLEAR);
-        g.be->clear_depth_stencil(g.be->user, g.zdepths[zslot].handle, flags,
-                                  zs ? (float)(zs >> 8) / 16777215.0f : 1.0f,
-                                  (u8)(zs & 0xFFu));
+        const float zval = zs ? (float)(zs >> 8) / 16777215.0f : 1.0f;
+        /* CLEAR_SURFACE honours the scissor. Unreal Engine 3 packs its
+         * per-object shadow maps into one depth target and clears each region
+         * just before drawing it; cleared whole, a later region's clear wiped
+         * the shadows drawn earlier in the frame. The rectangle is the
+         * draws' scissor (the guest scissor within the target); a clear that
+         * covers the whole target keeps the backend's plain clear.
+         * RSX_CLEAR_NO_SCISSOR=1 always clears the whole target. */
+        int partial = 0;
+        u32 cx = 0, cy = 0, cw = 0, ch = 0;
+        {
+            static int off = -1;
+            if (off < 0) off = getenv("RSX_CLEAR_NO_SCISSOR") ? 1 : 0;
+            const u32 h = rsx_dsp_reg(&g.rsx, M_SCISSOR_HORIZONTAL);
+            const u32 v = rsx_dsp_reg(&g.rsx, M_SCISSOR_VERTICAL);
+            const u32 gx = h & 0xFFFFu, gw = h >> 16, gy = v & 0xFFFFu, gh = v >> 16;
+            const u32 sw = sf.clip_w ? sf.clip_w : g.zdepths[zslot].w;
+            const u32 sh = sf.clip_h ? sf.clip_h : g.zdepths[zslot].h;
+            if (!off && gw > 0 && gh > 0 && g.be->clear_depth_stencil_rect) {
+                u32 right = sw, bottom = sh;
+                cx = gx; cy = gy;
+                if (gx + gw < right)  right = gx + gw;
+                if (gy + gh < bottom) bottom = gy + gh;
+                cw = right > cx ? right - cx : 0;
+                ch = bottom > cy ? bottom - cy : 0;
+                /* A scissor that covers the surface's clip clears what the
+                 * pass can see: the plain whole-target clear, as before. */
+                partial = !(cx == 0 && cy == 0 && cw >= sw && ch >= sh);
+                if (partial && (!cw || !ch)) return;   /* scissored away entirely */
+            }
+        }
+        if (partial)
+            g.be->clear_depth_stencil_rect(g.be->user, g.zdepths[zslot].handle, flags,
+                                           zval, (u8)(zs & 0xFFu), cx, cy, cw, ch);
+        else
+            g.be->clear_depth_stencil(g.be->user, g.zdepths[zslot].handle, flags,
+                                      zval, (u8)(zs & 0xFFu));
         g.zdepths[zslot].cleared = 1;
         if (mask & RSX_CLEAR_DEPTH) {
             /* A clear invalidates the older published depth image; the next
-             * texture consumer resolves the newly written pass exactly once. */
-            g.zdepths[zslot].had_write = 0;
+             * texture consumer resolves the newly written pass exactly once.
+             * A partial clear leaves the rest of the target's depth in place,
+             * so it still counts as written. */
+            if (!partial) g.zdepths[zslot].had_write = 0;
             g.zdepths[zslot].snapshot_valid = 0;
         }
     }
