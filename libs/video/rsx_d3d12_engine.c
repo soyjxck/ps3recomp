@@ -202,6 +202,7 @@ typedef struct {
 } EngStage;
 #define ENG_STAGE_POOL 8
 
+
 typedef struct { u32 slot, index; } EngVisReport;
 
 /* A submit the GPU may still be running. */
@@ -243,6 +244,25 @@ static ID3D12DescriptorHeap* s_smp_gpu[ENG_FRAMES];
 static u32 s_srv_step, s_rtv_step, s_dsv_step, s_smp_step;
 static u32 s_srv_used, s_smp_used;               /* within the current slot's region */
 static ID3D12QueryHeap* s_qheap; static ID3D12Resource* s_qread; static u32 s_q_used;
+/* RSX_GPU_TIME=1: a timestamp at the start and end of every command list.
+ * Every 5 s: submits a second, the GPU's busy time, the mean GPU time of a
+ * submit the walker waits on and of one it does not, and how long a list sat
+ * in the queue before the GPU started it -- is a synchronous wait GPU work,
+ * or latency? */
+static ID3D12QueryHeap* s_tsheap; static ID3D12Resource* s_tsread; static u64 s_ts_freq;
+static struct { u64 fence; int kind; LARGE_INTEGER cpu_exec; } s_ts_slot[ENG_FRAMES];
+static int s_submit_kind;   /* 0 present / other, 1 waited on */
+static u64 s_gt_draws, s_gt_bar_calls, s_gt_bars, s_gt_pso, s_gt_queries, s_gt_copies;
+
+/* RSX_GPU_TIME=2: also a timestamp wherever the recorded work changes target
+ * (a "pass": the draws into one set of targets, a clear, a copy, a depth
+ * resolve, the uploads), and every 5 s the passes that took the most GPU
+ * time, by kind, target size and format. Where the GPU time of a frame goes
+ * at 4K, which scales differently from the walker's. */
+#define ENG_PASS_MAX 1024u
+typedef struct { u8 kind; u8 nrt; u16 w, h; u32 fmt; u32 draws; } EngPassDesc;
+static EngPassDesc s_pass[ENG_FRAMES][ENG_PASS_MAX]; static u32 s_pass_n[ENG_FRAMES];
+static ID3D12QueryHeap* s_pheap; static ID3D12Resource* s_pread;
 static ID3D12RootSignature* s_rootsig;
 static ID3D12RootSignature* s_helper_rootsig;
 static ID3D12PipelineState* s_blit_pso, *s_depth_pso, *s_depth_pack_pso;
@@ -1099,6 +1119,20 @@ static int eng_init_device(u32 width, u32 height)
         if (s_qheap) s_qread = make_buffer(D3D12_HEAP_TYPE_READBACK, (u64)ENG_FRAMES * ENG_QUERIES_PER_SLOT * 8u, D3D12_RESOURCE_STATE_COPY_DEST);
         if (!s_qread) { RELEASE(s_qheap); }
     }
+    if (getenv("RSX_GPU_TIME")) {
+        D3D12_QUERY_HEAP_DESC th = {0};
+        th.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP; th.Count = ENG_FRAMES * 2;
+        if (SUCCEEDED(CALL(s_dev, CreateQueryHeap, &th, &IID_ID3D12QueryHeap, (void**)&s_tsheap)))
+            s_tsread = make_buffer(D3D12_HEAP_TYPE_READBACK, (u64)ENG_FRAMES * 16u, D3D12_RESOURCE_STATE_COPY_DEST);
+        if (!s_tsread || FAILED(CALL(s_queue, GetTimestampFrequency, &s_ts_freq)) || !s_ts_freq) { RELEASE(s_tsheap); RELEASE(s_tsread); }
+        if (s_tsheap && atoi(getenv("RSX_GPU_TIME")) >= 2) {
+            D3D12_QUERY_HEAP_DESC ph = {0};
+            ph.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP; ph.Count = ENG_FRAMES * (ENG_PASS_MAX + 1u);
+            if (SUCCEEDED(CALL(s_dev, CreateQueryHeap, &ph, &IID_ID3D12QueryHeap, (void**)&s_pheap)))
+                s_pread = make_buffer(D3D12_HEAP_TYPE_READBACK, (u64)ENG_FRAMES * (ENG_PASS_MAX + 1u) * 8u, D3D12_RESOURCE_STATE_COPY_DEST);
+            if (!s_pread) RELEASE(s_pheap);
+        }
+    }
     if (eng_make_root_signatures() != 0) return -1;
     {
         ID3DBlob* vs = eng_compile(kHelperHLSL, sizeof kHelperHLSL - 1, "vs_main", "vs_5_0", "helper vs");
@@ -1792,7 +1826,7 @@ static void eng_clear_depth_stencil_rect(void* user, u32 depth, u32 flags, float
 static D3D12_RESOURCE_BARRIER s_bar[32]; static u32 s_nbar;
 static void bar_flush(void)
 {
-    if (s_nbar) { CALL(s_list, ResourceBarrier, s_nbar, s_bar); s_nbar = 0; }
+    if (s_nbar) { CALL(s_list, ResourceBarrier, s_nbar, s_bar); s_gt_bar_calls++; s_gt_bars += s_nbar; s_nbar = 0; }
 }
 static void res_transition(ID3D12Resource* res, D3D12_RESOURCE_STATES* state, D3D12_RESOURCE_STATES to)
 {
@@ -1831,11 +1865,97 @@ static void eng_reset_bind_state(void)
     s_srv_used = s_smp_used = 0; s_q_used = 0;
 }
 
+static const char* pass_kind_name(int k)
+{
+    static const char* const n[] = { "draws", "clear colour", "clear depth", "copy", "depth resolve", "uploads" };
+    return k >= 0 && k < 6 ? n[k] : "?";
+}
+static void eng_pass_collect(u32 slot, int report)
+{
+    enum { N = 256 };
+    static struct { u8 kind, nrt; u16 w, h; u32 fmt; double ms; u64 n, draws; } st[N];
+    static u32 nst;
+    if (s_pheap && s_pass_n[slot]) {
+        const u32 base = slot * (ENG_PASS_MAX + 1u), np = s_pass_n[slot];
+        u64* p = NULL; D3D12_RANGE rg = { base * 8u, (base + np + 1u) * 8u };
+        if (SUCCEEDED(CALL(s_pread, Map, 0, &rg, (void**)&p))) {
+            for (u32 i = 0; i < np; i++) {
+                const u64 a = p[base + i], b = p[base + i + 1];
+                const double ms = b > a ? (double)(b - a) * 1000.0 / (double)s_ts_freq : 0.0;
+                const EngPassDesc* d = &s_pass[slot][i];
+                u32 k;
+                for (k = 0; k < nst; k++)
+                    if (st[k].kind == d->kind && st[k].w == d->w && st[k].h == d->h && st[k].fmt == d->fmt && st[k].nrt == d->nrt) break;
+                if (k == nst) { if (nst == N) continue; nst++; st[k].kind = d->kind; st[k].w = d->w; st[k].h = d->h; st[k].fmt = d->fmt; st[k].nrt = d->nrt; st[k].ms = 0; st[k].n = st[k].draws = 0; }
+                st[k].ms += ms; st[k].n++; st[k].draws += d->draws;
+            }
+            D3D12_RANGE wr = {0, 0}; CALL(s_pread, Unmap, 0, &wr);
+        }
+        s_pass_n[slot] = 0;
+    }
+    if (report && nst) {
+        double tot = 0; for (u32 k = 0; k < nst; k++) tot += st[k].ms;
+        fprintf(stderr, "[gpu-pass] %.1f ms of passes in 5 s; the largest:\n", tot);
+        for (int shown = 0; shown < 12; shown++) {
+            int best = -1;
+            for (u32 k = 0; k < nst; k++) if (st[k].n && (best < 0 || st[k].ms > st[best].ms)) best = (int)k;
+            if (best < 0 || st[best].ms <= 0) break;
+            fprintf(stderr, "[gpu-pass]   %5.1f%% %8.1f ms  %-13s %4ux%-4u fmt %3u x%u  %6llu passes, %7llu draws\n",
+                    tot > 0 ? 100.0 * st[best].ms / tot : 0.0, st[best].ms, pass_kind_name(st[best].kind),
+                    st[best].w, st[best].h, st[best].fmt, st[best].nrt,
+                    (unsigned long long)st[best].n, (unsigned long long)st[best].draws);
+            st[best].n = 0;   /* shown */
+        }
+        nst = 0;
+    }
+}
+
+static void eng_gpu_time_collect(u32 slot)
+{
+    static double busy_ms, wait_ms, other_ms, queue_ms; static unsigned n, n_wait, n_other;
+    static LARGE_INTEGER last; LARGE_INTEGER qf, now;
+    if (!s_tsread || !s_ts_slot[slot].fence) return;
+    QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&now);
+    u64* p = NULL; D3D12_RANGE rg = { slot * 16u, slot * 16u + 16u };
+    if (SUCCEEDED(CALL(s_tsread, Map, 0, &rg, (void**)&p))) {
+        const u64 t0 = p[slot * 2], t1 = p[slot * 2 + 1];
+        D3D12_RANGE wr = {0, 0}; CALL(s_tsread, Unmap, 0, &wr);
+        const double gpu_ms = t1 > t0 ? (double)(t1 - t0) * 1000.0 / (double)s_ts_freq : 0.0;
+        /* Where the GPU clock was when the CPU executed the list: one
+         * calibration a submit is cheap next to the submit itself. */
+        u64 g_now = 0, c_now = 0;
+        if (SUCCEEDED(CALL(s_queue, GetClockCalibration, &g_now, &c_now))) {
+            const double cpu_ago_ms = (double)((long long)c_now - s_ts_slot[slot].cpu_exec.QuadPart) * 1000.0 / (double)qf.QuadPart;
+            const double gpu_ago_ms = (double)((long long)g_now - (long long)t0) * 1000.0 / (double)s_ts_freq;
+            const double q = cpu_ago_ms - gpu_ago_ms;   /* exec -> GPU start */
+            if (q > 0 && q < 1000) queue_ms += q;
+        }
+        busy_ms += gpu_ms; n++;
+        eng_pass_collect(slot, 0);
+        if (s_ts_slot[slot].kind) { wait_ms += gpu_ms; n_wait++; } else { other_ms += gpu_ms; n_other++; }
+    }
+    s_ts_slot[slot].fence = 0;
+    if (!last.QuadPart) last = now;
+    const double secs = (double)(now.QuadPart - last.QuadPart) / (double)qf.QuadPart;
+    if (secs >= 5.0) {
+        fprintf(stderr, "[gpu-time] %.0f submits/s, GPU busy %.1f ms/s; waited-on submits %.0f/s, %.2f ms GPU each; others %.0f/s, %.2f ms each; exec->GPU start %.2f ms mean\n",
+                n / secs, busy_ms / secs, n_wait / secs, n_wait ? wait_ms / n_wait : 0.0,
+                n_other / secs, n_other ? other_ms / n_other : 0.0, n ? queue_ms / n : 0.0);
+        fprintf(stderr, "[gpu-time] per second: %.0f draws, %.0f PSO changes, %.0f ResourceBarrier calls (%.0f transitions), %.0f occlusion queries, %.0f texture uploads\n",
+                s_gt_draws / secs, s_gt_pso / secs, s_gt_bar_calls / secs, s_gt_bars / secs, s_gt_queries / secs, s_gt_copies / secs);
+        s_gt_draws = s_gt_pso = s_gt_bar_calls = s_gt_bars = s_gt_queries = s_gt_copies = 0;
+        eng_pass_collect(slot, 1);
+        busy_ms = wait_ms = other_ms = queue_ms = 0; n = n_wait = n_other = 0; last = now;
+    }
+}
+
 static void eng_list_begin(void)
 {
+    eng_gpu_time_collect(s_slot);
     CALL0(s_alloc[s_slot], Reset);
     CALL(s_list, Reset, s_alloc[s_slot], NULL);
     s_list_open = 1;
+    if (s_tsheap) CALL(s_list, EndQuery, s_tsheap, D3D12_QUERY_TYPE_TIMESTAMP, s_slot * 2u);
     ID3D12DescriptorHeap* heaps[2] = { s_srv_gpu, s_smp_gpu[s_slot] };
     CALL(s_list, SetDescriptorHeaps, 2, heaps);
     CALL(s_list, SetGraphicsRootSignature, s_rootsig);
@@ -1944,6 +2064,7 @@ static void eng_encode_upload(const EngRecord* r, ID3D12Resource* stage)
     src.PlacedFootprint.Footprint.Depth = 1;
     src.PlacedFootprint.Footprint.RowPitch = r->up_pitch;
     CALL(s_list, CopyTextureRegion, &dst, 0, 0, 0, &src, NULL);
+    s_gt_copies++;
 }
 
 static void eng_encode_draw(const EngRecord* r, ID3D12Resource* stage, D3D12_GPU_VIRTUAL_ADDRESS stage_va)
@@ -1998,7 +2119,7 @@ static void eng_encode_draw(const EngRecord* r, ID3D12Resource* stage, D3D12_GPU
         for (u32 k = 0; k < RSX_BE_MAX_COLOR_TARGETS; k++) s_cur_rt[k] = k < nrt ? r->rt[k] : 0;
         s_cur_nrt = nrt; s_cur_depth = depth; s_cur_targets_valid = 1;
     }
-    if (pso != s_cur_pso) { CALL(s_list, SetPipelineState, pso); s_cur_pso = pso; }
+    if (pso != s_cur_pso) { CALL(s_list, SetPipelineState, pso); s_cur_pso = pso; s_gt_pso++; }
     const D3D_PRIMITIVE_TOPOLOGY topo = topo_d3d(r->topology);
     if (topo != s_cur_topo) { CALL(s_list, IASetPrimitiveTopology, topo); s_cur_topo = topo; }
 
@@ -2060,16 +2181,46 @@ static void eng_encode_draw(const EngRecord* r, ID3D12Resource* stage, D3D12_GPU
 
     const int query = s_qheap && r->vis && s_q_used < ENG_QUERIES_PER_SLOT;
     const u32 qi = s_slot * ENG_QUERIES_PER_SLOT + s_q_used;
-    if (query) { CALL(s_list, BeginQuery, s_qheap, D3D12_QUERY_TYPE_OCCLUSION, qi); }
+    if (query) { CALL(s_list, BeginQuery, s_qheap, D3D12_QUERY_TYPE_OCCLUSION, qi); s_gt_queries++; }
+    s_gt_draws++;
     if (r->index_count) CALL(s_list, DrawIndexedInstanced, r->index_count, 1, 0, 0, 0);
     else                CALL(s_list, DrawInstanced, r->vertex_count, 1, 0, 0);
     if (query) { CALL(s_list, EndQuery, s_qheap, D3D12_QUERY_TYPE_OCCLUSION, qi); s_q_vis[s_q_used++] = r->vis - 1; }
 }
 
+static void eng_pass_mark(const EngRecord* r, u64* cur_key)
+{
+    int kind; u32 h1, h2 = 0;
+    switch (r->kind) {
+    case ENG_REC_DRAW:          kind = 0; h1 = r->nrt ? r->rt[0] : 0; h2 = r->depth; break;
+    case ENG_REC_CLEAR_COLOR:   kind = 1; h1 = r->rt[0]; break;
+    case ENG_REC_CLEAR_DS:
+    case ENG_REC_CLEAR_DS_RECT: kind = 2; h1 = r->depth; break;
+    case ENG_REC_COLOR_COPY:    kind = 3; h1 = r->resolve_dst; break;
+    case ENG_REC_DEPTH_RESOLVE: kind = 4; h1 = r->resolve_dst; break;
+    default:                    kind = 5; h1 = 0; break;
+    }
+    const u64 key = ((u64)kind << 56) | ((u64)(h1 & 0xFFFFFFu) << 24) | (h2 & 0xFFFFFFu);
+    u32* n = &s_pass_n[s_slot];
+    if (key != *cur_key && *n < ENG_PASS_MAX) {
+        CALL(s_list, EndQuery, s_pheap, D3D12_QUERY_TYPE_TIMESTAMP, s_slot * (ENG_PASS_MAX + 1u) + *n);
+        EngPassDesc* d = &s_pass[s_slot][*n];
+        memset(d, 0, sizeof *d);
+        d->kind = (u8)kind; d->nrt = (u8)(kind == 0 ? r->nrt : 0);
+        EngObj* o = eng_owner(h1 ? h1 : h2);
+        if (o) { d->w = (u16)o->w; d->h = (u16)o->h; d->fmt = (u32)o->fmt; }
+        (*n)++;
+        *cur_key = key;
+    }
+    if (kind == 0 && *n) s_pass[s_slot][*n - 1].draws++;
+}
+
 static void eng_encode_records(ID3D12Resource* stage, D3D12_GPU_VIRTUAL_ADDRESS stage_va)
 {
+    u64 pass_key = ~0ull;
     for (u32 i = 0; i < s_rec_count; i++) {
         const EngRecord* r = &s_rec[i];
+        if (s_pheap) eng_pass_mark(r, &pass_key);
         switch (r->kind) {
         case ENG_REC_DRAW:
             eng_encode_draw(r, stage, stage_va);
@@ -2124,6 +2275,9 @@ static void eng_encode_records(ID3D12Resource* stage, D3D12_GPU_VIRTUAL_ADDRESS 
             break; }
         }
     }
+    /* Close the last pass. */
+    if (s_pheap && s_pass_n[s_slot])
+        CALL(s_list, EndQuery, s_pheap, D3D12_QUERY_TYPE_TIMESTAMP, s_slot * (ENG_PASS_MAX + 1u) + s_pass_n[s_slot]);
 }
 
 /* ---- submit ---------------------------------------------------------------- */
@@ -2138,6 +2292,13 @@ static void eng_submit_list(u64* out_fence)
     if (s_q_used && s_qread)
         CALL(s_list, ResolveQueryData, s_qheap, D3D12_QUERY_TYPE_OCCLUSION, s_slot * ENG_QUERIES_PER_SLOT, s_q_used,
              s_qread, (UINT64)s_slot * ENG_QUERIES_PER_SLOT * 8u);
+    if (s_pheap && s_pass_n[s_slot])
+        CALL(s_list, ResolveQueryData, s_pheap, D3D12_QUERY_TYPE_TIMESTAMP, s_slot * (ENG_PASS_MAX + 1u), s_pass_n[s_slot] + 1u,
+             s_pread, (UINT64)s_slot * (ENG_PASS_MAX + 1u) * 8u);
+    if (s_tsheap) {
+        CALL(s_list, EndQuery, s_tsheap, D3D12_QUERY_TYPE_TIMESTAMP, s_slot * 2u + 1u);
+        CALL(s_list, ResolveQueryData, s_tsheap, D3D12_QUERY_TYPE_TIMESTAMP, s_slot * 2u, 2, s_tsread, (UINT64)s_slot * 16u);
+    }
     HRESULT hr = CALL0(s_list, Close);
     s_list_open = 0;
     if (FAILED(hr)) {
@@ -2146,17 +2307,25 @@ static void eng_submit_list(u64* out_fence)
         s_ready = 0; *out_fence = 0; return;
     }
     ID3D12CommandList* lists[1] = { (ID3D12CommandList*)s_list };
+    if (s_tsheap) QueryPerformanceCounter(&s_ts_slot[s_slot].cpu_exec);
     CALL(s_queue, ExecuteCommandLists, 1, lists);
     *out_fence = fence_signal();
     s_alloc_fence[s_slot] = *out_fence;
+    if (s_tsheap) { s_ts_slot[s_slot].fence = *out_fence; s_ts_slot[s_slot].kind = s_submit_kind; }
 }
 
 /* A completed submit: its query counts and the reports waiting on them. */
 static void eng_poll_submits(void)
 {
-    for (int i = 0; i < ENG_MAX_SUBMITS; i++) {
-        EngSubmit* s = &s_sub[i];
-        if (!s->live || !fence_done(s->fence)) continue;
+    for (;;) {
+        /* Oldest first: a report rides on the submit open when the walker met
+         * it, and the queries it counts may be in an earlier one, whose counts
+         * have to be in before it reads them. In table order a later submit in
+         * a lower slot was delivered first. */
+        EngSubmit* s = NULL;
+        for (int i = 0; i < ENG_MAX_SUBMITS; i++)
+            if (s_sub[i].live && (!s || s_sub[i].fence < s->fence)) s = &s_sub[i];
+        if (!s || !fence_done(s->fence)) break;
         if (s->q_count && s_qread) {
             D3D12_RANGE rg = { (SIZE_T)s->q_slot * ENG_QUERIES_PER_SLOT * 8u, ((SIZE_T)s->q_slot * ENG_QUERIES_PER_SLOT + s->q_count) * 8u };
             u64* p = NULL;
@@ -2256,7 +2425,9 @@ static void eng_submit(u32 present_surface, int wait)
         s_vis_npending = 0;
     }
     u64 f = 0;
+    s_submit_kind = wait;
     eng_submit_list(&f);
+    s_submit_kind = 0;
     sub->fence = f; sub->live = 1; sub->stage = s_stage_cur;
     if (s_stage_cur >= 0) { s_stage[s_stage_cur].fence = f; s_stage[s_stage_cur].in_use = 1; }
     s_stage_cur = -1; s_stage_used = 0;
@@ -2482,7 +2653,7 @@ static void eng_release_device(void)
     RELEASE(s_zero_cb); RELEASE(s_readback); s_readback_cap = 0; RELEASE(s_aux_alloc);
     RELEASE(s_null_tex); RELEASE(s_blit_pso); RELEASE(s_depth_pso); RELEASE(s_depth_pack_pso);
     RELEASE(s_rootsig); RELEASE(s_helper_rootsig);
-    RELEASE(s_qheap); RELEASE(s_qread);
+    RELEASE(s_qheap); RELEASE(s_qread); RELEASE(s_tsheap); RELEASE(s_tsread); RELEASE(s_pheap); RELEASE(s_pread);
     for (u32 i = 0; i < ENG_FRAMES; i++) { RELEASE(s_smp_gpu[i]); RELEASE(s_alloc[i]); s_alloc_fence[i] = 0; }
     RELEASE(s_srv_gpu); RELEASE(s_srv_cpu); RELEASE(s_rtv_cpu); RELEASE(s_dsv_cpu); RELEASE(s_smp_cpu);
     RELEASE(s_list);
