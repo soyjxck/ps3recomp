@@ -118,6 +118,7 @@ static PFN_vkDestroyDebugUtilsMessengerEXT vkDestroyDebugUtilsMessengerEXT;
 /* ---- internal resolution (as rsx_d3d12_engine.c) ---------------------------- */
 
 static float s_scale = 1.0f;
+extern volatile int g_rsx_display_reload;   /* rsx_draw_engine.c */
 static u32 s_scale_min = 64;
 static u32 sc_dim(u32 v) { u32 r = (u32)((float)v * s_scale + 0.5f); return v && !r ? 1u : r; }
 static u32 sc_pos(u32 v) { return (u32)((float)v * s_scale + 0.5f); }
@@ -1056,15 +1057,9 @@ static VkPipeline eng_build_pso(EngPipeline* p, int cls, VkShaderModule fs)
     return pso;
 }
 
-static u32 eng_pipeline_create_locked(const char* vs_hlsl, const char* ps_hlsl, const rsx_be_render_state* rs,
-                                      const rsx_vertex_layout_plan* layout, u32 vertex_stride,
-                                      rsx_be_format rt_fmt, u32 rt_count)
+/* A fragment program at the current internal resolution. */
+static VkShaderModule eng_fp_module(const char* ps_hlsl)
 {
-    if (!s_dev || !vertex_stride || s_pipe_count >= ENG_MAX_PIPES) return 0;
-    if (!rt_count) rt_count = 1;
-    if (rt_count > RSX_BE_MAX_COLOR_TARGETS) rt_count = RSX_BE_MAX_COLOR_TARGETS;
-    VkShaderModule vs = eng_module(vs_hlsl, RSX_SPV_STAGE_VERTEX, "vp");
-    if (!vs) return 0;
     /* WPOS (input.position) arrives in host pixels at a raised internal
      * resolution: divide it back, as the D3D12 backend does, and keep the
      * plain text for passes into a target kept at the guest size. */
@@ -1094,11 +1089,25 @@ static u32 eng_pipeline_create_locked(const char* vs_hlsl, const char* ps_hlsl, 
         }
     }
     if (!fs) fs = eng_module(ps_hlsl, RSX_SPV_STAGE_FRAGMENT, "fp");
+    return fs;
+}
+
+static u32 eng_pipeline_create_locked(const char* vs_hlsl, const char* ps_hlsl, const rsx_be_render_state* rs,
+                                      const rsx_vertex_layout_plan* layout, u32 vertex_stride,
+                                      rsx_be_format rt_fmt, u32 rt_count)
+{
+    if (!s_dev || !vertex_stride || s_pipe_count >= ENG_MAX_PIPES) return 0;
+    if (!rt_count) rt_count = 1;
+    if (rt_count > RSX_BE_MAX_COLOR_TARGETS) rt_count = RSX_BE_MAX_COLOR_TARGETS;
+    VkShaderModule vs = eng_module(vs_hlsl, RSX_SPV_STAGE_VERTEX, "vp");
+    if (!vs) return 0;
+    const int wp = strstr(ps_hlsl, "input.position") != NULL;
+    VkShaderModule fs = eng_fp_module(ps_hlsl);
     if (!fs) return 0;
     EngPipeline* p = &s_pipe[s_pipe_count];
     memset(p, 0, sizeof *p);
     p->vs = vs; p->fs = fs;
-    if (wp) p->ps_plain = _strdup(ps_hlsl);
+    if (wp) p->ps_plain = _strdup(ps_hlsl);   /* at any scale: a rescale rebuilds from it */
     p->rs = *rs;
     p->nattr = layout->count < RSX_DSP_NUM_VERTEX_ATTR ? layout->count : RSX_DSP_NUM_VERTEX_ATTR;
     p->stride = vertex_stride;
@@ -1139,7 +1148,7 @@ static VkPipeline eng_pso_for(u32 pipeline, int cls, int unscaled)
 {
     if (!pipeline || pipeline > s_pipe_count) return VK_NULL_HANDLE;
     EngPipeline* p = &s_pipe[pipeline - 1];
-    const int alt = unscaled && p->ps_plain;
+    const int alt = unscaled && p->ps_plain && s_scale != 1.0f;
     VkPipeline* slot = alt ? &p->pso1[cls] : &p->pso[cls];
     int* failed = alt ? &p->failed1[cls] : &p->failed[cls];
     if (*slot) return *slot;

@@ -45,6 +45,10 @@ static u32 s_cur_rt[RSX_BE_MAX_COLOR_TARGETS], s_cur_nrt, s_cur_depth, s_cur_tw,
 static VkPipeline s_cur_pso;
 static VkDescriptorSet s_cur_set;
 static u64 s_cur_set_key;
+/* Targets eng_rescale made again, cleared before anything else in the next
+ * list: their memory is a recycled sub-allocation, and the title does not
+ * draw every pixel of every target (garbage showed at the frame's edges). */
+static u32 s_clear_new[ENG_MAX_OBJECTS]; static u32 s_clear_new_n;
 static VkPrimitiveTopology s_cur_topo;
 
 static void render_end(void)
@@ -289,6 +293,23 @@ static void eng_encode_records(EngStage* stage)
 {
     s_in_render = 0; s_cur_pso = VK_NULL_HANDLE; s_cur_set = VK_NULL_HANDLE; s_cur_set_key = 0;
     s_cur_topo = VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
+    for (u32 i = 0; i < s_clear_new_n; i++) {
+        EngObj* o = eng_obj(s_clear_new[i]);
+        if (!o || !o->img) continue;
+        obj_layout(o, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        bar_flush();
+        if (o->kind == OBJ_DEPTH) {
+            const VkClearDepthStencilValue dv = { 1.0f, 0 };
+            VkImageSubresourceRange rg = { VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 0, 1, 0, 1 };
+            vkCmdClearDepthStencilImage(s_cmd, o->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &dv, 1, &rg);
+        } else {
+            const VkClearColorValue cv = { { 0.0f, 0.0f, 0.0f, 0.0f } };
+            VkImageSubresourceRange rg = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+            vkCmdClearColorImage(s_cmd, o->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &cv, 1, &rg);
+        }
+        s_bar_global = 1;
+    }
+    s_clear_new_n = 0;
     for (u32 i = 0; i < s_rec_count; i++) {
         const EngRecord* r = &s_rec[i];
         switch (r->kind) {
@@ -1198,9 +1219,136 @@ void rsx_vulkan_engine_shutdown(void)
 
 int rsx_vulkan_engine_active(void) { return s_active; }
 
+/* RSX_SCALE changed while running: as the D3D12 engine's eng_rescale. With
+ * the device idle, each colour and depth target at the internal resolution
+ * is made again at the new one under the same handle (views included), the
+ * WPOS-reading pipelines get their fragment program rebuilt, and the
+ * fallback depths are dropped. The targets come back empty. */
+static void eng_rescale(void)
+{
+    vkDeviceWaitIdle(s_dev);
+    AcquireSRWLockExclusive(&s_pipe_lock);
+    u32 np = 0;
+    for (u32 i = 0; i < s_pipe_count; i++) {
+        EngPipeline* p = &s_pipe[i];
+        if (!p->ps_plain || !p->vs) continue;
+        VkShaderModule fs = eng_fp_module(p->ps_plain);   /* cached modules: not destroyed */
+        if (!fs) continue;
+        p->fs = fs;
+        for (int k = 0; k < 3; k++) {
+            if (p->pso[k]) vkDestroyPipeline(s_dev, p->pso[k], NULL);
+            p->pso[k] = VK_NULL_HANDLE; p->failed[k] = 0;
+        }
+        np++;
+    }
+    ReleaseSRWLockExclusive(&s_pipe_lock);
+    for (u32 i = 0; i < s_fallback_n; i++) eng_obj_release(NULL, s_fallback_depth[i]);
+    s_fallback_n = 0;
+    u32 nt = 0;
+    for (u32 i = 0; i < s_obj_count; i++) {
+        EngObj* o = &s_obj[i];
+        const u32 h = i + 1;
+        if (o->retired || !o->img || !o->gw || !o->gh) continue;
+        if (o->kind != OBJ_COLOR && o->kind != OBJ_DEPTH) continue;
+        const int was = o->w != o->gw || o->h != o->gh;
+        const int now = eng_scales(o->gw, o->gh);
+        if (!was && !now) continue;
+        const u32 nw = now ? sc_dim(o->gw) : o->gw, nh = now ? sc_dim(o->gh) : o->gh;
+        if (nw == o->w && nh == o->h) continue;
+        const int depth = o->kind == OBJ_DEPTH;
+        const VkImageUsageFlags usage = depth
+            ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+              VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+            : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+              VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        VkImageCreateInfo ii = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+        ii.imageType = VK_IMAGE_TYPE_2D; ii.format = o->fmt;
+        ii.extent.width = nw; ii.extent.height = nh; ii.extent.depth = 1;
+        ii.mipLevels = 1; ii.arrayLayers = 1; ii.samples = VK_SAMPLE_COUNT_1_BIT;
+        ii.tiling = VK_IMAGE_TILING_OPTIMAL; ii.usage = usage; ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        VkImage img = VK_NULL_HANDLE;
+        if (vkCreateImage(s_dev, &ii, NULL, &img) != VK_SUCCESS) continue;
+        VkMemoryRequirements req; vkGetImageMemoryRequirements(s_dev, img, &req);
+        MemAlloc mem;
+        if (!mem_alloc(&req, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 1, &mem)) { vkDestroyImage(s_dev, img, NULL); continue; }
+        vkBindImageMemory(s_dev, img, s_blk[mem.block].mem, mem.off);
+        if (o->view) vkDestroyImageView(s_dev, o->view, NULL);
+        if (o->att) vkDestroyImageView(s_dev, o->att, NULL);
+        vkDestroyImage(s_dev, o->img, NULL);
+        mem_free(&o->mem);
+        o->img = img; o->mem = mem; o->w = nw; o->h = nh; o->layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (depth) {
+            o->view = make_view(img, o->fmt, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_DEPTH_BIT, 1, 1, k_identity);
+            o->att = make_view(img, o->fmt, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 1, 1, k_identity);
+        } else {
+            o->view = make_view(img, o->fmt, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, k_identity);
+            o->att = make_view(img, o->fmt, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, k_identity);
+        }
+        for (u32 v = 0; v < s_view_count; v++)
+            if (s_view[v].surface == h) {
+                EngObj* vo = eng_obj(s_view[v].view);
+                if (!vo) continue;
+                if (vo->view) vkDestroyImageView(s_dev, vo->view, NULL);
+                vo->view = make_view(img, o->fmt, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1,
+                                     eng_mapping(s_view[v].remap, s_view[v].format));
+                vo->w = nw; vo->h = nh;
+            }
+        if (s_clear_new_n < ENG_MAX_OBJECTS) s_clear_new[s_clear_new_n++] = h;
+        nt++;
+    }
+    s_cur_set = VK_NULL_HANDLE;
+    fprintf(stderr, "[RSX vulkan] internal resolution x%.2f (%ux%u): %u targets and %u programs rebuilt\n",
+            s_scale, sc_dim(s_width), sc_dim(s_height), nt, np);
+}
+
+/* g_rsx_display_reload: RSX_VSYNC / RSX_DISPLAY / RSX_WINDOW / RSX_SCALE
+ * changed (the settings page). On the window's thread, at the pump. */
+static void eng_display_reload(void)
+{
+    g_rsx_display_reload = 0;
+    const EngDisplayMode od = s_display;
+    const u32 ow = s_win_w, oh = s_win_h;
+    const int ov = s_vsync;
+    const float os = s_scale;
+    { const char* v = getenv("RSX_VSYNC"); s_vsync = (v && *v) ? (atoi(v) ? 1 : 0) : 1; }
+    eng_read_scale();
+    { const char* dm = getenv("RSX_DISPLAY");
+      const char* fs = getenv("RSX_FULLSCREEN");
+      s_display = DISP_WINDOWED;
+      if (dm && *dm) {
+          if (!_stricmp(dm, "borderless") || !_stricmp(dm, "fullscreen") || !_stricmp(dm, "exclusive")) s_display = DISP_BORDERLESS;
+      } else if (fs && *fs && *fs != '0') s_display = DISP_BORDERLESS;
+      const char* ws = getenv("RSX_WINDOW");
+      unsigned ww = 0, wh = 0;
+      const int have_ws = ws && *ws && sscanf(ws, "%ux%u", &ww, &wh) == 2 && ww >= 320 && wh >= 240 && ww <= 16384 && wh <= 16384;
+      s_win_w = s_width; s_win_h = s_height;
+      if (s_display == DISP_WINDOWED) { if (have_ws) { s_win_w = ww; s_win_h = wh; } }
+      else { s_win_w = (u32)GetSystemMetrics(SM_CXSCREEN); s_win_h = (u32)GetSystemMetrics(SM_CYSCREEN); } }
+    if (s_scale != os) eng_rescale();
+    if (s_display == od && s_win_w == ow && s_win_h == oh && s_vsync == ov) return;
+    vkDeviceWaitIdle(s_dev);
+    if (s_display != od || s_win_w != ow || s_win_h != oh) {
+        if (s_display == DISP_WINDOWED) {
+            RECT wr = {0, 0, (LONG)s_win_w, (LONG)s_win_h};
+            AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
+            const int w = wr.right - wr.left, h = wr.bottom - wr.top;
+            const int x = (GetSystemMetrics(SM_CXSCREEN) - w) / 2, y = (GetSystemMetrics(SM_CYSCREEN) - h) / 2;
+            SetWindowLongPtrA(s_hwnd, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
+            SetWindowPos(s_hwnd, HWND_NOTOPMOST, x > 0 ? x : 0, y > 0 ? y : 0, w, h, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+        } else {
+            SetWindowLongPtrA(s_hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+            SetWindowPos(s_hwnd, HWND_TOP, 0, 0, (int)s_win_w, (int)s_win_h, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+        }
+    }
+    if (eng_swapchain_create() != 0) fprintf(stderr, "[RSX vulkan] could not remake the swap chain\n");
+    fprintf(stderr, "[RSX vulkan] display: %s %ux%u, vsync %d\n",
+            s_display == DISP_BORDERLESS ? "borderless" : "windowed", s_win_w, s_win_h, s_vsync);
+}
+
 int rsx_vulkan_engine_pump_messages(void)
 {
     if (s_headless) return 0;
+    if (g_rsx_display_reload && s_ready && s_swap) eng_display_reload();
     MSG msg;
     while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
         if (msg.message == WM_QUIT) return -1;

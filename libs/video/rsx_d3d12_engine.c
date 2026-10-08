@@ -133,6 +133,7 @@ typedef struct {
  * Metal engine does (rsx_metal_backend.m, eng_obj_fx). */
 static float s_scale = 1.0f;
 static u32 s_scale_min = 64;
+extern volatile int g_rsx_display_reload;   /* rsx_draw_engine.c */
 static u32 s_win_w, s_win_h;                 /* the window and swap chain */
 typedef enum { DISP_WINDOWED = 0, DISP_BORDERLESS, DISP_FULLSCREEN } EngDisplayMode;
 static EngDisplayMode s_display = DISP_WINDOWED;
@@ -1035,6 +1036,74 @@ static ID3D12DescriptorHeap* eng_make_heap(D3D12_DESCRIPTOR_HEAP_TYPE type, u32 
 
 /* ---- device ---------------------------------------------------------------- */
 
+/* The swap chain over s_hwnd at s_win_w x s_win_h for s_display: flip
+ * model, three buffers; tearing allowed whenever the system supports it
+ * outside exclusive full screen, so v-sync can be switched off while
+ * running. At start-up and again when the display settings change. */
+static int eng_swapchain_create(IDXGIFactory4* factory)
+{
+    HRESULT hr;
+    DXGI_SWAP_CHAIN_DESC1 sd = {0};
+    sd.Width = s_win_w; sd.Height = s_win_h; sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.SampleDesc.Count = 1; sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.BufferCount = 3; sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    s_tearing = 0;
+    if (s_display != DISP_FULLSCREEN) {
+        IDXGIFactory5* f5 = NULL;
+        if (SUCCEEDED(CALL(factory, QueryInterface, &IID_IDXGIFactory5, (void**)&f5))) {
+            BOOL allow = FALSE;
+            if (SUCCEEDED(CALL(f5, CheckFeatureSupport, DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allow, sizeof allow)) && allow)
+                s_tearing = 1;
+            RELEASE(f5);
+        }
+        if (s_tearing) sd.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+    }
+    IDXGISwapChain1* sc1 = NULL;
+    DXGI_SWAP_CHAIN_FULLSCREEN_DESC fsd = {0};
+    fsd.Windowed = TRUE;
+    if (s_display == DISP_FULLSCREEN) {
+        /* Exclusive: the swap chain owns the output, at the mode its
+         * size names. ALLOW_MODE_SWITCH lets that be a different mode
+         * from the desktop's (RSX_WINDOW). */
+        sd.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
+        fsd.Windowed = FALSE;
+        fsd.RefreshRate.Numerator = 0; fsd.RefreshRate.Denominator = 0;
+        fsd.Scaling = DXGI_MODE_SCALING_UNSPECIFIED;
+        fsd.ScanlineOrdering = DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED;
+    }
+    hr = CALL(factory, CreateSwapChainForHwnd, (IUnknown*)s_queue, s_hwnd, &sd, &fsd, NULL, &sc1);
+    if (FAILED(hr) && s_display == DISP_FULLSCREEN) {
+        /* The output refused the mode: fall back to a borderless window
+         * of the same size rather than no window at all. */
+        fprintf(stderr, "[rsx engine/d3d12] exclusive full screen refused (0x%08lX); borderless instead\n", (long)hr);
+        s_display = DISP_BORDERLESS;
+        sd.Flags &= ~(UINT)DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
+        {
+            IDXGIFactory5* f5 = NULL; BOOL allow = FALSE;
+            if (SUCCEEDED(CALL(factory, QueryInterface, &IID_IDXGIFactory5, (void**)&f5))) {
+                if (SUCCEEDED(CALL(f5, CheckFeatureSupport, DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allow, sizeof allow)) && allow)
+                    s_tearing = 1;
+                RELEASE(f5);
+            }
+            if (s_tearing) sd.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+        }
+        hr = CALL(factory, CreateSwapChainForHwnd, (IUnknown*)s_queue, s_hwnd, &sd, NULL, NULL, &sc1);
+    }
+    if (FAILED(hr)) { fprintf(stderr, "[rsx engine/d3d12] swap chain failed: 0x%08lX\n", (long)hr); return -1; }
+    CALL(factory, MakeWindowAssociation, s_hwnd, DXGI_MWA_NO_ALT_ENTER);
+    hr = CALL(sc1, QueryInterface, &IID_IDXGISwapChain3, (void**)&s_swap);
+    RELEASE(sc1);
+    if (FAILED(hr)) return -1;
+    if (!s_backbuf_rtv_heap) s_backbuf_rtv_heap = eng_make_heap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 3, 0);
+    if (!s_backbuf_rtv_heap) return -1;
+    s_rtv_step = CALL(s_dev, GetDescriptorHandleIncrementSize, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    for (u32 i = 0; i < 3; i++) {
+        if (FAILED(CALL(s_swap, GetBuffer, i, &IID_ID3D12Resource, (void**)&s_backbuf[i]))) return -1;
+        CALL(s_dev, CreateRenderTargetView, s_backbuf[i], NULL, cpu_handle(s_backbuf_rtv_heap, s_rtv_step, i));
+    }
+    return 0;
+}
+
 static int eng_init_device(u32 width, u32 height)
 {
     HRESULT hr;
@@ -1072,65 +1141,7 @@ static int eng_init_device(u32 width, u32 height)
     D3D12_COMMAND_QUEUE_DESC qd = {0}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     if (FAILED(CALL(s_dev, CreateCommandQueue, &qd, &IID_ID3D12CommandQueue, (void**)&s_queue))) { RELEASE(factory); return -1; }
 
-    if (!s_headless) {
-        DXGI_SWAP_CHAIN_DESC1 sd = {0};
-        sd.Width = width; sd.Height = height; sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        sd.SampleDesc.Count = 1; sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-        sd.BufferCount = 3; sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-        if (!s_vsync && s_display != DISP_FULLSCREEN) {
-            IDXGIFactory5* f5 = NULL;
-            if (SUCCEEDED(CALL(factory, QueryInterface, &IID_IDXGIFactory5, (void**)&f5))) {
-                BOOL allow = FALSE;
-                if (SUCCEEDED(CALL(f5, CheckFeatureSupport, DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allow, sizeof allow)) && allow)
-                    s_tearing = 1;
-                RELEASE(f5);
-            }
-            if (s_tearing) sd.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
-        }
-        IDXGISwapChain1* sc1 = NULL;
-        DXGI_SWAP_CHAIN_FULLSCREEN_DESC fsd = {0};
-        fsd.Windowed = TRUE;
-        if (s_display == DISP_FULLSCREEN) {
-            /* Exclusive: the swap chain owns the output, at the mode its
-             * size names. ALLOW_MODE_SWITCH lets that be a different mode
-             * from the desktop's (RSX_WINDOW). */
-            sd.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
-            fsd.Windowed = FALSE;
-            fsd.RefreshRate.Numerator = 0; fsd.RefreshRate.Denominator = 0;
-            fsd.Scaling = DXGI_MODE_SCALING_UNSPECIFIED;
-            fsd.ScanlineOrdering = DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED;
-        }
-        hr = CALL(factory, CreateSwapChainForHwnd, (IUnknown*)s_queue, s_hwnd, &sd, &fsd, NULL, &sc1);
-        if (FAILED(hr) && s_display == DISP_FULLSCREEN) {
-            /* The output refused the mode: fall back to a borderless window
-             * of the same size rather than no window at all. */
-            fprintf(stderr, "[rsx engine/d3d12] exclusive full screen refused (0x%08lX); borderless instead\n", (long)hr);
-            s_display = DISP_BORDERLESS;
-            sd.Flags &= ~(UINT)DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
-            if (!s_vsync) {
-                IDXGIFactory5* f5 = NULL; BOOL allow = FALSE;
-                if (SUCCEEDED(CALL(factory, QueryInterface, &IID_IDXGIFactory5, (void**)&f5))) {
-                    if (SUCCEEDED(CALL(f5, CheckFeatureSupport, DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allow, sizeof allow)) && allow)
-                        s_tearing = 1;
-                    RELEASE(f5);
-                }
-                if (s_tearing) sd.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
-            }
-            hr = CALL(factory, CreateSwapChainForHwnd, (IUnknown*)s_queue, s_hwnd, &sd, NULL, NULL, &sc1);
-        }
-        if (FAILED(hr)) { fprintf(stderr, "[rsx engine/d3d12] swap chain failed: 0x%08lX\n", (long)hr); RELEASE(factory); return -1; }
-        CALL(factory, MakeWindowAssociation, s_hwnd, DXGI_MWA_NO_ALT_ENTER);
-        hr = CALL(sc1, QueryInterface, &IID_IDXGISwapChain3, (void**)&s_swap);
-        RELEASE(sc1);
-        if (FAILED(hr)) { RELEASE(factory); return -1; }
-        s_backbuf_rtv_heap = eng_make_heap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 3, 0);
-        if (!s_backbuf_rtv_heap) { RELEASE(factory); return -1; }
-        s_rtv_step = CALL(s_dev, GetDescriptorHandleIncrementSize, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-        for (u32 i = 0; i < 3; i++) {
-            if (FAILED(CALL(s_swap, GetBuffer, i, &IID_ID3D12Resource, (void**)&s_backbuf[i]))) { RELEASE(factory); return -1; }
-            CALL(s_dev, CreateRenderTargetView, s_backbuf[i], NULL, cpu_handle(s_backbuf_rtv_heap, s_rtv_step, i));
-        }
-    }
+    if (!s_headless && eng_swapchain_create(factory) != 0) { RELEASE(factory); return -1; }
     RELEASE(factory);
 
     if (FAILED(CALL(s_dev, CreateFence, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void**)&s_fence))) return -1;
@@ -1558,23 +1569,15 @@ static ID3DBlob* eng_shader(const char* hlsl, int stage, const char* what)
     return blob;
 }
 
-static u32 eng_pipeline_create_locked(const char* vs_hlsl, const char* ps_hlsl,
-                                      const rsx_be_render_state* rs,
-                                      const rsx_vertex_layout_plan* layout,
-                                      u32 vertex_stride, rsx_be_format rt_fmt, u32 rt_count)
+/* A fragment program at the current internal resolution. */
+static ID3DBlob* eng_fp_blob(const char* ps_hlsl)
 {
-    if (!s_dev || !vertex_stride) return 0;
-    if (!rt_count) rt_count = 1;
-    if (rt_count > RSX_BE_MAX_COLOR_TARGETS) rt_count = RSX_BE_MAX_COLOR_TARGETS;
-    if (s_pipe_count >= ENG_MAX_PIPES) return 0;
-    ID3DBlob* vs = eng_shader(vs_hlsl, 0, "vp");
-    if (!vs) return 0;
-    ID3DBlob* ps = NULL;
     /* With the internal resolution raised, a fragment program's WPOS (the
      * decompiler's `input.position`) arrives in host pixels; the title
      * computes screen UVs and offsets from it in its own. Divide it back:
      * every use of the input is wrapped, and the text is what the shader
      * cache is keyed on, so the two builds never collide. */
+    ID3DBlob* ps = NULL;
     const char* wp = (s_scale != 1.0f) ? strstr(ps_hlsl, "input.position") : NULL;
     if (wp) {
         const char* needle = "input.position";
@@ -1600,13 +1603,30 @@ static u32 eng_pipeline_create_locked(const char* vs_hlsl, const char* ps_hlsl,
         }
     }
     if (!ps) ps = eng_shader(ps_hlsl, 1, "fp");
+    return ps;
+}
+
+static u32 eng_pipeline_create_locked(const char* vs_hlsl, const char* ps_hlsl,
+                                      const rsx_be_render_state* rs,
+                                      const rsx_vertex_layout_plan* layout,
+                                      u32 vertex_stride, rsx_be_format rt_fmt, u32 rt_count)
+{
+    if (!s_dev || !vertex_stride) return 0;
+    if (!rt_count) rt_count = 1;
+    if (rt_count > RSX_BE_MAX_COLOR_TARGETS) rt_count = RSX_BE_MAX_COLOR_TARGETS;
+    if (s_pipe_count >= ENG_MAX_PIPES) return 0;
+    ID3DBlob* vs = eng_shader(vs_hlsl, 0, "vp");
+    if (!vs) return 0;
+    ID3DBlob* ps = NULL;
+    const int wp = strstr(ps_hlsl, "input.position") != NULL;
+    ps = eng_fp_blob(ps_hlsl);
     if (!ps) return 0;
 
     EngPipeline* p = &s_pipe[s_pipe_count];
     memset(p, 0, sizeof *p);
     CALL0(vs, AddRef); CALL0(ps, AddRef);
     p->vs = vs; p->ps = ps;
-    if (wp) p->ps_plain = _strdup(ps_hlsl);
+    if (wp) p->ps_plain = _strdup(ps_hlsl);   /* at any scale: a rescale rebuilds from it */
     /* Input slot i carries attribute attrs[i] at i*16: the layout SLOT, as
      * rsx_metal_backend.m's eng_pipeline_create explains. */
     for (u32 slot = 0; slot < layout->count && slot < RSX_DSP_NUM_VERTEX_ATTR; slot++) {
@@ -1767,7 +1787,7 @@ static ID3D12PipelineState* eng_pso_for(u32 pipeline, int cls, int unscaled)
 {
     if (!unscaled || !pipeline || pipeline > s_pipe_count) return eng_pso(pipeline, cls);
     EngPipeline* p = &s_pipe[pipeline - 1];
-    if (!p->ps_plain) return eng_pso(pipeline, cls);
+    if (!p->ps_plain || s_scale == 1.0f) return eng_pso(pipeline, cls);
     if (p->pso1[cls]) return p->pso1[cls];
     if (!p->vs || p->failed1[cls]) return NULL;
     LARGE_INTEGER pq0, pq1, pqf; QueryPerformanceFrequency(&pqf); QueryPerformanceCounter(&pq0);
@@ -2784,6 +2804,162 @@ static void eng_poll_submits(void)
 
 static void eng_dump_frame(u32 surface);
 
+static void eng_swapchain_release(void)
+{
+    if (!s_swap) return;
+    if (s_display == DISP_FULLSCREEN) CALL(s_swap, SetFullscreenState, FALSE, NULL);
+    for (u32 i = 0; i < 3; i++) RELEASE(s_backbuf[i]);
+    RELEASE(s_swap);
+}
+
+/* RSX_DISPLAY / RSX_FULLSCREEN / RSX_WINDOW -> s_display and the window
+ * size: a windowed window of RSX_WINDOW (else the base size), the others
+ * over the display at its current mode. */
+static void eng_read_display(void)
+{
+    const char* dm = getenv("RSX_DISPLAY");
+    const char* fs = getenv("RSX_FULLSCREEN");
+    s_display = DISP_WINDOWED;
+    if (dm && *dm) {
+        if (!_stricmp(dm, "borderless")) s_display = DISP_BORDERLESS;
+        else if (!_stricmp(dm, "fullscreen") || !_stricmp(dm, "exclusive")) s_display = DISP_FULLSCREEN;
+        else if (_stricmp(dm, "windowed") && _stricmp(dm, "window"))
+            fprintf(stderr, "[RSX d3d12] RSX_DISPLAY=%s ignored (windowed, borderless or fullscreen)\n", dm);
+    } else if (fs && *fs && *fs != '0') s_display = DISP_BORDERLESS;
+    const char* ws = getenv("RSX_WINDOW");
+    unsigned ww = 0, wh = 0;
+    const int have_ws = ws && *ws && sscanf(ws, "%ux%u", &ww, &wh) == 2 && ww >= 320 && wh >= 240 && ww <= 16384 && wh <= 16384;
+    if (ws && *ws && !have_ws) fprintf(stderr, "[RSX d3d12] RSX_WINDOW=%s ignored (want <w>x<h>)\n", ws);
+    s_win_w = s_width; s_win_h = s_height;
+    if (s_display == DISP_WINDOWED) { if (have_ws) { s_win_w = ww; s_win_h = wh; } }
+    else { s_win_w = (u32)GetSystemMetrics(SM_CXSCREEN); s_win_h = (u32)GetSystemMetrics(SM_CYSCREEN); }
+}
+
+static int eng_read_vsync(void)
+{
+    const char* v = getenv("RSX_VSYNC");
+    return (v && *v) ? (atoi(v) ? 1 : 0) : 1;
+}
+
+/* g_rsx_display_reload (rsx_draw_engine.c): the settings page changed
+ * RSX_VSYNC / RSX_DISPLAY / RSX_WINDOW / RSX_SCALE. Picked up by the message pump, on
+ * the thread that owns the window and presents. V-sync alone is the next
+ * present's interval; a new mode or size drains the GPU, restyles the
+ * window and makes a new swap chain (a frame or two of black). */
+static void eng_rescale(void);   /* below */
+static void eng_display_reload(void)
+{
+    g_rsx_display_reload = 0;
+    const EngDisplayMode od = s_display;
+    const u32 ow = s_win_w, oh = s_win_h;
+    const int ov = s_vsync;
+    const float os = s_scale;
+    s_vsync = eng_read_vsync();
+    eng_read_display();
+    eng_read_scale();
+    if (s_scale != os) eng_rescale();
+    if (s_vsync != ov) fprintf(stderr, "[RSX d3d12] vsync %d\n", s_vsync);
+    if (s_display == od && s_win_w == ow && s_win_h == oh) return;
+    fence_wait(fence_signal());
+    const EngDisplayMode nd = s_display;
+    s_display = od;
+    eng_swapchain_release();
+    s_display = nd;
+    if (s_display == DISP_WINDOWED) {
+        RECT wr = {0, 0, (LONG)s_win_w, (LONG)s_win_h};
+        AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
+        const int w = wr.right - wr.left, h = wr.bottom - wr.top;
+        const int x = (GetSystemMetrics(SM_CXSCREEN) - w) / 2, y = (GetSystemMetrics(SM_CYSCREEN) - h) / 2;
+        SetWindowLongPtrA(s_hwnd, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
+        SetWindowPos(s_hwnd, HWND_NOTOPMOST, x > 0 ? x : 0, y > 0 ? y : 0, w, h, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    } else {
+        SetWindowLongPtrA(s_hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+        SetWindowPos(s_hwnd, HWND_TOP, 0, 0, (int)s_win_w, (int)s_win_h, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    }
+    IDXGIFactory4* factory = NULL;
+    if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory4, (void**)&factory)) || eng_swapchain_create(factory) != 0)
+        fprintf(stderr, "[RSX d3d12] could not make a swap chain for the new display mode\n");
+    RELEASE(factory);
+    fprintf(stderr, "[RSX d3d12] display: %s %ux%u, vsync %d\n",
+            s_display == DISP_FULLSCREEN ? "full screen" : s_display == DISP_BORDERLESS ? "borderless" : "windowed",
+            s_win_w, s_win_h, s_vsync);
+}
+
+/* RSX_SCALE changed while running (the reload below). With the GPU idle:
+ * every colour and depth target at the internal resolution is made again at
+ * the new one under the same handle (the views cut from it pointed at the
+ * new resource), the pipelines whose fragment program reads WPOS get that
+ * program rebuilt for the new divisor, and the pools of host-sized
+ * scratch targets are emptied. The targets come back empty: the title draws
+ * nearly all of them every frame, so this is a frame or two of black. */
+static void eng_rescale(void)
+{
+    fence_wait(fence_signal());
+    AcquireSRWLockExclusive(&s_pipe_lock);
+    u32 np = 0;
+    for (u32 i = 0; i < s_pipe_count; i++) {
+        EngPipeline* p = &s_pipe[i];
+        if (!p->ps_plain || !p->vs) continue;
+        ID3DBlob* ps = eng_fp_blob(p->ps_plain);
+        if (!ps) continue;
+        CALL0(ps, AddRef);
+        RELEASE(p->ps);
+        p->ps = ps;
+        p->desc.PS.pShaderBytecode = CALL0(ps, GetBufferPointer);
+        p->desc.PS.BytecodeLength = CALL0(ps, GetBufferSize);
+        for (int c = 0; c < 3; c++) { RELEASE(p->pso[c]); p->failed[c] = 0; }
+        np++;
+    }
+    ReleaseSRWLockExclusive(&s_pipe_lock);
+    for (u32 i = 0; i < s_fallback_n; i++) eng_obj_release(NULL, s_fallback_depth[i]);
+    s_fallback_n = 0;
+    for (u32 i = 0; i < s_snap_pool_n; i++) RELEASE(s_snap_pool[i].res);
+    s_snap_pool_n = 0;
+    u32 nt = 0;
+    for (u32 i = 0; i < s_obj_count; i++) {
+        EngObj* o = &s_obj[i];
+        const u32 h = i + 1;
+        if (o->retired || !o->res || !o->gw || !o->gh) continue;
+        if (o->kind != OBJ_COLOR && o->kind != OBJ_DEPTH) continue;
+        const int was = o->w != o->gw || o->h != o->gh;
+        const int now = eng_scales(o->gw, o->gh);
+        if (!was && !now) continue;
+        const u32 nw = now ? sc_dim(o->gw) : o->gw, nh = now ? sc_dim(o->gh) : o->gh;
+        if (nw == o->w && nh == o->h) continue;
+        RELEASE(o->res);
+        D3D12_CLEAR_VALUE cv = {0};
+        if (o->kind == OBJ_COLOR) {
+            cv.Format = o->fmt;
+            o->res = make_texture(o->fmt, nw, nh, 1, 1, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                                  D3D12_RESOURCE_STATE_RENDER_TARGET, &cv);
+            o->state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            if (!o->res) continue;
+            eng_write_srv(h, o->res, o->fmt, 1, 1, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+            CALL(s_dev, CreateRenderTargetView, o->res, NULL, obj_rtv(h));
+        } else {
+            cv.Format = ENG_DEPTH_FMT; cv.DepthStencil.Depth = 1.0f;
+            o->res = make_texture(ENG_DEPTH_RES_FMT, nw, nh, 1, 1, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+                                  D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv);
+            o->state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+            if (!o->res) continue;
+            D3D12_DEPTH_STENCIL_VIEW_DESC dd = {0};
+            dd.Format = ENG_DEPTH_FMT; dd.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+            CALL(s_dev, CreateDepthStencilView, o->res, &dd, obj_dsv(h));
+            eng_write_srv(h, o->res, ENG_DEPTH_SRV_FMT, 1, 1, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+        }
+        o->w = nw; o->h = nh;
+        for (u32 v = 0; v < s_view_count; v++)
+            if (s_view[v].surface == h) {
+                eng_write_srv(s_view[v].view, o->res, o->fmt, 1, 1, eng_mapping(s_view[v].remap, s_view[v].format));
+                EngObj* vo = eng_obj(s_view[v].view);
+                if (vo) { vo->w = nw; vo->h = nh; }
+            }
+        nt++;
+    }
+    fprintf(stderr, "[RSX d3d12] internal resolution x%.2f (%ux%u): %u targets and %u programs rebuilt\n",
+            s_scale, sc_dim(s_width), sc_dim(s_height), nt, np);
+}
+
 /* Back in exclusive full screen after a focus loss. The GPU is drained first
  * (the back buffers are released and recreated), so this costs a frame. */
 static void eng_fullscreen_restore(void)
@@ -3127,7 +3303,7 @@ int rsx_d3d12_engine_init(u32 width, u32 height, const char* title)
     const char* hl = getenv("PS3RECOMP_D3D12_HEADLESS");
     s_headless = (hl && *hl && *hl != '0');
     s_width = width ? width : 1280; s_height = height ? height : 720;
-    { const char* v = getenv("RSX_VSYNC"); if (v && *v) s_vsync = atoi(v) ? 1 : 0; }
+    s_vsync = eng_read_vsync();
     eng_read_scale();
     { const char* e = getenv("RSX_BUF_POOL"); if (e && *e == '0') g_eng_buf_pool = 0; }
     /* Per-monitor DPI awareness, before any window exists: without it a
@@ -3138,25 +3314,7 @@ int rsx_d3d12_engine_init(u32 width, u32 height, const char* title)
       typedef BOOL (WINAPI *SetCtxFn)(DPI_AWARENESS_CONTEXT);
       SetCtxFn set_ctx = u32 ? (SetCtxFn)(void*)GetProcAddress(u32, "SetProcessDpiAwarenessContext") : NULL;
       if (!set_ctx || !set_ctx(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)) SetProcessDPIAware(); }
-    s_win_w = s_width; s_win_h = s_height;
-    { const char* dm = getenv("RSX_DISPLAY");
-      const char* fs = getenv("RSX_FULLSCREEN");
-      s_display = DISP_WINDOWED;
-      if (dm && *dm) {
-          if (!_stricmp(dm, "borderless")) s_display = DISP_BORDERLESS;
-          else if (!_stricmp(dm, "fullscreen") || !_stricmp(dm, "exclusive")) s_display = DISP_FULLSCREEN;
-          else if (_stricmp(dm, "windowed") && _stricmp(dm, "window"))
-              fprintf(stderr, "[RSX d3d12] RSX_DISPLAY=%s ignored (windowed, borderless or fullscreen)\n", dm);
-      } else if (fs && *fs && *fs != '0') s_display = DISP_BORDERLESS;
-      const char* ws = getenv("RSX_WINDOW");
-      unsigned ww = 0, wh = 0;
-      const int have_ws = ws && *ws && sscanf(ws, "%ux%u", &ww, &wh) == 2 && ww >= 320 && wh >= 240 && ww <= 16384 && wh <= 16384;
-      if (ws && *ws && !have_ws) fprintf(stderr, "[RSX d3d12] RSX_WINDOW=%s ignored (want <w>x<h>)\n", ws);
-      if (s_display == DISP_WINDOWED) { if (have_ws) { s_win_w = ww; s_win_h = wh; } }
-      else {
-          /* Both over the display at its current mode: no mode switch. */
-          s_win_w = (u32)GetSystemMetrics(SM_CXSCREEN); s_win_h = (u32)GetSystemMetrics(SM_CYSCREEN);
-      } }
+    eng_read_display();
 
     /* The engine is this backend's default; PS3RECOMP_RSX_ENGINE=vtable is
      * the way back to the rsx_state path. The query needs a registered
@@ -3206,6 +3364,7 @@ int rsx_d3d12_engine_active(void) { return s_active; }
 int rsx_d3d12_engine_pump_messages(void)
 {
     if (s_headless) return 0;
+    if (g_rsx_display_reload && s_ready && s_swap) eng_display_reload();
     MSG msg;
     while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
         if (msg.message == WM_QUIT) return -1;

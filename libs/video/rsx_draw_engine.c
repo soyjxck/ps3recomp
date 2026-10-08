@@ -935,6 +935,10 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
  * frame: when every page under a texture is protected and none was written
  * since the last hash, the bytes are known unchanged. RSX_TEX_WATCH=0, or a
  * host without it, hashes as before. -1 undecided; a host may switch it. */
+/* Set (by the port's settings page) when RSX_VSYNC / RSX_DISPLAY /
+ * RSX_WINDOW have changed; the backend applies them at its next message
+ * pump and clears it. */
+volatile int g_rsx_display_reload;
 int g_eng_tex_watch = -1;
 static unsigned long long s_tex_skips_total;   /* hashes the watch saved, for [frametime] */
 static int eng_tex_watch_on(void)
