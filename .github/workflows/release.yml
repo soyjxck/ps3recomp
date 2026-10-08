@@ -126,7 +126,7 @@ jobs:
           case "${{ matrix.platform }}" in
             win-x64)    CAN="renders and runs recompiled titles (D3D12)" ;;
             mac-arm64)  CAN="renders through Metal; cannot yet load a title -- the PPU boot scaffold does not run on POSIX" ;;
-            linux-x64)  CAN="toolkit and runtime library only -- no renderer (Vulkan is unwritten), and the PPU boot scaffold does not run on POSIX" ;;
+            linux-x64)  CAN="toolkit and runtime library only -- no renderer in this bundle (the Vulkan backend is opt-in, build from source with -DPS3RECOMP_RSX_VULKAN=ON), and the PPU boot scaffold does not run on POSIX" ;;
             *)          CAN="unknown" ;;
           esac
 

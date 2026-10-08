@@ -325,6 +325,22 @@ port owner cannot see from inside their own title.
   invisible list command into something you can read: the destination LSA at
   issue, and what a stall handler leaves behind (#168).
 
+*The 2026-09-16 WWS job-manager batch, from LittleBigPlanet*
+- **`bi $rN` through a non-r0 link register returns through that register**
+  (#174) — Sony's compiler links through r4/r5/r6/r8/r78 as well as r0, and
+  `SPU_RET` always took r0, so every such return unwound the host stack and the
+  job manager restarted on every job.
+- **`lift_jobmods` seeds the entries modules reach only through data** (#175) —
+  the post-header stub and the hand-built return addresses that 46 of 47 job
+  modules use.
+- **SPU drain resumes at a lifted entry and unwinds an `iret` to the frame that
+  took the interrupt** (#176).
+- **The taskset syscall HLE'd for a standalone task on a planted context**
+  (#177) — LBP's audio tasks died on their first syscall and the loader waited
+  forever on their event flag.
+- **`_sys_spu_image_import` writes the segment source at +0x10** (#178) — the
+  FMOD mixer DMA'd its DSP overlay from EA 0 and jumped into zeroed local store.
+
 ### Paulo Adriano Alves — [@pauloadrianoalves](https://github.com/pauloadrianoalves)
 Initial **PPU boot path** and supporting tooling (PR #3, partially incorporated
 in **v0.6.2** — the SPU portions were superseded by the v0.6.0 SPU subsystem and
@@ -402,6 +418,35 @@ Gave the project its first CI and its second platform, in **v0.9.0**.
   and `GetFileAttributesA` in two diagnostic gates), so master stopped building
   off Windows. Fixed each the way the file already did it, and gave the compat
   layer a POSIX `GetFileAttributesA` with a test.
+- **A Vulkan RSX backend** (#182, #192) — Linux had no renderer. Opt-in,
+  `libvulkan` loaded at run time, Vulkan 1.0 core only: clears, the fixed-function
+  fallback path, depth, textures and an SDL2 window first, then the guest's own
+  vertex/fragment programs through an HLSL → SPIR-V translator on the shared
+  register-file draw engine. Every `ps3recomp_host` scene passes on it under
+  the Khronos validation layer — on lavapipe in CI, and on a Nintendo Switch's
+  Tegra X1.
+
+### André Brum — [@andrebrumdev](https://github.com/andrebrumdev)
+Lifter and RSX correctness found bringing up *God of War II HD* and *Ben 10
+Omniverse* — every fix arrives with a test that fails on master.
+- **Jump-table base register arbitrated by validated targets** (#179, fixing his
+  own report #115) — with `lwzx rD,rA,rB` either operand can be the table base;
+  the lifter took the first one it could resolve, so an absolute table whose
+  index also came off r2 lost its dispatcher silently.
+- **Callee-save slots snapshotted only for a real epilogue restore** (#207) — a
+  reload of a frame local written by `stvx` or through a pointer read the stale
+  value from fragment entry; a Ben 10 dialog band drew half a tile off-centre.
+  Same PR: **`vcmpequb.`/`vcmpequh.` set CR6**, closing the last gap in the
+  family.
+- **`SET_TRANSFORM_CONSTANT` is a 32-dword window, not 64** (#208) — three
+  registers above it were landing in the vertex constant file, inside God of
+  War's skinning palette: 46% of samples had a non-rigid bone, now 0.1%.
+- **`-msse4.1` probed instead of assumed** (#206) — Apple clang 21 and aarch64
+  GCC reject it outright.
+
+### bojogon7 — [@bojogon7](https://github.com/bojogon7)
+- Added [AnyPS5](https://github.com/boykopovar/AnyPS5) to the README's list of
+  sibling recompilation projects (#209).
 
 ---
 

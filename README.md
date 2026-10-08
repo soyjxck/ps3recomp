@@ -24,6 +24,7 @@ This is the same philosophy behind:
 - [PS2Recomp](https://github.com/ran-j/PS2Recomp) (PS2 -> native)
 - [burnout3](https://github.com/sp00nznet/burnout3) (Original Xbox -> native)
 - [ReXGlue](https://github.com/rexglue/rexglue-sdk) (Xbox 360 -> native)
+- [AnyPS5](https://github.com/boykopovar/AnyPS5) (PS5 -> native)
 
 ...but for the PS3's glorious, terrifying **Cell Broadband Engine**.
 
@@ -50,7 +51,7 @@ same as running a game, and only one row claims that.
 |---|---|---|---|
 | Runtime library builds | yes | yes | yes |
 | Lifter + 8 test suites | yes | yes | yes |
-| Render backend | D3D12 | Metal | null (headless software) |
+| Render backend | D3D12 | Metal | null (headless software); Vulkan (opt-in) |
 | Runs a recompiled game | **yes** | **no** | no |
 
 The gap on macOS is the PPU boot scaffold — `ppu_loader.cpp`, `boot_main.cpp`
@@ -95,9 +96,13 @@ longer has to reimplement them to draw anything.
   through the decompiler, then textures. `ps3recomp_host` already drives
   cellGcm → RSX → Metal with no lifted game, so each step is testable before a
   title exists to run.
-- **Linux** has no renderer at all — the headless backend is a CPU triangle
-  filler for CI, deliberately. Vulkan is the obvious target, and it starts from
-  the same neutral draw record Metal reads.
+- **Linux** has an opt-in Vulkan backend (`-DPS3RECOMP_RSX_VULKAN=ON`). With
+  guest programs on (glslang at build time, `PS3RECOMP_VK_GUEST_PROGRAMS=1`) it
+  runs on the shared register-file draw engine, the path Metal takes, and every
+  `ps3recomp_host` scene passes on it -- including render-to-texture, MRT and
+  depth textures; without them it draws the null backend's fixed-function
+  contract. It has not run a recompiled title yet. The default is still the
+  headless backend, a CPU triangle filler for CI, deliberately.
 
 **Deliberately not claimed:** the table above says "no" for running a game on
 macOS and Linux, and it will keep saying "no" until a title actually boots to
@@ -280,7 +285,7 @@ We're building HLE implementations based on RPCS3's module system. **97 modules 
 | **Video Output** | cellVideoOut (resolution config, 720p default) | ✅ Complete |
 | **Codecs** | cellPngDec, cellJpgDec, cellGifDec (stb_image) | ✅ Complete |
 | **Font** | cellFont (stb_truetype backend + fallback metrics) | ✅ Complete |
-| **Network** | sys_net (BSD sockets), cellNet, cellNetCtl, cellHttpUtil, cellSsl, sceNp*, sceNpTrophy | ✅ Complete |
+| **Network** | sys_net (BSD sockets, P2P), cellNet, cellNetCtl, cellHttpUtil, cellSsl, sceNp*, sceNpTrophy, sceNpMatching2 + Score over [psnr](docs/ONLINE.md) | ✅ Complete |
 | **Hardware** | cellUsbd (USB), cellCamera (PS Eye), cellGem (PS Move) — stub, no devices | ✅ Complete |
 | **Sync** | cellSync (atomic spinlocks, LF queue), cellSync2 (OS-backed) | ✅ Complete |
 | **System** | cellRtc, cellMsgDialog, cellOskDialog, cellUserInfo, cellGameExec | ✅ Complete |
@@ -324,6 +329,7 @@ We've written extensive docs covering every aspect of the project. Whether you'r
 | **[Debug Console](docs/DEBUG_CONSOLE.md)** | Ask a title that is already running what it is doing, without a rebuild |
 | **[Runtime Diagnostics](docs/DIAGNOSTICS.md)** | Generated index of every diagnostic environment variable the runtime reads |
 | **[Prototype & Debug Builds](docs/PROTO_BUILDS.md)** | Why unencrypted, symbol-bearing prototype builds are the pipeline's ground truth |
+| **[Online Play](docs/ONLINE.md)** | Matchmaking, leaderboards and P2P play through a [psnr](https://github.com/sp00nznet/psnr) server — `--psnr host --username NAME` |
 | **[Regression Gate](docs/REGRESSION_GATE.md)** | How five ports are checked against recorded goldens before a shared-runtime change lands — and how to tell a real red from the four kinds of measurement artefact |
 
 ## Getting Started
@@ -361,19 +367,44 @@ See [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) for the full walkthrough.
 
 ## Game Ports Using ps3recomp
 
-*Status verified 2026-09-06 against each port's own tree. Each repo's README carries the live detail.*
+*Status as of 2026-10-07. Each port's own README carries the live detail and the run recipe.*
+
+### In game
 
 | Game | Title ID | Status | Repo |
 |------|----------|--------|------|
-| **Rubber Ducky** / *Bigduck* (Sony, E3 2006 tech demo) | NPEA00003 | 8,530 functions detected, 13,484 emitted — **99.0% recall against the binary's own `.symtab`**. Ships as a *debug build with full symbols and DWARF*, which makes it the pipeline's ground truth: the `find_functions` recall fix and the phantom-function fix were both validated here. **Rendered its own scene** on 2026-08-26 — tiled walls, the mosaic tub, the towel, the chrome faucet and the duck ([docs/images/ducky.png](https://github.com/sp00nznet/rubberducky)) — and **does not today**: it issues zero draws against a current toolkit, with the port tree unchanged since before that date. Reconciling what was hand-rolled to get there is open work. Water was never visible, blocked upstream of the renderer because the guest never populates its particle buffers. ~4–5 fps with the SPU fluid sim interpreted (~16 M SPU instructions/frame).<br><br>**No longer a regression-gate subject**: it ships as a debug build with full symbols, which is exactly what makes it good ground truth for the lifter and a poor statement about whether a change is safe for retail titles | [sp00nznet/rubberducky](https://github.com/sp00nznet/rubberducky) |
-| **You Don't Know Jack** (Jellyvision/THQ) | BLUS30569 | 5,859 functions; **reaches gameplay** — boots, renders its Scaleform UI through the live D3D12 engine, navigates the menus under real pad input, loads an episode and puts answerable quiz questions on screen with scoring HUD. The episode load used to hang here: `CellSyncMutex` is a big-endian ticket lock (`m_freed`/`m_order`) and we stored it as a host-endian flag, so a mutex the SPU left *free* read as `0x01000100` and `TryLock` spun 160 M times (#118). Frontier: the USM/Sofdec decode never fills its video planes, so every movie-backed screen draws colour noise behind correct UI; and one `cellSpursEventFlagWait` on `0x005C1200` still needs the `SPURS_EF_FORCE=1` diagnostic to pass | [sp00nznet/youdontknowjack](https://github.com/sp00nznet/youdontknowjack) |
-| **flOw** (thatgamecompany) | NPUA80001 | 102,056 functions; **assets load and the app loop runs** — 2,816 draws, on the live engine shared with Twisted Metal, with the real decrypted `libsre.prx` loaded so `cellSpurs`/`cellSync` dispatch into recompiled Sony library code instead of stubs. The loader had been starving on missing meshes: the title asks for `P_manta_head6.PSSG` and siblings while the extracted `USRDIR` only carries the `_BA` variants, so one unresolvable entry left a load permanently pending and the title polled its queue forever — ~43 loader objects a second, 90 MB of heap, no progress | [sp00nznet/flow](https://github.com/sp00nznet/flow) |
-| **Tokyo Jungle** (Crispy's/SCE Japan) | NPUA80523 | 7,924 functions — *down* from an advertised 35,208, because `find_functions` had been counting intra-function basic blocks as separate functions; the correction was ground-truthed against Rubber Ducky's symbol table. **The first 3D title attempted, and it reaches its menus.** Boots end to end, runs the PSN data-install flow, brings up SPURS and its SPU job images, and renders: the Crispy's developer logo, the title screen, "PRESS ANY BUTTON", then the **main menu** (SURVIVAL / STORY / STATS / ARCHIVES) and the STORY mode select, RANKING, RESULTS and STATS screens — all at ~30 fps on D3D12, verified from presented-frame dumps rather than log counters. Getting here needed `sys_ppu_thread_once` (unimplemented, and it reported success without running the initialiser), a FIFO resync that was swallowing fences, and SPURS carrying the SPU's answer to a job query. Frontier: roughly half of all boots still lose an early audio-module registration to a race, and the title's save and movie paths each crashed on a guest address used as a host pointer until `cellSaveData` and `cellSail` were fixed to marshal through guest memory | [sp00nznet/tokyojungle](https://github.com/sp00nznet/tokyojungle) |
-| **The Simpsons Arcade Game** (Konami) | NPUB30563 | 14,754 functions discovered, 17,397 lifted. **Playable** — boots, plays its intro, reaches the menus and runs the arcade core at 28–49 fps under keyboard input; Stage 1 Downtown Springfield plays through. A Konami arcade *emulator* EBOOT: the 1991 coin-op ROM lives inside `SIMPSONS.SR` and the binary emulates the hardware around it, which is what drove the SPU-task pipeline work. Its already-playable Xbox 360 sibling serves as the oracle. Known artifact: entering some menus can draw the whole font/button atlas as one quad | [sp00nznet/simpsonsarcade-ps3](https://github.com/sp00nznet/simpsonsarcade-ps3) |
-| **Twisted Metal** (Eat Sleep Play/SCEA) | BCUS98106 | The port that drove the live NV4097 engine upstream (#113) and the HDR/subchannel fixes with it. **The renderer works end to end** — geometry rasterises and the guest's own fragment shader executes; forcing a constant colour fills exactly the shape that drew. Boots real game code through `cellGcmInit`, video-out, the FIOS file-I/O scheduler, its game-data install and BoomRangBuss audio, opening 186 asset files off the disc | [sp00nznet/twistedmetal](https://github.com/sp00nznet/twistedmetal) |
-| **Virtua Fighter 5** (Sega AM2) | BLUS30020 | 17,856 functions; 107 imports across 10 modules, **zero `cellSpurs` and zero PSN imports** — which is what makes it an unusually clean target. **Renders** — 13,874 draw groups executed, 0 dropped, 72,652 real texture binds, 134 files loaded, zero unresolved imports. On screen: its own NOW LOADING and CRIWARE screens at 58 fps | [sp00nznet/vf5](https://github.com/sp00nznet/vf5) |
+| **The Simpsons Arcade Game** (Konami) | NPUB30563 | **Playable, and playable online.** Boots through the Konami intro and character select into Stage 1, Downtown Springfield, with its ATRAC3plus music (#186) and correct flashes and glyphs (#185). **Two players meet over [psnr](https://github.com/sp00nznet/psnr)** and play a match together: lobby, character select, the host's game setup, then Stage 1 in sync on both machines with each player's input moving their character on both screens — including with one player behind a NAT, through psnr's relay (#200, see [docs/ONLINE.md](docs/ONLINE.md)). A Konami arcade *emulator* EBOOT: the 1991 coin-op ROM lives in `SIMPSONS.SR` and the binary emulates the hardware around it | [sp00nznet/simpsonsarcade-ps3](https://github.com/sp00nznet/simpsonsarcade-ps3) |
+| **Tornado Outbreak** (Loose Cannon / Konami) | BLUS30371 | **In game, rendering correctly with no per-title overrides.** Logos and Bink intro, title, main menu, New Game (the save is created), the story intro and dialogue, then the first level under stick control at ~10–16 fps. The runtime fixes it needed — raw-SPU proxy DMA, vertex-program flow control, GPU resolve copies — are shared (#189) | [sp00nznet/tornado](https://github.com/sp00nznet/tornado) |
 
-Want to port a game? Start with the [Getting Started](#getting-started) section, check [docs/MODULE_STATUS.md](docs/MODULE_STATUS.md) for system library coverage, and see the [flOw case study](docs/GAME_PORTING_GUIDE.md#case-study-flow) for a real-world walkthrough.
+<p align="center">
+  <img src="https://raw.githubusercontent.com/sp00nznet/simpsonsarcade-ps3/main/docs/media/06-stage1.png" alt="The Simpsons Arcade Game, Stage 1" width="48%">
+  <img src="https://raw.githubusercontent.com/sp00nznet/tornado/main/docs/media/hero.gif" alt="Tornado Outbreak in the farmers' market" width="48%">
+</p>
+
+### Earlier ports
+
+Not under active development; they are where much of the runtime was first
+proven, and several stay in the [regression gate](docs/REGRESSION_GATE.md).
+
+| Game | Title ID | Where it got to | Repo |
+|------|----------|-----------------|------|
+| **Virtua Fighter 5** (Sega AM2) | BLUS30020 | Renders its NOW LOADING, CRIWARE and AM2 screens; zero SPURS and zero PSN imports | [sp00nznet/vf5](https://github.com/sp00nznet/vf5) |
+| **Tokyo Jungle** (Crispy's/SCE Japan) | NPUA80523 | Data install, SPURS jobs, title screen and the main menus | [sp00nznet/tokyojungle](https://github.com/sp00nznet/tokyojungle) |
+| **You Don't Know Jack** (Jellyvision/THQ) | BLUS30569 | Menus and answerable quiz questions; movie-backed screens still draw noise | [sp00nznet/youdontknowjack](https://github.com/sp00nznet/youdontknowjack) |
+| **Twisted Metal** (Eat Sleep Play) | BCUS98106 | Drove the live NV4097 engine (#113); boots real game code and its asset install | [sp00nznet/twistedmetal](https://github.com/sp00nznet/twistedmetal) |
+| **flOw** (thatgamecompany) | NPUA80001 | First draws with the real `libsre.prx`; assets load | [sp00nznet/flow](https://github.com/sp00nznet/flow) |
+| **Rubber Ducky** (Sony E3 2006 demo) | NPEA00003 | A debug build with full symbols — the lifter's ground truth, not a game target | [sp00nznet/rubberducky](https://github.com/sp00nznet/rubberducky) |
+
+### In the community
+
+Ports other people are running on ps3recomp, and whose fixes come back upstream:
+*LittleBigPlanet* ([@sagemono](https://github.com/sagemono)), *Yakuza: Dead
+Souls* ([@canersaka](https://github.com/canersaka)), *God of War II HD* and
+*Ben 10 Omniverse* ([@andrebrumdev](https://github.com/andrebrumdev)), and
+*DBZ Budokai HD* ([@gnome41](https://github.com/gnome41/ps3recomp-dbz-budokai-hd)).
+Ask in the [Discord](https://discord.gg/CRpzGWZFcu) to get yours listed.
+
+Want to port a game? Start with the [Getting Started](#getting-started) section, check [docs/MODULE_STATUS.md](docs/MODULE_STATUS.md) for system library coverage, and see the [Game Porting Guide](docs/GAME_PORTING_GUIDE.md) for a real-world walkthrough.
 
 ## Relationship to Other Projects
 
@@ -391,7 +422,7 @@ Want to port a game? Start with the [Getting Started](#getting-started) section,
 - **RPCS3's HLE modules** — 100+ modules of battle-tested PS3 system behavior
 - **XenonRecomp's PowerPC lifter** — adapted for Cell PPU (same ISA family, different extensions)
 - **LLVM** — for optimized native code generation from lifted C
-- **Direct3D 12 / Metal** — for RSX graphics translation. D3D12 is the backend that runs games today; Metal is the macOS one, and the headless null backend is what CI draws with. Vulkan is the intended Linux backend and is **not written yet** — the comments in `libs/video` that mention it are describing the plan, not the tree
+- **Direct3D 12 / Metal** — for RSX graphics translation. D3D12 is the backend that runs games today; Metal is the macOS one, and the headless null backend is what CI draws with. Vulkan is the Linux one, opt-in (see [docs/BUILDING.md](docs/BUILDING.md#the-vulkan-backend-linux-opt-in)); like Metal, it has not run a recompiled title yet
 - **SDL2** — input and audio off Windows. `cellPad` and `cellAudio` select their SDL2 backends unconditionally on non-Windows hosts, so it is required there; on Windows they use XInput and WASAPI. It does no windowing here — each graphics backend makes its own
 
 ## Contributing
@@ -428,6 +459,54 @@ ps3recomp is built by a growing community. See **[CONTRIBUTORS.md](CONTRIBUTORS.
 for who did what — thank you, everyone.
 
 ## Changelog
+
+### v0.13.0 — *"Player Two"* (October 2026)
+
+*Two titles in game, and one of them online. The Simpsons Arcade Game plays a*
+*two-player match over the network, and Tornado Outbreak reaches its first level*
+*rendering correctly with no per-title overrides. Thirty-odd pull requests from*
+*six people since v0.12.1.*
+
+**Online**
+- **NP online over [psnr](https://github.com/sp00nznet/psnr)** (#196, #200) —
+  real host sockets behind `PS3_NET_ONLINE`; sceNpMatching2 rooms, signaling and
+  callbacks, sceNpScore leaderboards, sceNpLookup, cellSysutilAvc2; NAT probes,
+  hole punching and a relay for peers that cannot reach each other.
+  `--psnr host --username NAME` on the runtime's command line. Offline is still
+  the default and unchanged. See [docs/ONLINE.md](docs/ONLINE.md).
+
+**Rendering**
+- **A Vulkan backend for Linux** — *[@gabryboy12-ai](https://github.com/gabryboy12-ai)*
+  (#182, #192). Opt-in; runs the guest's own shaders on the shared register-file
+  draw engine and passes every `ps3recomp_host` scene under the validation layer.
+- **`SET_TRANSFORM_CONSTANT` is a 32-dword window** — *[@andrebrumdev](https://github.com/andrebrumdev)*
+  (#208); three registers were corrupting God of War II's skinning palette.
+- Fragment-program flow control (IFE/LOOP/REP/BRK) and LIF (#187), vertex-program
+  flow control, GPU resolve copies and raw-SPU proxy DMA (#189), job-chain Join
+  and in-FIFO flips (#185).
+
+**Lifter**
+- *[@andrebrumdev](https://github.com/andrebrumdev)*: jump-table base arbitrated
+  by validated targets (#179); callee-save snapshots only for real epilogue
+  restores, and `vcmpequb.`/`vcmpequh.` set CR6 (#207).
+- Conditional fallthrough at a chunk end (#202), multi-TOC jump-table ranking
+  (#195), table-less computed jumps with a constant base (#193), `lwax` tables.
+
+**SPU** — *[@sagemono](https://github.com/sagemono)*, from LittleBigPlanet:
+non-r0 link returns (#174), data-only job-module entries (#175), drain resume
+and `iret` unwind (#176), the taskset syscall on a planted context (#177),
+`_sys_spu_image_import` segment source (#178).
+
+**Audio and media** — cellAtrac with ATRAC3plus (#186), cellVdec/cellAdec query
+and open fixes (#197, #198, #201), cellSail state changes (#190), job-chain
+completion carrying the job index (#204).
+
+**Build** — Linux and macOS building again (*[@gabryboy12-ai](https://github.com/gabryboy12-ai)*
+#191, #205), `-msse4.1` probed (*[@andrebrumdev](https://github.com/andrebrumdev)* #206),
+`spu_lifter --header-name` honoured (*[@tomspilman](https://github.com/tomspilman)* #181),
+the onboarding docs rewritten to the pipeline the tools implement (#180), and
+[AnyPS5](https://github.com/boykopovar/AnyPS5) added to the sibling projects
+(*[@bojogon7](https://github.com/bojogon7)* #209).
 
 ### v0.12.1 — *"Downloads, Again"* (September 2026)
 

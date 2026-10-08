@@ -44,6 +44,29 @@ file(GLOB_RECURSE HLE_SOURCES
 # Exclude test harnesses (e.g. libs/video/tests/*): they define their own main().
 list(FILTER HLE_SOURCES EXCLUDE REGEX "/tests/")
 
+# The Vulkan RSX backend is opt-in while it grows (stage V0: clear + present).
+# It loads libvulkan at run time, so building needs only the Vulkan headers --
+# no target-architecture libvulkan, which keeps cross-compiling simple.
+option(PS3RECOMP_RSX_VULKAN "Build the Vulkan RSX backend (Linux)" OFF)
+list(FILTER HLE_SOURCES EXCLUDE REGEX "rsx_vulkan_backend\\.c$")
+if(PS3RECOMP_RSX_VULKAN)
+    # Not in this fork: this backend's HLSL -> SPIR-V interface and binding
+    # plan (rsx_hlsl_to_spirv with a caller buffer; textures at 16, samplers
+    # at 48) differ from the draw-engine Vulkan engine's, which owns
+    # libs/video/rsx_shader_spirv.* here (libs/video/rsx_vulkan_engine.c).
+    message(FATAL_ERROR "PS3RECOMP_RSX_VULKAN (upstream's Linux Vulkan backend) is not built in this fork; "
+        "the draw-engine Vulkan engine (rsx_vulkan_engine.c) is the Vulkan path here")
+    find_path(PS3RECOMP_VULKAN_INCLUDE_DIR vulkan/vulkan.h)
+    if(NOT PS3RECOMP_VULKAN_INCLUDE_DIR)
+        message(FATAL_ERROR "Vulkan headers not found. Debian/Ubuntu: "
+            "libvulkan-dev, Fedora: vulkan-headers -- or pass "
+            "-DPS3RECOMP_VULKAN_INCLUDE_DIR=<dir containing vulkan/vulkan.h>")
+    endif()
+    list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_vulkan_backend.c")
+    # HLSL -> SPIR-V for guest programs: a stub unless glslang is found below.
+    list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_spirv.cpp")
+endif()
+
 # The Metal backend is Objective-C and Apple-only, so it is added explicitly
 # rather than globbed. It needs no platform #ifdef of its own as a result.
 if(APPLE)
@@ -187,6 +210,14 @@ if(APPLE)
     message(STATUS "  Metal:        RSX backend enabled (rsx_metal_backend.m)")
 endif()
 
+if(PS3RECOMP_RSX_VULKAN)
+    target_include_directories(ps3recomp_runtime PRIVATE "${PS3RECOMP_VULKAN_INCLUDE_DIR}")
+    # PUBLIC: ps3recomp_host selects its backend on this definition.
+    target_compile_definitions(ps3recomp_runtime PUBLIC PS3RECOMP_RSX_VULKAN)
+    target_link_libraries(ps3recomp_runtime PUBLIC ${CMAKE_DL_LIBS})
+    message(STATUS "  Vulkan:       RSX backend enabled (rsx_vulkan_backend.c, headers in ${PS3RECOMP_VULKAN_INCLUDE_DIR})")
+endif()
+
 # ---------------------------------------------------------------------------
 # Guest shaders on Metal: HLSL -> SPIR-V -> MSL
 # ---------------------------------------------------------------------------
@@ -270,6 +301,27 @@ if(UNIX)
     endif()
 endif()
 
+# Guest shaders on Vulkan: HLSL -> SPIR-V. glslang only -- Vulkan consumes
+# SPIR-V, so spirv-cross is not needed. Without glslang
+# libs/video/rsx_shader_spirv.cpp is a stub and the Vulkan backend stays on
+# its fixed-function path.
+if(PS3RECOMP_RSX_VULKAN)
+    if(glslang_FOUND AND TARGET glslang::glslang AND TARGET glslang::SPIRV)
+        set_source_files_properties(
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_spirv.cpp"
+            PROPERTIES COMPILE_DEFINITIONS PS3RECOMP_HAVE_SPIRV_TRANSLATION=1)
+        target_link_libraries(ps3recomp_runtime PRIVATE glslang::glslang glslang::SPIRV)
+        if(TARGET glslang::glslang-default-resource-limits)
+            target_link_libraries(ps3recomp_runtime PRIVATE
+                glslang::glslang-default-resource-limits)
+        endif()
+        message(STATUS "  Vulkan:       guest programs available (glslang ${glslang_VERSION}); "
+                       "opt in with PS3RECOMP_VK_GUEST_PROGRAMS=1")
+    else()
+        message(STATUS "  Vulkan:       glslang not found; guest programs unavailable")
+    endif()
+endif()
+
 # ---------------------------------------------------------------------------
 # Compiler flags
 # ---------------------------------------------------------------------------
@@ -290,10 +342,12 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
         $<$<CONFIG:Release,RelWithDebInfo>:-O2>
     )
     # SSE4.1 (any x86-64 since ~2008): pshufb/blendv for spu_shufb, the
-    # hottest SPU op in lifted audio code. x86 only -- arm64 clang rejects the
-    # flag outright, and spu_helpers.h falls back without __SSE4_1__.
-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i[3-6]86" AND
-       NOT CMAKE_OSX_ARCHITECTURES MATCHES "arm64")
+    # hottest SPU op in lifted audio code. Probed rather than assumed: recent
+    # Apple clang rejects the flag outright for arm64 ("unsupported option
+    # '-msse4.1'"), which stops the whole runtime from building there.
+    include(CheckCCompilerFlag)
+    check_c_compiler_flag(-msse4.1 PS3RECOMP_HAS_MSSE41)
+    if(PS3RECOMP_HAS_MSSE41)
         target_compile_options(ps3recomp_runtime PRIVATE -msse4.1)
     endif()
 elseif(MSVC)

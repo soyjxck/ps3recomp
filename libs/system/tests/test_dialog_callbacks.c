@@ -13,6 +13,7 @@ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
 void spu_coh_notify_write(uint32_t a) { (void)a; }
 void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
+void np_psnr_pump(void) {}
 
 static unsigned calls;
 static int waiting;

@@ -189,7 +189,7 @@ static inline uint64_t ppc_mulhdu(uint64_t a, uint64_t b) {
 /* VM base pointer (defined by game project) */
 extern "C" uint8_t* vm_base;
 
-/* Indirect call dispatch (bctrl/bctr) â€” implemented by the game project.
+/* Indirect call dispatch (bctrl/bctr) — implemented by the game project.
  * Looks up the guest address in CTR via a hash table and calls the
  * corresponding host function. Handles OPD resolution. */
 extern "C" void ps3_indirect_call(ppu_context* ctx);
@@ -344,6 +344,7 @@ static void check_fpr(const char* name, int reg, uint64_t got, uint64_t want) {
  * later memory-op tranches need them. */
 #include <stdlib.h>   /* MSVC _byteswap_* */
 static uint8_t g_vm_stub[65536];
+extern "C" { uint8_t* vm_base = g_vm_stub; }
 #define VMOFF(a) ((uint32_t)(a) & 0xFFFFu)
 /* Trap guard. A "may_trap" case exists to prove lifted code does NOT fault --
  * e.g. divw by zero must be lowered to a defined result, not a hardware trap.
@@ -7517,6 +7518,1383 @@ int main(void) {
       { uint16_t* d=(uint16_t*)&ctx->vr[2]; uint16_t* b=(uint16_t*)&ctx->vr[5]; uint16_t v=b[3]; for(int i=0;i<8;i++) d[i]=v; }
       { uint8_t _want[16] = { 0xDE, 0xF0, 0xDE, 0xF0, 0xDE, 0xF0, 0xDE, 0xF0, 0xDE, 0xF0, 0xDE, 0xF0, 0xDE, 0xF0, 0xDE, 0xF0 }; check_vr("vsplth w=3 canary", (const uint8_t*)&ctx->vr[2], _want); }
     }
+    { /* vcase 18: vmaxfp canary | vmaxfp v2, v0, v1 */
+      memset(ctx, 0, sizeof(*ctx));
+      { uint8_t _vb[16] = { 0x40, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x40, 0xA0, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00 }; memcpy(&ctx->vr[1], _vb, 16); }
+      { uint8_t _va[16] = { 0x3F, 0x80, 0x00, 0x00, 0xBF, 0x80, 0x00, 0x00, 0x7F, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }; memcpy(&ctx->vr[0], _va, 16); }
+      { float a[4],b[4],d[4]; ppu_vldf4(&ctx->vr[0],a); ppu_vldf4(&ctx->vr[1],b); for(int i=0;i<4;i++) d[i] = (a[i]!=a[i]) ? a[i]+a[i] : (b[i]!=b[i]) ? b[i]+b[i] : ((a[i]>b[i]) ? a[i] : (b[i]>a[i]) ? b[i] : (signbit(a[i]) ? b[i] : a[i])); ppu_vstf4(&ctx->vr[2],d); }
+      { uint8_t _want[16] = { 0x40, 0x00, 0x00, 0x00, 0xBF, 0x80, 0x00, 0x00, 0x7F, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }; check_vr("vmaxfp canary", (const uint8_t*)&ctx->vr[2], _want); }
+    }
+    { /* vcase 19: vminfp canary | vminfp v2, v0, v1 */
+      memset(ctx, 0, sizeof(*ctx));
+      { uint8_t _vb[16] = { 0x40, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x7F, 0xC0, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00 }; memcpy(&ctx->vr[1], _vb, 16); }
+      { uint8_t _va[16] = { 0x3F, 0x80, 0x00, 0x00, 0xBF, 0x80, 0x00, 0x00, 0x40, 0xA0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }; memcpy(&ctx->vr[0], _va, 16); }
+      { float a[4],b[4],d[4]; ppu_vldf4(&ctx->vr[0],a); ppu_vldf4(&ctx->vr[1],b); for(int i=0;i<4;i++) d[i] = (a[i]!=a[i]) ? a[i]+a[i] : (b[i]!=b[i]) ? b[i]+b[i] : ((a[i]<b[i]) ? a[i] : (b[i]<a[i]) ? b[i] : (signbit(a[i]) ? a[i] : b[i])); ppu_vstf4(&ctx->vr[2],d); }
+      { uint8_t _want[16] = { 0x3F, 0x80, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x7F, 0xC0, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00 }; check_vr("vminfp canary", (const uint8_t*)&ctx->vr[2], _want); }
+    }
+    { /* vcase 20: vrfin | vrfin v2, v0, v1 */
+      memset(ctx, 0, sizeof(*ctx));
+      { uint8_t _vb[16] = { 0x3F, 0xC0, 0x00, 0x00, 0x40, 0x20, 0x00, 0x00, 0xBF, 0xC0, 0x00, 0x00, 0x40, 0x19, 0x99, 0x9A }; memcpy(&ctx->vr[1], _vb, 16); }
+      { float b[4],d[4]; ppu_vldf4(&ctx->vr[1],b); for(int i=0;i<4;i++) d[i]=nearbyintf(b[i]); ppu_vstf4(&ctx->vr[2],d); }
+      { uint8_t _want[16] = { 0x40, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00 }; check_vr("vrfin", (const uint8_t*)&ctx->vr[2], _want); }
+    }
+    { /* vcase 21: vrfiz | vrfiz v2, v0, v1 */
+      memset(ctx, 0, sizeof(*ctx));
+      { uint8_t _vb[16] = { 0x3F, 0xC0, 0x00, 0x00, 0x40, 0x20, 0x00, 0x00, 0xBF, 0xC0, 0x00, 0x00, 0xC0, 0x2C, 0xCC, 0xCD }; memcpy(&ctx->vr[1], _vb, 16); }
+      { float b[4],d[4]; ppu_vldf4(&ctx->vr[1],b); for(int i=0;i<4;i++) d[i]=truncf(b[i]); ppu_vstf4(&ctx->vr[2],d); }
+      { uint8_t _want[16] = { 0x3F, 0x80, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0xBF, 0x80, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00 }; check_vr("vrfiz", (const uint8_t*)&ctx->vr[2], _want); }
+    }
+    { /* vcase 22: vcmpbfp | vcmpbfp v2, v0, v1 */
+      memset(ctx, 0, sizeof(*ctx));
+      { uint8_t _vb[16] = { 0x40, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00 }; memcpy(&ctx->vr[1], _vb, 16); }
+      { uint8_t _va[16] = { 0x3F, 0x80, 0x00, 0x00, 0x40, 0x40, 0x00, 0x00, 0xC0, 0x40, 0x00, 0x00, 0x7F, 0xC0, 0x00, 0x00 }; memcpy(&ctx->vr[0], _va, 16); }
+      { float a[4],b[4]; uint32_t d[4]; ppu_vldf4(&ctx->vr[0],a); ppu_vldf4(&ctx->vr[1],b); for(int i=0;i<4;i++) { uint32_t r=0; if(!(a[i]<=b[i])) r|=0x80000000u; if(!(a[i]>=-b[i])) r|=0x40000000u; d[i]=r; } ppu_vstu4(&ctx->vr[2],d); }
+      { uint8_t _want[16] = { 0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00 }; check_vr("vcmpbfp", (const uint8_t*)&ctx->vr[2], _want); }
+    }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=544;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      const uint8_t want[] = {160};
+      if (memcmp((uint8_t*)&ctx->vr[2]+0, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=0 offset=0: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=544;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      const uint8_t want[] = {16,161,162,163,164,165,166,167,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=0 offset=0: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=545;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      const uint8_t want[] = {161};
+      if (memcmp((uint8_t*)&ctx->vr[2]+1, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=0 offset=1: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=545;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      const uint8_t want[] = {160,17,162,163,164,165,166,167,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=0 offset=1: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=546;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      const uint8_t want[] = {162};
+      if (memcmp((uint8_t*)&ctx->vr[2]+2, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=0 offset=2: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=546;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      const uint8_t want[] = {160,161,18,163,164,165,166,167,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=0 offset=2: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=547;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      const uint8_t want[] = {163};
+      if (memcmp((uint8_t*)&ctx->vr[2]+3, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=0 offset=3: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=547;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      const uint8_t want[] = {160,161,162,19,164,165,166,167,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=0 offset=3: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=548;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      const uint8_t want[] = {164};
+      if (memcmp((uint8_t*)&ctx->vr[2]+4, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=0 offset=4: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=548;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      const uint8_t want[] = {160,161,162,163,20,165,166,167,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=0 offset=4: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=549;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      const uint8_t want[] = {165};
+      if (memcmp((uint8_t*)&ctx->vr[2]+5, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=0 offset=5: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=549;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      const uint8_t want[] = {160,161,162,163,164,21,166,167,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=0 offset=5: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=550;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      const uint8_t want[] = {166};
+      if (memcmp((uint8_t*)&ctx->vr[2]+6, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=0 offset=6: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=550;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      const uint8_t want[] = {160,161,162,163,164,165,22,167,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=0 offset=6: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=551;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      const uint8_t want[] = {167};
+      if (memcmp((uint8_t*)&ctx->vr[2]+7, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=0 offset=7: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=551;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,23,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=0 offset=7: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=552;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      const uint8_t want[] = {168};
+      if (memcmp((uint8_t*)&ctx->vr[2]+8, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=0 offset=8: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=552;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,24,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=0 offset=8: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=553;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      const uint8_t want[] = {169};
+      if (memcmp((uint8_t*)&ctx->vr[2]+9, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=0 offset=9: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=553;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,168,25,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=0 offset=9: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=554;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      const uint8_t want[] = {170};
+      if (memcmp((uint8_t*)&ctx->vr[2]+10, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=0 offset=10: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=554;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,26,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=0 offset=10: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=555;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      const uint8_t want[] = {171};
+      if (memcmp((uint8_t*)&ctx->vr[2]+11, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=0 offset=11: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=555;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,27,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=0 offset=11: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=556;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      const uint8_t want[] = {172};
+      if (memcmp((uint8_t*)&ctx->vr[2]+12, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=0 offset=12: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=556;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,28,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=0 offset=12: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=557;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      const uint8_t want[] = {173};
+      if (memcmp((uint8_t*)&ctx->vr[2]+13, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=0 offset=13: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=557;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,172,29,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=0 offset=13: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=558;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      const uint8_t want[] = {174};
+      if (memcmp((uint8_t*)&ctx->vr[2]+14, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=0 offset=14: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=558;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,172,173,30,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=0 offset=14: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=559;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      const uint8_t want[] = {175};
+      if (memcmp((uint8_t*)&ctx->vr[2]+15, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=0 offset=15: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=559;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,172,173,174,31};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=0 offset=15: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=32;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      const uint8_t want[] = {160};
+      if (memcmp((uint8_t*)&ctx->vr[2]+0, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=3 offset=0: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=32;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      const uint8_t want[] = {16,161,162,163,164,165,166,167,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=3 offset=0: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=33;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      const uint8_t want[] = {161};
+      if (memcmp((uint8_t*)&ctx->vr[2]+1, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=3 offset=1: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=33;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      const uint8_t want[] = {160,17,162,163,164,165,166,167,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=3 offset=1: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=34;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      const uint8_t want[] = {162};
+      if (memcmp((uint8_t*)&ctx->vr[2]+2, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=3 offset=2: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=34;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      const uint8_t want[] = {160,161,18,163,164,165,166,167,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=3 offset=2: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=35;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      const uint8_t want[] = {163};
+      if (memcmp((uint8_t*)&ctx->vr[2]+3, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=3 offset=3: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=35;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      const uint8_t want[] = {160,161,162,19,164,165,166,167,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=3 offset=3: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=36;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      const uint8_t want[] = {164};
+      if (memcmp((uint8_t*)&ctx->vr[2]+4, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=3 offset=4: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=36;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      const uint8_t want[] = {160,161,162,163,20,165,166,167,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=3 offset=4: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=37;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      const uint8_t want[] = {165};
+      if (memcmp((uint8_t*)&ctx->vr[2]+5, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=3 offset=5: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=37;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      const uint8_t want[] = {160,161,162,163,164,21,166,167,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=3 offset=5: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=38;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      const uint8_t want[] = {166};
+      if (memcmp((uint8_t*)&ctx->vr[2]+6, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=3 offset=6: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=38;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      const uint8_t want[] = {160,161,162,163,164,165,22,167,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=3 offset=6: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=39;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      const uint8_t want[] = {167};
+      if (memcmp((uint8_t*)&ctx->vr[2]+7, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=3 offset=7: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=39;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,23,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=3 offset=7: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=40;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      const uint8_t want[] = {168};
+      if (memcmp((uint8_t*)&ctx->vr[2]+8, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=3 offset=8: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=40;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,24,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=3 offset=8: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=41;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      const uint8_t want[] = {169};
+      if (memcmp((uint8_t*)&ctx->vr[2]+9, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=3 offset=9: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=41;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,168,25,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=3 offset=9: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=42;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      const uint8_t want[] = {170};
+      if (memcmp((uint8_t*)&ctx->vr[2]+10, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=3 offset=10: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=42;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,26,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=3 offset=10: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=43;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      const uint8_t want[] = {171};
+      if (memcmp((uint8_t*)&ctx->vr[2]+11, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=3 offset=11: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=43;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,27,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=3 offset=11: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=44;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      const uint8_t want[] = {172};
+      if (memcmp((uint8_t*)&ctx->vr[2]+12, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=3 offset=12: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=44;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,28,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=3 offset=12: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=45;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      const uint8_t want[] = {173};
+      if (memcmp((uint8_t*)&ctx->vr[2]+13, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=3 offset=13: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=45;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,172,29,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=3 offset=13: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=46;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      const uint8_t want[] = {174};
+      if (memcmp((uint8_t*)&ctx->vr[2]+14, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=3 offset=14: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=46;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,172,173,30,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=3 offset=14: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=47;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      const uint8_t want[] = {175};
+      if (memcmp((uint8_t*)&ctx->vr[2]+15, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=3 offset=15: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=47;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,172,173,174,31};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=3 offset=15: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=544;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      const uint8_t want[] = {160,161};
+      if (memcmp((uint8_t*)&ctx->vr[2]+0, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=0 offset=0: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=544;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      const uint8_t want[] = {16,17,162,163,164,165,166,167,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=0 offset=0: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=545;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      const uint8_t want[] = {160,161};
+      if (memcmp((uint8_t*)&ctx->vr[2]+0, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=0 offset=1: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=545;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      const uint8_t want[] = {16,17,162,163,164,165,166,167,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=0 offset=1: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=546;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      const uint8_t want[] = {162,163};
+      if (memcmp((uint8_t*)&ctx->vr[2]+2, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=0 offset=2: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=546;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      const uint8_t want[] = {160,161,18,19,164,165,166,167,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=0 offset=2: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=547;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      const uint8_t want[] = {162,163};
+      if (memcmp((uint8_t*)&ctx->vr[2]+2, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=0 offset=3: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=547;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      const uint8_t want[] = {160,161,18,19,164,165,166,167,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=0 offset=3: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=548;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      const uint8_t want[] = {164,165};
+      if (memcmp((uint8_t*)&ctx->vr[2]+4, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=0 offset=4: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=548;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      const uint8_t want[] = {160,161,162,163,20,21,166,167,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=0 offset=4: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=549;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      const uint8_t want[] = {164,165};
+      if (memcmp((uint8_t*)&ctx->vr[2]+4, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=0 offset=5: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=549;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      const uint8_t want[] = {160,161,162,163,20,21,166,167,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=0 offset=5: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=550;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      const uint8_t want[] = {166,167};
+      if (memcmp((uint8_t*)&ctx->vr[2]+6, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=0 offset=6: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=550;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      const uint8_t want[] = {160,161,162,163,164,165,22,23,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=0 offset=6: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=551;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      const uint8_t want[] = {166,167};
+      if (memcmp((uint8_t*)&ctx->vr[2]+6, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=0 offset=7: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=551;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      const uint8_t want[] = {160,161,162,163,164,165,22,23,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=0 offset=7: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=552;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      const uint8_t want[] = {168,169};
+      if (memcmp((uint8_t*)&ctx->vr[2]+8, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=0 offset=8: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=552;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,24,25,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=0 offset=8: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=553;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      const uint8_t want[] = {168,169};
+      if (memcmp((uint8_t*)&ctx->vr[2]+8, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=0 offset=9: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=553;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,24,25,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=0 offset=9: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=554;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      const uint8_t want[] = {170,171};
+      if (memcmp((uint8_t*)&ctx->vr[2]+10, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=0 offset=10: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=554;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,26,27,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=0 offset=10: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=555;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      const uint8_t want[] = {170,171};
+      if (memcmp((uint8_t*)&ctx->vr[2]+10, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=0 offset=11: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=555;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,26,27,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=0 offset=11: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=556;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      const uint8_t want[] = {172,173};
+      if (memcmp((uint8_t*)&ctx->vr[2]+12, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=0 offset=12: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=556;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,28,29,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=0 offset=12: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=557;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      const uint8_t want[] = {172,173};
+      if (memcmp((uint8_t*)&ctx->vr[2]+12, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=0 offset=13: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=557;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,28,29,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=0 offset=13: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=558;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      const uint8_t want[] = {174,175};
+      if (memcmp((uint8_t*)&ctx->vr[2]+14, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=0 offset=14: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=558;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,172,173,30,31};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=0 offset=14: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=559;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      const uint8_t want[] = {174,175};
+      if (memcmp((uint8_t*)&ctx->vr[2]+14, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=0 offset=15: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=559;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,172,173,30,31};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=0 offset=15: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=32;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      const uint8_t want[] = {160,161};
+      if (memcmp((uint8_t*)&ctx->vr[2]+0, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=3 offset=0: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=32;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      const uint8_t want[] = {16,17,162,163,164,165,166,167,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=3 offset=0: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=33;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      const uint8_t want[] = {160,161};
+      if (memcmp((uint8_t*)&ctx->vr[2]+0, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=3 offset=1: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=33;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      const uint8_t want[] = {16,17,162,163,164,165,166,167,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=3 offset=1: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=34;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      const uint8_t want[] = {162,163};
+      if (memcmp((uint8_t*)&ctx->vr[2]+2, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=3 offset=2: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=34;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      const uint8_t want[] = {160,161,18,19,164,165,166,167,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=3 offset=2: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=35;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      const uint8_t want[] = {162,163};
+      if (memcmp((uint8_t*)&ctx->vr[2]+2, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=3 offset=3: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=35;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      const uint8_t want[] = {160,161,18,19,164,165,166,167,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=3 offset=3: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=36;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      const uint8_t want[] = {164,165};
+      if (memcmp((uint8_t*)&ctx->vr[2]+4, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=3 offset=4: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=36;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      const uint8_t want[] = {160,161,162,163,20,21,166,167,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=3 offset=4: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=37;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      const uint8_t want[] = {164,165};
+      if (memcmp((uint8_t*)&ctx->vr[2]+4, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=3 offset=5: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=37;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      const uint8_t want[] = {160,161,162,163,20,21,166,167,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=3 offset=5: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=38;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      const uint8_t want[] = {166,167};
+      if (memcmp((uint8_t*)&ctx->vr[2]+6, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=3 offset=6: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=38;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      const uint8_t want[] = {160,161,162,163,164,165,22,23,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=3 offset=6: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=39;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      const uint8_t want[] = {166,167};
+      if (memcmp((uint8_t*)&ctx->vr[2]+6, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=3 offset=7: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=39;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      const uint8_t want[] = {160,161,162,163,164,165,22,23,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=3 offset=7: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=40;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      const uint8_t want[] = {168,169};
+      if (memcmp((uint8_t*)&ctx->vr[2]+8, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=3 offset=8: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=40;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,24,25,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=3 offset=8: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=41;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      const uint8_t want[] = {168,169};
+      if (memcmp((uint8_t*)&ctx->vr[2]+8, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=3 offset=9: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=41;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,24,25,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=3 offset=9: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=42;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      const uint8_t want[] = {170,171};
+      if (memcmp((uint8_t*)&ctx->vr[2]+10, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=3 offset=10: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=42;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,26,27,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=3 offset=10: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=43;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      const uint8_t want[] = {170,171};
+      if (memcmp((uint8_t*)&ctx->vr[2]+10, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=3 offset=11: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=43;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,26,27,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=3 offset=11: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=44;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      const uint8_t want[] = {172,173};
+      if (memcmp((uint8_t*)&ctx->vr[2]+12, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=3 offset=12: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=44;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,28,29,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=3 offset=12: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=45;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      const uint8_t want[] = {172,173};
+      if (memcmp((uint8_t*)&ctx->vr[2]+12, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=3 offset=13: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=45;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,28,29,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=3 offset=13: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=46;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      const uint8_t want[] = {174,175};
+      if (memcmp((uint8_t*)&ctx->vr[2]+14, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=3 offset=14: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=46;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,172,173,30,31};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=3 offset=14: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=47;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      const uint8_t want[] = {174,175};
+      if (memcmp((uint8_t*)&ctx->vr[2]+14, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=3 offset=15: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=47;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,172,173,30,31};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=3 offset=15: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=544;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      const uint8_t want[] = {160,161,162,163};
+      if (memcmp((uint8_t*)&ctx->vr[2]+0, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=0 offset=0: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=544;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      const uint8_t want[] = {16,17,18,19,164,165,166,167,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=0 offset=0: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=545;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      const uint8_t want[] = {160,161,162,163};
+      if (memcmp((uint8_t*)&ctx->vr[2]+0, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=0 offset=1: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=545;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      const uint8_t want[] = {16,17,18,19,164,165,166,167,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=0 offset=1: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=546;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      const uint8_t want[] = {160,161,162,163};
+      if (memcmp((uint8_t*)&ctx->vr[2]+0, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=0 offset=2: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=546;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      const uint8_t want[] = {16,17,18,19,164,165,166,167,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=0 offset=2: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=547;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      const uint8_t want[] = {160,161,162,163};
+      if (memcmp((uint8_t*)&ctx->vr[2]+0, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=0 offset=3: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=547;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      const uint8_t want[] = {16,17,18,19,164,165,166,167,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=0 offset=3: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=548;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      const uint8_t want[] = {164,165,166,167};
+      if (memcmp((uint8_t*)&ctx->vr[2]+4, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=0 offset=4: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=548;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      const uint8_t want[] = {160,161,162,163,20,21,22,23,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=0 offset=4: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=549;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      const uint8_t want[] = {164,165,166,167};
+      if (memcmp((uint8_t*)&ctx->vr[2]+4, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=0 offset=5: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=549;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      const uint8_t want[] = {160,161,162,163,20,21,22,23,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=0 offset=5: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=550;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      const uint8_t want[] = {164,165,166,167};
+      if (memcmp((uint8_t*)&ctx->vr[2]+4, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=0 offset=6: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=550;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      const uint8_t want[] = {160,161,162,163,20,21,22,23,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=0 offset=6: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=551;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      const uint8_t want[] = {164,165,166,167};
+      if (memcmp((uint8_t*)&ctx->vr[2]+4, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=0 offset=7: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=551;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      const uint8_t want[] = {160,161,162,163,20,21,22,23,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=0 offset=7: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=552;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      const uint8_t want[] = {168,169,170,171};
+      if (memcmp((uint8_t*)&ctx->vr[2]+8, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=0 offset=8: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=552;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,24,25,26,27,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=0 offset=8: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=553;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      const uint8_t want[] = {168,169,170,171};
+      if (memcmp((uint8_t*)&ctx->vr[2]+8, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=0 offset=9: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=553;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,24,25,26,27,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=0 offset=9: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=554;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      const uint8_t want[] = {168,169,170,171};
+      if (memcmp((uint8_t*)&ctx->vr[2]+8, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=0 offset=10: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=554;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,24,25,26,27,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=0 offset=10: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=555;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      const uint8_t want[] = {168,169,170,171};
+      if (memcmp((uint8_t*)&ctx->vr[2]+8, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=0 offset=11: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=555;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,24,25,26,27,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=0 offset=11: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=556;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      const uint8_t want[] = {172,173,174,175};
+      if (memcmp((uint8_t*)&ctx->vr[2]+12, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=0 offset=12: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=556;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,28,29,30,31};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=0 offset=12: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=557;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      const uint8_t want[] = {172,173,174,175};
+      if (memcmp((uint8_t*)&ctx->vr[2]+12, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=0 offset=13: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=557;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,28,29,30,31};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=0 offset=13: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=558;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      const uint8_t want[] = {172,173,174,175};
+      if (memcmp((uint8_t*)&ctx->vr[2]+12, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=0 offset=14: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=558;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,28,29,30,31};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=0 offset=14: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=559;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      const uint8_t want[] = {172,173,174,175};
+      if (memcmp((uint8_t*)&ctx->vr[2]+12, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=0 offset=15: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=559;
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,28,29,30,31};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=0 offset=15: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=32;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      const uint8_t want[] = {160,161,162,163};
+      if (memcmp((uint8_t*)&ctx->vr[2]+0, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=3 offset=0: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=32;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      const uint8_t want[] = {16,17,18,19,164,165,166,167,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=3 offset=0: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=33;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      const uint8_t want[] = {160,161,162,163};
+      if (memcmp((uint8_t*)&ctx->vr[2]+0, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=3 offset=1: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=33;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      const uint8_t want[] = {16,17,18,19,164,165,166,167,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=3 offset=1: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=34;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      const uint8_t want[] = {160,161,162,163};
+      if (memcmp((uint8_t*)&ctx->vr[2]+0, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=3 offset=2: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=34;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      const uint8_t want[] = {16,17,18,19,164,165,166,167,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=3 offset=2: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=35;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      const uint8_t want[] = {160,161,162,163};
+      if (memcmp((uint8_t*)&ctx->vr[2]+0, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=3 offset=3: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=35;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      const uint8_t want[] = {16,17,18,19,164,165,166,167,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=3 offset=3: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=36;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      const uint8_t want[] = {164,165,166,167};
+      if (memcmp((uint8_t*)&ctx->vr[2]+4, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=3 offset=4: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=36;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      const uint8_t want[] = {160,161,162,163,20,21,22,23,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=3 offset=4: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=37;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      const uint8_t want[] = {164,165,166,167};
+      if (memcmp((uint8_t*)&ctx->vr[2]+4, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=3 offset=5: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=37;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      const uint8_t want[] = {160,161,162,163,20,21,22,23,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=3 offset=5: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=38;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      const uint8_t want[] = {164,165,166,167};
+      if (memcmp((uint8_t*)&ctx->vr[2]+4, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=3 offset=6: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=38;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      const uint8_t want[] = {160,161,162,163,20,21,22,23,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=3 offset=6: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=39;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      const uint8_t want[] = {164,165,166,167};
+      if (memcmp((uint8_t*)&ctx->vr[2]+4, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=3 offset=7: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=39;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      const uint8_t want[] = {160,161,162,163,20,21,22,23,168,169,170,171,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=3 offset=7: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=40;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      const uint8_t want[] = {168,169,170,171};
+      if (memcmp((uint8_t*)&ctx->vr[2]+8, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=3 offset=8: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=40;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,24,25,26,27,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=3 offset=8: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=41;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      const uint8_t want[] = {168,169,170,171};
+      if (memcmp((uint8_t*)&ctx->vr[2]+8, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=3 offset=9: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=41;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,24,25,26,27,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=3 offset=9: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=42;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      const uint8_t want[] = {168,169,170,171};
+      if (memcmp((uint8_t*)&ctx->vr[2]+8, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=3 offset=10: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=42;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,24,25,26,27,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=3 offset=10: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=43;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      const uint8_t want[] = {168,169,170,171};
+      if (memcmp((uint8_t*)&ctx->vr[2]+8, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=3 offset=11: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=43;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,24,25,26,27,172,173,174,175};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=3 offset=11: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=44;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      const uint8_t want[] = {172,173,174,175};
+      if (memcmp((uint8_t*)&ctx->vr[2]+12, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=3 offset=12: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=44;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,28,29,30,31};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=3 offset=12: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=45;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      const uint8_t want[] = {172,173,174,175};
+      if (memcmp((uint8_t*)&ctx->vr[2]+12, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=3 offset=13: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=45;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,28,29,30,31};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=3 offset=13: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=46;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      const uint8_t want[] = {172,173,174,175};
+      if (memcmp((uint8_t*)&ctx->vr[2]+12, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=3 offset=14: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=46;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,28,29,30,31};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=3 offset=14: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=47;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      const uint8_t want[] = {172,173,174,175};
+      if (memcmp((uint8_t*)&ctx->vr[2]+12, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=3 offset=15: wrong element or address\n"); ++g_fail; } }
+    { memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
+      for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
+      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=47;
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,28,29,30,31};
+      if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=3 offset=15: wrong element or address\n"); ++g_fail; } }
 
     printf("\n[ppu-conformance] %d checks passed, %d FAILED, %d skipped\n",
            g_pass, g_fail, g_skip);
