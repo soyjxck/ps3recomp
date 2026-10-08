@@ -2250,6 +2250,13 @@ static u32 s_eng_obj_gw[ENG_MAX_OBJECTS], s_eng_obj_gh[ENG_MAX_OBJECTS];
  * textures with a mip chain (the ones anisotropic filtering is for). */
 static u32 s_eng_tgt_gw[ENG_MAX_OBJECTS], s_eng_tgt_gh[ENG_MAX_OBJECTS];
 static u8  s_eng_obj_mipped[ENG_MAX_OBJECTS];
+/* MSAA (RSX_AA=msaa2|msaa4|msaa8): a target drawn by a multisampled pass has
+ * a multisampled twin (eng_ms_twin); s_eng_twin_stale when the target was
+ * written since by anything else. s_eng_pass_samples is the pass being
+ * encoded. */
+static id<MTLTexture> s_eng_twin[ENG_MAX_OBJECTS];
+static u8  s_eng_twin_stale[ENG_MAX_OBJECTS];
+static u32 s_eng_pass_samples = 1;
 static u32 sc_dim(u32 v) { u32 r = (u32)((float)v * s_eng_scale + 0.5f); return v && !r ? 1u : r; }
 /* [x, x+w) in guest pixels -> host pixels, as the two ends rounded, so
  * neighbouring rectangles still meet. */
@@ -2299,11 +2306,15 @@ typedef struct {
     id<MTLDepthStencilState>   ds;
     MTLCullMode cull;
     MTLWinding  winding;
-    /* A fragment program that reads WPOS: its HLSL, its function and the
-     * descriptor, so a live RSX_SCALE change can make pso_scaled again. */
+    /* The descriptor and fragment functions it was built from: a live
+     * RSX_SCALE change makes pso_scaled again from ps_wpos (the HLSL, for a
+     * program that reads WPOS), and MSAA builds pso_ms -- [scaled][2x, 4x,
+     * 8x] -- on first use. zwrite: its draws can write depth or stencil. */
     char*                        ps_wpos;
-    id<MTLFunction>              fs;
+    id<MTLFunction>              fs, fs_scaled;
     MTLRenderPipelineDescriptor* pd;
+    id<MTLRenderPipelineState>   pso_ms[2][3];
+    u8                           zwrite;
 } EngPipeline;
 static EngPipeline s_eng_pipe[ENG_MAX_PIPES];
 static u32 s_eng_pipe_count;
@@ -2440,6 +2451,88 @@ static NSString* const kEngHelperMSL = @
 "                                 sampler s [[sampler(0)]]) {\n"
 "    uint v = uint(clamp(src.read(uint2(i.pos.xy)), 0.0, 1.0) * 16777215.0 + 0.5);\n"
 "    return float4(float((v >> 8) & 255u), float(v & 255u), 0.0, float((v >> 16) & 255u)) / 255.0;\n"
+"}\n"
+"/* A stale MSAA depth twin made again from its target: every sample of a\n"
+" * pixel the target's depth there. */\n"
+"fragment ZOut eng_zcopy_fs(BOut i [[stage_in]], depth2d<float> src [[texture(0)]]) {\n"
+"    ZOut o; o.d = src.read(uint2(i.pos.xy)); return o;\n"
+"}\n"
+"/* The present blit scaling down (an internal resolution above the window's,\n"
+" * the Resolution setting's supersampling): the taps averaged over each window\n"
+" * pixel's footprint -- an exact box at 2x and 3x -- instead of one bilinear\n"
+" * tap. As rsx_present_passes.h's ps_blit_area. */\n"
+"fragment float4 eng_blit_area_fs(BOut i [[stage_in]],\n"
+"                                 texture2d<float> src [[texture(0)]],\n"
+"                                 sampler s [[sampler(0)]]) {\n"
+"    float2 sz = float2(src.get_width(), src.get_height());\n"
+"    float2 d = float2(dfdx(i.uv.x), dfdy(i.uv.y));\n"
+"    float2 fp = abs(d) * sz;\n"
+"    if (fp.x <= 1.25 && fp.y <= 1.25) return src.sample(s, i.uv, level(0));\n"
+"    int nx = clamp(int(ceil(fp.x - 0.01)), 1, 4), ny = clamp(int(ceil(fp.y - 0.01)), 1, 4);\n"
+"    float4 acc = 0.0;\n"
+"    for (int y = 0; y < ny; y++)\n"
+"        for (int x = 0; x < nx; x++)\n"
+"            acc += src.sample(s, i.uv + (float2(x + 0.5, y + 0.5) / float2(nx, ny) - 0.5) * d, level(0));\n"
+"    return acc / float(nx * ny);\n"
+"}\n"
+"/* FXAA on the finished frame (RSX_AA=fxaa), as rsx_present_passes.h's\n"
+" * ps_fxaa: luma contrast decides whether a pixel is on an edge; the edge's\n"
+" * direction and both its ends are searched for; the pixel is re-sampled\n"
+" * across the edge by how far it sits from the nearer end, and blended for\n"
+" * sub-pixel aliasing (Lottes, 2009). */\n"
+"static float fxaa_luma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }\n"
+"static float fxaa_l(texture2d<float> t, sampler s, float2 uv) { return fxaa_luma(t.sample(s, uv, level(0)).rgb); }\n"
+"fragment float4 eng_fxaa_fs(BOut i [[stage_in]],\n"
+"                            texture2d<float> src [[texture(0)]],\n"
+"                            sampler s [[sampler(0)]]) {\n"
+"    float2 rcp = 1.0 / float2(src.get_width(), src.get_height());\n"
+"    float2 uv = i.uv;\n"
+"    float4 rgbM = src.sample(s, uv, level(0));\n"
+"    float lM = fxaa_luma(rgbM.rgb);\n"
+"    float lN = fxaa_l(src, s, uv + float2(0, -rcp.y)), lS = fxaa_l(src, s, uv + float2(0, rcp.y));\n"
+"    float lW = fxaa_l(src, s, uv + float2(-rcp.x, 0)), lE = fxaa_l(src, s, uv + float2(rcp.x, 0));\n"
+"    float lMax = max(max(max(lN, lS), max(lW, lE)), lM);\n"
+"    float lMin = min(min(min(lN, lS), min(lW, lE)), lM);\n"
+"    float range = lMax - lMin;\n"
+"    if (range < max(0.0312, lMax * 0.125)) return float4(rgbM.rgb, 1.0);\n"
+"    float lNW = fxaa_l(src, s, uv - rcp), lSE = fxaa_l(src, s, uv + rcp);\n"
+"    float lNE = fxaa_l(src, s, uv + float2(rcp.x, -rcp.y)), lSW = fxaa_l(src, s, uv + float2(-rcp.x, rcp.y));\n"
+"    float lNS = lN + lS, lWE = lW + lE;\n"
+"    float sub = saturate(abs((2.0 * (lNS + lWE) + lNW + lNE + lSW + lSE) / 12.0 - lM) / range);\n"
+"    sub = (-2.0 * sub + 3.0) * sub * sub;\n"
+"    float subpix = sub * sub * 0.75;\n"
+"    float edgeH = abs(-2.0 * lW + lNW + lSW) + 2.0 * abs(-2.0 * lM + lNS) + abs(-2.0 * lE + lNE + lSE);\n"
+"    float edgeV = abs(-2.0 * lN + lNW + lNE) + 2.0 * abs(-2.0 * lM + lWE) + abs(-2.0 * lS + lSW + lSE);\n"
+"    bool horz = edgeH >= edgeV;\n"
+"    float l1 = horz ? lN : lW, l2 = horz ? lS : lE;\n"
+"    float g1 = l1 - lM, g2 = l2 - lM;\n"
+"    bool pairN = abs(g1) >= abs(g2);\n"
+"    float grad = max(abs(g1), abs(g2));\n"
+"    float stepL = horz ? rcp.y : rcp.x;\n"
+"    if (pairN) stepL = -stepL;\n"
+"    float lAvg = 0.5 * ((pairN ? l1 : l2) + lM);\n"
+"    float2 posB = uv;\n"
+"    if (horz) posB.y += stepL * 0.5; else posB.x += stepL * 0.5;\n"
+"    float2 off = horz ? float2(rcp.x, 0) : float2(0, rcp.y);\n"
+"    float2 posN = posB - off, posP = posB + off;\n"
+"    float gs = grad * 0.25;\n"
+"    float eN = fxaa_l(src, s, posN) - lAvg, eP = fxaa_l(src, s, posP) - lAvg;\n"
+"    bool dN = abs(eN) >= gs, dP = abs(eP) >= gs;\n"
+"    const float q[11] = { 1.5, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 4.0, 8.0, 8.0 };\n"
+"    for (int k = 0; k < 11 && !(dN && dP); k++) {\n"
+"        if (!dN) { posN -= off * q[k]; eN = fxaa_l(src, s, posN) - lAvg; dN = abs(eN) >= gs; }\n"
+"        if (!dP) { posP += off * q[k]; eP = fxaa_l(src, s, posP) - lAvg; dP = abs(eP) >= gs; }\n"
+"    }\n"
+"    float distN = horz ? uv.x - posN.x : uv.y - posN.y;\n"
+"    float distP = horz ? posP.x - uv.x : posP.y - uv.y;\n"
+"    bool nearN = distN < distP;\n"
+"    float eEnd = nearN ? eN : eP;\n"
+"    bool good = (eEnd < 0.0) != ((lM - lAvg) < 0.0);\n"
+"    float px = good ? 0.5 - min(distN, distP) / (distN + distP) : 0.0;\n"
+"    px = max(px, subpix);\n"
+"    float2 fuv = uv;\n"
+"    if (horz) fuv.y += px * stepL; else fuv.x += px * stepL;\n"
+"    return float4(src.sample(s, fuv, level(0)).rgb, 1.0);\n"
 "}\n";
 
 static u32 eng_obj_add(id<MTLTexture> t)
@@ -2465,6 +2558,7 @@ static u32 eng_obj_add(id<MTLTexture> t)
     s_eng_obj_gw[slot] = s_eng_obj_gh[slot] = 0;   /* a scaled creator sets them */
     s_eng_tgt_gw[slot] = s_eng_tgt_gh[slot] = 0;   /* a target creator sets them */
     s_eng_obj_mipped[slot] = 0;
+    s_eng_twin[slot] = nil;
     return slot + 1;
 }
 
@@ -2774,8 +2868,9 @@ static void eng_shutdown(void* user)
         s_eng_pipe[i].ds = nil;
         free(s_eng_pipe[i].ps_wpos);
         s_eng_pipe[i].ps_wpos = NULL;
-        s_eng_pipe[i].fs = nil;
+        s_eng_pipe[i].fs = s_eng_pipe[i].fs_scaled = nil;
         s_eng_pipe[i].pd = nil;
+        for (int a = 0; a < 2; a++) for (int b = 0; b < 3; b++) s_eng_pipe[i].pso_ms[a][b] = nil;
     }
     for (u32 i = 0; i < s_eng_func_count; i++) s_eng_func[i].fn = nil;
     for (u32 i = 0; i < s_eng_samp_count; i++) s_eng_samp[i].samp = nil;
@@ -3165,7 +3260,7 @@ static u32 eng_pipeline_create_locked(void* user, const char* vs_hlsl, const cha
  * builds) as well as on the walker: one at a time, since the translation
  * buffers and the function cache are shared. Encoding reads only entries
  * whose handle it was given, which were complete before it got it. */
-static pthread_mutex_t s_eng_pipe_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t s_eng_pipe_mu = PTHREAD_MUTEX_INITIALIZER;   /* declared above (MSAA) */
 
 /* With the internal resolution raised, a fragment program's WPOS (the
  * decompiler's `input.position`) arrives in host pixels in a pass into a
@@ -3335,8 +3430,12 @@ static u32 eng_pipeline_create_locked(void* user, const char* vs_hlsl, const cha
     s_eng_pipe[slot].pso_scaled = pso_scaled;
     s_eng_pipe[slot].ds  = ds;
     s_eng_pipe[slot].ps_wpos = reads_wpos ? strdup(ps_hlsl) : NULL;
-    s_eng_pipe[slot].fs = reads_wpos ? fs : nil;
-    s_eng_pipe[slot].pd = reads_wpos ? pd : nil;
+    s_eng_pipe[slot].fs = fs;
+    s_eng_pipe[slot].fs_scaled = fs_scaled;
+    s_eng_pipe[slot].pd = pd;
+    for (int a = 0; a < 2; a++) for (int b = 0; b < 3; b++) s_eng_pipe[slot].pso_ms[a][b] = nil;
+    s_eng_pipe[slot].zwrite = (rs->depth_test && rs->depth_write) ||
+                              (rs->stencil_enable && (rs->s_write_mask & 0xFFu));
     /* CULL_FACE FRONT=0x0404 BACK=0x0405 FRONT_AND_BACK=0x0408 (front here,
      * as in the D3D12 engine); FRONT_FACE CW=0x0900 CCW=0x0901. */
     s_eng_pipe[slot].cull = MTLCullModeNone;
@@ -3361,8 +3460,9 @@ static void eng_pipeline_release(void* user, u32 pipeline)
         s_eng_pipe[pipeline - 1].ds  = nil;
         free(s_eng_pipe[pipeline - 1].ps_wpos);
         s_eng_pipe[pipeline - 1].ps_wpos = NULL;
-        s_eng_pipe[pipeline - 1].fs = nil;
+        s_eng_pipe[pipeline - 1].fs = s_eng_pipe[pipeline - 1].fs_scaled = nil;
         s_eng_pipe[pipeline - 1].pd = nil;
+        for (int a = 0; a < 2; a++) for (int b = 0; b < 3; b++) s_eng_pipe[pipeline - 1].pso_ms[a][b] = nil;
     }
     pthread_mutex_unlock(&s_eng_pipe_mu);
 }
@@ -3618,6 +3718,161 @@ static void eng_clear_depth_stencil_rect(void* user, u32 depth, u32 flags,
 
 /* A depth/stencil clear of a rectangle: a pass over the target alone that
  * writes the clear value (and the stencil, by REPLACE) inside the scissor. */
+/* ---- MSAA ------------------------------------------------------------------
+ *
+ * RSX_AA=msaa2|msaa4|msaa8 (rsx_aa_mode, rsx_draw_engine.c), as the D3D12 and
+ * Vulkan engines: a pass is multisampled when it has a real depth target and
+ * every attachment is a full-size target (guest 960x540 or more) -- the 3D
+ * scene, not the post-process chain or the UI. It draws into multisampled
+ * twins of its attachments and resolves them into the targets as it ends
+ * (colour averaged, depth and stencil sample 0, the store action), so every
+ * read -- textures, snapshots, copies, readbacks, the present -- reads the
+ * targets and finds them current. A target written by anything else marks
+ * its twin stale, and the next multisampled pass makes the twin again from
+ * the target first (a depth twin's stencil is cleared: it cannot be copied).
+ * Clear rectangles clear both. Occlusion counts are divided by the samples.
+ * A changed sample count makes twins and pipelines again on use. */
+extern int rsx_aa_mode(void);
+static pthread_mutex_t s_eng_pipe_mu;
+static u32 eng_ms_samples(void)
+{
+    const int m = rsx_aa_mode();
+    u32 n = (m == 2 || m == 4 || m == 8) ? (u32)m : 1;
+    while (n > 1 && ![s_dev supportsTextureSampleCount:n]) n >>= 1;
+    return n;
+}
+static int eng_ms_idx(u32 n) { return n <= 2 ? 0 : n == 4 ? 1 : 2; }
+
+/* Target `handle`'s twin at n samples, made (stale) if it has none of that
+ * count and size. */
+static id<MTLTexture> eng_ms_twin(u32 handle, u32 n)
+{
+    id<MTLTexture> t = eng_obj(handle);
+    if (!t) return nil;
+    id<MTLTexture> w = s_eng_twin[handle - 1];
+    if (w && [w sampleCount] == n && [w width] == [t width] && [w height] == [t height]) return w;
+    MTLTextureDescriptor* td = [MTLTextureDescriptor new];
+    td.textureType = MTLTextureType2DMultisample;
+    td.pixelFormat = [t pixelFormat];
+    td.width       = [t width];
+    td.height      = [t height];
+    td.sampleCount = n;
+    td.usage       = MTLTextureUsageRenderTarget;
+    td.storageMode = MTLStorageModePrivate;
+    w = [s_dev newTextureWithDescriptor:td];
+    s_eng_twin[handle - 1] = w;
+    s_eng_twin_stale[handle - 1] = 1;
+    return w;
+}
+
+/* The pass's sample count: n when it qualifies, else 1. */
+static u32 eng_ms_pass(const u32* rt, u32 attach, u32 depth, id<MTLTexture> zbuf, id<MTLTexture> zfallback)
+{
+    const u32 n = eng_ms_samples();
+    if (n < 2 || !depth || !zbuf || zbuf == zfallback) return 1;
+    if (s_eng_tgt_gw[depth - 1] < 960 || s_eng_tgt_gh[depth - 1] < 540) return 1;
+    for (u32 k = 0; k < attach; k++)
+        if (!rt[k] || s_eng_tgt_gw[rt[k] - 1] < 960 || s_eng_tgt_gh[rt[k] - 1] < 540) return 1;
+    return n;
+}
+
+/* Full-screen helper pipelines at n samples. */
+typedef struct { MTLPixelFormat fmt; u32 n; id<MTLRenderPipelineState> pso; } EngMsHelper;
+static EngMsHelper s_eng_ms_copy[32];
+static u32 s_eng_ms_copy_n;
+static id<MTLRenderPipelineState> s_eng_ms_zcopy[3], s_eng_ms_zclear[3];
+static id<MTLDepthStencilState> s_eng_ms_zcopy_ds;
+static id<MTLRenderPipelineState> eng_ms_helper(NSString* fs, MTLPixelFormat color, u32 n)
+{
+    MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
+    pd.vertexFunction   = [s_eng_helper_lib newFunctionWithName:@"eng_fullscreen_vs"];
+    pd.fragmentFunction = [s_eng_helper_lib newFunctionWithName:fs];
+    if (color != MTLPixelFormatInvalid) pd.colorAttachments[0].pixelFormat = color;
+    else {
+        pd.depthAttachmentPixelFormat   = MTL_DEPTH_FORMAT;
+        pd.stencilAttachmentPixelFormat = MTL_DEPTH_FORMAT;
+    }
+    pd.rasterSampleCount = n;
+    NSError* err = nil;
+    id<MTLRenderPipelineState> p = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+    if (!p) fprintf(stderr, "[rsx engine/metal] MSAA helper %s failed: %s\n", [fs UTF8String],
+                    [[err localizedDescription] UTF8String]);
+    return p;
+}
+
+/* A stale twin made again from its target. */
+static void eng_ms_refresh(id<MTLCommandBuffer> cb, u32 handle)
+{
+    id<MTLTexture> t = eng_obj(handle), w = s_eng_twin[handle - 1];
+    if (!t || !w || !s_eng_helper_lib) return;
+    const u32 n = (u32)[w sampleCount];
+    const int depth = [t pixelFormat] == MTL_DEPTH_FORMAT;
+    id<MTLRenderPipelineState> pso = nil;
+    MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    if (depth) {
+        __strong id<MTLRenderPipelineState>* slot = &s_eng_ms_zcopy[eng_ms_idx(n)];
+        if (!*slot) *slot = eng_ms_helper(@"eng_zcopy_fs", MTLPixelFormatInvalid, n);
+        pso = *slot;
+        if (!s_eng_ms_zcopy_ds) {
+            MTLDepthStencilDescriptor* dd = [MTLDepthStencilDescriptor new];
+            dd.depthCompareFunction = MTLCompareFunctionAlways;
+            dd.depthWriteEnabled = YES;
+            s_eng_ms_zcopy_ds = [s_dev newDepthStencilStateWithDescriptor:dd];
+        }
+        rp.depthAttachment.texture       = w;
+        rp.depthAttachment.loadAction    = MTLLoadActionDontCare;
+        rp.depthAttachment.storeAction   = MTLStoreActionStore;
+        rp.stencilAttachment.texture     = w;
+        rp.stencilAttachment.loadAction  = MTLLoadActionClear;
+        rp.stencilAttachment.clearStencil = 0;
+        rp.stencilAttachment.storeAction = MTLStoreActionStore;
+        rp.renderTargetWidth  = [w width];
+        rp.renderTargetHeight = [w height];
+    } else {
+        for (u32 k = 0; k < s_eng_ms_copy_n; k++)
+            if (s_eng_ms_copy[k].fmt == [t pixelFormat] && s_eng_ms_copy[k].n == n) pso = s_eng_ms_copy[k].pso;
+        if (!pso && s_eng_ms_copy_n < 32) {
+            pso = eng_ms_helper(@"eng_blit_fs", [t pixelFormat], n);
+            s_eng_ms_copy[s_eng_ms_copy_n++] = (EngMsHelper){ [t pixelFormat], n, pso };
+        }
+        rp.colorAttachments[0].texture     = w;
+        rp.colorAttachments[0].loadAction  = MTLLoadActionDontCare;
+        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    }
+    if (!pso) return;
+    id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+    if (!e) return;
+    [e setRenderPipelineState:pso];
+    if (depth) [e setDepthStencilState:s_eng_ms_zcopy_ds];
+    [e setFragmentTexture:t atIndex:0];
+    [e setFragmentSamplerState:s_eng_point_sampler atIndex:0];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [e endEncoding];
+    s_eng_twin_stale[handle - 1] = 0;
+}
+
+/* A pipeline's state for a pass of s_eng_pass_samples, built on first use. */
+static id<MTLRenderPipelineState> eng_pipe_ms(u32 idx, int scaled)
+{
+    EngPipeline* p = &s_eng_pipe[idx];
+    const int k = eng_ms_idx(s_eng_pass_samples);
+    if (p->pso_ms[scaled][k]) return p->pso_ms[scaled][k];
+    if (!p->pd) return nil;
+    pthread_mutex_lock(&s_eng_pipe_mu);
+    id<MTLRenderPipelineState> ps = p->pso_ms[scaled][k];
+    if (!ps) {
+        MTLRenderPipelineDescriptor* d = [p->pd copy];
+        d.rasterSampleCount = s_eng_pass_samples;
+        d.fragmentFunction  = (scaled && p->fs_scaled) ? p->fs_scaled : p->fs;
+        NSError* err = nil;
+        ps = [s_dev newRenderPipelineStateWithDescriptor:d error:&err];
+        if (!ps) fprintf(stderr, "[rsx engine/metal] MSAA pipeline failed: %s\n", [[err localizedDescription] UTF8String]);
+        p->pso_ms[scaled][k] = ps;
+    }
+    pthread_mutex_unlock(&s_eng_pipe_mu);
+    return ps;
+}
+
 static void eng_encode_clear_rect(id<MTLCommandBuffer> cb, const EngRecord* r)
 {
     id<MTLTexture> zbuf = eng_obj(r->depth);
@@ -3684,6 +3939,25 @@ static void eng_encode_clear_rect(id<MTLCommandBuffer> cb, const EngRecord* r)
     [e setFragmentBytes:&z length:sizeof z atIndex:0];
     [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [e endEncoding];
+    /* A current MSAA twin is cleared the same way (a stale one is made
+     * again from this target before it is used). */
+    id<MTLTexture> tw2 = s_eng_twin[r->depth - 1];
+    if (!tw2 || s_eng_twin_stale[r->depth - 1]) return;
+    const u32 n = (u32)[tw2 sampleCount];
+    __strong id<MTLRenderPipelineState>* slot = &s_eng_ms_zclear[eng_ms_idx(n)];
+    if (!*slot) *slot = eng_ms_helper(@"eng_zclear_fs", MTLPixelFormatInvalid, n);
+    if (!*slot) { s_eng_twin_stale[r->depth - 1] = 1; return; }
+    rp.depthAttachment.texture   = tw2;
+    rp.stencilAttachment.texture = tw2;
+    id<MTLRenderCommandEncoder> e2 = [cb renderCommandEncoderWithDescriptor:rp];
+    if (!e2) { s_eng_twin_stale[r->depth - 1] = 1; return; }
+    [e2 setRenderPipelineState:*slot];
+    [e2 setDepthStencilState:s_eng_zclear_ds[dsi]];
+    [e2 setStencilReferenceValue:r->clear_stencil];
+    [e2 setScissorRect:(MTLScissorRect){ x, y, w, h }];
+    [e2 setFragmentBytes:&z length:sizeof z atIndex:0];
+    [e2 drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [e2 endEncoding];
 }
 
 /* ---- replay -------------------------------------------------------------- */
@@ -3695,8 +3969,13 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
     const EngPipeline* p = &s_eng_pipe[r->pipeline - 1];
     if (!p->pso) return;
     /* A pipeline whose fragment program reads WPOS has a second state that
-     * divides it back to guest pixels, for passes into scaled targets. */
-    [enc setRenderPipelineState:(pf != 1.0f && p->pso_scaled ? p->pso_scaled : p->pso)];
+     * divides it back to guest pixels, for passes into scaled targets; a
+     * multisampled pass takes the build of either at its sample count. */
+    const int use_scaled = pf != 1.0f && p->pso_scaled;
+    id<MTLRenderPipelineState> ps = use_scaled ? p->pso_scaled : p->pso;
+    if (s_eng_pass_samples > 1) ps = eng_pipe_ms(r->pipeline - 1, use_scaled);
+    if (!ps) return;
+    [enc setRenderPipelineState:ps];
     [enc setDepthStencilState:p->ds];
     [enc setCullMode:p->cull];
     [enc setFrontFacingWinding:p->winding];
@@ -3897,6 +4176,29 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
         id<MTLTexture> zfallback = attach ? eng_fallback_depth(tex[0]) : nil;
         if (attach && !zbuf) zbuf = zfallback;
 
+        /* MSAA: the twins this pass draws into, made current first. */
+        const int clear_ds_here = have_clear_ds && depth == cd;
+        u32 msn = (attach == nrt) ? eng_ms_pass(rt, attach, depth, zbuf, zfallback) : 1;
+        id<MTLTexture> twin[RSX_BE_MAX_COLOR_TARGETS];
+        id<MTLTexture> ztwin = nil;
+        if (msn > 1) {
+            int ok = 1;
+            for (u32 k = 0; k < attach && ok; k++) ok = (twin[k] = eng_ms_twin(rt[k], msn)) != nil;
+            if (ok) ok = (ztwin = eng_ms_twin(depth, msn)) != nil;
+            if (!ok) msn = 1;
+        }
+        if (msn > 1) {
+            for (u32 k = 0; k < attach; k++) {
+                int cleared = 0;
+                for (u32 c = 0; c < n_cc; c++) if (cc_surf[c] == rt[k]) cleared = 1;
+                if (cleared) s_eng_twin_stale[rt[k] - 1] = 0;
+                else if (s_eng_twin_stale[rt[k] - 1]) eng_ms_refresh(cb, rt[k]);
+            }
+            const int both = clear_ds_here && (ds_flags & RSX_BE_CLEAR_DEPTH) && (ds_flags & RSX_BE_CLEAR_STENCIL);
+            if (both) s_eng_twin_stale[depth - 1] = 0;
+            else if (s_eng_twin_stale[depth - 1]) eng_ms_refresh(cb, depth);
+        }
+
         MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
         const u32 vis_pass = ++s_vis_serial ? s_vis_serial : ++s_vis_serial;
         if (s_vis_buf) {
@@ -3938,14 +4240,33 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
             rp.renderTargetWidth  = [zbuf width];
             rp.renderTargetHeight = [zbuf height];
         }
+        if (msn > 1) {
+            /* Draw into the twins; resolve into the targets as the pass ends. */
+            for (u32 k = 0; k < attach; k++) {
+                rp.colorAttachments[k].texture        = twin[k];
+                rp.colorAttachments[k].resolveTexture = tex[k];
+                rp.colorAttachments[k].storeAction    = MTLStoreActionStoreAndMultisampleResolve;
+            }
+            rp.depthAttachment.texture             = ztwin;
+            rp.depthAttachment.resolveTexture      = zbuf;
+            rp.depthAttachment.depthResolveFilter  = MTLMultisampleDepthResolveFilterSample0;
+            rp.depthAttachment.storeAction         = MTLStoreActionStoreAndMultisampleResolve;
+            rp.stencilAttachment.texture             = ztwin;
+            rp.stencilAttachment.resolveTexture      = zbuf;
+            rp.stencilAttachment.stencilResolveFilter = MTLMultisampleStencilResolveFilterSample0;
+            rp.stencilAttachment.storeAction         = MTLStoreActionStoreAndMultisampleResolve;
+        }
 
         id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
         u32 cur_vis = 0;
+        int pass_zwrite = clear_ds_here;
         /* A draw's pipeline declares as many colour attachments as its record
          * named, so a pass that could not bind them all takes its clears and
          * skips those draws rather than encoding a mismatch. */
         if (!enc || attach != nrt) {
             if (enc) [enc endEncoding];
+            for (u32 k = 0; k < attach; k++) if (s_eng_twin[rt[k] - 1]) s_eng_twin_stale[rt[k] - 1] = 1;
+            if (depth && clear_ds_here && s_eng_twin[depth - 1]) s_eng_twin_stale[depth - 1] = 1;
             while (i < s_eng_rec_count && s_eng_rec[i].kind == ENG_REC_DRAW &&
                    eng_record_targets_are(&s_eng_rec[i], rt, nrt)) i++;
             continue;
@@ -3962,24 +4283,85 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
                 if (cur_vis) {
                     const u32 ctr = eng_vis_counter(cur_vis - 1, vis_pass);
                     [enc setVisibilityResultMode:MTLVisibilityResultModeCounting offset:(NSUInteger)ctr * 8u];
-                    s_vis_fx2[ctr] = pf * pf;
+                    s_vis_fx2[ctr] = pf * pf * (float)msn;   /* samples, in guest pixels */
                 } else
                     [enc setVisibilityResultMode:MTLVisibilityResultModeDisabled offset:0];
             }
+            const u32 pi = s_eng_rec[i].pipeline;
+            if (pi && pi <= s_eng_pipe_count && s_eng_pipe[pi - 1].zwrite) pass_zwrite = 1;
+            s_eng_pass_samples = msn;
             eng_encode_draw(enc, &s_eng_rec[i], stage, pf);
+            s_eng_pass_samples = 1;
             i++;
         }
         [enc endEncoding];
+        /* What a single-sampled pass wrote leaves the twins behind. */
+        if (msn == 1) {
+            for (u32 k = 0; k < attach; k++) if (s_eng_twin[rt[k] - 1]) s_eng_twin_stale[rt[k] - 1] = 1;
+            if (depth && zbuf != zfallback && pass_zwrite && s_eng_twin[depth - 1]) s_eng_twin_stale[depth - 1] = 1;
+        }
     }
 }
 
 /* Put a surface on the drawable. A straight blit would need matching formats
  * and sizes; a full-screen sample needs neither, and the guest's surfaces are
  * routinely a different size from the window. */
+/* A full-screen helper pipeline into one colour format, made on first use. */
+static id<MTLRenderPipelineState> eng_present_pso(NSString* fs, MTLPixelFormat fmt,
+                                                  __strong id<MTLRenderPipelineState>* cache, MTLPixelFormat* cache_fmt)
+{
+    if (*cache && *cache_fmt == fmt) return *cache;
+    MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
+    pd.vertexFunction   = [s_eng_helper_lib newFunctionWithName:@"eng_fullscreen_vs"];
+    pd.fragmentFunction = [s_eng_helper_lib newFunctionWithName:fs];
+    pd.colorAttachments[0].pixelFormat = fmt;
+    NSError* err = nil;
+    *cache = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+    if (!*cache) fprintf(stderr, "[rsx engine/metal] %s pipeline failed: %s\n", [fs UTF8String],
+                         [[err localizedDescription] UTF8String]);
+    *cache_fmt = fmt;
+    return *cache;
+}
+
+/* RSX_AA=fxaa: FXAA on the finished frame at its own size, into a frame-sized
+ * target the window blit then reads. Live: rsx_aa_mode is read per frame. */
+static id<MTLTexture> s_eng_fxaa_tex;
+static id<MTLRenderPipelineState> s_eng_fxaa_pso, s_eng_blit_area_pso;
+static MTLPixelFormat s_eng_fxaa_fmt, s_eng_blit_area_fmt;
+static id<MTLTexture> eng_fxaa(id<MTLCommandBuffer> cb, id<MTLTexture> src)
+{
+    if (rsx_aa_mode() != 1 || !s_eng_linear_sampler) return src;
+    id<MTLRenderPipelineState> pso = eng_present_pso(@"eng_fxaa_fs", [src pixelFormat], &s_eng_fxaa_pso, &s_eng_fxaa_fmt);
+    if (!pso) return src;
+    if (!s_eng_fxaa_tex || [s_eng_fxaa_tex width] != [src width] || [s_eng_fxaa_tex height] != [src height] ||
+        [s_eng_fxaa_tex pixelFormat] != [src pixelFormat]) {
+        MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:[src pixelFormat]
+                                                                                       width:[src width]
+                                                                                      height:[src height]
+                                                                                   mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;   /* default storage: frame grabs read it */
+        s_eng_fxaa_tex = [s_dev newTextureWithDescriptor:td];
+        if (!s_eng_fxaa_tex) return src;
+    }
+    MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture     = s_eng_fxaa_tex;
+    rp.colorAttachments[0].loadAction  = MTLLoadActionDontCare;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+    if (!e) return src;
+    [e setRenderPipelineState:pso];
+    [e setFragmentTexture:src atIndex:0];
+    [e setFragmentSamplerState:s_eng_linear_sampler atIndex:0];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [e endEncoding];
+    return s_eng_fxaa_tex;
+}
+
 static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
                                 id<MTLTexture> dst)
 {
     if (!src || !dst || !s_eng_helper_lib) return;
+    src = eng_fxaa(cb, src);
     if (!s_eng_blit_pso || s_eng_blit_pso_fmt != [dst pixelFormat]) {
         MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
         pd.vertexFunction   = [s_eng_helper_lib newFunctionWithName:@"eng_fullscreen_vs"];
@@ -4017,12 +4399,17 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
         const double x = floor((dw - vw) * 0.5), y = floor((dh - vh) * 0.5);
         [e setViewport:(MTLViewport){ x, y, floor(vw + 0.5), floor(vh + 0.5), 0.0, 1.0 }];
     }
-    [e setRenderPipelineState:s_eng_blit_pso];
-    [e setFragmentTexture:src atIndex:0];
     /* Texel for texel when the sizes match (headless dumps, a 1x surface in
      * a 1280x720 drawable); filtered when the surface is scaled to a window
-     * of another size. */
+     * of another size -- and scaling down (an internal resolution above the
+     * window's), averaged over each window pixel's footprint, so the higher
+     * resolution is real supersampling. */
     const int same = [src width] == [dst width] && [src height] == [dst height];
+    const int down = (double)[src width] > vw + 0.5 || (double)[src height] > vh + 0.5;
+    id<MTLRenderPipelineState> area = (down && s_eng_linear_sampler)
+        ? eng_present_pso(@"eng_blit_area_fs", [dst pixelFormat], &s_eng_blit_area_pso, &s_eng_blit_area_fmt) : nil;
+    [e setRenderPipelineState:(area ? area : s_eng_blit_pso)];
+    [e setFragmentTexture:src atIndex:0];
     [e setFragmentSamplerState:(same || !s_eng_linear_sampler ? s_eng_point_sampler : s_eng_linear_sampler)
                        atIndex:0];
     [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
@@ -4337,6 +4724,7 @@ static void eng_rescale(void)
             id<MTLTexture> n = [s_dev newTextureWithDescriptor:td];
             if (!n) continue;
             s_eng_obj[i] = n;
+            s_eng_twin[i] = nil;   /* made again, at the new size, by its next MSAA pass */
             s_eng_obj_gw[i] = (nw != gw || nh != gh) ? gw : 0;
             s_eng_obj_gh[i] = (nw != gw || nh != gh) ? gh : 0;
             MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -4374,8 +4762,11 @@ static void eng_rescale(void)
             EngPipeline* p = &s_eng_pipe[i];
             if (!p->pso || !p->ps_wpos || !p->pd || !p->fs) continue;
             id<MTLRenderPipelineState> scaled = nil;
+            p->fs_scaled = nil;
+            for (int b = 0; b < 3; b++) p->pso_ms[1][b] = nil;
             if (s_eng_scale != 1.0f) {
                 id<MTLFunction> f = eng_wpos_function(p->ps_wpos, s_eng_scale);
+                p->fs_scaled = f;
                 if (f) {
                     NSError* err = nil;
                     p->pd.fragmentFunction = f;
@@ -4407,8 +4798,15 @@ static void eng_present(void* user, u32 surface)
     if (!src) eng_encode_and_commit(nil);
     else {
         eng_encode_and_commit(src);
-        eng_dump_frame(src, surface);
+        /* Grabs and dumps see what the window got: FXAA's output when on. */
+        eng_dump_frame((rsx_aa_mode() == 1 && s_eng_fxaa_tex && !s_headless) ? s_eng_fxaa_tex : src, surface);
     }
+    /* MSAA turned off or to another count: the twins go (made again on use). */
+    { static u32 s_ms_last = 1; const u32 n = eng_ms_samples();
+      if (n != s_ms_last) {
+          for (u32 k = 0; k < s_eng_obj_count; k++) s_eng_twin[k] = nil;
+          s_ms_last = n;
+      } }
     if (g_rsx_display_reload) {
         g_rsx_display_reload = 0;
         s_disp_window_pending = 1;
