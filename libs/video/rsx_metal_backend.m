@@ -2325,11 +2325,13 @@ static u32 s_eng_pipe_count;
 typedef struct { u64 hash; id<MTLFunction> fn; } EngFunc;
 /* The compiled-pipeline archive and the pipeline list (see "the
  * compiled-pipeline archive" below). */
-static id<MTLBinaryArchive> s_eng_archive;
-static NSURL* s_eng_archive_url;
+static NSMutableArray<id<MTLBinaryArchive>>* s_eng_arch_set;   /* every earlier launch's file, lookups only */
+static id<MTLBinaryArchive> s_eng_archive;                    /* this launch's, what it compiles */
+static char s_eng_arch_dir[1024];
 static pthread_mutex_t s_eng_arch_mu = PTHREAD_MUTEX_INITIALIZER;
-static u32 s_eng_arch_unsaved, s_eng_arch_added, s_eng_arch_hits;
+static u32 s_eng_arch_unsaved, s_eng_arch_added, s_eng_arch_hits, s_eng_arch_files;
 static int s_eng_arch_broken;            /* adding failed: stop trying */
+static int s_eng_arch_fold;              /* the set is being rebuilt into one file */
 static FILE* s_eng_list;                 /* pipelines.list, append */
 static u64* s_eng_list_known; static u32 s_eng_list_known_n, s_eng_list_known_cap;
 static void eng_archive_save(void);
@@ -3376,10 +3378,17 @@ static id<MTLFunction> eng_wpos_function(const char* ps_hlsl, float scale)
  * the draw skipped until each was ready (characters and walls black for the
  * first minutes). Two files beside the MSL cache replace that:
  *
- *   <cache>/metal_pipelines.bin   an MTLBinaryArchive of every pipeline made,
- *       looked up before a pipeline is compiled: a hit is a load, not a
- *       compile, whatever binary asks. Serialised every few additions and at
- *       shutdown. A file an OS or GPU update cannot read is replaced.
+ *   <cache>/metal_pipelines/NNN.bin  MTLBinaryArchives of every pipeline
+ *       this machine compiled, one file per launch that compiled something:
+ *       all of them are loaded at start and asked before a pipeline is
+ *       compiled (a hit is a load, not a compile, whatever binary asks), and
+ *       the ones compiled this time go into a new file. An archive is
+ *       serialised ONCE and never added to again: re-serialising a growing
+ *       archive, or adding to one read back from disk, leaves a file the
+ *       archiver cannot pack ("expecting 'fragment' stage in pipeline no.
+ *       N", macOS 27, M1 Pro), so saving within a launch rotates to a fresh
+ *       archive object. Files an OS or GPU update cannot read are dropped;
+ *       the set is folded into one file when it grows past 32.
  *   <cache>/pipelines.list        one line per pipeline (both programs' HLSL
  *       hashes and the state the descriptor is built from). At launch
  *       eng_warmup_start builds every listed pipeline on all cores from the
@@ -3387,7 +3396,7 @@ static id<MTLFunction> eng_wpos_function(const char* ps_hlsl, float scale)
  *       compiles nothing in play and a cold one does its compiling up front.
  *
  * <cache> is the MSL cache's parent (PS3RECOMP_MSL_CACHE=cache/msl ->
- * cache/); PS3RECOMP_METAL_ARCHIVE=<file> and PS3RECOMP_PIPELINE_LIST=<file>
+ * cache/); PS3RECOMP_METAL_ARCHIVE=<dir> and PS3RECOMP_PIPELINE_LIST=<file>
  * move them; PS3RECOMP_METAL_WARMUP=0 skips the warm-up. */
 
 static const char* eng_cache_parent(char* buf, size_t n)
@@ -3412,44 +3421,68 @@ static void eng_archive_open(void)
 static void eng_archive_open_locked(void)
 {
     if (@available(macOS 11.0, *)) {} else return;
-    char parent[1024], path[1200];
+    char parent[1024];
     const char* e = getenv("PS3RECOMP_METAL_ARCHIVE");
-    if (e && *e) snprintf(path, sizeof path, "%s", e);
-    else if (eng_cache_parent(parent, sizeof parent)) snprintf(path, sizeof path, "%s/metal_pipelines.bin", parent);
+    if (e && *e) snprintf(s_eng_arch_dir, sizeof s_eng_arch_dir, "%s", e);
+    else if (eng_cache_parent(parent, sizeof parent)) snprintf(s_eng_arch_dir, sizeof s_eng_arch_dir, "%s/metal_pipelines", parent);
     else return;
-    s_eng_archive_url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path]];
-    MTLBinaryArchiveDescriptor* d = [MTLBinaryArchiveDescriptor new];
+    mkdir(s_eng_arch_dir, 0755);
+    s_eng_arch_set = [NSMutableArray array];
     NSError* err = nil;
-    if (access(path, R_OK) == 0) {
-        d.url = s_eng_archive_url;
-        s_eng_archive = [s_dev newBinaryArchiveWithDescriptor:d error:&err];
-        if (!s_eng_archive) {
-            fprintf(stderr, "[rsx engine/metal] pipeline archive %s not usable (%s): starting a new one\n",
-                    path, [[err localizedDescription] UTF8String]);
-            unlink(path);
+    NSArray<NSString*>* names = [[NSFileManager.defaultManager contentsOfDirectoryAtPath:[NSString stringWithUTF8String:s_eng_arch_dir] error:nil]
+                                 sortedArrayUsingSelector:@selector(compare:)];
+    u32 last = 0, count = 0;
+    for (NSString* n in names) if ([n hasSuffix:@".bin"]) count++;
+    /* Past 32 files the set is rebuilt: none of them is loaded, so the
+     * warm-up compiles every listed pipeline into one new file, and the old
+     * files go once it has (eng_warmup_run). Adding to a reloaded archive
+     * would corrupt it, so folding is done by compiling, not merging. */
+    s_eng_arch_fold = count > 32;
+    for (NSString* n in names) {
+        if (![n hasSuffix:@".bin"]) continue;
+        const u32 num = (u32)[n intValue];
+        if (num > last) last = num;
+        if (s_eng_arch_fold) continue;
+        MTLBinaryArchiveDescriptor* d = [MTLBinaryArchiveDescriptor new];
+        d.url = [NSURL fileURLWithPath:[NSString stringWithFormat:@"%s/%@", s_eng_arch_dir, n]];
+        id<MTLBinaryArchive> a = [s_dev newBinaryArchiveWithDescriptor:d error:&err];
+        if (a) [s_eng_arch_set addObject:a];
+        else {
+            fprintf(stderr, "[rsx engine/metal] pipeline archive %s not usable (%s): dropped\n",
+                    n.UTF8String, [[err localizedDescription] UTF8String]);
+            unlink(d.url.fileSystemRepresentation);
         }
     }
-    if (!s_eng_archive) {
-        d.url = nil;
-        s_eng_archive = [s_dev newBinaryArchiveWithDescriptor:d error:&err];
-        if (!s_eng_archive)
-            fprintf(stderr, "[rsx engine/metal] no pipeline archive: %s\n", [[err localizedDescription] UTF8String]);
-    }
+    s_eng_arch_files = last;
+    s_eng_archive = [s_dev newBinaryArchiveWithDescriptor:[MTLBinaryArchiveDescriptor new] error:&err];
+    if (!s_eng_archive)
+        fprintf(stderr, "[rsx engine/metal] no pipeline archive: %s\n", [[err localizedDescription] UTF8String]);
 }
 
-/* Write the archive out: to a temporary file, then into place. */
+/* This launch's archive to a new file of the set, then a fresh archive for
+ * whatever is compiled next (a serialised archive is never added to again).
+ * The file just written joins the set for lookups. */
 static void eng_archive_save_locked(void)
 {
-    if (!s_eng_archive || !s_eng_archive_url || !s_eng_arch_unsaved) return;
+    if (!s_eng_archive || !s_eng_arch_dir[0] || !s_eng_arch_unsaved) return;
     if (@available(macOS 11.0, *)) {
-        NSURL* tmp = [NSURL fileURLWithPath:[s_eng_archive_url.path stringByAppendingString:@".tmp"]];
+        char path[1200], tmp[1300];
+        snprintf(path, sizeof path, "%s/%03u.bin", s_eng_arch_dir, s_eng_arch_files + 1);
+        snprintf(tmp, sizeof tmp, "%s.tmp", path);
         NSError* err = nil;
-        if ([s_eng_archive serializeToURL:tmp error:&err]) {
-            rename(tmp.fileSystemRepresentation, s_eng_archive_url.fileSystemRepresentation);
+        if ([s_eng_archive serializeToURL:[NSURL fileURLWithPath:[NSString stringWithUTF8String:tmp]] error:&err]) {
+            rename(tmp, path);
+            s_eng_arch_files++;
+            MTLBinaryArchiveDescriptor* d = [MTLBinaryArchiveDescriptor new];
+            d.url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path]];
+            id<MTLBinaryArchive> back = [s_dev newBinaryArchiveWithDescriptor:d error:&err];
+            if (back) [s_eng_arch_set addObject:back];
+            s_eng_archive = [s_dev newBinaryArchiveWithDescriptor:[MTLBinaryArchiveDescriptor new] error:&err];
             s_eng_arch_unsaved = 0;
         } else {
             fprintf(stderr, "[rsx engine/metal] pipeline archive not saved: %s\n", [[err localizedDescription] UTF8String]);
-            unlink(tmp.fileSystemRepresentation);
+            unlink(tmp);
+            s_eng_arch_unsaved = 0;   /* not again with the same contents */
         }
     }
 }
@@ -3463,38 +3496,36 @@ static void eng_archive_save(void)
  * go to disk even when no more arrive. */
 static void eng_archive_tick(void)
 {
-    static time_t last;
+    static time_t last, first_unsaved;
     const time_t now = time(NULL);
     if (now == last) return;
     last = now;
-    if (!__atomic_load_n(&s_eng_arch_unsaved, __ATOMIC_RELAXED)) return;
+    const u32 pending = __atomic_load_n(&s_eng_arch_unsaved, __ATOMIC_RELAXED);
+    if (!pending) { first_unsaved = 0; return; }
+    if (!first_unsaved) { first_unsaved = now; return; }
+    if (now - first_unsaved < 10) return;
     if (pthread_mutex_trylock(&s_eng_arch_mu) != 0) return;   /* a build is adding: next second */
-    static time_t first_seen; static u32 seen_count;
-    if (s_eng_arch_unsaved != seen_count) { seen_count = s_eng_arch_unsaved; first_seen = now; }
-    else if (now - first_seen >= 10) { eng_archive_save_locked(); seen_count = 0; }
+    eng_archive_save_locked();
+    first_unsaved = 0;
     pthread_mutex_unlock(&s_eng_arch_mu);
 }
 
 /* A pipeline just COMPILED from pd goes into the archive. One the archive
- * supplied (a few ms, no compile) must not be added back: adding a pipeline
- * the archive already holds corrupts it -- every later save fails with
- * "expecting 'fragment' stage in pipeline no. N" (macOS 27, M1 Pro), and the
- * second launch, which gets most of its pipelines from the archive, lost
- * every save that way. The compile time tells the two apart. */
-static void eng_archive_add(MTLRenderPipelineDescriptor* pd, double create_ms)
+ * supplied must not be added back: adding a pipeline the archive already
+ * holds corrupts it -- every later save fails with "expecting 'fragment'
+ * stage in pipeline no. N" (macOS 27, M1 Pro), and the second launch, which
+ * gets most of its pipelines from the archive, lost every save that way.
+ * Timing cannot tell the two apart (Metal's own cache makes a compile as
+ * quick as a load), so eng_pipeline_state asks the archive first. */
+static void eng_archive_add(MTLRenderPipelineDescriptor* pd)
 {
     if (!s_eng_archive || s_eng_arch_broken) return;
-    if (create_ms < 4.0) { __atomic_add_fetch(&s_eng_arch_hits, 1, __ATOMIC_RELAXED); return; }
     if (@available(macOS 11.0, *)) {
         pthread_mutex_lock(&s_eng_arch_mu);
         NSError* err = nil;
         if ([s_eng_archive addRenderPipelineFunctionsWithDescriptor:pd error:&err]) {
             s_eng_arch_added++;
-            /* Saved every 24 additions, or 10 s after the first unsaved one:
-             * a force-quit or a crash loses at most that much. */
-            static time_t first_unsaved;
-            if (!s_eng_arch_unsaved) first_unsaved = time(NULL);
-            if (++s_eng_arch_unsaved >= 24 || time(NULL) - first_unsaved >= 10) eng_archive_save_locked();
+            s_eng_arch_unsaved++;   /* written out by eng_archive_tick (10 s) or at shutdown */
         } else {
             s_eng_arch_broken = 1;
             fprintf(stderr, "[rsx engine/metal] pipeline archive: cannot add pipelines (%s); compiled pipelines stay in Metal's own cache only\n",
@@ -3604,23 +3635,36 @@ static MTLRenderPipelineDescriptor* eng_pipeline_descriptor(id<MTLFunction> vs, 
         }
     }
     eng_archive_open();
-    if (s_eng_archive) {
-        if (@available(macOS 11.0, *)) pd.binaryArchives = @[s_eng_archive];
-    }
     return pd;
 }
 
-/* The pipeline state for pd, through the archive, and into it. */
+/* The pipeline state for pd: from the archive when it holds one (a lookup
+ * that fails rather than compiles on a miss), else compiled and added. */
 static id<MTLRenderPipelineState> eng_pipeline_state(MTLRenderPipelineDescriptor* pd, NSError** err)
 {
+    id<MTLRenderPipelineState> pso = nil;
+    if (@available(macOS 11.0, *)) {
+        pthread_mutex_lock(&s_eng_arch_mu);
+        NSArray* set = s_eng_arch_set.count ? [s_eng_arch_set copy] : nil;
+        pthread_mutex_unlock(&s_eng_arch_mu);
+        if (set) {
+            NSError* miss = nil;
+            pd.binaryArchives = set;
+            pso = [s_dev newRenderPipelineStateWithDescriptor:pd
+                                                      options:MTLPipelineOptionFailOnBinaryArchiveMiss
+                                                   reflection:nil error:&miss];
+            pd.binaryArchives = @[];
+            if (pso) { __atomic_add_fetch(&s_eng_arch_hits, 1, __ATOMIC_RELAXED); return pso; }
+        }
+    }
     struct timespec t0, t1;
     timespec_get(&t0, TIME_UTC);
-    id<MTLRenderPipelineState> pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:err];
+    pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:err];
     timespec_get(&t1, TIME_UTC);
-    const double ms = (double)(t1.tv_sec - t0.tv_sec) * 1e3 + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
-    if (pso) eng_archive_add(pd, ms);
+    if (pso) eng_archive_add(pd);
     { static int log = -1; if (log < 0) log = getenv("RSX_PIPE_LOG") ? 1 : 0;
-      if (log) fprintf(stderr, "[rsx engine/metal] pipeline state in %.1f ms%s\n", ms, ms < 4.0 ? " (archive)" : ""); }
+      if (log) fprintf(stderr, "[rsx engine/metal] pipeline compiled in %.1f ms\n",
+                       (double)(t1.tv_sec - t0.tv_sec) * 1e3 + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6); }
     return pso;
 }
 
@@ -3689,8 +3733,23 @@ static void eng_warmup_run(void)
     });
     timespec_get(&t1, TIME_UTC);
     eng_archive_save();
+    if (s_eng_arch_fold) {
+        pthread_mutex_lock(&s_eng_arch_mu);
+        NSArray<NSString*>* names = [NSFileManager.defaultManager contentsOfDirectoryAtPath:[NSString stringWithUTF8String:s_eng_arch_dir] error:nil];
+        char keep[1200];
+        snprintf(keep, sizeof keep, "%03u.bin", s_eng_arch_files);
+        u32 removed = 0;
+        for (NSString* n in names)
+            if ([n hasSuffix:@".bin"] && ![n isEqualToString:[NSString stringWithUTF8String:keep]]) {
+                char path[1300]; snprintf(path, sizeof path, "%s/%s", s_eng_arch_dir, n.UTF8String);
+                if (unlink(path) == 0) removed++;
+            }
+        s_eng_arch_fold = 0;
+        pthread_mutex_unlock(&s_eng_arch_mu);
+        fprintf(stderr, "[rsx engine/metal] pipeline archives folded into one file (%u removed)\n", removed);
+    }
     fprintf(stderr, "[rsx engine/metal] warm-up: %u of %u listed pipelines ready in %.1f s "
-            "(%u functions compiled, %u pipelines from the archive, %u new in it, %u without cached MSL, %u failed)\n",
+            "(%u functions compiled, %u pipelines from the archives, %u compiled and kept, %u without cached MSL, %u failed)\n",
             built, n, (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9,
             s_eng_func_count - funcs0, s_eng_arch_hits - hits0, s_eng_arch_added - added0,
             no_msl, failed);
