@@ -1095,6 +1095,10 @@ int main(int argc, char** argv)
     /* frames = 0 runs until the window is closed, which is what the .app
      * bundle uses; a fixed count keeps the CI runs bounded. */
     int frames = 3, do_draw = 0;
+    /* The draws below are checked on the frame they are issued, so their
+     * pipelines are built on the spot rather than on the engine's worker
+     * threads (a draw whose pipeline is still building is skipped). */
+    setenv("RSX_ASYNC_SHADERS", "0", 0);
     for (int i = 1; i < argc; i++) {
         if (strncmp(argv[i], "--frames=", 9) == 0) frames = atoi(argv[i] + 9);
         else if (strcmp(argv[i], "--draw") == 0)   do_draw = 1;

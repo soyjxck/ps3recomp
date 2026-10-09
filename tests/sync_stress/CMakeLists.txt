@@ -98,7 +98,9 @@ if(WIN32)
     add_executable(test_cond_semantics
         test_cond_semantics.c test_shims.c
         "${RUNTIME_SYNC_DIR}/sys_mutex.c"
-        "${RUNTIME_SYNC_DIR}/sys_cond.c")
+        "${RUNTIME_SYNC_DIR}/sys_cond.c"
+        # the cached getenv the sync objects read their knobs through
+        "${PS3RECOMP_TREE_ROOT}/runtime/platform/env_cache.c")
     target_include_directories(test_cond_semantics PRIVATE
         "${PS3RECOMP_TREE_ROOT}" "${PS3RECOMP_TREE_ROOT}/include")
     target_compile_definitions(test_cond_semantics PRIVATE _CRT_SECURE_NO_WARNINGS)

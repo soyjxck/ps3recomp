@@ -2794,6 +2794,16 @@ static void sink_end(void* user, const rsx_dispatch* r)
     sink_end_impl(user, r);
     s_fstat.draws++; s_fstat.draw_ms += eng_now_ms() - t0;
 }
+/* 2^(ex - 15) for a half float's exponent field 1..30, as the float with that
+ * exponent: no libm, which the standalone draw-engine test is linked without
+ * on Linux, and exact where pow(2.0, n) is only promised to be close. */
+static inline float eng_half_pow2(unsigned ex)
+{
+    union { u32 u; float f; } p;
+    p.u = (ex + 112u) << 23;
+    return p.f;
+}
+
 static void sink_end_impl(void* user, const rsx_dispatch* r)
 {
     (void)user; (void)r;
@@ -3156,7 +3166,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
                   float c[4] = {0, 0, 0, 0};
                   if (bpp == 8) for (int k = 0; k < 4; k++) {
                       const u16 v = ((const u16*)b)[k]; const u32 ex = (v >> 10) & 0x1F, mant = v & 0x3FF;
-                      float o = ex == 0 ? mant / 1024.0f / 16384.0f : ex == 31 ? 65504.0f : (1.0f + mant / 1024.0f) * (float)pow(2.0, (int)ex - 15);
+                      float o = ex == 0 ? mant / 1024.0f / 16384.0f : ex == 31 ? 65504.0f : (1.0f + mant / 1024.0f) * eng_half_pow2(ex);
                       c[k] = (v & 0x8000) ? -o : o; }
                   else for (int k = 0; k < 4; k++) c[k] = b[k] / 255.0f;
                   u64 fh = 0;
@@ -3358,7 +3368,7 @@ static void eng_surface_dump_now(void)
                     u16 v = h[k]; u32 sgn = (v >> 15) & 1, ex = (v >> 10) & 0x1F, mant = v & 0x3FF; float out;
                     if (ex == 0) out = (float)mant / 1024.0f / 16384.0f;
                     else if (ex == 31) { out = mant ? 0.0f : 1e30f; if (mant) nan++; }
-                    else out = (1.0f + mant / 1024.0f) * (float)pow(2.0, (int)ex - 15);
+                    else out = (1.0f + mant / 1024.0f) * eng_half_pow2(ex);
                     a4[k] = sgn ? -out : out;
                 }
                 c[0] = a4[0]; c[1] = a4[1]; c[2] = a4[2];
@@ -3391,7 +3401,7 @@ static void eng_surface_dump_now(void)
                 for (u32 p = 0; p < sf->w * sf->h; p++) {
                     const u16 v = ((const u16*)(buf + (size_t)p * 8))[3];
                     u32 ex = (v >> 10) & 0x1F, mant = v & 0x3FF; float out;
-                    if (ex == 0) out = (float)mant / 1024.0f / 16384.0f; else if (ex == 31) out = 0; else out = (1.0f + mant / 1024.0f) * (float)pow(2.0, (int)ex - 15);
+                    if (ex == 0) out = (float)mant / 1024.0f / 16384.0f; else if (ex == 31) out = 0; else out = (1.0f + mant / 1024.0f) * eng_half_pow2(ex);
                     if (v & 0x8000) out = -out;
                     float t = out / (float)amax; t = t < 0 ? 0 : t > 1 ? 1 : t; u8 g8 = (u8)(t * 255.0f + 0.5f); u8 px3[3] = { g8, g8, g8 };
                     fwrite(px3, 1, 3, af); }
