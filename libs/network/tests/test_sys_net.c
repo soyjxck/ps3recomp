@@ -22,6 +22,10 @@ void ppu_resv_break_store(uint64_t ea) { (void)ea; }
 int  spu_coh_is_reserved(uint32_t addr) { (void)addr; return 0; }
 void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
+/* The inline store path's coherence flag (tested before spu_coh_is_reserved
+ * is called) and the file-read write-watch hook: no SPU, no watch here. */
+int  g_spu_coh_armed = 0;
+void vm_watch_touch(uint32_t ea, uint32_t len) { (void)ea; (void)len; }
 void spu_coh_notify_write(uint32_t addr) { (void)addr; }
 void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width) { (void)addr; (void)val; (void)width; }
 static uint16_t s_p2p_port = 36658;

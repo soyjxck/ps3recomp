@@ -17,6 +17,26 @@
  */
 #include "rsx_capture.h"
 
+#if !defined(PS3RECOMP_HAVE_ZLIB)
+/* Built without zlib (CMakeLists.txt): no capture. The engine's calls cost a
+ * load of g_rsx_capture_on, which stays 0, and the trigger never fires. */
+int g_rsx_capture_on;
+void rsx_capture_read(u32 location, u32 offset, u32 len) { (void)location; (void)offset; (void)len; }
+void rsx_capture_method(u32 method, u32 arg) { (void)method; (void)arg; }
+void rsx_capture_flip(u32 buffer_id) { (void)buffer_id; }
+void rsx_capture_display_buffer(u32 id, u32 location, u32 offset, u32 pitch, u32 width, u32 height)
+{
+    (void)id; (void)location; (void)offset; (void)pitch; (void)width; (void)height;
+}
+int rsx_capture_wants_mean(u32 frame) { (void)frame; return 0; }
+void rsx_capture_present(u32 frame, double mean, const u32* regs, u32 nregs, const u32* vp, u32 nvp,
+                         const u32* constants, u32 nconst_words, const u32* dispbuf, u32 ndispbuf)
+{
+    (void)frame; (void)mean; (void)regs; (void)nregs; (void)vp; (void)nvp;
+    (void)constants; (void)nconst_words; (void)dispbuf; (void)ndispbuf;
+}
+#else
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -198,3 +218,5 @@ void rsx_capture_present(u32 frame, double mean,
             s_nframes, frame, mean >= 0 ? " (brightness trigger)" : "", s_path);
     (void)s_stop_pending;
 }
+
+#endif /* PS3RECOMP_HAVE_ZLIB */

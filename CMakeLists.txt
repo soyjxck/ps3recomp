@@ -196,9 +196,16 @@ if(NOT WIN32)
     target_link_libraries(ps3recomp_runtime PRIVATE Threads::Threads)
 endif()
 
-# Frame capture (libs/video/rsx_capture.c) writes gzip.
-find_package(ZLIB REQUIRED)
-target_link_libraries(ps3recomp_runtime PUBLIC ZLIB::ZLIB)
+# Frame capture (libs/video/rsx_capture.c) writes gzip and the replay
+# harness reads it. Without zlib on the host (a bare Windows runner) the
+# capture is compiled out and rsx_replay is not built; the game is unaffected.
+find_package(ZLIB)
+if(ZLIB_FOUND)
+    target_link_libraries(ps3recomp_runtime PUBLIC ZLIB::ZLIB)
+    target_compile_definitions(ps3recomp_runtime PUBLIC PS3RECOMP_HAVE_ZLIB=1)
+else()
+    message(STATUS "  zlib:         not found; frame capture/replay off")
+endif()
 
 # PS3RECOMP_DEBUG_INFO: debug records in the runtime's objects (clang-cl /Z7,
 # -g elsewhere) so a host profiler or crash handler can name its functions.
@@ -448,7 +455,7 @@ if(UNIX)
 
     # Frame replay: a capture (RSX_CAPTURE=...) played back through the draw
     # engine and the headless Metal backend with no game -- see rsx_replay.c.
-    if(APPLE)
+    if(APPLE AND ZLIB_FOUND)
         add_executable(rsx_replay
             runtime/host/rsx_replay.c
             runtime/host/host_stubs.c
@@ -506,7 +513,7 @@ endif()
 
 # Frame replay on Windows: the same harness over the D3D12 draw-engine
 # backend, headless.
-if(WIN32)
+if(WIN32 AND ZLIB_FOUND)
     add_executable(rsx_replay
         runtime/host/rsx_replay.c
         runtime/host/host_stubs.c
