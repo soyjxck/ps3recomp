@@ -42,6 +42,7 @@
  */
 
 #include <pthread.h>
+#include "ps3emu/env_cache.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -250,6 +251,13 @@ int main(void)
  * delivery hook's owner, the PPU's reservation and watch helpers, and the
  * title-specific SPURS hooks. None of them is on the path this test drives.
  * -----------------------------------------------------------------------*/
+/* The env cache (served straight from getenv), the guest clock and the store
+ * watch's page commit: the runtime pieces these objects call that are not
+ * part of the test. */
+ps3_env_slot g_ps3_env_cache[PS3_ENV_CACHE_SLOTS];
+const char* ps3_env_fill(const char* name, unsigned first_slot) { (void)first_slot; return (getenv)(name); }   /* the real one: these files alias getenv to ps3_env */
+int64_t ps3_guest_ticks(int64_t host_ticks) { return host_ticks; }
+int     vm_commit_reserved(void* p, uint64_t n) { (void)p; (void)n; return 1; }
 void ppu_resv_break_store(uint64_t ea)                 { (void)ea; }
 void ps3_ww_report_inline(uint32_t a, uint64_t v, int w)
 {

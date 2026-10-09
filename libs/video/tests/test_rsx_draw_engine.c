@@ -13,6 +13,9 @@
  * Builds and runs on Linux as well as macOS; nothing in it is Apple-specific.
  */
 #include "rsx_draw_engine.h"
+#include "rsx_capture.h"
+#include "ps3emu/env_cache.h"
+#include "ps3emu/vm_watch.h"
 #include "rsx_primitives.h"   /* RSX_PRIMITIVE_* */
 
 #include <stdio.h>
@@ -54,6 +57,30 @@ u32 cellGcmResolveIO(u32 offset)
 {
     return offset < GUEST_LOCAL_EA ? offset : 0;
 }
+
+/* The engine's hooks into the rest of the runtime, none of which is here: the
+ * GCM report and trace hook, the frame capture (off), the store watch (not
+ * available: the engine hashes), the env cache (served straight from getenv)
+ * and the job-chain walk timers. */
+void cellGcm_set_report_value(u32 index, u32 value) { (void)index; (void)value; }
+void (*g_gcm_trace_hook)(u32 type, u32 a, u32 b);
+double   g_jc_walk_ms;
+unsigned g_jc_walks;
+ps3_env_slot g_ps3_env_cache[PS3_ENV_CACHE_SLOTS];
+const char* ps3_env_fill(const char* name, unsigned first_slot) { (void)first_slot; return (getenv)(name); }   /* the real one: these files alias getenv to ps3_env */
+int g_rsx_capture_on;
+void rsx_capture_read(u32 location, u32 offset, u32 len) { (void)location; (void)offset; (void)len; }
+void rsx_capture_method(u32 method, u32 arg) { (void)method; (void)arg; }
+void rsx_capture_flip(u32 buffer_id) { (void)buffer_id; }
+void rsx_capture_display_buffer(u32 id, u32 location, u32 offset, u32 pitch, u32 width, u32 height)
+{ (void)id; (void)location; (void)offset; (void)pitch; (void)width; (void)height; }
+int  rsx_capture_wants_mean(u32 frame) { (void)frame; return 0; }
+void rsx_capture_present(u32 frame, double mean, const u32* regs, u32 nregs, const u32* vp, u32 nvp,
+                         const u32* constants, u32 nconst_words, const u32* dispbuf, u32 ndispbuf)
+{ (void)frame; (void)mean; (void)regs; (void)nregs; (void)vp; (void)nvp; (void)constants; (void)nconst_words; (void)dispbuf; (void)ndispbuf; }
+int      vm_watch_available(void) { return 0; }
+uint64_t vm_watch_arm(uint32_t ea, uint32_t len, uint32_t* unwatched) { (void)ea; if (unwatched) *unwatched = len; return 0; }
+void     vm_watch_stats(uint64_t* faults, uint64_t* pages_protected) { if (faults) *faults = 0; if (pages_protected) *pages_protected = 0; }
 
 /* ---- the stub backend ---------------------------------------------------- */
 

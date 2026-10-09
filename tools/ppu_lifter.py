@@ -185,6 +185,14 @@ SOURCE_PREAMBLE = """\
 #include <string.h>
 #include <math.h>
 
+/* A branch the float helpers take only for a NaN result. MSVC's cl (which
+ * builds the conformance driver) has no __builtin_expect. */
+#if defined(__GNUC__) || defined(__clang__)
+#define PPU_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#else
+#define PPU_UNLIKELY(x) (x)
+#endif
+
 /* Float->int conversion per Book I 4.6.7: SATURATE out-of-range (positive
  * overflow => max, negative => min, NaN => min) and honor the rounding mode
  * (rn=1: FPSCR default round-to-nearest-even via nearbyint; rn=0: the z
@@ -241,7 +249,7 @@ static double ppu_fp_bin_nan(double a, double b)
 }
 static inline double ppu_fp_bin(double a, double b, double r)
 {
-    if (__builtin_expect(r != r, 0)) return ppu_fp_bin_nan(a, b);
+    if (PPU_UNLIKELY(r != r)) return ppu_fp_bin_nan(a, b);
     return r;
 }
 static inline double ppu_fadd(double a, double b) { return ppu_fp_bin(a, b, a + b); }
@@ -260,21 +268,21 @@ static double ppu_fmadd_nan(double a, double c, double b)
 static inline double ppu_fmadd_core(double a, double c, double b, int neg_b, int neg_res)
 {
     const double r = fma(a, c, neg_b ? -b : b);
-    if (__builtin_expect(r != r, 0)) return ppu_fmadd_nan(a, c, b);   /* any NaN input lands here */
+    if (PPU_UNLIKELY(r != r)) return ppu_fmadd_nan(a, c, b);   /* any NaN input lands here */
     return neg_res ? -r : r;
 }
 /* The single-precision arithmetic forms, fused: one NaN test and the round
  * to single, where ppu_fp_single(ppu_fadd(..)) tested twice. Identical
  * results: a NaN result takes the same priority rules and keeps its double
  * payload (ppu_fp_single leaves NaNs alone); anything else is rounded. */
-static inline double ppu_fadds(double a, double b) { const double r = a + b; if (__builtin_expect(r != r, 0)) return ppu_fp_bin_nan(a, b); return (double)(float)r; }
-static inline double ppu_fsubs(double a, double b) { const double r = a - b; if (__builtin_expect(r != r, 0)) return ppu_fp_bin_nan(a, b); return (double)(float)r; }
-static inline double ppu_fmuls(double a, double b) { const double r = a * b; if (__builtin_expect(r != r, 0)) return ppu_fp_bin_nan(a, b); return (double)(float)r; }
-static inline double ppu_fdivs(double a, double b) { const double r = a / b; if (__builtin_expect(r != r, 0)) return ppu_fp_bin_nan(a, b); return (double)(float)r; }
+static inline double ppu_fadds(double a, double b) { const double r = a + b; if (PPU_UNLIKELY(r != r)) return ppu_fp_bin_nan(a, b); return (double)(float)r; }
+static inline double ppu_fsubs(double a, double b) { const double r = a - b; if (PPU_UNLIKELY(r != r)) return ppu_fp_bin_nan(a, b); return (double)(float)r; }
+static inline double ppu_fmuls(double a, double b) { const double r = a * b; if (PPU_UNLIKELY(r != r)) return ppu_fp_bin_nan(a, b); return (double)(float)r; }
+static inline double ppu_fdivs(double a, double b) { const double r = a / b; if (PPU_UNLIKELY(r != r)) return ppu_fp_bin_nan(a, b); return (double)(float)r; }
 static inline double ppu_fmadds_core(double a, double c, double b, int neg_b, int neg_res)
 {
     const double r = fma(a, c, neg_b ? -b : b);
-    if (__builtin_expect(r != r, 0)) return ppu_fmadd_nan(a, c, b);
+    if (PPU_UNLIKELY(r != r)) return ppu_fmadd_nan(a, c, b);
     return (double)(float)(neg_res ? -r : r);
 }
 /* Round-to-single of a NaN keeps the full double payload (quieted). */
