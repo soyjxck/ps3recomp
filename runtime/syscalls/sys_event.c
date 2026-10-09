@@ -137,6 +137,7 @@ uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size)
 
     evt_table_unlock();
 
+    if (ps3_log_verbose())   /* six a second in Drakengard 3 */
     fprintf(stderr, "[evt] queue_create_direct -> id=%d key=0x%llX size=%d\n",
             slot + 1, (unsigned long long)key, size);
     return (uint32_t)(slot + 1);
@@ -1096,6 +1097,10 @@ int64_t sys_event_port_send(ppu_context* ctx)
       g_spu_pending_evt_valid = 0; }
 
     if (event_queue_push(q, &evt) < 0) {
+        /* Drakengard 3 fills one queue 17 times a second, by design (the
+         * sender takes EBUSY); once, then every 1000th, unless verbose. */
+        static unsigned long _full = 0;
+        if (ps3_log_verbose() || ++_full <= 1 || (_full % 1000) == 0)
         fprintf(stderr, "[evt] port_send(port=%u): queue %d FULL -> EBUSY%c",
                 port_id, qidx, 10);
         return (int64_t)(int32_t)CELL_EBUSY;

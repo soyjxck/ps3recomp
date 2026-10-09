@@ -1739,7 +1739,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
     static _Thread_local unsigned long long s_wait_exit_ms;
     { extern unsigned long long ps3_ms_now(void);
       unsigned long long _now = ps3_ms_now();
-      static int _n = 0; if (_n++ < 200 || (_n % 500) == 0)
+      static int _n = 0; if (ps3_log_verbose() && (_n++ < 200 || (_n % 500) == 0))
         fprintf(stderr, "[spu_workload] WAIT_SIGNAL#%d enter task=%u taskset=0x%08X ran=%llums\n",
                 _n, taskId, taskset_ea,
                 s_wait_exit_ms ? (_now - s_wait_exit_ms) : 0ull); }

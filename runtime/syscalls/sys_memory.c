@@ -3,6 +3,7 @@
  */
 
 #include "sys_memory.h"
+#include "../ps3_log.h"   /* ps3_log_verbose */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -128,8 +129,9 @@ int64_t sys_memory_allocate(ppu_context* ctx)
     uint32_t flags     = LV2_ARG_U32(ctx, 1);
     uint32_t addr_out  = LV2_ARG_PTR(ctx, 2);
 
-    fprintf(stderr, "[sys_memory] allocate(size=0x%X, flags=0x%X)\n",
-            size, flags);
+    if (ps3_log_verbose())   /* Drakengard 3 allocates ten times a second */
+        fprintf(stderr, "[sys_memory] allocate(size=0x%X, flags=0x%X)\n",
+                size, flags);
 
     /* Determine alignment based on page size flags */
     uint32_t alignment;
@@ -241,7 +243,8 @@ int64_t sys_memory_allocate(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ENOMEM;
     }
 
-    fprintf(stderr, "[sys_memory] allocate -> 0x%08X (live=%u MB)\n", alloc_addr, s_total_allocated >> 20);
+    if (ps3_log_verbose())
+        fprintf(stderr, "[sys_memory] allocate -> 0x%08X (live=%u MB)\n", alloc_addr, s_total_allocated >> 20);
 
     if (addr_out != 0) {
         write_be32(addr_out, alloc_addr);

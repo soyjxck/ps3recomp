@@ -12,6 +12,7 @@
 #include "rsx_draw_engine.h"
 #include "cellGcmSys.h"
 #include "../../runtime/platform/win32_compat.h"
+#include "../../runtime/ps3_log.h"          /* ps3_log_verbose */
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 (translate + byte-swap, OOB-safe) */
 #include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
 int64_t ps3_guest_ticks(int64_t host_ticks);   /* sys_timer.c: still while paused */
@@ -1227,6 +1228,7 @@ static void nv0039_copy(void)
       const u32 a = s_nv0039.off_out, b = s_nv0039.off_out + len * lines;
       if (a < lo[k][d] || b > hi[k][d]) {
           if (a < lo[k][d]) lo[k][d] = a; if (b > hi[k][d]) hi[k][d] = b;
+          if (ps3_log_verbose())   /* a title whose range keeps growing printed 12 a second */
           printf("[NV0039] range %s->%s now 0x%08X..0x%08X (this copy in=0x%08X out=0x%08X len=%u lines=%u)\n",
                  k ? "report" : "local", d ? "main" : "local", lo[k][d], hi[k][d],
                  s_nv0039.off_in, s_nv0039.off_out, len, lines); } }
