@@ -323,23 +323,33 @@ static inline void ppu_vstu4(void* v, const uint32_t in[4]) {
  * (multiply, then add), as the scalar ones were. */
 #if (defined(__x86_64__) || defined(_M_X64)) && !defined(PPU_NO_SSE_VMX)
 #include <immintrin.h>
-static inline __m128i ppu_vbswap128(__m128i x) {
+/* GCC and Clang only inline an SSSE3/SSE4.1 intrinsic into a function
+ * compiled for those targets: without -mssse3 -msse4.1 on the command line
+ * GCC refuses ("inlining failed in call to always_inline"). Naming the
+ * targets on the helpers themselves builds anywhere, with any flags; MSVC
+ * needs nothing (its intrinsics are not gated). */
+#if defined(__GNUC__) || defined(__clang__)
+#define PPU_VMX_INLINE static inline __attribute__((target("ssse3,sse4.1")))
+#else
+#define PPU_VMX_INLINE static inline
+#endif
+PPU_VMX_INLINE __m128i ppu_vbswap128(__m128i x) {
     const __m128i m = _mm_setr_epi8(3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12);
     return _mm_shuffle_epi8(x, m);
 }
-static inline __m128i ppu_vld128(const void* v) { return _mm_loadu_si128((const __m128i*)v); }
-static inline void    ppu_vst128(void* v, __m128i x) { _mm_storeu_si128((__m128i*)v, x); }
-static inline __m128  ppu_vldps(const void* v) { return _mm_castsi128_ps(ppu_vbswap128(ppu_vld128(v))); }
-static inline void    ppu_vstps(void* v, __m128 f) { ppu_vst128(v, ppu_vbswap128(_mm_castps_si128(f))); }
-static inline void ppu_vmaddfp(void* d, const void* a, const void* b, const void* c)
+PPU_VMX_INLINE __m128i ppu_vld128(const void* v) { return _mm_loadu_si128((const __m128i*)v); }
+PPU_VMX_INLINE void    ppu_vst128(void* v, __m128i x) { _mm_storeu_si128((__m128i*)v, x); }
+PPU_VMX_INLINE __m128  ppu_vldps(const void* v) { return _mm_castsi128_ps(ppu_vbswap128(ppu_vld128(v))); }
+PPU_VMX_INLINE void    ppu_vstps(void* v, __m128 f) { ppu_vst128(v, ppu_vbswap128(_mm_castps_si128(f))); }
+PPU_VMX_INLINE void ppu_vmaddfp(void* d, const void* a, const void* b, const void* c)
 { ppu_vstps(d, _mm_add_ps(_mm_mul_ps(ppu_vldps(a), ppu_vldps(c)), ppu_vldps(b))); }
-static inline void ppu_vnmsubfp(void* d, const void* a, const void* b, const void* c)
+PPU_VMX_INLINE void ppu_vnmsubfp(void* d, const void* a, const void* b, const void* c)
 { ppu_vstps(d, _mm_sub_ps(ppu_vldps(b), _mm_mul_ps(ppu_vldps(a), ppu_vldps(c)))); }
-static inline void ppu_vaddfp(void* d, const void* a, const void* b) { ppu_vstps(d, _mm_add_ps(ppu_vldps(a), ppu_vldps(b))); }
-static inline void ppu_vsubfp(void* d, const void* a, const void* b) { ppu_vstps(d, _mm_sub_ps(ppu_vldps(a), ppu_vldps(b))); }
-static inline void ppu_vmulfp(void* d, const void* a, const void* b) { ppu_vstps(d, _mm_mul_ps(ppu_vldps(a), ppu_vldps(b))); }
+PPU_VMX_INLINE void ppu_vaddfp(void* d, const void* a, const void* b) { ppu_vstps(d, _mm_add_ps(ppu_vldps(a), ppu_vldps(b))); }
+PPU_VMX_INLINE void ppu_vsubfp(void* d, const void* a, const void* b) { ppu_vstps(d, _mm_sub_ps(ppu_vldps(a), ppu_vldps(b))); }
+PPU_VMX_INLINE void ppu_vmulfp(void* d, const void* a, const void* b) { ppu_vstps(d, _mm_mul_ps(ppu_vldps(a), ppu_vldps(b))); }
 /* vperm: byte i of the result is byte sel[i]&31 of a||b. */
-static inline void ppu_vperm(void* d, const void* a, const void* b, const void* c)
+PPU_VMX_INLINE void ppu_vperm(void* d, const void* a, const void* b, const void* c)
 {
     const __m128i sel = _mm_and_si128(ppu_vld128(c), _mm_set1_epi8(0x1F));
     const __m128i idx = _mm_and_si128(sel, _mm_set1_epi8(0x0F));
@@ -348,11 +358,11 @@ static inline void ppu_vperm(void* d, const void* a, const void* b, const void* 
     const __m128i hi = _mm_slli_epi16(_mm_and_si128(sel, _mm_set1_epi8(0x10)), 3);   /* 0x10 -> 0x80 */
     ppu_vst128(d, _mm_blendv_epi8(pa, pb, hi));
 }
-static inline void ppu_vspltw(void* d, const void* b, int u)
+PPU_VMX_INLINE void ppu_vspltw(void* d, const void* b, int u)
 { uint32_t w; memcpy(&w, (const uint8_t*)b + 4 * u, 4); ppu_vst128(d, _mm_set1_epi32((int)w)); }
 /* Float compares: the mask lanes are all-ones or all-zero, so they need no
  * swap; returns how many lanes were true (the dot form's CR6). */
-static inline int ppu_vcmpfp(void* d, const void* a, const void* b, int op)
+PPU_VMX_INLINE int ppu_vcmpfp(void* d, const void* a, const void* b, int op)
 {
     const __m128 x = ppu_vldps(a), y = ppu_vldps(b);
     const __m128 m = op == 0 ? _mm_cmpeq_ps(x, y) : op == 1 ? _mm_cmpge_ps(x, y) : _mm_cmpgt_ps(x, y);
@@ -360,7 +370,7 @@ static inline int ppu_vcmpfp(void* d, const void* a, const void* b, int op)
     const int k = _mm_movemask_ps(m);
     return (k & 1) + ((k >> 1) & 1) + ((k >> 2) & 1) + ((k >> 3) & 1);
 }
-static inline int ppu_vcmpequw(void* d, const void* a, const void* b)
+PPU_VMX_INLINE int ppu_vcmpequw(void* d, const void* a, const void* b)
 {
     const __m128i m = _mm_cmpeq_epi32(ppu_vld128(a), ppu_vld128(b));
     ppu_vst128(d, m);
@@ -369,7 +379,7 @@ static inline int ppu_vcmpequw(void* d, const void* a, const void* b)
 }
 /* vmrgh and vmrgl: interleave the first (high) or second (low) half of the
  * elements of a and b, in memory order. */
-static inline void ppu_vmrg(void* d, const void* a, const void* b, int esz, int high)
+PPU_VMX_INLINE void ppu_vmrg(void* d, const void* a, const void* b, int esz, int high)
 {
     const __m128i x = ppu_vld128(a), y = ppu_vld128(b);
     __m128i r;

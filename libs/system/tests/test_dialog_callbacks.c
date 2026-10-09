@@ -13,6 +13,10 @@ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
 void spu_coh_notify_write(uint32_t a) { (void)a; }
 void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
+/* The inline store path's coherence flag (tested before spu_coh_is_reserved
+ * is called) and the file-read write-watch hook: no SPU, no watch here. */
+int  g_spu_coh_armed = 0;
+void vm_watch_touch(uint32_t ea, uint32_t len) { (void)ea; (void)len; }
 void np_psnr_pump(void) {}
 
 static unsigned calls;
