@@ -714,6 +714,7 @@ u32 cellGcmGetFlipStatus(void)
 static volatile LONG s_gcm_pending = 0;    /* bit0 = vblank, bit1 = flip */
 #define GCM_PENDING_SET(bits)  InterlockedOr(&s_gcm_pending, (bits))
 #define GCM_PENDING_TAKE()     InterlockedExchange(&s_gcm_pending, 0)
+#define GCM_PENDING_PEEK()     (s_gcm_pending != 0)
 static volatile LONG s_gcm_pumping = 0;
 #define GCM_PUMP_TRY_ENTER() (InterlockedCompareExchange(&s_gcm_pumping, 1, 0) == 0)
 #define GCM_PUMP_LEAVE()     InterlockedExchange(&s_gcm_pumping, 0)
@@ -722,6 +723,7 @@ static volatile LONG s_gcm_pumping = 0;
 static atomic_int s_gcm_pending = 0;
 #define GCM_PENDING_SET(bits)  atomic_fetch_or(&s_gcm_pending, (bits))
 #define GCM_PENDING_TAKE()     atomic_exchange(&s_gcm_pending, 0)
+#define GCM_PENDING_PEEK()     (atomic_load_explicit(&s_gcm_pending, memory_order_relaxed) != 0)
 static atomic_flag s_gcm_pumping = ATOMIC_FLAG_INIT;
 #define GCM_PUMP_TRY_ENTER() (!atomic_flag_test_and_set_explicit(&s_gcm_pumping, memory_order_acquire))
 #define GCM_PUMP_LEAVE()     atomic_flag_clear_explicit(&s_gcm_pumping, memory_order_release)
@@ -762,6 +764,13 @@ void cellGcm_request_tick(void)
 extern void (*g_gcm_trace_hook)(u32 type, u32 a, u32 b);   /* defined with the ring recycle */
 void ppu_gcm_pump(void)
 {
+    /* Nothing pending -- the case at nearly every HLE call, from the game
+     * thread and the render thread alike: no atomics, no lock. Three
+     * interlocked operations and an SRW lock on a line both threads bounce
+     * were 2% of Drakengard 3's main thread. A tick or a command that lands
+     * right after these reads is delivered at the next HLE call, as it is
+     * when another thread is pumping. */
+    if (!GCM_PENDING_PEEK() && *(volatile u32*)&s_user_qhead == *(volatile u32*)&s_user_qtail) return;
     if (!GCM_PUMP_TRY_ENTER()) return;
     long p = (long)GCM_PENDING_TAKE();
     if (p && g_gcm_trace_hook) g_gcm_trace_hook(11, (u32)p, s_vblank_count);
