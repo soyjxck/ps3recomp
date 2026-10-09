@@ -2323,6 +2323,16 @@ static u32 s_eng_pipe_count;
  * program is translated and compiled once however many pipeline variants
  * reference it. */
 typedef struct { u64 hash; id<MTLFunction> fn; } EngFunc;
+/* The compiled-pipeline archive and the pipeline list (see "the
+ * compiled-pipeline archive" below). */
+static id<MTLBinaryArchive> s_eng_archive;
+static NSURL* s_eng_archive_url;
+static pthread_mutex_t s_eng_arch_mu = PTHREAD_MUTEX_INITIALIZER;
+static u32 s_eng_arch_unsaved, s_eng_arch_added, s_eng_arch_hits;
+static int s_eng_arch_broken;            /* adding failed: stop trying */
+static FILE* s_eng_list;                 /* pipelines.list, append */
+static u64* s_eng_list_known; static u32 s_eng_list_known_n, s_eng_list_known_cap;
+static void eng_archive_save(void);
 static EngFunc s_eng_func[ENG_MAX_FUNCS];
 static u32 s_eng_func_count;
 
@@ -2857,6 +2867,10 @@ static void eng_query_report(void* user, u32 query, u32 report_index)
 static void eng_shutdown(void* user)
 {
     (void)user;
+    eng_archive_save();
+    pthread_mutex_lock(&s_eng_arch_mu);
+    if (s_eng_list) { fclose(s_eng_list); s_eng_list = NULL; }
+    pthread_mutex_unlock(&s_eng_arch_mu);
     for (u32 i = 0; i < s_eng_obj_count; i++) s_eng_obj[i] = nil;
     for (u32 i = 0; i < s_eng_pipe_count; i++) {
         s_eng_pipe[i].pso = nil;
@@ -3174,30 +3188,97 @@ static u32 eng_depth_snapshot_rgba8(void* user, u32 depth, u32 w, u32 h)
 
 /* ---- pipelines ----------------------------------------------------------- */
 
-static id<MTLFunction> eng_function(const char* hlsl, int stage,
-                                    const char* what)
-{
-    const u64 hash = fnv1a64(hlsl, (u32)strlen(hlsl), 1469598103934665603ull);
-    for (u32 i = 0; i < s_eng_func_count; i++)
-        if (s_eng_func[i].hash == hash) return s_eng_func[i].fn;
-    if (s_eng_func_count >= ENG_MAX_FUNCS) return nil;
+static pthread_mutex_t s_eng_pipe_mu;   /* defined below, with the pipeline table */
 
+/* The function table is shared by the engine's build workers and the
+ * launch warm-up (eng_warmup_start): a lookup and an insert take the pipeline
+ * lock for a moment, the translation and the compile run outside it. A
+ * second thread compiling the same program loses the race and uses the
+ * winner's function. */
+static id<MTLFunction> eng_function_lookup(u64 hash, int* found)
+{
+    pthread_mutex_lock(&s_eng_pipe_mu);
     id<MTLFunction> fn = nil;
-    char name[64];
-    snprintf(name, sizeof name, "%s_%016llx.hlsl", what, (unsigned long long)hash);
-    dump_shader(name, hlsl);
-    /* PS3RECOMP_MSL_CACHE=<dir>: keep each translation's MSL on disk, keyed on
-     * the HLSL and the stage. HLSL -> SPIR-V (glslang plus the spirv-opt
-     * legalisation passes) -> MSL was most of a pipeline's cost, and the
-     * engine compiles on the FIFO walker's thread: a burst of new shaders held
-     * the walker for 8 s in one Drakengard 3 run. Metal keeps its own cache of
-     * compiled source, so a warm run skips both halves. Bump the tag when the
-     * translator's output changes. */
+    *found = 0;
+    for (u32 i = 0; i < s_eng_func_count; i++)
+        if (s_eng_func[i].hash == hash) { fn = s_eng_func[i].fn; *found = 1; break; }
+    pthread_mutex_unlock(&s_eng_pipe_mu);
+    return fn;
+}
+static id<MTLFunction> eng_function_insert(u64 hash, id<MTLFunction> fn)
+{
+    pthread_mutex_lock(&s_eng_pipe_mu);
+    for (u32 i = 0; i < s_eng_func_count; i++)
+        if (s_eng_func[i].hash == hash) { fn = s_eng_func[i].fn; pthread_mutex_unlock(&s_eng_pipe_mu); return fn; }
+    if (s_eng_func_count < ENG_MAX_FUNCS) {
+        s_eng_func[s_eng_func_count].hash = hash;
+        s_eng_func[s_eng_func_count].fn   = fn;
+        s_eng_func_count++;
+    } else fn = nil;
+    pthread_mutex_unlock(&s_eng_pipe_mu);
+    return fn;
+}
+/* The translated-MSL cache (PS3RECOMP_MSL_CACHE), and the file a program's
+ * translation lives in. The key is the HLSL hash and the stage; bump the
+ * tag when the translator's output changes. */
+static const char* eng_msl_cache_dir(void)
+{
     static const char* cache_dir = (const char*)1;
     if (cache_dir == (const char*)1) {
         cache_dir = getenv("PS3RECOMP_MSL_CACHE");
         if (cache_dir && *cache_dir) mkdir(cache_dir, 0755); else cache_dir = NULL;
     }
+    return cache_dir;
+}
+static void eng_msl_cache_path(char* out, size_t n, const char* what, u64 hash, int stage)
+{
+    const u64 key = fnv1a64("msl-v1", 6, hash ^ (u64)(stage + 1) * 0x9E3779B97F4A7C15ull);
+    snprintf(out, n, "%s/%s_%016llx.msl", eng_msl_cache_dir(), what, (unsigned long long)key);
+}
+/* A program's function from its cached translation alone (the warm-up has
+ * no HLSL): nil when the cache has no file for it. */
+#define ENG_MSL_MAX (512 * 1024)   /* a translation, at most */
+static id<MTLFunction> eng_function_from_cache(u64 hash, int stage, const char* what)
+{
+    int found;
+    id<MTLFunction> fn = eng_function_lookup(hash, &found);
+    if (found) return fn;
+    if (!eng_msl_cache_dir()) return nil;
+    char cpath[1024];
+    eng_msl_cache_path(cpath, sizeof cpath, what, hash, stage);
+    FILE* cf = fopen(cpath, "rb");
+    if (!cf) return nil;
+    char* msl = (char*)malloc(ENG_MSL_MAX);
+    if (!msl) { fclose(cf); return nil; }
+    const size_t n = fread(msl, 1, ENG_MSL_MAX - 1, cf);
+    fclose(cf);
+    if (n == 0 || n >= ENG_MSL_MAX - 1) { free(msl); return nil; }
+    msl[n] = 0;
+    char name[64];
+    snprintf(name, sizeof name, "%s %016llx", what, (unsigned long long)hash);
+    fn = compile_guest_function(msl, name);
+    free(msl);
+    return eng_function_insert(hash, fn);
+}
+static id<MTLFunction> eng_function(const char* hlsl, int stage,
+                                    const char* what)
+{
+    const u64 hash = fnv1a64(hlsl, (u32)strlen(hlsl), 1469598103934665603ull);
+    int found;
+    id<MTLFunction> fn = eng_function_lookup(hash, &found);
+    if (found) return fn;
+    char* s_msl = (char*)malloc(ENG_MSL_MAX);   /* this call's; the table keeps only the function */
+    char  s_log[8192];
+    if (!s_msl) return nil;
+    char name[64];
+    snprintf(name, sizeof name, "%s_%016llx.hlsl", what, (unsigned long long)hash);
+    dump_shader(name, hlsl);
+    /* PS3RECOMP_MSL_CACHE=<dir>: keep each translation's MSL on disk, keyed on
+     * the HLSL and the stage. HLSL -> SPIR-V (glslang plus the spirv-opt
+     * legalisation passes) -> MSL was most of a pipeline's cost; the compiled
+     * pipelines are kept in the binary archive (eng_archive), so a warm run
+     * skips both halves whatever binary it is. */
+    const char* cache_dir = eng_msl_cache_dir();
     char cpath[1024] = "";
     int cached = 0;
     /* RSX_MSL_OVERRIDE=<dir>: use <dir>/<what>_<hlsl hash>.msl instead of the
@@ -3210,25 +3291,23 @@ static id<MTLFunction> eng_function(const char* hlsl, int stage,
           snprintf(opath, sizeof opath, "%s/%s_%016llx.msl", od, what, (unsigned long long)hash);
           FILE* of = fopen(opath, "rb");
           if (of) {
-              const size_t n = fread(s_msl, 1, sizeof s_msl - 1, of);
+              const size_t n = fread(s_msl, 1, ENG_MSL_MAX - 1, of);
               fclose(of);
-              if (n > 0 && n < sizeof s_msl - 1) {
+              if (n > 0 && n < ENG_MSL_MAX - 1) {
                   s_msl[n] = 0; cached = 1;
                   fprintf(stderr, "[rsx engine/metal] %s %016llx: using override %s\n", what, (unsigned long long)hash, opath);
-                  cache_dir = cache_dir ? cache_dir : NULL;
               }
           } } }
     if (!cached && cache_dir) {
-        const u64 key = fnv1a64("msl-v1", 6, hash ^ (u64)(stage + 1) * 0x9E3779B97F4A7C15ull);
-        snprintf(cpath, sizeof cpath, "%s/%s_%016llx.msl", cache_dir, what, (unsigned long long)key);
+        eng_msl_cache_path(cpath, sizeof cpath, what, hash, stage);
         FILE* cf = fopen(cpath, "rb");
         if (cf) {
-            const size_t n = fread(s_msl, 1, sizeof s_msl - 1, cf);
+            const size_t n = fread(s_msl, 1, ENG_MSL_MAX - 1, cf);
             fclose(cf);
-            if (n > 0 && n < sizeof s_msl - 1) { s_msl[n] = 0; cached = 1; }
+            if (n > 0 && n < ENG_MSL_MAX - 1) { s_msl[n] = 0; cached = 1; }
         }
     }
-    if (!cached && rsx_hlsl_to_msl(hlsl, stage, s_msl, sizeof s_msl, s_log, sizeof s_log) != 0) {
+    if (!cached && rsx_hlsl_to_msl(hlsl, stage, s_msl, ENG_MSL_MAX, s_log, sizeof s_log) != 0) {
         fprintf(stderr, "[rsx engine/metal] %s %016llx: %s\n", what,
                 (unsigned long long)hash, s_log);
     } else {
@@ -3242,10 +3321,8 @@ static id<MTLFunction> eng_function(const char* hlsl, int stage,
         snprintf(name, sizeof name, "%s %016llx", what, (unsigned long long)hash);
         fn = compile_guest_function(s_msl, name);
     }
-    s_eng_func[s_eng_func_count].hash = hash;
-    s_eng_func[s_eng_func_count].fn   = fn;
-    s_eng_func_count++;
-    return fn;
+    free(s_msl);
+    return eng_function_insert(hash, fn);
 }
 
 static u32 eng_pipeline_create_locked(void* user, const char* vs_hlsl, const char* ps_hlsl,
@@ -3292,41 +3369,194 @@ static id<MTLFunction> eng_wpos_function(const char* ps_hlsl, float scale)
     free(text);
     return fn;
 }
-static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_hlsl,
-                               const rsx_be_render_state* rs,
-                               const rsx_vertex_layout_plan* layout,
-                               u32 vertex_stride, rsx_be_format rt_fmt,
-                               u32 rt_count)
-{
-    pthread_mutex_lock(&s_eng_pipe_mu);
-    u32 h;
-    @autoreleasepool {
-        h = eng_pipeline_create_locked(user, vs_hlsl, ps_hlsl, rs, layout, vertex_stride, rt_fmt, rt_count);
-    }
-    pthread_mutex_unlock(&s_eng_pipe_mu);
-    return h;
-}
-static u32 eng_pipeline_create_locked(void* user, const char* vs_hlsl, const char* ps_hlsl,
-                                      const rsx_be_render_state* rs,
-                                      const rsx_vertex_layout_plan* layout,
-                                      u32 vertex_stride, rsx_be_format rt_fmt,
-                                      u32 rt_count)
-{
-    (void)user;
-    if (!s_dev || !s_guest_shaders || !vertex_stride) return 0;
-    if (!rt_count) rt_count = 1;
-    if (rt_count > RSX_BE_MAX_COLOR_TARGETS) rt_count = RSX_BE_MAX_COLOR_TARGETS;
-    if (s_eng_pipe_count >= ENG_MAX_PIPES) return 0;
-    id<MTLFunction> vs = eng_function(vs_hlsl, RSX_SHADER_STAGE_VERTEX, "vp");
-    if (!vs) return 0;
-    id<MTLFunction> fs = eng_function(ps_hlsl, RSX_SHADER_STAGE_FRAGMENT, "fp");
-    if (!fs) return 0;
-    /* WPOS at the internal resolution: eng_wpos_function. */
-    const int reads_wpos = strstr(ps_hlsl, "input.position") != NULL;
-    { static int log = -1; if (log < 0) log = getenv("RSX_PIPE_LOG") ? 1 : 0;
-      if (log && reads_wpos) fprintf(stderr, "[rsx engine/metal] pipeline %u reads WPOS\n", s_eng_pipe_count + 1); }
-    id<MTLFunction> fs_scaled = (reads_wpos && s_eng_scale != 1.0f) ? eng_wpos_function(ps_hlsl, s_eng_scale) : nil;
+/* ---- the compiled-pipeline archive and the pipeline list -----------------
+ *
+ * Metal keeps its own cache of compiled shaders, but keyed on the binary:
+ * every new build of the game compiled every pipeline again, in play, with
+ * the draw skipped until each was ready (characters and walls black for the
+ * first minutes). Two files beside the MSL cache replace that:
+ *
+ *   <cache>/metal_pipelines.bin   an MTLBinaryArchive of every pipeline made,
+ *       looked up before a pipeline is compiled: a hit is a load, not a
+ *       compile, whatever binary asks. Serialised every few additions and at
+ *       shutdown. A file an OS or GPU update cannot read is replaced.
+ *   <cache>/pipelines.list        one line per pipeline (both programs' HLSL
+ *       hashes and the state the descriptor is built from). At launch
+ *       eng_warmup_start builds every listed pipeline on all cores from the
+ *       MSL cache and the archive, while the title boots, so a warm machine
+ *       compiles nothing in play and a cold one does its compiling up front.
+ *
+ * <cache> is the MSL cache's parent (PS3RECOMP_MSL_CACHE=cache/msl ->
+ * cache/); PS3RECOMP_METAL_ARCHIVE=<file> and PS3RECOMP_PIPELINE_LIST=<file>
+ * move them; PS3RECOMP_METAL_WARMUP=0 skips the warm-up. */
 
+static const char* eng_cache_parent(char* buf, size_t n)
+{
+    const char* msl = eng_msl_cache_dir();
+    if (!msl) return NULL;
+    snprintf(buf, n, "%s", msl);
+    char* sl = strrchr(buf, '/');
+    if (sl && sl != buf) *sl = 0; else snprintf(buf, n, ".");
+    return buf;
+}
+
+static void eng_archive_open_locked(void);
+static void eng_archive_open(void)
+{
+    static int opened;
+    if (__atomic_load_n(&opened, __ATOMIC_ACQUIRE)) return;
+    pthread_mutex_lock(&s_eng_arch_mu);
+    if (!opened) { eng_archive_open_locked(); __atomic_store_n(&opened, 1, __ATOMIC_RELEASE); }
+    pthread_mutex_unlock(&s_eng_arch_mu);
+}
+static void eng_archive_open_locked(void)
+{
+    if (@available(macOS 11.0, *)) {} else return;
+    char parent[1024], path[1200];
+    const char* e = getenv("PS3RECOMP_METAL_ARCHIVE");
+    if (e && *e) snprintf(path, sizeof path, "%s", e);
+    else if (eng_cache_parent(parent, sizeof parent)) snprintf(path, sizeof path, "%s/metal_pipelines.bin", parent);
+    else return;
+    s_eng_archive_url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path]];
+    MTLBinaryArchiveDescriptor* d = [MTLBinaryArchiveDescriptor new];
+    NSError* err = nil;
+    if (access(path, R_OK) == 0) {
+        d.url = s_eng_archive_url;
+        s_eng_archive = [s_dev newBinaryArchiveWithDescriptor:d error:&err];
+        if (!s_eng_archive) {
+            fprintf(stderr, "[rsx engine/metal] pipeline archive %s not usable (%s): starting a new one\n",
+                    path, [[err localizedDescription] UTF8String]);
+            unlink(path);
+        }
+    }
+    if (!s_eng_archive) {
+        d.url = nil;
+        s_eng_archive = [s_dev newBinaryArchiveWithDescriptor:d error:&err];
+        if (!s_eng_archive)
+            fprintf(stderr, "[rsx engine/metal] no pipeline archive: %s\n", [[err localizedDescription] UTF8String]);
+    }
+}
+
+/* Write the archive out: to a temporary file, then into place. */
+static void eng_archive_save_locked(void)
+{
+    if (!s_eng_archive || !s_eng_archive_url || !s_eng_arch_unsaved) return;
+    if (@available(macOS 11.0, *)) {
+        NSURL* tmp = [NSURL fileURLWithPath:[s_eng_archive_url.path stringByAppendingString:@".tmp"]];
+        NSError* err = nil;
+        if ([s_eng_archive serializeToURL:tmp error:&err]) {
+            rename(tmp.fileSystemRepresentation, s_eng_archive_url.fileSystemRepresentation);
+            s_eng_arch_unsaved = 0;
+        } else {
+            fprintf(stderr, "[rsx engine/metal] pipeline archive not saved: %s\n", [[err localizedDescription] UTF8String]);
+            unlink(tmp.fileSystemRepresentation);
+        }
+    }
+}
+static void eng_archive_save(void)
+{
+    pthread_mutex_lock(&s_eng_arch_mu);
+    eng_archive_save_locked();
+    pthread_mutex_unlock(&s_eng_arch_mu);
+}
+/* From the present, once a second or so: pending additions older than 10 s
+ * go to disk even when no more arrive. */
+static void eng_archive_tick(void)
+{
+    static time_t last;
+    const time_t now = time(NULL);
+    if (now == last) return;
+    last = now;
+    if (!__atomic_load_n(&s_eng_arch_unsaved, __ATOMIC_RELAXED)) return;
+    if (pthread_mutex_trylock(&s_eng_arch_mu) != 0) return;   /* a build is adding: next second */
+    static time_t first_seen; static u32 seen_count;
+    if (s_eng_arch_unsaved != seen_count) { seen_count = s_eng_arch_unsaved; first_seen = now; }
+    else if (now - first_seen >= 10) { eng_archive_save_locked(); seen_count = 0; }
+    pthread_mutex_unlock(&s_eng_arch_mu);
+}
+
+/* A pipeline just COMPILED from pd goes into the archive. One the archive
+ * supplied (a few ms, no compile) must not be added back: adding a pipeline
+ * the archive already holds corrupts it -- every later save fails with
+ * "expecting 'fragment' stage in pipeline no. N" (macOS 27, M1 Pro), and the
+ * second launch, which gets most of its pipelines from the archive, lost
+ * every save that way. The compile time tells the two apart. */
+static void eng_archive_add(MTLRenderPipelineDescriptor* pd, double create_ms)
+{
+    if (!s_eng_archive || s_eng_arch_broken) return;
+    if (create_ms < 4.0) { __atomic_add_fetch(&s_eng_arch_hits, 1, __ATOMIC_RELAXED); return; }
+    if (@available(macOS 11.0, *)) {
+        pthread_mutex_lock(&s_eng_arch_mu);
+        NSError* err = nil;
+        if ([s_eng_archive addRenderPipelineFunctionsWithDescriptor:pd error:&err]) {
+            s_eng_arch_added++;
+            /* Saved every 24 additions, or 10 s after the first unsaved one:
+             * a force-quit or a crash loses at most that much. */
+            static time_t first_unsaved;
+            if (!s_eng_arch_unsaved) first_unsaved = time(NULL);
+            if (++s_eng_arch_unsaved >= 24 || time(NULL) - first_unsaved >= 10) eng_archive_save_locked();
+        } else {
+            s_eng_arch_broken = 1;
+            fprintf(stderr, "[rsx engine/metal] pipeline archive: cannot add pipelines (%s); compiled pipelines stay in Metal's own cache only\n",
+                    [[err localizedDescription] UTF8String]);
+        }
+        pthread_mutex_unlock(&s_eng_arch_mu);
+    }
+}
+
+/* The list: a line is "p1 <vs hash> <ps hash> <wpos> <layout count> <stride>
+ * <rt fmt> <rt count> <n> <n words of render state>". */
+#define ENG_RS_WORDS ((u32)(sizeof(rsx_be_render_state) / 4u))
+static void eng_list_line(char* out, size_t n, u64 vs, u64 ps, int wpos, u32 lcount, u32 stride,
+                          u32 rt_fmt, u32 rt_count, const rsx_be_render_state* rs)
+{
+    int k = snprintf(out, n, "p1 %016llx %016llx %d %u %u %u %u %u", (unsigned long long)vs,
+                     (unsigned long long)ps, wpos ? 1 : 0, lcount, stride, rt_fmt, rt_count, ENG_RS_WORDS);
+    const u32* w = (const u32*)rs;
+    for (u32 i = 0; i < ENG_RS_WORDS && k > 0 && (size_t)k < n - 12; i++)
+        k += snprintf(out + k, n - (size_t)k, " %08x", w[i]);
+}
+static int eng_list_known(u64 h)   /* under s_eng_arch_mu */
+{
+    for (u32 i = 0; i < s_eng_list_known_n; i++) if (s_eng_list_known[i] == h) return 1;
+    if (s_eng_list_known_n == s_eng_list_known_cap) {
+        const u32 c = s_eng_list_known_cap ? s_eng_list_known_cap * 2 : 1024;
+        u64* nk = (u64*)realloc(s_eng_list_known, c * sizeof *nk);
+        if (!nk) return 1;
+        s_eng_list_known = nk; s_eng_list_known_cap = c;
+    }
+    s_eng_list_known[s_eng_list_known_n++] = h;
+    return 0;
+}
+static void eng_list_path(char* out, size_t n)
+{
+    char parent[1024];
+    const char* e = getenv("PS3RECOMP_PIPELINE_LIST");
+    if (e && *e) snprintf(out, n, "%s", e);
+    else if (eng_cache_parent(parent, sizeof parent)) snprintf(out, n, "%s/pipelines.list", parent);
+    else out[0] = 0;
+}
+static void eng_list_record(const char* line)
+{
+    pthread_mutex_lock(&s_eng_arch_mu);
+    if (!eng_list_known(fnv1a64(line, (u32)strlen(line), 1469598103934665603ull))) {
+        if (!s_eng_list) {
+            char path[1200];
+            eng_list_path(path, sizeof path);
+            if (path[0]) s_eng_list = fopen(path, "a");
+        }
+        if (s_eng_list) { fprintf(s_eng_list, "%s\n", line); fflush(s_eng_list); }
+    }
+    pthread_mutex_unlock(&s_eng_arch_mu);
+}
+
+/* The render pipeline descriptor a pipeline is made from, shared by the
+ * engine's creates and the warm-up. */
+static MTLRenderPipelineDescriptor* eng_pipeline_descriptor(id<MTLFunction> vs, id<MTLFunction> fs,
+                                                            u32 layout_count, u32 vertex_stride,
+                                                            rsx_be_format rt_fmt, u32 rt_count,
+                                                            const rsx_be_render_state* rs)
+{
     /* Attribute index is the layout SLOT, not the guest's ATTRn number.
      * glslang numbers an HLSL input struct's members in DECLARATION order --
      * a compact VSInput declaring ATTR0 and ATTR3 puts a3 at location 1 --
@@ -3334,13 +3564,12 @@ static u32 eng_pipeline_create_locked(void* user, const char* vs_hlsl, const cha
      * agree for the all-sixteen layout, where slot is the attribute number,
      * which is why the vtable path above can index by either. */
     MTLVertexDescriptor* vd = [MTLVertexDescriptor vertexDescriptor];
-    for (u32 slot = 0; slot < layout->count; slot++) {
+    for (u32 slot = 0; slot < layout_count; slot++) {
         vd.attributes[slot].format      = MTLVertexFormatFloat4;
         vd.attributes[slot].offset      = (NSUInteger)(slot * 16u);
         vd.attributes[slot].bufferIndex = MTL_VB_INDEX;
     }
     vd.layouts[MTL_VB_INDEX].stride = vertex_stride;
-
     MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
     pd.vertexFunction   = vs;
     pd.fragmentFunction = fs;
@@ -3374,10 +3603,148 @@ static u32 eng_pipeline_create_locked(void* user, const char* vs_hlsl, const cha
             ca.alphaBlendOperation         = blend_equation_to_metal(rs->eq_a);
         }
     }
+    eng_archive_open();
+    if (s_eng_archive) {
+        if (@available(macOS 11.0, *)) pd.binaryArchives = @[s_eng_archive];
+    }
+    return pd;
+}
 
+/* The pipeline state for pd, through the archive, and into it. */
+static id<MTLRenderPipelineState> eng_pipeline_state(MTLRenderPipelineDescriptor* pd, NSError** err)
+{
+    struct timespec t0, t1;
+    timespec_get(&t0, TIME_UTC);
+    id<MTLRenderPipelineState> pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:err];
+    timespec_get(&t1, TIME_UTC);
+    const double ms = (double)(t1.tv_sec - t0.tv_sec) * 1e3 + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
+    if (pso) eng_archive_add(pd, ms);
+    { static int log = -1; if (log < 0) log = getenv("RSX_PIPE_LOG") ? 1 : 0;
+      if (log) fprintf(stderr, "[rsx engine/metal] pipeline state in %.1f ms%s\n", ms, ms < 4.0 ? " (archive)" : ""); }
+    return pso;
+}
+
+/* ---- the launch warm-up -------------------------------------------------- */
+typedef struct { u64 vs, ps; u32 wpos, lcount, stride, rt_fmt, rt_count; rsx_be_render_state rs; } EngListEntry;
+
+static int eng_list_parse(const char* line, EngListEntry* e)
+{
+    unsigned long long vs, ps; unsigned wpos, lc, st, fmt, rc, n; int used = 0;
+    if (sscanf(line, "p1 %llx %llx %u %u %u %u %u %u%n", &vs, &ps, &wpos, &lc, &st, &fmt, &rc, &n, &used) != 8) return 0;
+    if (n != ENG_RS_WORDS || !lc || lc > 16 || !st || rc > RSX_BE_MAX_COLOR_TARGETS) return 0;
+    u32* w = (u32*)&e->rs;
+    const char* q = line + used;
+    for (u32 k = 0; k < n; k++) {
+        unsigned v; int m = 0;
+        if (sscanf(q, " %x%n", &v, &m) != 1) return 0;
+        w[k] = v; q += m;
+    }
+    e->vs = vs; e->ps = ps; e->wpos = wpos; e->lcount = lc; e->stride = st; e->rt_fmt = (u32)fmt; e->rt_count = rc;
+    return 1;
+}
+
+/* Build every pipeline the list names, on all cores, from the MSL cache and
+ * the archive: nothing the game asks for afterwards has to be compiled. The
+ * pipelines themselves are not kept -- the engine's own create finds the
+ * functions in the table and the pipeline state in the archive, both
+ * instant -- so the table is untouched by the warm-up. */
+static void eng_warmup_run(void)
+{
+    char path[1200];
+    eng_list_path(path, sizeof path);
+    if (!path[0]) return;
+    FILE* f = fopen(path, "r");
+    if (!f) return;
+    EngListEntry* list = NULL; u32 n = 0, cap = 0;
+    char line[1200];
+    pthread_mutex_lock(&s_eng_arch_mu);
+    while (fgets(line, sizeof line, f)) {
+        char* nl = strchr(line, '\n'); if (nl) *nl = 0;
+        if (eng_list_known(fnv1a64(line, (u32)strlen(line), 1469598103934665603ull))) continue;
+        EngListEntry e;
+        if (!eng_list_parse(line, &e)) continue;
+        if (n == cap) { cap = cap ? cap * 2 : 256; list = (EngListEntry*)realloc(list, cap * sizeof *list); if (!list) { n = 0; break; } }
+        list[n++] = e;
+    }
+    pthread_mutex_unlock(&s_eng_arch_mu);
+    fclose(f);
+    if (!n) { free(list); return; }
+    struct timespec t0, t1;
+    timespec_get(&t0, TIME_UTC);
+    const u32 funcs0 = s_eng_func_count, hits0 = s_eng_arch_hits, added0 = s_eng_arch_added;
+    __block u32 built = 0, no_msl = 0, failed = 0;
+    dispatch_apply(n, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^(size_t k) {
+        @autoreleasepool {
+            const EngListEntry* e = &list[k];
+            id<MTLFunction> vs = eng_function_from_cache(e->vs, RSX_SHADER_STAGE_VERTEX, "vp");
+            id<MTLFunction> fs = eng_function_from_cache(e->ps, RSX_SHADER_STAGE_FRAGMENT, "fp");
+            if (!vs || !fs) { __atomic_add_fetch(&no_msl, 1, __ATOMIC_RELAXED); return; }
+            MTLRenderPipelineDescriptor* pd = eng_pipeline_descriptor(vs, fs, e->lcount, e->stride, (rsx_be_format)e->rt_fmt,
+                                                                      e->rt_count ? e->rt_count : 1, &e->rs);
+            NSError* err = nil;
+            id<MTLRenderPipelineState> pso = eng_pipeline_state(pd, &err);
+            if (pso) __atomic_add_fetch(&built, 1, __ATOMIC_RELAXED);
+            else __atomic_add_fetch(&failed, 1, __ATOMIC_RELAXED);
+        }
+    });
+    timespec_get(&t1, TIME_UTC);
+    eng_archive_save();
+    fprintf(stderr, "[rsx engine/metal] warm-up: %u of %u listed pipelines ready in %.1f s "
+            "(%u functions compiled, %u pipelines from the archive, %u new in it, %u without cached MSL, %u failed)\n",
+            built, n, (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9,
+            s_eng_func_count - funcs0, s_eng_arch_hits - hits0, s_eng_arch_added - added0,
+            no_msl, failed);
+    free(list);
+}
+
+/* From init, once the device and the translator are up: the warm-up runs on
+ * a background thread while the title boots. PS3RECOMP_METAL_WARMUP=0 skips
+ * it (the replay harness does not need it). */
+static void eng_warmup_start(void)
+{
+    const char* e = getenv("PS3RECOMP_METAL_WARMUP");
+    if ((e && *e == '0') || !s_guest_shaders || !eng_msl_cache_dir()) return;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ eng_warmup_run(); });
+}
+
+static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_hlsl,
+                               const rsx_be_render_state* rs,
+                               const rsx_vertex_layout_plan* layout,
+                               u32 vertex_stride, rsx_be_format rt_fmt,
+                               u32 rt_count)
+{
+    /* The compiles run unlocked (several build workers at once, and the
+     * warm-up); the table insert at the end takes the lock. */
+    u32 h;
+    @autoreleasepool {
+        h = eng_pipeline_create_locked(user, vs_hlsl, ps_hlsl, rs, layout, vertex_stride, rt_fmt, rt_count);
+    }
+    return h;
+}
+static u32 eng_pipeline_create_locked(void* user, const char* vs_hlsl, const char* ps_hlsl,
+                                      const rsx_be_render_state* rs,
+                                      const rsx_vertex_layout_plan* layout,
+                                      u32 vertex_stride, rsx_be_format rt_fmt,
+                                      u32 rt_count)
+{
+    (void)user;
+    if (!s_dev || !s_guest_shaders || !vertex_stride) return 0;
+    if (!rt_count) rt_count = 1;
+    if (rt_count > RSX_BE_MAX_COLOR_TARGETS) rt_count = RSX_BE_MAX_COLOR_TARGETS;
+    if (s_eng_pipe_count >= ENG_MAX_PIPES) return 0;
+    id<MTLFunction> vs = eng_function(vs_hlsl, RSX_SHADER_STAGE_VERTEX, "vp");
+    if (!vs) return 0;
+    id<MTLFunction> fs = eng_function(ps_hlsl, RSX_SHADER_STAGE_FRAGMENT, "fp");
+    if (!fs) return 0;
+    /* WPOS at the internal resolution: eng_wpos_function. */
+    const int reads_wpos = strstr(ps_hlsl, "input.position") != NULL;
+    { static int log = -1; if (log < 0) log = getenv("RSX_PIPE_LOG") ? 1 : 0;
+      if (log && reads_wpos) fprintf(stderr, "[rsx engine/metal] pipeline %u reads WPOS\n", s_eng_pipe_count + 1); }
+    id<MTLFunction> fs_scaled = (reads_wpos && s_eng_scale != 1.0f) ? eng_wpos_function(ps_hlsl, s_eng_scale) : nil;
+
+    MTLRenderPipelineDescriptor* pd = eng_pipeline_descriptor(vs, fs, layout->count, vertex_stride, rt_fmt, rt_count, rs);
     NSError* err = nil;
-    id<MTLRenderPipelineState> pso =
-        [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+    id<MTLRenderPipelineState> pso = eng_pipeline_state(pd, &err);
     if (!pso) {
         fprintf(stderr, "[rsx engine/metal] pipeline state failed: %s\n",
                 [[err localizedDescription] UTF8String]);
@@ -3386,8 +3753,16 @@ static u32 eng_pipeline_create_locked(void* user, const char* vs_hlsl, const cha
     id<MTLRenderPipelineState> pso_scaled = nil;
     if (fs_scaled) {
         pd.fragmentFunction = fs_scaled;
-        pso_scaled = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+        pso_scaled = eng_pipeline_state(pd, &err);
         pd.fragmentFunction = fs;
+    }
+    {   /* the list, for the next launch's warm-up */
+        char line[1024];
+        eng_list_line(line, sizeof line,
+                      fnv1a64(vs_hlsl, (u32)strlen(vs_hlsl), 1469598103934665603ull),
+                      fnv1a64(ps_hlsl, (u32)strlen(ps_hlsl), 1469598103934665603ull),
+                      reads_wpos, layout->count, vertex_stride, rt_fmt, rt_count, rs);
+        eng_list_record(line);
     }
 
     /* Depth and stencil are pipeline state in D3D12 and an encoder object in
@@ -3422,28 +3797,36 @@ static u32 eng_pipeline_create_locked(void* user, const char* vs_hlsl, const cha
     id<MTLDepthStencilState> ds = [s_dev newDepthStencilStateWithDescriptor:dd];
     if (!ds) return 0;
 
-    const u32 slot = s_eng_pipe_count++;
-    s_eng_pipe[slot].pso = pso;
-    s_eng_pipe[slot].pso_scaled = pso_scaled;
-    s_eng_pipe[slot].ds  = ds;
-    s_eng_pipe[slot].ps_wpos = reads_wpos ? strdup(ps_hlsl) : NULL;
-    s_eng_pipe[slot].fs = fs;
-    s_eng_pipe[slot].fs_scaled = fs_scaled;
-    s_eng_pipe[slot].pd = pd;
-    for (int a = 0; a < 2; a++) for (int b = 0; b < 3; b++) s_eng_pipe[slot].pso_ms[a][b] = nil;
-    s_eng_pipe[slot].zwrite = (rs->depth_test && rs->depth_write) ||
-                              (rs->stencil_enable && (rs->s_write_mask & 0xFFu));
+    EngPipeline np = {0};
+    np.pso = pso;
+    np.pso_scaled = pso_scaled;
+    np.ds  = ds;
+    np.ps_wpos = reads_wpos ? strdup(ps_hlsl) : NULL;
+    np.fs = fs;
+    np.fs_scaled = fs_scaled;
+    np.pd = pd;
+    for (int a = 0; a < 2; a++) for (int b = 0; b < 3; b++) np.pso_ms[a][b] = nil;
+    np.zwrite = (rs->depth_test && rs->depth_write) ||
+                (rs->stencil_enable && (rs->s_write_mask & 0xFFu));
     /* CULL_FACE FRONT=0x0404 BACK=0x0405 FRONT_AND_BACK=0x0408 (front here,
      * as in the D3D12 engine); FRONT_FACE CW=0x0900 CCW=0x0901. */
-    s_eng_pipe[slot].cull = MTLCullModeNone;
+    np.cull = MTLCullModeNone;
     if (rs->cull_enable && rs->cull_face)
-        s_eng_pipe[slot].cull = (rs->cull_face == 0x0404u || rs->cull_face == 0x0408u)
-                                    ? MTLCullModeFront
-                                    : (rs->cull_face == 0x0405u ? MTLCullModeBack
-                                                                : MTLCullModeNone);
-    s_eng_pipe[slot].winding = (rs->front_face == 0x0901u)
-                                   ? MTLWindingCounterClockwise
-                                   : MTLWindingClockwise;
+        np.cull = (rs->cull_face == 0x0404u || rs->cull_face == 0x0408u)
+                      ? MTLCullModeFront
+                      : (rs->cull_face == 0x0405u ? MTLCullModeBack
+                                                  : MTLCullModeNone);
+    np.winding = (rs->front_face == 0x0901u)
+                     ? MTLWindingCounterClockwise
+                     : MTLWindingClockwise;
+    /* Into the table under the lock, the count last: anything walking the
+     * table (eng_rescale, the MSAA twins) sees whole entries. */
+    pthread_mutex_lock(&s_eng_pipe_mu);
+    if (s_eng_pipe_count >= ENG_MAX_PIPES) { pthread_mutex_unlock(&s_eng_pipe_mu); free(np.ps_wpos); return 0; }
+    const u32 slot = s_eng_pipe_count;
+    s_eng_pipe[slot] = np;
+    __atomic_store_n(&s_eng_pipe_count, slot + 1, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&s_eng_pipe_mu);
     return slot + 1;
 }
 
@@ -4857,6 +5240,7 @@ static void eng_rescale(void)
 
 static void eng_present(void* user, u32 surface)
 {
+    eng_archive_tick();
     (void)user;
     /* RSX_OBJ_STATS=1: the object table's occupancy every 600 presents -- a
      * leak shows as a climbing live count long before the table fills. */
@@ -5046,6 +5430,7 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
          * tell a translation problem from a fetch or state one. */
         const char* ff = getenv("PS3RECOMP_METAL_FIXED_FUNCTION");
         s_guest_shaders = rsx_hlsl_to_msl_available() && !(ff && *ff && *ff != '0');
+        if (!s_headless) eng_warmup_start();
 
         s_inflight = dispatch_semaphore_create(MTL_MAX_INFLIGHT);
         if (!s_inflight) {

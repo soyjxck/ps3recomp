@@ -1438,7 +1438,26 @@ static pj_mutex_t s_pj_mu = PJ_MUTEX_INIT;
 static pj_cond_t  s_pj_work = PJ_COND_INIT, s_pj_done = PJ_COND_INIT;
 static eng_pipe_job *s_pj_head, *s_pj_tail;
 static int s_pj_started, s_pj_quit;
-static pj_thread_t s_pj_thread;
+#define PJ_MAX_THREADS 8
+static pj_thread_t s_pj_threads[PJ_MAX_THREADS];
+static int s_pj_nthreads;
+/* RSX_ASYNC_THREADS=<n>: build workers (default: the cores less two, 2..8).
+ * Both backends compile outside their locks, so builds overlap. */
+static int eng_pipe_nthreads(void)
+{
+    const char* e = getenv("RSX_ASYNC_THREADS");
+    int n = e ? atoi(e) : 0;
+    if (n <= 0) {
+#if defined(_WIN32)
+        SYSTEM_INFO si; GetSystemInfo(&si); n = (int)si.dwNumberOfProcessors - 2;
+#else
+        n = (int)sysconf(_SC_NPROCESSORS_ONLN) - 2;
+#endif
+    }
+    if (n < 2) n = 2;
+    if (n > PJ_MAX_THREADS) n = PJ_MAX_THREADS;
+    return n;
+}
 
 static int eng_async_on(void)
 {
@@ -1495,15 +1514,22 @@ static eng_pipe_job* eng_pipe_submit(const char* vs, const char* ps, const rsx_b
     pj_lock(&s_pj_mu);
     if (!s_pj_started) {
         s_pj_started = 1; s_pj_quit = 0;
+        const int want = eng_pipe_nthreads();
+        s_pj_nthreads = 0;
+        for (int t = 0; t < want; t++) {
 #if defined(_WIN32)
-        s_pj_thread = CreateThread(NULL, 64u << 20, eng_pipe_worker, NULL, 0, NULL);
-        if (!s_pj_thread) s_pj_started = -1;
+            s_pj_threads[t] = CreateThread(NULL, 64u << 20, eng_pipe_worker, NULL, 0, NULL);
+            if (!s_pj_threads[t]) break;
 #else
-        pthread_attr_t at; pthread_attr_init(&at);
-        pthread_attr_setstacksize(&at, 64u << 20);   /* glslang and spirv-opt recurse deeply */
-        if (pthread_create(&s_pj_thread, &at, eng_pipe_worker, NULL) != 0) s_pj_started = -1;
-        pthread_attr_destroy(&at);
+            pthread_attr_t at; pthread_attr_init(&at);
+            pthread_attr_setstacksize(&at, 64u << 20);   /* glslang and spirv-opt recurse deeply */
+            const int rc = pthread_create(&s_pj_threads[t], &at, eng_pipe_worker, NULL);
+            pthread_attr_destroy(&at);
+            if (rc != 0) break;
 #endif
+            s_pj_nthreads++;
+        }
+        if (!s_pj_nthreads) s_pj_started = -1;
     }
     if (s_pj_started < 0) { pj_unlock(&s_pj_mu); free(j->vs); free(j->ps); free(j); return NULL; }
     if (s_pj_tail) s_pj_tail->next = j; else s_pj_head = j;
@@ -1535,11 +1561,14 @@ static void eng_pipe_stop(void)
     s_pj_quit = 1;
     pj_broadcast(&s_pj_work);
     pj_unlock(&s_pj_mu);
+    for (int t = 0; started && t < s_pj_nthreads; t++) {
 #if defined(_WIN32)
-    if (started) { WaitForSingleObject(s_pj_thread, INFINITE); CloseHandle(s_pj_thread); s_pj_thread = NULL; }
+        WaitForSingleObject(s_pj_threads[t], INFINITE); CloseHandle(s_pj_threads[t]); s_pj_threads[t] = NULL;
 #else
-    if (started) pthread_join(s_pj_thread, NULL);
+        pthread_join(s_pj_threads[t], NULL);
 #endif
+    }
+    s_pj_nthreads = 0;
     s_pj_started = 0;
 }
 /* An entry whose build is in flight: its handle once done (and the job
