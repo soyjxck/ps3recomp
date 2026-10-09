@@ -43,6 +43,9 @@ Complete guide to building the ps3recomp runtime library and game projects.
 - Visual Studio 2022 (MSVC 17.x) or Clang/LLVM 14+
 - Windows SDK 10.0.19041+
 - System libraries (auto-linked): `ws2_32.lib`, `xinput.lib`, `ole32.lib`, `bcrypt.lib`
+- Optional: SDL2 (`vcpkg install sdl2:x64-windows`) with `-DPS3RECOMP_PAD_SDL2=ON`
+  reads controllers through SDL2 instead of XInput (DualShock 4, DualSense,
+  Switch Pro and other non-Xbox pads, wired or Bluetooth)
 
 **Linux:**
 - GCC 12+ or Clang 14+
@@ -344,7 +347,7 @@ guarded now (see `include/ps3emu/endian.h`) and that is no longer true.
 
 **Link Libraries (auto-linked by CMake):**
 - `ws2_32` — Winsock2 for networking (sys_net, cellHttp, cellNet)
-- `xinput` — XInput for gamepad (cellPad)
+- `xinput` — XInput for gamepad (cellPad; `PS3RECOMP_PAD_SDL2=ON` reads pads through SDL2 instead)
 - `ole32` — COM initialization for WASAPI audio (cellAudio)
 - `bcrypt` — BCryptGenRandom for cryptographic RNG (cellSsl)
 

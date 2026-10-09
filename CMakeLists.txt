@@ -142,10 +142,19 @@ if(WIN32)
         ole32       # COM for WASAPI audio
         bcrypt      # BCryptGenRandom for SSL RNG
     )
-else()
-    # cellPad and cellAudio select their SDL2 backends unconditionally off
-    # Windows (see PAD_BACKEND_SDL2 / AUDIO_BACKEND_SDL2), so SDL2 is required
-    # here -- docs/BUILDING.md already lists it as the Linux/macOS dependency.
+endif()
+
+# cellPad and cellAudio select their SDL2 backends unconditionally off Windows
+# (see PAD_BACKEND_SDL2 / AUDIO_BACKEND_SDL2), so SDL2 is required there --
+# docs/BUILDING.md already lists it as the Linux/macOS dependency. On Windows
+# the pad reads XInput unless PS3RECOMP_PAD_SDL2 asks for SDL2 there too, for
+# the pads XInput never sees (DualShock 4, DualSense, Switch Pro, ...); audio
+# stays on WASAPI.
+option(PS3RECOMP_PAD_SDL2 "Windows: read controllers through SDL2 instead of XInput" OFF)
+if(WIN32 AND PS3RECOMP_PAD_SDL2)
+    target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_PAD_USE_SDL2)
+endif()
+if(NOT WIN32 OR PS3RECOMP_PAD_SDL2)
     find_package(SDL2 QUIET)
     if(SDL2_FOUND)
         if(TARGET SDL2::SDL2)
@@ -165,17 +174,24 @@ else()
             endforeach()
             target_link_libraries(ps3recomp_runtime PRIVATE ${SDL2_LIBRARIES})
         endif()
-        message(STATUS "  SDL2:         found (input + audio backends enabled)")
+        if(WIN32)
+            message(STATUS "  SDL2:         found (input backend)")
+        else()
+            message(STATUS "  SDL2:         found (input + audio backends enabled)")
+        endif()
     else()
         message(FATAL_ERROR
             "SDL2 not found. It provides the cellPad and cellAudio backends on "
-            "non-Windows hosts.\n"
-            "  macOS:  brew install sdl2\n"
-            "  Debian: apt install libsdl2-dev\n"
+            "non-Windows hosts, and cellPad on Windows with PS3RECOMP_PAD_SDL2.\n"
+            "  macOS:   brew install sdl2\n"
+            "  Debian:  apt install libsdl2-dev\n"
+            "  Windows: vcpkg install sdl2:x64-windows\n"
             "If SDL2 is installed in a non-standard prefix, pass "
             "-DCMAKE_PREFIX_PATH=<prefix>.")
     endif()
+endif()
 
+if(NOT WIN32)
     find_package(Threads REQUIRED)
     target_link_libraries(ps3recomp_runtime PRIVATE Threads::Threads)
 endif()
