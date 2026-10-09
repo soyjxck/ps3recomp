@@ -55,6 +55,21 @@
 
 #define PAD_MAX_HOST_PORTS  4  /* XInput supports max 4; SDL may support more */
 
+/* Re-poll the host at most every PAD_POLL_INTERVAL_MS; serve cached state in
+ * between.
+ *
+ * XInputGetState is a driver call, and on a slot with nothing plugged in it is
+ * an expensive one: measured at 97.6 us for a sweep of the 7 host ports on a
+ * machine with no controller attached. cellPadGetData ran that sweep on EVERY
+ * call, and a guest that polls the pad from a spin loop -- The Simpsons Arcade
+ * Game does, in its input stage -- therefore spends its whole main thread
+ * inside the input driver.
+ *
+ * 4 ms is 250 Hz, well above the 60 Hz a title can actually observe (and above
+ * a real DualShock 3's own report rate), so no game can tell the difference,
+ * including one sampling for button-press edges. */
+#define PAD_POLL_INTERVAL_MS 4
+
 typedef struct {
     int  connected;
     u16  buttons;           /* CELL_PAD_CTRL_* bitmask */
@@ -83,11 +98,6 @@ static u32           s_port_setting[CELL_PAD_MAX_PORT_NUM];
 static PadHostState  s_host_state[PAD_MAX_HOST_PORTS];
 /* Per-port "a report has arrived since your last read" flag; see cellPadGetData. */
 static int s_data_fresh[PAD_MAX_HOST_PORTS];
-
-#if PAD_BACKEND_SDL2
-static SDL_GameController* s_sdl_controllers[PAD_MAX_HOST_PORTS];
-static int s_sdl_inited = 0;
-#endif
 
 /* ---------------------------------------------------------------------------
  * XInput backend
@@ -208,6 +218,26 @@ static void pad_shutdown_backend(void)
 
 #if PAD_BACKEND_SDL2
 
+/* SDL is driven from a thread of its own, and the guest never calls it.
+ *
+ * SDL_GameControllerUpdate also runs every driver's device detection, and on
+ * Windows a pad plugged in or out makes that enumerate the DirectInput and HID
+ * devices on the calling thread, with the joystick lock held: hundreds of
+ * milliseconds to seconds. Polled from the game thread, one plug event
+ * stalled Drakengard 3 for 3 s (4 fps over the next five seconds). So the pad
+ * thread polls every PAD_POLL_INTERVAL_MS, keeps the latest state of every
+ * port in s_sdl_state and applies the rumble the guest asked for; the guest's
+ * poll copies that snapshot and its actuator call leaves a request, both under
+ * s_sdl_lock, which the pad thread holds only for the copy. */
+static SDL_mutex*          s_sdl_lock;
+static SDL_Thread*         s_sdl_thread;
+static volatile int        s_sdl_quit;
+static PadHostState        s_sdl_state[PAD_MAX_HOST_PORTS];      /* under s_sdl_lock */
+static u8                  s_sdl_rumble[PAD_MAX_HOST_PORTS][2];  /* large, small; under s_sdl_lock */
+static int                 s_sdl_rumble_new[PAD_MAX_HOST_PORTS]; /* under s_sdl_lock */
+/* The pad thread's own */
+static SDL_GameController* s_sdl_controllers[PAD_MAX_HOST_PORTS];
+
 static u8 pad_sdl_axis_to_u8(int raw)
 {
     /* SDL axis: -32768..32767 -> 0..255, a centred stick exactly 128 (the
@@ -225,6 +255,43 @@ static u8 pad_sdl_trigger_to_u8(int raw)
     if (val < 0) val = 0;
     if (val > 255) val = 255;
     return (u8)val;
+}
+
+/* The subsystem, started on the pad thread. */
+static int pad_sdl_start(void)
+{
+    /* Hints are read when the subsystem starts, so they go first. */
+    /* The pad is read whether or not a window of ours has the focus, as the
+     * XInput backend does; a port decides for itself what to do in the
+     * background. (Only matters where the window is SDL's.) */
+    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+    /* Buttons by position, not by label: the bottom face button is CROSS on
+     * a Switch Pro pad too, which is what a PS3 title's prompts mean. */
+    SDL_SetHint(SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS, "0");
+#ifdef SDL_HINT_JOYSTICK_HIDAPI_PS4_RUMBLE
+    /* Extended reports over Bluetooth, which carry the rumble. */
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS4_RUMBLE, "1");
+#endif
+#ifdef SDL_HINT_JOYSTICK_HIDAPI_PS5_RUMBLE
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS5_RUMBLE, "1");
+#endif
+#ifdef _WIN32
+    /* No SDL_PumpEvents runs anywhere here: SDL's own joystick thread owns
+     * the DirectInput/XInput device-notification window and re-checks the
+     * XInput slots by itself. */
+    SDL_SetHint(SDL_HINT_JOYSTICK_THREAD, "1");
+#endif
+    if (SDL_WasInit(SDL_INIT_GAMECONTROLLER) == 0 &&
+        SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER) != 0) {
+        printf("[cellPad] SDL_InitSubSystem(GAMECONTROLLER) failed: %s\n", SDL_GetError());
+        fflush(stdout);
+        return 0;   /* no pad: the keyboard fallback */
+    }
+    /* State is read by polling; nobody drains SDL's event queue, so stop it
+     * from filling with every stick movement. */
+    SDL_JoystickEventState(SDL_IGNORE);
+    SDL_GameControllerEventState(SDL_IGNORE);
+    return 1;
 }
 
 /* Put every pad SDL knows and no slot holds into the lowest free slot.
@@ -255,7 +322,8 @@ static void pad_sdl_open_new(void)
     }
 }
 
-static void pad_poll_sdl2(void)
+/* One sweep: pads gone, pads new, then every port into st. */
+static void pad_sdl_read(PadHostState* st)
 {
     /* Also runs every driver's device detection, so a pad plugged in
      * mid-game is seen without anyone pumping SDL's event queue. */
@@ -274,12 +342,11 @@ static void pad_poll_sdl2(void)
 
     for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
         SDL_GameController* gc = s_sdl_controllers[i];
-        if (!gc) {
-            s_host_state[i].connected = 0;
-            continue;
-        }
+        PadHostState* hs = &st[i];
+        memset(hs, 0, sizeof *hs);
+        if (!gc) continue;
 
-        s_host_state[i].connected = 1;
+        hs->connected = 1;
 
         u16 btns = 0;
         if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_BACK))          btns |= CELL_PAD_CTRL_SELECT;
@@ -303,85 +370,119 @@ static void pad_poll_sdl2(void)
         if (lt > 3000) btns |= CELL_PAD_CTRL_L2;
         if (rt > 3000) btns |= CELL_PAD_CTRL_R2;
 
-        s_host_state[i].buttons = btns;
+        hs->buttons = btns;
 
         /* Analog sticks */
-        s_host_state[i].analog_lx = pad_sdl_axis_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTX));
-        s_host_state[i].analog_ly = pad_sdl_axis_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTY));
-        s_host_state[i].analog_rx = pad_sdl_axis_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTX));
-        s_host_state[i].analog_ry = pad_sdl_axis_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTY));
+        hs->analog_lx = pad_sdl_axis_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTX));
+        hs->analog_ly = pad_sdl_axis_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTY));
+        hs->analog_rx = pad_sdl_axis_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTX));
+        hs->analog_ry = pad_sdl_axis_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTY));
 
         /* Triggers */
-        s_host_state[i].trigger_l2 = pad_sdl_trigger_to_u8(lt);
-        s_host_state[i].trigger_r2 = pad_sdl_trigger_to_u8(rt);
+        hs->trigger_l2 = pad_sdl_trigger_to_u8(lt);
+        hs->trigger_r2 = pad_sdl_trigger_to_u8(rt);
 
         /* Pressure: SDL has digital buttons, so 0 or 255 */
-        s_host_state[i].press_up       = (btns & CELL_PAD_CTRL_UP)       ? 255 : 0;
-        s_host_state[i].press_down     = (btns & CELL_PAD_CTRL_DOWN)     ? 255 : 0;
-        s_host_state[i].press_left     = (btns & CELL_PAD_CTRL_LEFT)     ? 255 : 0;
-        s_host_state[i].press_right    = (btns & CELL_PAD_CTRL_RIGHT)    ? 255 : 0;
-        s_host_state[i].press_triangle = (btns & CELL_PAD_CTRL_TRIANGLE) ? 255 : 0;
-        s_host_state[i].press_circle   = (btns & CELL_PAD_CTRL_CIRCLE)   ? 255 : 0;
-        s_host_state[i].press_cross    = (btns & CELL_PAD_CTRL_CROSS)    ? 255 : 0;
-        s_host_state[i].press_square   = (btns & CELL_PAD_CTRL_SQUARE)   ? 255 : 0;
-        s_host_state[i].press_l1       = (btns & CELL_PAD_CTRL_L1)       ? 255 : 0;
-        s_host_state[i].press_r1       = (btns & CELL_PAD_CTRL_R1)       ? 255 : 0;
+        hs->press_up       = (btns & CELL_PAD_CTRL_UP)       ? 255 : 0;
+        hs->press_down     = (btns & CELL_PAD_CTRL_DOWN)     ? 255 : 0;
+        hs->press_left     = (btns & CELL_PAD_CTRL_LEFT)     ? 255 : 0;
+        hs->press_right    = (btns & CELL_PAD_CTRL_RIGHT)    ? 255 : 0;
+        hs->press_triangle = (btns & CELL_PAD_CTRL_TRIANGLE) ? 255 : 0;
+        hs->press_circle   = (btns & CELL_PAD_CTRL_CIRCLE)   ? 255 : 0;
+        hs->press_cross    = (btns & CELL_PAD_CTRL_CROSS)    ? 255 : 0;
+        hs->press_square   = (btns & CELL_PAD_CTRL_SQUARE)   ? 255 : 0;
+        hs->press_l1       = (btns & CELL_PAD_CTRL_L1)       ? 255 : 0;
+        hs->press_r1       = (btns & CELL_PAD_CTRL_R1)       ? 255 : 0;
     }
 }
 
-static void pad_init_backend(void)
+/* With s_sdl_lock held. A request is sent as it arrives, and a non-zero one
+ * again every 50 ms: SDL's rumble has a duration, the guest's actuator call
+ * does not (a DS3 rumbles until told otherwise). */
+static void pad_sdl_rumble_apply(void)
 {
-    if (!s_sdl_inited) {
-        /* Hints are read when the subsystem starts, so they go first. */
-        /* The pad is read whether or not a window of ours has the focus,
-         * as the XInput backend does; a port decides for itself what to do
-         * in the background. (Only matters where the window is SDL's.) */
-        SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
-        /* Buttons by position, not by label: the bottom face button is
-         * CROSS on a Switch Pro pad too, which is what a PS3 title's prompts
-         * mean. */
-        SDL_SetHint(SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS, "0");
-#ifdef SDL_HINT_JOYSTICK_HIDAPI_PS4_RUMBLE
-        /* Extended reports over Bluetooth, which carry the rumble. */
-        SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS4_RUMBLE, "1");
-#endif
-#ifdef SDL_HINT_JOYSTICK_HIDAPI_PS5_RUMBLE
-        SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS5_RUMBLE, "1");
-#endif
+    static Uint32 last[PAD_MAX_HOST_PORTS];
+    const Uint32 now = SDL_GetTicks();
+    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
+        SDL_GameController* gc = s_sdl_controllers[i];
+        if (!gc) continue;
+        const int on = s_sdl_rumble[i][0] || s_sdl_rumble[i][1];
+        if (!s_sdl_rumble_new[i] && !(on && now - last[i] >= 50)) continue;
+        s_sdl_rumble_new[i] = 0;
+        last[i] = now;
+        SDL_GameControllerRumble(gc, (Uint16)(s_sdl_rumble[i][0] * 257),
+                                 (Uint16)(s_sdl_rumble[i][1] * 257), 100);
+    }
+}
+
+static int SDLCALL pad_sdl_thread_main(void* arg)
+{
+    (void)arg;
+    const int ok = pad_sdl_start();
+    while (!s_sdl_quit) {
+        if (ok) {
 #ifdef _WIN32
-        /* There is no SDL window here and the pad is polled from whichever
-         * guest thread asks: SDL's own thread owns the device-notification
-         * window and re-checks the XInput slots, so hot-plugging does not
-         * depend on who pumps what. */
-        SDL_SetHint(SDL_HINT_JOYSTICK_THREAD, "1");
+            /* The HID discovery window SDL made when the subsystem started
+             * belongs to this thread, and its device-change messages are
+             * dispatched by whoever pumps this thread's queue: here. */
+            MSG msg;
+            while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
 #endif
-        if (SDL_WasInit(SDL_INIT_GAMECONTROLLER) == 0 &&
-            SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER) != 0) {
-            printf("[cellPad] SDL_InitSubSystem(GAMECONTROLLER) failed: %s\n", SDL_GetError());
-            fflush(stdout);
-            return;   /* SDL_NumJoysticks is 0 until then: no pad, keyboard fallback */
+            PadHostState st[PAD_MAX_HOST_PORTS];
+            pad_sdl_read(st);
+            SDL_LockMutex(s_sdl_lock);
+            memcpy(s_sdl_state, st, sizeof st);
+            pad_sdl_rumble_apply();
+            SDL_UnlockMutex(s_sdl_lock);
         }
-        /* State is read by polling; nobody drains SDL's event queue, so
-         * stop it from filling with every stick movement. */
-        SDL_JoystickEventState(SDL_IGNORE);
-        SDL_GameControllerEventState(SDL_IGNORE);
-        s_sdl_inited = 1;
+        SDL_Delay(PAD_POLL_INTERVAL_MS);
     }
-    memset(s_sdl_controllers, 0, sizeof(s_sdl_controllers));
-    pad_sdl_open_new();
-}
-
-static void pad_shutdown_backend(void)
-{
     for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
         if (s_sdl_controllers[i]) {
             SDL_GameControllerClose(s_sdl_controllers[i]);
             s_sdl_controllers[i] = NULL;
         }
     }
+    return 0;
+}
+
+/* The guest's side: the latest snapshot. */
+static void pad_poll_sdl2(void)
+{
+    if (!s_sdl_lock) return;
+    SDL_LockMutex(s_sdl_lock);
+    memcpy(s_host_state, s_sdl_state, sizeof s_sdl_state);
+    SDL_UnlockMutex(s_sdl_lock);
+}
+
+static void pad_init_backend(void)
+{
+    if (!s_sdl_lock) s_sdl_lock = SDL_CreateMutex();
+    memset(s_sdl_state, 0, sizeof s_sdl_state);
+    memset(s_sdl_rumble, 0, sizeof s_sdl_rumble);
+    memset(s_sdl_rumble_new, 0, sizeof s_sdl_rumble_new);
+    if (s_sdl_thread) return;
+    s_sdl_quit = 0;
+    s_sdl_thread = SDL_CreateThread(pad_sdl_thread_main, "cellPad", NULL);
+    if (!s_sdl_thread) {
+        printf("[cellPad] SDL_CreateThread failed: %s\n", SDL_GetError());
+        fflush(stdout);
+    }
+}
+
+static void pad_shutdown_backend(void)
+{
+    if (!s_sdl_thread) return;
+    s_sdl_quit = 1;
+    SDL_WaitThread(s_sdl_thread, NULL);
+    s_sdl_thread = NULL;
 }
 
 #endif /* PAD_BACKEND_SDL2 */
+
 
 /* Keyboard fallback for port 0.
  *
@@ -530,20 +631,6 @@ static void pad_poll_keyboard(void)
  * Poll dispatcher
  * -----------------------------------------------------------------------*/
 
-/* Re-poll the host at most every PAD_POLL_INTERVAL_MS; serve cached state in
- * between.
- *
- * XInputGetState is a driver call, and on a slot with nothing plugged in it is
- * an expensive one: measured at 97.6 us for a sweep of the 7 host ports on a
- * machine with no controller attached. cellPadGetData ran that sweep on EVERY
- * call, and a guest that polls the pad from a spin loop -- The Simpsons Arcade
- * Game does, in its input stage -- therefore spends its whole main thread
- * inside the input driver.
- *
- * 4 ms is 250 Hz, well above the 60 Hz a title can actually observe (and above
- * a real DualShock 3's own report rate), so no game can tell the difference,
- * including one sampling for button-press edges. */
-#define PAD_POLL_INTERVAL_MS 4
 
 static unsigned long long pad_now_ms(void)
 {
@@ -1252,13 +1339,12 @@ s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param)
 #endif
 
 #if PAD_BACKEND_SDL2
-    if (port_no < PAD_MAX_HOST_PORTS && s_sdl_controllers[port_no]) {
-        SDL_GameControllerRumble(
-            s_sdl_controllers[port_no],
-            (Uint16)(param->motor[CELL_PAD_ACTUATOR_PARAM_LARGE] * 257),
-            (Uint16)(param->motor[CELL_PAD_ACTUATOR_PARAM_SMALL] * 257),
-            100 /* duration ms */
-        );
+    if (port_no < PAD_MAX_HOST_PORTS && s_sdl_lock) {
+        SDL_LockMutex(s_sdl_lock);
+        s_sdl_rumble[port_no][0] = (u8)param->motor[CELL_PAD_ACTUATOR_PARAM_LARGE];
+        s_sdl_rumble[port_no][1] = (u8)param->motor[CELL_PAD_ACTUATOR_PARAM_SMALL];
+        s_sdl_rumble_new[port_no] = 1;
+        SDL_UnlockMutex(s_sdl_lock);
     }
 #endif
 
