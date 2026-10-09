@@ -5,6 +5,12 @@
  * it with the SPURS task ABI. cellSpurs's AddWorkload/CreateTask call
  * spu_workload_dispatch(); the registry is populated by the title's lifted set.
  */
+/* pthread_getattr_np (the stack bounds, below) is a GNU extension that glibc
+ * declares only under _GNU_SOURCE; the CMake build passes it, the standalone
+ * test compiles of the workflows do not. Before any header. */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE 1
+#endif
 #include "spu_workload.h"
 #if defined(__APPLE__)
 #include <pthread/qos.h>
