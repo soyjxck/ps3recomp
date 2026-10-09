@@ -1619,13 +1619,21 @@ static void dump_shader(const char* name, const void* text, size_t n)
 /* Compiled DXBC, keyed on the HLSL the decompilers emitted: one program is
  * compiled once however many pipeline variants reference it.
  * PS3RECOMP_DXBC_CACHE=<dir> keeps the bytecode on disk between runs. */
+static SRWLOCK s_blob_lock = SRWLOCK_INIT;
 static ID3DBlob* eng_shader(const char* hlsl, int stage, const char* what)
 {
     const u32 len = (u32)strlen(hlsl);
     const u64 hash = fnv1a64(hlsl, len, 1469598103934665603ull);
+    /* The cache under its own lock and the compile under none. A D3DCompile
+     * is 20-300 ms, and with it inside s_pipe_lock every state object the
+     * walker had to build for a draw queued behind the build thread: frames
+     * of 100-300 ms the first time through an area, on a machine without the
+     * bytecode cache. Two threads compiling the same text keep the first
+     * one in. */
+    AcquireSRWLockExclusive(&s_blob_lock);
     for (u32 i = 0; i < s_blob_count; i++)
-        if (s_blob[i].hash == hash) return s_blob[i].blob;
-    if (s_blob_count >= ENG_MAX_BLOBS) return NULL;
+        if (s_blob[i].hash == hash) { ID3DBlob* b = s_blob[i].blob; ReleaseSRWLockExclusive(&s_blob_lock); return b; }
+    ReleaseSRWLockExclusive(&s_blob_lock);
 
     char name[96];
     snprintf(name, sizeof name, "%s_%016llx.hlsl", what, (unsigned long long)hash);
@@ -1663,9 +1671,19 @@ static ID3DBlob* eng_shader(const char* hlsl, int stage, const char* what)
             }
         }
     }
+    AcquireSRWLockExclusive(&s_blob_lock);
+    for (u32 i = 0; i < s_blob_count; i++)
+        if (s_blob[i].hash == hash) {   /* compiled by another thread meanwhile */
+            ID3DBlob* b = s_blob[i].blob;
+            ReleaseSRWLockExclusive(&s_blob_lock);
+            RELEASE(blob);
+            return b;
+        }
+    if (s_blob_count >= ENG_MAX_BLOBS) { ReleaseSRWLockExclusive(&s_blob_lock); RELEASE(blob); return NULL; }
     s_blob[s_blob_count].hash = hash;
     s_blob[s_blob_count].blob = blob;
     s_blob_count++;
+    ReleaseSRWLockExclusive(&s_blob_lock);
     return blob;
 }
 
@@ -1706,21 +1724,17 @@ static ID3DBlob* eng_fp_blob(const char* ps_hlsl)
     return ps;
 }
 
-static u32 eng_pipeline_create_locked(const char* vs_hlsl, const char* ps_hlsl,
+/* The entry, from shaders already compiled (eng_pipeline_create). */
+static u32 eng_pipeline_create_locked(ID3DBlob* vs, ID3DBlob* ps, const char* ps_hlsl,
                                       const rsx_be_render_state* rs,
                                       const rsx_vertex_layout_plan* layout,
                                       u32 vertex_stride, rsx_be_format rt_fmt, u32 rt_count)
 {
-    if (!s_dev || !vertex_stride) return 0;
+    if (!s_dev || !vertex_stride || !vs || !ps) return 0;
     if (!rt_count) rt_count = 1;
     if (rt_count > RSX_BE_MAX_COLOR_TARGETS) rt_count = RSX_BE_MAX_COLOR_TARGETS;
     if (s_pipe_count >= ENG_MAX_PIPES) return 0;
-    ID3DBlob* vs = eng_shader(vs_hlsl, 0, "vp");
-    if (!vs) return 0;
-    ID3DBlob* ps = NULL;
     const int wp = strstr(ps_hlsl, "input.position") != NULL;
-    ps = eng_fp_blob(ps_hlsl);
-    if (!ps) return 0;
 
     EngPipeline* p = &s_pipe[s_pipe_count];
     memset(p, 0, sizeof *p);
@@ -1815,8 +1829,13 @@ static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
                                u32 vertex_stride, rsx_be_format rt_fmt, u32 rt_count)
 {
     (void)user;
+    if (!s_dev) return 0;
+    /* The shaders first, under no lock (eng_shader); the table under it. */
+    ID3DBlob* vs = eng_shader(vs_hlsl, 0, "vp");
+    ID3DBlob* ps = vs ? eng_fp_blob(ps_hlsl) : NULL;
+    if (!vs || !ps) return 0;
     AcquireSRWLockExclusive(&s_pipe_lock);
-    const u32 h = eng_pipeline_create_locked(vs_hlsl, ps_hlsl, rs, layout, vertex_stride, rt_fmt, rt_count);
+    const u32 h = eng_pipeline_create_locked(vs, ps, ps_hlsl, rs, layout, vertex_stride, rt_fmt, rt_count);
     ReleaseSRWLockExclusive(&s_pipe_lock);
     /* The pipeline state for triangles too, here: this runs on the draw
      * engine's build thread (RSX_ASYNC_SHADERS), and a state object is the
@@ -1853,21 +1872,25 @@ static ID3D12PipelineState* eng_pso(u32 pipeline, int cls)
     if (!p->vs || p->failed[cls]) return NULL;
     if (p->pso[cls]) return p->pso[cls];
     LARGE_INTEGER pq0, pq1, pqf; QueryPerformanceFrequency(&pqf); QueryPerformanceCounter(&pq0);
+    /* Built under no lock -- the driver's compile, tens of ms for a state
+     * object it has not cached -- and published under it: the entry's desc
+     * and layout never change once it is in the table, and of two threads
+     * building the same one the first to publish wins. */
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = p->desc;
+    pd.InputLayout.pInputElementDescs = pd.InputLayout.NumElements ? p->il : NULL;
+    pd.PrimitiveTopologyType = cls == 0 ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT
+                             : cls == 1 ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE
+                                        : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    ID3D12PipelineState* pso = NULL;
+    HRESULT hr = CALL(s_dev, CreateGraphicsPipelineState, &pd, &IID_ID3D12PipelineState, (void**)&pso);
     AcquireSRWLockExclusive(&s_pipe_lock);
-    if (!p->pso[cls] && !p->failed[cls]) {
-        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = p->desc;
-        pd.InputLayout.pInputElementDescs = pd.InputLayout.NumElements ? p->il : NULL;
-        pd.PrimitiveTopologyType = cls == 0 ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT
-                                 : cls == 1 ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE
-                                            : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-        HRESULT hr = CALL(s_dev, CreateGraphicsPipelineState, &pd, &IID_ID3D12PipelineState, (void**)&p->pso[cls]);
-        if (FAILED(hr)) {
-            static int n = 0;
-            if (n++ < 16) fprintf(stderr, "[rsx engine/d3d12] pipeline state failed: 0x%08lX (removed 0x%08lX)\n",
-                                  (long)hr, (long)CALL0(s_dev, GetDeviceRemovedReason));
-            p->failed[cls] = 1; p->pso[cls] = NULL;
-        }
-    }
+    if (p->pso[cls]) RELEASE(pso);
+    else if (FAILED(hr)) {
+        static int n = 0;
+        if (n++ < 16) fprintf(stderr, "[rsx engine/d3d12] pipeline state failed: 0x%08lX (removed 0x%08lX)\n",
+                              (long)hr, (long)CALL0(s_dev, GetDeviceRemovedReason));
+        p->failed[cls] = 1;
+    } else p->pso[cls] = pso;
     ReleaseSRWLockExclusive(&s_pipe_lock);
     QueryPerformanceCounter(&pq1);
     const double pso_ms = (double)(pq1.QuadPart - pq0.QuadPart) * 1000.0 / (double)pqf.QuadPart;
@@ -1891,21 +1914,25 @@ static ID3D12PipelineState* eng_pso_for(u32 pipeline, int cls, int unscaled)
     if (p->pso1[cls]) return p->pso1[cls];
     if (!p->vs || p->failed1[cls]) return NULL;
     LARGE_INTEGER pq0, pq1, pqf; QueryPerformanceFrequency(&pqf); QueryPerformanceCounter(&pq0);
-    AcquireSRWLockExclusive(&s_pipe_lock);
-    if (!p->pso1[cls] && !p->failed1[cls]) {
-        if (!p->ps1) { p->ps1 = eng_shader(p->ps_plain, 1, "fp"); if (p->ps1) CALL0(p->ps1, AddRef); }
-        HRESULT hr = E_FAIL;
-        if (p->ps1) {
-            D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = p->desc;
-            pd.InputLayout.pInputElementDescs = pd.InputLayout.NumElements ? p->il : NULL;
-            pd.PS.pShaderBytecode = CALL0(p->ps1, GetBufferPointer); pd.PS.BytecodeLength = CALL0(p->ps1, GetBufferSize);
-            pd.PrimitiveTopologyType = cls == 0 ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT
-                                     : cls == 1 ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE
-                                                : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-            hr = CALL(s_dev, CreateGraphicsPipelineState, &pd, &IID_ID3D12PipelineState, (void**)&p->pso1[cls]);
-        }
-        if (FAILED(hr)) { p->failed1[cls] = 1; p->pso1[cls] = NULL; }
+    /* As eng_pso: compiled and built under no lock, published under it. The
+     * blob cache hands out one blob per text, so two threads meet on ps1. */
+    ID3DBlob* ps1 = p->ps1 ? p->ps1 : eng_shader(p->ps_plain, 1, "fp");
+    ID3D12PipelineState* pso = NULL;
+    HRESULT hr = E_FAIL;
+    if (ps1) {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = p->desc;
+        pd.InputLayout.pInputElementDescs = pd.InputLayout.NumElements ? p->il : NULL;
+        pd.PS.pShaderBytecode = CALL0(ps1, GetBufferPointer); pd.PS.BytecodeLength = CALL0(ps1, GetBufferSize);
+        pd.PrimitiveTopologyType = cls == 0 ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT
+                                 : cls == 1 ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE
+                                            : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        hr = CALL(s_dev, CreateGraphicsPipelineState, &pd, &IID_ID3D12PipelineState, (void**)&pso);
     }
+    AcquireSRWLockExclusive(&s_pipe_lock);
+    if (!p->ps1 && ps1) { p->ps1 = ps1; CALL0(ps1, AddRef); }
+    if (p->pso1[cls]) RELEASE(pso);
+    else if (FAILED(hr)) p->failed1[cls] = 1;
+    else p->pso1[cls] = pso;
     ReleaseSRWLockExclusive(&s_pipe_lock);
     QueryPerformanceCounter(&pq1);
     const double pso_ms = (double)(pq1.QuadPart - pq0.QuadPart) * 1000.0 / (double)pqf.QuadPart;
@@ -2567,19 +2594,27 @@ static ID3D12PipelineState* eng_pso_ms(u32 pipeline, int cls)
     EngPipeline* p = &s_pipe[pipeline - 1];
     if (!p->vs || p->failedms[cls]) return NULL;
     if (p->psoms[cls]) return p->psoms[cls];
+    /* As eng_pso. A sample count that changed meanwhile (eng_ms_apply, which
+     * drops these) makes the build stale: dropped, not published. */
+    const u32 n = s_ms_n;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = p->desc;
+    pd.InputLayout.pInputElementDescs = pd.InputLayout.NumElements ? p->il : NULL;
+    pd.PrimitiveTopologyType = cls == 0 ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT
+                             : cls == 1 ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE
+                                        : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.SampleDesc.Count = n; pd.SampleDesc.Quality = 0;
+    pd.RasterizerState.MultisampleEnable = TRUE;
+    ID3D12PipelineState* pso = NULL;
+    const HRESULT hr = CALL(s_dev, CreateGraphicsPipelineState, &pd, &IID_ID3D12PipelineState, (void**)&pso);
     AcquireSRWLockExclusive(&s_pipe_lock);
-    if (!p->psoms[cls] && !p->failedms[cls]) {
-        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = p->desc;
-        pd.InputLayout.pInputElementDescs = pd.InputLayout.NumElements ? p->il : NULL;
-        pd.PrimitiveTopologyType = cls == 0 ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT
-                                 : cls == 1 ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE
-                                            : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-        pd.SampleDesc.Count = s_ms_n; pd.SampleDesc.Quality = 0;
-        pd.RasterizerState.MultisampleEnable = TRUE;
-        if (FAILED(CALL(s_dev, CreateGraphicsPipelineState, &pd, &IID_ID3D12PipelineState, (void**)&p->psoms[cls]))) {
-            p->failedms[cls] = 1; p->psoms[cls] = NULL;
-        }
+    if (p->psoms[cls] || n != s_ms_n) RELEASE(pso);
+    else if (FAILED(hr)) {
+        static int nf = 0;
+        if (nf++ < 16) fprintf(stderr, "[rsx engine/d3d12] MSAA x%u pipeline state failed: 0x%08lX (pipeline %u class %d)\n",
+                               n, (long)hr, pipeline, cls);
+        p->failedms[cls] = 1;
     }
+    else p->psoms[cls] = pso;
     ReleaseSRWLockExclusive(&s_pipe_lock);
     return p->psoms[cls];
 }
@@ -2809,10 +2844,9 @@ static ID3D12PipelineState* eng_copy_pso_build(u32 pipeline, int cls, DXGI_FORMA
     int* failed = ms ? &p->copy_failed_ms[cls] : &p->copy_failed[cls];
     if (!p->vs || *failed) return NULL;
     if (*slot && *slot_fmt == fmt) return *slot;
+    /* As eng_pso: built under no lock, published under it. */
     ID3D12PipelineState* pso = NULL;
-    AcquireSRWLockExclusive(&s_pipe_lock);
-    if (*slot && *slot_fmt == fmt) pso = *slot;
-    else if (!*failed) {
+    {
         D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = p->desc;
         pd.InputLayout.pInputElementDescs = pd.InputLayout.NumElements ? p->il : NULL;
         pd.PS.pShaderBytecode = CALL0(ps_blob, GetBufferPointer);
@@ -2837,16 +2871,20 @@ static ID3D12PipelineState* eng_copy_pso_build(u32 pipeline, int cls, DXGI_FORMA
                                  : cls == 1 ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE
                                             : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         HRESULT hr = CALL(s_dev, CreateGraphicsPipelineState, &pd, &IID_ID3D12PipelineState, (void**)&pso);
-        if (FAILED(hr)) {
+        AcquireSRWLockExclusive(&s_pipe_lock);
+        if (*slot && *slot_fmt == fmt) { RELEASE(pso); pso = *slot; }
+        else if (FAILED(hr)) {
             static int n = 0;
             if (n++ < 8) fprintf(stderr, "[rsx engine/d3d12] snapshot-copy pipeline failed: 0x%08lX\n", (long)hr);
             *failed = 1; pso = NULL;
+        } else if (ms && ps_blob != s_snap_copy_ms_ps) {
+            RELEASE(pso);   /* the sample count changed meanwhile: stale */
         } else {
             /* A format change leaves the old one to any list still naming it. */
             *slot = pso; *slot_fmt = fmt;
         }
+        ReleaseSRWLockExclusive(&s_pipe_lock);
     }
-    ReleaseSRWLockExclusive(&s_pipe_lock);
     return pso;
 }
 
