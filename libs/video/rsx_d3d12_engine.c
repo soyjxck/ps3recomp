@@ -191,6 +191,12 @@ typedef struct {
     ID3D12PipelineState* copy_pso[3];
     DXGI_FORMAT copy_fmt[3];
     int copy_failed[3];
+    /* The same reading the target's multisampled twin (eng_ms_*): for a
+     * snapshot taken while the twin holds draws the target lacks, instead
+     * of a resolve of the whole twin first. */
+    ID3D12PipelineState* copy_pso_ms[3];
+    DXGI_FORMAT copy_fmt_ms[3];
+    int copy_failed_ms[3];
     /* The MSAA build (s_ms_n samples), for passes into MSAA twins. */
     ID3D12PipelineState* psoms[3];
     int failedms[3];
@@ -200,6 +206,20 @@ static const char kSnapCopyHLSL[] =
     "struct PSInput { float4 position : SV_POSITION; };\n"
     "float4 main(PSInput input) : SV_Target0 { return rsx_tex[0].Load(int3((int2)input.position.xy, 0)); }\n";
 static ID3DBlob* s_snap_copy_ps;
+/* The same from a multisampled twin, the samples averaged: what a resolve
+ * of the pixel would give. Built for the sample count in use (eng_ms_apply). */
+static const char kSnapCopyMsHLSL[] =
+    "Texture2DMS<float4, %u> rsx_tex_ms : register(t0);\n"
+    "struct PSInput { float4 position : SV_POSITION; };\n"
+    "float4 main(PSInput input) : SV_Target0 {\n"
+    "  int2 p = (int2)input.position.xy; float4 c = 0;\n"
+    "  [unroll] for (int s = 0; s < %u; s++) c += rsx_tex_ms.Load(p, s);\n"
+    "  return c / %u; }\n";
+static ID3DBlob* s_snap_copy_ms_ps;
+/* RSX_MS_TWIN=0 (read on first use; the host A/B, DOD3_AB=mstwin, flips it):
+ * snapshots resolve the whole twin first and passes without a real depth
+ * target draw single-sampled, as before. */
+int g_rsx_ms_twin = -1;
 static u64 s_snap_incr_n, s_snap_full_n, s_snap_copy_draws;   /* RSX_GPU_TIME */
 int g_rsx_snap_incr = -1;   /* RSX_SNAP_INCR (see eng_encode_records) */
 
@@ -2423,6 +2443,11 @@ static int eng_ms_make(u32 h)
         D3D12_RENDER_TARGET_VIEW_DESC rd = {0};
         rd.Format = o->fmt; rd.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMS;
         CALL(s_dev, CreateRenderTargetView, o->ms, &rd, obj_rtv_ms(h));
+        /* Read by the snapshot copy draws (eng_encode_copy_draw). */
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd = {0};
+        sd.Format = o->fmt; sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        CALL(s_dev, CreateShaderResourceView, o->ms, &sd, obj_srv_ms(h));
     }
     o->ms_dirty = 0; o->ms_stale = 1;
     return 1;
@@ -2571,12 +2596,21 @@ static void eng_ms_apply(int want)
     s_ms_open_n = 0;
     AcquireSRWLockExclusive(&s_pipe_lock);
     for (u32 i = 0; i < s_pipe_count; i++)
-        for (int c = 0; c < 3; c++) { RELEASE(s_pipe[i].psoms[c]); s_pipe[i].failedms[c] = 0; }
+        for (int c = 0; c < 3; c++) {
+            RELEASE(s_pipe[i].psoms[c]); s_pipe[i].failedms[c] = 0;
+            RELEASE(s_pipe[i].copy_pso_ms[c]); s_pipe[i].copy_failed_ms[c] = 0;
+        }
     ReleaseSRWLockExclusive(&s_pipe_lock);
     u32 n = (u32)want;
     while (n > 1 && !(eng_ms_format_ok(DXGI_FORMAT_R8G8B8A8_UNORM, n) && eng_ms_format_ok(DXGI_FORMAT_R16G16B16A16_FLOAT, n) &&
                       eng_ms_format_ok(ENG_DEPTH_FMT, n))) n >>= 1;
     s_ms_n = n ? n : 1;
+    RELEASE(s_snap_copy_ms_ps);
+    if (s_ms_n > 1) {
+        char src[512];
+        const int len = snprintf(src, sizeof src, kSnapCopyMsHLSL, s_ms_n, s_ms_n, s_ms_n);
+        s_snap_copy_ms_ps = eng_compile(src, (u32)len, "main", "ps_5_0", "snapshot copy ps (msaa)");
+    }
     fprintf(stderr, "[RSX d3d12] MSAA %s\n", s_ms_n > 1 ? (s_ms_n == 2 ? "x2" : s_ms_n == 4 ? "x4" : "x8") : "off");
 }
 
@@ -2611,6 +2645,18 @@ static void eng_encode_draw(const EngRecord* r, ID3D12Resource* stage, D3D12_GPU
         ms = eng_ms_make(depth);
         for (u32 k = 0; ms && k < nrt; k++) ms = eng_ms_make(r->rt[k]);
     }
+    /* A pass without a real depth target (post-processing, the UI) into
+     * targets that already have twins draws into the twins too, against the
+     * fallback depth's twin. Single-sampled, it had the twin resolved into
+     * the target first and left the twin stale, refreshed by a full-screen
+     * draw at the next 3D pass: a 4K resolve and a 4K draw for each of the
+     * ~15 such passes Drakengard 3 interleaves with its 3D passes. */
+    if (g_rsx_ms_twin < 0) { const char* e = getenv("RSX_MS_TWIN"); g_rsx_ms_twin = !(e && e[0] == '0'); }
+    if (!ms && g_rsx_ms_twin > 0 && s_ms_n > 1 && !real_depth && nrt && eng_ms_ok(z)) {
+        ms = 1;
+        for (u32 k = 0; ms && k < nrt; k++) { EngObj* o = eng_owner(r->rt[k]); ms = o && o->ms != NULL; }
+        if (ms) ms = eng_ms_make(depth);
+    }
     ID3D12PipelineState* pso = ms ? eng_pso_ms(r->pipeline, topo_class(r->topology))
                                   : eng_pso_for(r->pipeline, topo_class(r->topology), !scaled);
     if (!pso) return;
@@ -2620,7 +2666,7 @@ static void eng_encode_draw(const EngRecord* r, ID3D12Resource* stage, D3D12_GPU
             rtv[k] = obj_rtv_ms(r->rt[k]);
         }
         if (z->ms_stale) eng_ms_refresh(depth);
-        z->ms_znewer = 1;
+        if (real_depth) z->ms_znewer = 1;   /* the fallback depth's twin holds nothing anyone reads back */
         for (u32 k = 0; k < nrt; k++) { EngObj* o = eng_obj(r->rt[k]); res_transition(o->ms, &o->ms_state, D3D12_RESOURCE_STATE_RENDER_TARGET); }
         res_transition(z->ms, &z->ms_state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     } else {
@@ -2753,20 +2799,24 @@ static void eng_encode_draw(const EngRecord* r, ID3D12Resource* stage, D3D12_GPU
  * earlier one in the same submit takes the full copy. RSX_SNAP_INCR=0: full
  * copies always. */
 
-static ID3D12PipelineState* eng_copy_pso_build(u32 pipeline, int cls, DXGI_FORMAT fmt)
+static ID3D12PipelineState* eng_copy_pso_build(u32 pipeline, int cls, DXGI_FORMAT fmt, int ms)
 {
-    if (!s_snap_copy_ps || !pipeline || pipeline > s_pipe_count) return NULL;
+    ID3DBlob* ps_blob = ms ? s_snap_copy_ms_ps : s_snap_copy_ps;
+    if (!ps_blob || !pipeline || pipeline > s_pipe_count) return NULL;
     EngPipeline* p = &s_pipe[pipeline - 1];
-    if (!p->vs || p->copy_failed[cls]) return NULL;
-    if (p->copy_pso[cls] && p->copy_fmt[cls] == fmt) return p->copy_pso[cls];
+    ID3D12PipelineState** slot = ms ? &p->copy_pso_ms[cls] : &p->copy_pso[cls];
+    DXGI_FORMAT* slot_fmt = ms ? &p->copy_fmt_ms[cls] : &p->copy_fmt[cls];
+    int* failed = ms ? &p->copy_failed_ms[cls] : &p->copy_failed[cls];
+    if (!p->vs || *failed) return NULL;
+    if (*slot && *slot_fmt == fmt) return *slot;
     ID3D12PipelineState* pso = NULL;
     AcquireSRWLockExclusive(&s_pipe_lock);
-    if (p->copy_pso[cls] && p->copy_fmt[cls] == fmt) pso = p->copy_pso[cls];
-    else if (!p->copy_failed[cls]) {
+    if (*slot && *slot_fmt == fmt) pso = *slot;
+    else if (!*failed) {
         D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = p->desc;
         pd.InputLayout.pInputElementDescs = pd.InputLayout.NumElements ? p->il : NULL;
-        pd.PS.pShaderBytecode = CALL0(s_snap_copy_ps, GetBufferPointer);
-        pd.PS.BytecodeLength = CALL0(s_snap_copy_ps, GetBufferSize);
+        pd.PS.pShaderBytecode = CALL0(ps_blob, GetBufferPointer);
+        pd.PS.BytecodeLength = CALL0(ps_blob, GetBufferSize);
         pd.NumRenderTargets = 1;
         for (u32 r = 0; r < 8; r++) pd.RTVFormats[r] = DXGI_FORMAT_UNKNOWN;
         pd.RTVFormats[0] = fmt;
@@ -2790,10 +2840,10 @@ static ID3D12PipelineState* eng_copy_pso_build(u32 pipeline, int cls, DXGI_FORMA
         if (FAILED(hr)) {
             static int n = 0;
             if (n++ < 8) fprintf(stderr, "[rsx engine/d3d12] snapshot-copy pipeline failed: 0x%08lX\n", (long)hr);
-            p->copy_failed[cls] = 1; pso = NULL;
+            *failed = 1; pso = NULL;
         } else {
             /* A format change leaves the old one to any list still naming it. */
-            p->copy_pso[cls] = pso; p->copy_fmt[cls] = fmt;
+            *slot = pso; *slot_fmt = fmt;
         }
     }
     ReleaseSRWLockExclusive(&s_pipe_lock);
@@ -2806,7 +2856,7 @@ static ID3D12PipelineState* eng_copy_pso_build(u32 pipeline, int cls, DXGI_FORMA
  * RSX_ASYNC_SHADERS=0 (the replays) they are built in place. */
 static SRWLOCK s_cp_lock = SRWLOCK_INIT;
 static CONDITION_VARIABLE s_cp_cv = CONDITION_VARIABLE_INIT;
-static struct { u32 pipeline; int cls; DXGI_FORMAT fmt; } s_cp_req[256];
+static struct { u32 pipeline; int cls; DXGI_FORMAT fmt; int ms; } s_cp_req[256];
 static u32 s_cp_head, s_cp_tail;      /* ring of requests */
 static int s_cp_thread_started;
 static DWORD WINAPI eng_copy_pso_worker(LPVOID arg)
@@ -2817,26 +2867,28 @@ static DWORD WINAPI eng_copy_pso_worker(LPVOID arg)
         while (s_cp_head == s_cp_tail) SleepConditionVariableSRW(&s_cp_cv, &s_cp_lock, INFINITE, 0);
         const u32 i = s_cp_head++ % 256u;
         const u32 pl = s_cp_req[i].pipeline; const int cls = s_cp_req[i].cls; const DXGI_FORMAT fmt = s_cp_req[i].fmt;
+        const int ms = s_cp_req[i].ms;
         ReleaseSRWLockExclusive(&s_cp_lock);
-        eng_copy_pso_build(pl, cls, fmt);
+        eng_copy_pso_build(pl, cls, fmt, ms);
     }
     return 0;
 }
-static ID3D12PipelineState* eng_copy_pso(u32 pipeline, int cls, DXGI_FORMAT fmt)
+static ID3D12PipelineState* eng_copy_pso(u32 pipeline, int cls, DXGI_FORMAT fmt, int ms)
 {
-    if (!s_snap_copy_ps || !pipeline || pipeline > s_pipe_count) return NULL;
+    if (!(ms ? s_snap_copy_ms_ps : s_snap_copy_ps) || !pipeline || pipeline > s_pipe_count) return NULL;
     EngPipeline* p = &s_pipe[pipeline - 1];
-    if (!p->vs || p->copy_failed[cls]) return NULL;
-    if (p->copy_pso[cls] && p->copy_fmt[cls] == fmt) return p->copy_pso[cls];
+    if (!p->vs || (ms ? p->copy_failed_ms[cls] : p->copy_failed[cls])) return NULL;
+    if (ms) { if (p->copy_pso_ms[cls] && p->copy_fmt_ms[cls] == fmt) return p->copy_pso_ms[cls]; }
+    else    { if (p->copy_pso[cls] && p->copy_fmt[cls] == fmt) return p->copy_pso[cls]; }
     static int async = -1;
     if (async < 0) { const char* e = getenv("RSX_ASYNC_SHADERS"); async = !(e && e[0] == '0'); }
-    if (!async) return eng_copy_pso_build(pipeline, cls, fmt);
-    /* Ask once per (pipeline, class, format): requests[] remembers. */
-    static struct { u32 pipeline; int cls; DXGI_FORMAT fmt; } asked[1024];
+    if (!async) return eng_copy_pso_build(pipeline, cls, fmt, ms);
+    /* Ask once per (pipeline, class, format, variant): requests[] remembers. */
+    static struct { u32 pipeline; int cls; DXGI_FORMAT fmt; int ms; } asked[1024];
     static u32 nasked;
     for (u32 i = 0; i < nasked; i++)
-        if (asked[i].pipeline == pipeline && asked[i].cls == cls && asked[i].fmt == fmt) return NULL;
-    if (nasked < 1024) { asked[nasked].pipeline = pipeline; asked[nasked].cls = cls; asked[nasked].fmt = fmt; nasked++; }
+        if (asked[i].pipeline == pipeline && asked[i].cls == cls && asked[i].fmt == fmt && asked[i].ms == ms) return NULL;
+    if (nasked < 1024) { asked[nasked].pipeline = pipeline; asked[nasked].cls = cls; asked[nasked].fmt = fmt; asked[nasked].ms = ms; nasked++; }
     AcquireSRWLockExclusive(&s_cp_lock);
     if (!s_cp_thread_started) {
         HANDLE th = CreateThread(NULL, 1u << 20, eng_copy_pso_worker, NULL, 0, NULL);
@@ -2844,7 +2896,7 @@ static ID3D12PipelineState* eng_copy_pso(u32 pipeline, int cls, DXGI_FORMAT fmt)
     }
     if (s_cp_thread_started && s_cp_tail - s_cp_head < 256u) {
         const u32 i = s_cp_tail++ % 256u;
-        s_cp_req[i].pipeline = pipeline; s_cp_req[i].cls = cls; s_cp_req[i].fmt = fmt;
+        s_cp_req[i].pipeline = pipeline; s_cp_req[i].cls = cls; s_cp_req[i].fmt = fmt; s_cp_req[i].ms = ms;
         WakeConditionVariable(&s_cp_cv);
     }
     ReleaseSRWLockExclusive(&s_cp_lock);
@@ -2856,14 +2908,18 @@ static int eng_encode_copy_draw(const EngRecord* r, u32 T, u32 S, ID3D12Resource
 {
     EngObj* t = eng_owner(T); EngObj* sn = eng_owner(S);
     if (!t || !sn || !sn->has_rtv) return 0;
-    ID3D12PipelineState* pso = eng_copy_pso(r->pipeline, topo_class(r->topology), sn->fmt);
+    /* From the twin while it holds draws the target lacks. A snapshot used
+     * to resolve the whole twin first: at 4K, ~25 snapshots a frame, that
+     * resolve was the largest single item of the MSAA frame's GPU time. */
+    const int ms = t->ms && t->ms_dirty;
+    ID3D12PipelineState* pso = eng_copy_pso(r->pipeline, topo_class(r->topology), sn->fmt, ms);
     if (!pso) return 0;
     ID3D12Resource* vres = r->vbuf ? s_buf[r->vbuf - 1] : stage;
     if (!vres) return 0;
     /* Tables first: a full descriptor ring flushes the list and rebinds. */
     D3D12_CPU_DESCRIPTOR_HANDLE srv[ENG_SRV_TABLE];
     for (u32 u = 0; u < ENG_SRV_TABLE; u++) srv[u] = obj_srv(0);
-    srv[0] = obj_srv(T);
+    srv[0] = ms ? obj_srv_ms((u32)(t - s_obj) + 1) : obj_srv(T);
     u32 vt_h[RSX_BE_MAX_VERTEX_TEXTURES] = {0};
     for (u32 u = 0; u < RSX_BE_MAX_VERTEX_TEXTURES; u++) {
         EngObj* o = eng_owner(r->vtex[u]);
@@ -2875,7 +2931,8 @@ static int eng_encode_copy_draw(const EngRecord* r, u32 T, u32 S, ID3D12Resource
     for (u32 u = 0; u < RSX_BE_MAX_VERTEX_TEXTURES; u++) smp[RSX_BE_MAX_TEXTURES + u] = r->vsamp[u];
     const D3D12_GPU_DESCRIPTOR_HANDLE sm = eng_smp_table(smp);
 
-    res_transition(t->res, &t->state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    if (ms) res_transition(t->ms, &t->ms_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    else    res_transition(t->res, &t->state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     res_transition(sn->res, &sn->state, D3D12_RESOURCE_STATE_RENDER_TARGET);
     for (u32 u = 0; u < RSX_BE_MAX_VERTEX_TEXTURES; u++) if (vt_h[u]) obj_transition(vt_h[u], ENG_SHADER_READ);
     bar_flush();
@@ -2964,7 +3021,12 @@ static void eng_encode_records(ID3D12Resource* stage, D3D12_GPU_VIRTUAL_ADDRESS 
         if (s_pheap) eng_pass_mark(r, &pass_key);
         if (r->kind == ENG_REC_COLOR_COPY) {
             const u32 T = r->depth, S = r->resolve_dst;
-            { EngObj* t = eng_owner(T); if (t && t->ms && t->ms_dirty) eng_ms_resolve((u32)(t - s_obj) + 1); }
+            /* The copy draws read the twin while it is the newer of the two
+             * (eng_encode_copy_draw); only the full copy needs the target
+             * itself brought up to date. */
+            EngObj* tobj = eng_owner(T);
+            const int tms = g_rsx_ms_twin > 0 && tobj && tobj->ms && tobj->ms_dirty;
+            if (!tms && tobj && tobj->ms && tobj->ms_dirty) eng_ms_resolve((u32)(tobj - s_obj) + 1);   /* RSX_MS_TWIN=0: as before */
             u32 k = 0;
             while (k < nsy && sy[k].surf != T) k++;
             int done = 0;
@@ -2979,7 +3041,7 @@ static void eng_encode_records(ID3D12Resource* stage, D3D12_GPU_VIRTUAL_ADDRESS 
             if (incr && k < nsy && sy[k].valid && sy[k].snap == S && sobj && sobj->has_rtv) {
                 /* Every copy pipeline ready, or the full copy this time. */
                 for (u32 j = 0; j < sy[k].n; j++)
-                    if (!eng_copy_pso(s_rec[sy[k].idx[j]].pipeline, topo_class(s_rec[sy[k].idx[j]].topology), sobj->fmt)) { ready = 0; break; }
+                    if (!eng_copy_pso(s_rec[sy[k].idx[j]].pipeline, topo_class(s_rec[sy[k].idx[j]].topology), sobj->fmt, tms)) { ready = 0; break; }
             }
             if (incr && ready && k < nsy && sy[k].valid && sy[k].snap == S && sobj && sobj->has_rtv) {
                 done = 1;
@@ -2996,6 +3058,7 @@ static void eng_encode_records(ID3D12Resource* stage, D3D12_GPU_VIRTUAL_ADDRESS 
             else {
                 EngObj* src = eng_owner(T); EngObj* dst = sobj;
                 if (src && dst) {
+                    if (tms) eng_ms_resolve((u32)(src - s_obj) + 1);
                     res_transition(src->res, &src->state, D3D12_RESOURCE_STATE_COPY_SOURCE);
                     res_transition(dst->res, &dst->state, D3D12_RESOURCE_STATE_COPY_DEST);
                     bar_flush();
