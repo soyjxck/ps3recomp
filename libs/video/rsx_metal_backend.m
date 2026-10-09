@@ -2804,7 +2804,12 @@ static int eng_vis_accumulates(void)
     static int on = -1;
     if (on < 0) {
         on = 0;
+        /* Only when the SDK names the accumulate type (the render-pass
+         * setting below is compiled out otherwise): the counter chain
+         * stands in on older SDKs even on a macOS 26 host. */
+#if defined(MAC_OS_VERSION_26_0) && MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_VERSION_26_0
         if (@available(macOS 26.0, *)) on = 1;
+#endif
         const char* e = getenv("RSX_VIS_ACCUM");
         if (e && e[0] == '0') on = 0;
     }
@@ -4700,9 +4705,14 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
         const u32 vis_pass = ++s_vis_serial ? s_vis_serial : ++s_vis_serial;
         if (s_vis_buf) {
             rp.visibilityResultBuffer = s_vis_buf;
+            /* The accumulate type is macOS 26's; an older SDK (the macos-14
+             * CI runner's) has no name for it, so the line is for the SDKs
+             * that do, and the per-pass counter chain stands in below. */
+#if defined(MAC_OS_VERSION_26_0) && MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_VERSION_26_0
             if (eng_vis_accumulates()) {
                 if (@available(macOS 26.0, *)) rp.visibilityResultType = MTLVisibilityResultTypeAccumulate;
             }
+#endif
         }
         for (u32 k = 0; k < attach; k++) {
             rp.colorAttachments[k].texture     = tex[k];
