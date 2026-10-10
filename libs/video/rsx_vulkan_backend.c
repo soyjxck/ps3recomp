@@ -1014,7 +1014,6 @@ static int vk_ensure_vertex_buffer(VkDeviceSize bytes)
 #define VK_GPIPE_CACHE   512
 #define VK_FP_MAX_BYTES  4096u              /* bound on a fragment program, as Metal/D3D12 */
 #define VK_HLSL_BYTES    (256u * 1024u)
-#define VK_SPV_WORDS     (256u * 1024u)
 #define VK_VPCONST_BYTES ((RSX_MAX_VERTEX_CONSTANTS + 2u) * 16u)
 #define VK_GUEST_ATTRS   16u
 #define VK_GUEST_FLOATS  (VK_GUEST_ATTRS * 4u)   /* per vertex */
@@ -1026,7 +1025,6 @@ typedef struct { int vs, fs; u32 depth_key; VkPipeline pipe; } vk_gpipe_entry;
 static struct {
     int                   on;
     char*                 hlsl;
-    u32*                  spv;
     char                  log[4096];
     VkDescriptorSetLayout set_layout;
     VkPipelineLayout      pipe_layout;
@@ -1045,6 +1043,11 @@ static struct {
     u32                   draws, last_draws;
     u32                   warned;
 } s_g;
+
+/* The version the instance was made with (vk_init_all): 1.1 (SPIR-V 1.3 for
+ * the translated guest programs, negative viewport heights), or 1.0 from a
+ * loader that knows nothing newer -- the fixed-function path alone, then. */
+static u32 s_vk_api = VK_API_VERSION_1_0;
 
 int rsx_vulkan_backend_guest_programs(void)
 {
@@ -1088,19 +1091,21 @@ static u32 vk_vtex_mask(const rsx_state* st)
 
 static VkShaderModule vk_guest_module(const char* what, int stage)
 {
-    u32 n = 0;
-    if (rsx_hlsl_to_spirv(s_g.hlsl, stage, s_g.spv, VK_SPV_WORDS, &n,
-                          s_g.log, sizeof s_g.log) != 0) {
+    u32* words = NULL;
+    const u32 n = rsx_hlsl_to_spirv(s_g.hlsl, stage, &words, s_g.log, sizeof s_g.log);
+    if (!n || !words) {
         VK_LOG("%s: %s\n", what, s_g.log);
+        free(words);
         return VK_NULL_HANDLE;
     }
     VkShaderModuleCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-                                    .codeSize = (size_t)n * 4u, .pCode = s_g.spv };
+                                    .codeSize = (size_t)n * 4u, .pCode = words };
     VkShaderModule m = VK_NULL_HANDLE;
     if (pvkCreateShaderModule(s_vk.device, &ci, NULL, &m) != VK_SUCCESS) {
         VK_LOG("%s: vkCreateShaderModule failed\n", what);
-        return VK_NULL_HANDLE;
+        m = VK_NULL_HANDLE;
     }
+    free(words);
     return m;
 }
 
@@ -1124,7 +1129,7 @@ static int vk_vp_slot(const rsx_state* st)
     VkShaderModule m = VK_NULL_HANDLE;
     const int ni = rsx_vp_decompile_ex(uc, len, 0, s_g.hlsl, VK_HLSL_BYTES);
     if (ni <= 0) VK_LOG("%s: decompile failed (%d)\n", what, ni);
-    else         m = vk_guest_module(what, RSX_SHADER_STAGE_VERTEX);
+    else         m = vk_guest_module(what, RSX_SPV_STAGE_VERTEX);
     if (s_g.vp_count < 32)
         VK_LOG("%s: %d instrs -> %s\n", what, ni, m ? "ok" : "FAILED (fixed-function instead)");
     const int slot = (int)s_g.vp_count++;
@@ -1167,7 +1172,7 @@ static int vk_fp_slot(const rsx_state* st, const u8** uc)
         rsx_fp_apply_alpha_test_buffered(s_g.hlsl, VK_HLSL_BYTES, st->alpha_func) < 0)
         ni = -1;
     if (ni <= 0) VK_LOG("%s: decompile failed (%d)\n", what, ni);
-    else         m = vk_guest_module(what, RSX_SHADER_STAGE_FRAGMENT);
+    else         m = vk_guest_module(what, RSX_SPV_STAGE_FRAGMENT);
     if (s_g.fp_count < 32)
         VK_LOG("%s: %d instrs, %u constants -> %s\n", what, ni, nconst,
                m ? "ok" : "FAILED (fixed-function instead)");
@@ -1274,11 +1279,16 @@ static int vk_guest_init(void)
 {
     if (!rsx_vulkan_backend_guest_programs()) return 0;
     s_g.hlsl = (char*)malloc(VK_HLSL_BYTES);
-    s_g.spv  = (u32*)malloc(VK_SPV_WORDS * sizeof(u32));
-    if (!s_g.hlsl || !s_g.spv) { VK_LOG("guest programs: out of memory\n"); return -1; }
+    if (!s_g.hlsl) { VK_LOG("guest programs: out of memory\n"); return -1; }
 
     VkPhysicalDeviceProperties p;
     pvkGetPhysicalDeviceProperties(s_vk.phys, &p);
+    /* The translator writes SPIR-V 1.3, which takes Vulkan 1.1 of the
+     * instance (s_vk_api) and of the device alike. */
+    if (s_vk_api < VK_API_VERSION_1_1 || p.apiVersion < VK_API_VERSION_1_1) {
+        VK_LOG("guest programs: off, the translated shaders need Vulkan 1.1\n");
+        return 0;
+    }
     s_g.max_ubo_range = p.limits.maxUniformBufferRange;
     VkDeviceSize align = p.limits.minUniformBufferOffsetAlignment;
     if (align == 0) align = 256;
@@ -1291,11 +1301,11 @@ static int vk_guest_init(void)
 
     const VkShaderStageFlags both = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     VkDescriptorSetLayoutBinding b[4] = {
-        { RSX_SPIRV_VPCONST_BINDING, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, both, NULL },
-        { RSX_SPIRV_PSCONST_BINDING, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, both, NULL },
-        { RSX_SPIRV_TEXTURE_BINDING, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, RSX_MAX_TEXTURES,
+        { RSX_SPV_BIND_VS_CB, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, both, NULL },
+        { RSX_SPV_BIND_FS_CB, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, both, NULL },
+        { RSX_SPV_BIND_FS_TEX, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, RSX_MAX_TEXTURES,
           VK_SHADER_STAGE_FRAGMENT_BIT, NULL },
-        { RSX_SPIRV_SAMPLER_BINDING, VK_DESCRIPTOR_TYPE_SAMPLER, RSX_MAX_TEXTURES,
+        { RSX_SPV_BIND_FS_SAMP, VK_DESCRIPTOR_TYPE_SAMPLER, RSX_MAX_TEXTURES,
           VK_SHADER_STAGE_FRAGMENT_BIT, NULL },
     };
     VkDescriptorSetLayoutCreateInfo lci = {
@@ -1347,7 +1357,6 @@ static void vk_guest_shutdown(void)
         vk_destroy_buffer(&s_g.vertices);
     }
     free(s_g.hlsl);
-    free(s_g.spv);
     free(s_g.cpu);
     memset(&s_g, 0, sizeof s_g);
 }
@@ -1435,16 +1444,16 @@ static int vk_guest_draw(const rsx_state* st, u32 prim, u32 first, u32 count)
     }
     VkWriteDescriptorSet w[4] = {
         { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = s_g.set,
-          .dstBinding = RSX_SPIRV_VPCONST_BINDING, .descriptorCount = 1,
+          .dstBinding = RSX_SPV_BIND_VS_CB, .descriptorCount = 1,
           .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &bi[0] },
         { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = s_g.set,
-          .dstBinding = RSX_SPIRV_PSCONST_BINDING, .descriptorCount = 1,
+          .dstBinding = RSX_SPV_BIND_FS_CB, .descriptorCount = 1,
           .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &bi[1] },
         { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = s_g.set,
-          .dstBinding = RSX_SPIRV_TEXTURE_BINDING, .descriptorCount = RSX_MAX_TEXTURES,
+          .dstBinding = RSX_SPV_BIND_FS_TEX, .descriptorCount = RSX_MAX_TEXTURES,
           .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, .pImageInfo = ii },
         { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = s_g.set,
-          .dstBinding = RSX_SPIRV_SAMPLER_BINDING, .descriptorCount = RSX_MAX_TEXTURES,
+          .dstBinding = RSX_SPV_BIND_FS_SAMP, .descriptorCount = RSX_MAX_TEXTURES,
           .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER, .pImageInfo = si },
     };
     pvkUpdateDescriptorSets(s_vk.device, 4, w, 0, NULL);
@@ -1457,7 +1466,8 @@ static int vk_guest_draw(const rsx_state* st, u32 prim, u32 first, u32 count)
                                   .renderArea = { { 0, 0 }, { s_vk.width, s_vk.height } } };
     pvkCmdBeginRenderPass(s_vk.cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
     pvkCmdBindPipeline(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
-    VkViewport vpt = { 0.0f, 0.0f, (float)s_vk.width, (float)s_vk.height, 0.0f, 1.0f };
+    /* D3D clip space from the decompilers, flipped by the negative height. */
+    VkViewport vpt = { 0.0f, (float)s_vk.height, (float)s_vk.width, -(float)s_vk.height, 0.0f, 1.0f };
     VkRect2D sc = { { 0, 0 }, { s_vk.width, s_vk.height } };
     pvkCmdSetViewport(s_vk.cmd, 0, 1, &vpt);
     pvkCmdSetScissor(s_vk.cmd, 0, 1, &sc);
@@ -2497,15 +2507,19 @@ static VkStencilOpState vk_gcm_stencil_face(u32 func, u32 fail, u32 zfail, u32 z
 
 static int vk_eng_translate(const char* hlsl, int stage, VkShaderModule* out)
 {
-    u32 words = 0;
-    if (rsx_hlsl_to_spirv(hlsl, stage, s_g.spv, VK_SPV_WORDS, &words, s_g.log, sizeof s_g.log) || !words) {
+    u32* words = NULL;
+    const u32 n = rsx_hlsl_to_spirv(hlsl, stage, &words, s_g.log, sizeof s_g.log);
+    if (!n || !words) {
         VK_LOG("engine: %s translation failed: %s\n",
-               stage == RSX_SHADER_STAGE_VERTEX ? "vertex" : "fragment", s_g.log);
+               stage == RSX_SPV_STAGE_VERTEX ? "vertex" : "fragment", s_g.log);
+        free(words);
         return -1;
     }
     VkShaderModuleCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-                                    .codeSize = (size_t)words * 4u, .pCode = s_g.spv };
-    return pvkCreateShaderModule(s_vk.device, &ci, NULL, out) == VK_SUCCESS ? 0 : -1;
+                                    .codeSize = (size_t)n * 4u, .pCode = words };
+    const VkResult r = pvkCreateShaderModule(s_vk.device, &ci, NULL, out);
+    free(words);
+    return r == VK_SUCCESS ? 0 : -1;
 }
 
 static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_hlsl,
@@ -2526,8 +2540,8 @@ static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* p
     if (slot == VK_ENG_MAX_PIPE) return 0;
     vk_eng_pipe* P = &s_epipe[slot];
     memset(P, 0, sizeof *P);
-    if (vk_eng_translate(vs_hlsl, RSX_SHADER_STAGE_VERTEX, &P->vs)) return 0;
-    if (vk_eng_translate(ps_hlsl, RSX_SHADER_STAGE_FRAGMENT, &P->fs)) {
+    if (vk_eng_translate(vs_hlsl, RSX_SPV_STAGE_VERTEX, &P->vs)) return 0;
+    if (vk_eng_translate(ps_hlsl, RSX_SPV_STAGE_FRAGMENT, &P->fs)) {
         pvkDestroyShaderModule(s_vk.device, P->vs, NULL); memset(P, 0, sizeof *P); return 0;
     }
     P->rs = *rs;
@@ -2822,16 +2836,16 @@ static void vk_eng_write_descriptors(void)
     }
     VkWriteDescriptorSet w[4] = {
         { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = s_g.set,
-          .dstBinding = RSX_SPIRV_VPCONST_BINDING, .descriptorCount = 1,
+          .dstBinding = RSX_SPV_BIND_VS_CB, .descriptorCount = 1,
           .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &bi[0] },
         { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = s_g.set,
-          .dstBinding = RSX_SPIRV_PSCONST_BINDING, .descriptorCount = 1,
+          .dstBinding = RSX_SPV_BIND_FS_CB, .descriptorCount = 1,
           .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &bi[1] },
         { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = s_g.set,
-          .dstBinding = RSX_SPIRV_TEXTURE_BINDING, .descriptorCount = RSX_MAX_TEXTURES,
+          .dstBinding = RSX_SPV_BIND_FS_TEX, .descriptorCount = RSX_MAX_TEXTURES,
           .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, .pImageInfo = ii },
         { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = s_g.set,
-          .dstBinding = RSX_SPIRV_SAMPLER_BINDING, .descriptorCount = RSX_MAX_TEXTURES,
+          .dstBinding = RSX_SPV_BIND_FS_SAMP, .descriptorCount = RSX_MAX_TEXTURES,
           .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER, .pImageInfo = si },
     };
     pvkUpdateDescriptorSets(s_vk.device, 4, w, 0, NULL);
@@ -2886,9 +2900,11 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
                                   .renderArea = { { 0, 0 }, { w, h } } };
     pvkCmdBeginRenderPass(s_vk.cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
     pvkCmdBindPipeline(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
-    VkViewport vp = { 0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f };
+    /* D3D clip space from the decompilers (y up), flipped by a negative
+     * viewport height: the engine's viewport has its origin at the top. */
+    VkViewport vp = { 0.0f, (float)h, (float)w, -(float)h, 0.0f, 1.0f };
     if (s_e2.have_vp && s_e2.vp[2] > 0.0f && s_e2.vp[3] > 0.0f) {
-        vp.x = s_e2.vp[0]; vp.y = s_e2.vp[1]; vp.width = s_e2.vp[2]; vp.height = s_e2.vp[3];
+        vp.x = s_e2.vp[0]; vp.y = s_e2.vp[1] + s_e2.vp[3]; vp.width = s_e2.vp[2]; vp.height = -s_e2.vp[3];
     }
     VkRect2D sc = { { 0, 0 }, { w, h } };
     if (s_e2.have_sc) {                       /* clamped: Vulkan rejects negative or over-size */
@@ -2974,7 +2990,7 @@ static int vk_init_all(u32 width, u32 height, const char* title)
 
     VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
                               .pApplicationName = "ps3recomp", .pEngineName = "ps3recomp RSX",
-                              .apiVersion = VK_API_VERSION_1_0 };
+                              .apiVersion = VK_API_VERSION_1_1 };
     VkInstanceCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
                                 .pApplicationInfo = &app };
     if (s_vk.windowed) {
@@ -2982,6 +2998,11 @@ static int vk_init_all(u32 width, u32 height, const char* title)
         ci.ppEnabledExtensionNames = s_vk.inst_exts;
     }
     VkResult ir = pvkCreateInstance(&ci, NULL, &s_vk.instance);
+    if (ir == VK_ERROR_INCOMPATIBLE_DRIVER) {         /* a Vulkan 1.0 loader */
+        app.apiVersion = VK_API_VERSION_1_0;
+        ir = pvkCreateInstance(&ci, NULL, &s_vk.instance);
+    }
+    s_vk_api = app.apiVersion;
     if (ir != VK_SUCCESS && s_vk.windowed) {
         vk_window_drop("vkCreateInstance with the surface extensions failed");
         ci.enabledExtensionCount = 0;

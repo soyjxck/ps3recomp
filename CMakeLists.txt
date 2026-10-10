@@ -44,18 +44,15 @@ file(GLOB_RECURSE HLE_SOURCES
 # Exclude test harnesses (e.g. libs/video/tests/*): they define their own main().
 list(FILTER HLE_SOURCES EXCLUDE REGEX "/tests/")
 
-# The Vulkan RSX backend is opt-in while it grows (stage V0: clear + present).
-# It loads libvulkan at run time, so building needs only the Vulkan headers --
-# no target-architecture libvulkan, which keeps cross-compiling simple.
+# The Vulkan RSX backend (Linux) is opt-in. It loads libvulkan at run time,
+# so building needs only the Vulkan headers -- no target-architecture
+# libvulkan, which keeps cross-compiling simple. It shares the HLSL -> SPIR-V
+# translator and its binding plan (libs/video/rsx_shader_spirv.*) with the
+# draw-engine Vulkan engine (libs/video/rsx_vulkan_engine.c, Windows), which
+# is listed below for every build; nothing is added twice here.
 option(PS3RECOMP_RSX_VULKAN "Build the Vulkan RSX backend (Linux)" OFF)
 list(FILTER HLE_SOURCES EXCLUDE REGEX "rsx_vulkan_backend\\.c$")
 if(PS3RECOMP_RSX_VULKAN)
-    # Not in this fork: this backend's HLSL -> SPIR-V interface and binding
-    # plan (rsx_hlsl_to_spirv with a caller buffer; textures at 16, samplers
-    # at 48) differ from the draw-engine Vulkan engine's, which owns
-    # libs/video/rsx_shader_spirv.* here (libs/video/rsx_vulkan_engine.c).
-    message(FATAL_ERROR "PS3RECOMP_RSX_VULKAN (upstream's Linux Vulkan backend) is not built in this fork; "
-        "the draw-engine Vulkan engine (rsx_vulkan_engine.c) is the Vulkan path here")
     find_path(PS3RECOMP_VULKAN_INCLUDE_DIR vulkan/vulkan.h)
     if(NOT PS3RECOMP_VULKAN_INCLUDE_DIR)
         message(FATAL_ERROR "Vulkan headers not found. Debian/Ubuntu: "
@@ -63,8 +60,6 @@ if(PS3RECOMP_RSX_VULKAN)
             "-DPS3RECOMP_VULKAN_INCLUDE_DIR=<dir containing vulkan/vulkan.h>")
     endif()
     list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_vulkan_backend.c")
-    # HLSL -> SPIR-V for guest programs: a stub unless glslang is found below.
-    list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_spirv.cpp")
 endif()
 
 # The Metal backend is Objective-C and Apple-only, so it is added explicitly
@@ -330,9 +325,11 @@ endif()
 # its fixed-function path.
 if(PS3RECOMP_RSX_VULKAN)
     if(glslang_FOUND AND TARGET glslang::glslang AND TARGET glslang::SPIRV)
+        # PS3RECOMP_HAVE_GLSLANG_SPIRV is the define rsx_shader_spirv.cpp
+        # is built on (the Windows Vulkan engine's block below sets the same).
         set_source_files_properties(
             "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_spirv.cpp"
-            PROPERTIES COMPILE_DEFINITIONS PS3RECOMP_HAVE_SPIRV_TRANSLATION=1)
+            PROPERTIES COMPILE_DEFINITIONS PS3RECOMP_HAVE_GLSLANG_SPIRV=1)
         target_link_libraries(ps3recomp_runtime PRIVATE glslang::glslang glslang::SPIRV)
         if(TARGET glslang::glslang-default-resource-limits)
             target_link_libraries(ps3recomp_runtime PRIVATE

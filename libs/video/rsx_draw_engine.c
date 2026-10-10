@@ -3491,11 +3491,12 @@ static void eng_present(u32 buffer_id)
                       now - first, n / span, span * 1000.0 / n, worst, slow, n);
               /* The texture write-watch's work in the window, when it runs. */
               if (eng_tex_watch_on()) {
-                  static unsigned long long f0, s0;
-                  unsigned long long f = 0, pp = 0;
+                  static uint64_t f0;
+                  static unsigned long long s0;
+                  uint64_t f = 0, pp = 0;          /* vm_watch_stats takes uint64_t: unsigned long on Linux */
                   vm_watch_stats(&f, &pp);
                   fprintf(stderr, "; watch: %llu faults, %llu hashes saved, %llu pages protected in all",
-                          f - f0, s_tex_skips_total - s0, pp);
+                          (unsigned long long)(f - f0), s_tex_skips_total - s0, (unsigned long long)pp);
                   f0 = f; s0 = s_tex_skips_total;
               }
               fputc('\n', stderr);
