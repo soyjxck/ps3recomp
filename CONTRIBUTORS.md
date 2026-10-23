@@ -470,6 +470,12 @@ came from this work.
   (#216), `PS3_NULL_READ_STACK` (#226) and `g_ppu_main_ctx` (#228).
 - Depth bounds test in the draw engine and Vulkan (#319), measured on Twisted
   Metal's deferred lighting.
+- **v0.16.0, 12 PRs.** In-stream flips that complete when the RSX reaches them
+  (#343), get across a JUMP (#347), FP16 transfers (#367) and pixel-wise row
+  conversion (#348); a cache of HLSL to SPIR-V translations (#346); Vulkan
+  feedback snapshots (#352) and a split present (#351); atomic task signal
+  bits (#340), job frames below cache buffers (#366), AVX2/SSE2 SPU float
+  (#369, #370), and AIO reads that keep the fd's position (#376).
 
 
 ### undecuple — [@undecuple](https://github.com/undecuple)
@@ -516,6 +522,8 @@ came from this work.
   - cellFs directory entries and disc roots (#247, #249), GCM strict IO
     mapping (#248), network (#250, #265), timezone (#264), sysmodules (#267),
     dialogs (#251), and Sail (#252).
+- Guest spinlocks with a 32-bit atomic on LP64 hosts, an arm64 fault
+  (#326, v0.16.0).
 
 
 ### Noah Peterson — [@NoahBPeterson](https://github.com/NoahBPeterson)
@@ -536,6 +544,15 @@ well:
 - NV40 pack/unpack opcodes (#314);
 - cellGem/cellCamera imports (#315);
 - Metal command-buffer errors reported (#316).
+- **v0.16.0, 21 PRs.** 3D textures (#335); FACING/TC8/TC9 (#328),
+  perspective-correct texcoords (#329), `_bx2` and biased-remap fetches (#331),
+  Y16_X16/HILO8 crossbars (#332); flips that complete in order (#354), a
+  bounded semaphore acquire (#327), GCM callbacks at timer sleeps (#353),
+  unscaled NV3089 rows (#334); Metal MRT masks (#330), anisotropy (#373),
+  FXAA and sharpening (#374), gamma (#355) and `precise::` math (#356);
+  sparse texture re-hashing (#375) and per-draw vertex spans (#357);
+  `PS3_FTRACE` (#339), FP debug knobs (#336), `PS3_LANG` (#333),
+  `PS3_GAMEDATA_ROOT` (#338) and full-strength rumble (#372).
 
 ### deucebucket — [@deucebucket](https://github.com/deucebucket)
 - Reported that `fw_spu/` was tracking decrypted firmware PRXs and lifted C,
@@ -544,6 +561,23 @@ well:
 ### bojogon7 — [@bojogon7](https://github.com/bojogon7)
 - Added [AnyPS5](https://github.com/boykopovar/AnyPS5) to the README's list of
   sibling recompilation projects (#209).
+
+### n0madic — [@n0madic](https://github.com/n0madic)
+Fixes from a *SoulCalibur II HD* port
+([n0madic/Soulcalibur2HD-recomp](https://github.com/n0madic/Soulcalibur2HD-recomp)):
+- **An SPU thread runs the image its own bytes identify** (#362), not
+  whichever registered image has code at its entry point. SPU user events
+  find the port the PPU binds (#363).
+- **NV3089's 12.4 source origin** (#358): copies were 256 times too short.
+- The D3D12 vertex program cache keyed on the program (#361), which took
+  most D3DCompile calls off the FIFO thread.
+- `cellGameBootCheck` game type from PARAM.SFO (#359), and the msg-dialog
+  NONE/INVALID button codes (#360).
+
+### kalpakprod — [@kalpakprod](https://github.com/kalpakprod)
+- `CELL_FS_O_*` flag values corrected so `O_CREAT` creates (#349).
+- `/dev_hdd1` maps to a writable host root with its cache directory (#350).
+- Syscall 14 classifies lock-line addresses by guest segment (#341).
 
 ---
 

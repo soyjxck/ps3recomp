@@ -295,6 +295,15 @@ void cellGame_init_from_paramsfo(const char* sfo_path)
         printf("[cellGame] PARAM.SFO not read ('%s'); keeping title id '%s'\n",
                sfo_path, s_title_id);
     }
+    /* CATEGORY decides the type cellGameBootCheck reports: "DG" is a disc game, "HG" an HDD game (a PSN
+     * download, booted from /dev_hdd0/game/<id>). Titles check it and give up on a type they do not expect.
+     * RPCS3 reports HDD for every category that is not a disc one; only these two are mapped here, any
+     * other keeps the default. */
+    if (sfo_read_string(sfo_path, "CATEGORY", tmp, sizeof(tmp)) == 0 && tmp[0]) {
+        if (strcmp(tmp, "HG") == 0)      s_game_type = CELL_GAME_GAMETYPE_HDD;
+        else if (strcmp(tmp, "DG") == 0) s_game_type = CELL_GAME_GAMETYPE_DISC;
+        printf("[cellGame] CATEGORY '%s' -> game type %u\n", tmp, (unsigned)s_game_type);
+    }
     if (sfo_read_string(sfo_path, "TITLE", tmp, sizeof(tmp)) == 0 && tmp[0]) {
         strncpy(s_title, tmp, sizeof(s_title) - 1); s_title[sizeof(s_title) - 1] = '\0';
     }
@@ -312,6 +321,12 @@ void cellGame_init_from_paramsfo(const char* sfo_path)
 
 /* Central title-id accessor so other modules (cellSysutil etc.) don't hardcode it. */
 const char* cellGame_get_title_id(void) { return s_title_id; }
+/* The title id when the booted title is an HDD game (CATEGORY "HG"), else NULL:
+ * its /dev_hdd0/game/<id>/ IS the booted game directory (sys_fs.c). */
+const char* cellGame_get_hdd_title_id(void)
+{
+    return s_game_type == CELL_GAME_GAMETYPE_HDD && s_title_id[0] ? s_title_id : NULL;
+}
 
 /* PS3_GAME_PATCH=1: the title boots as its installed update, the way a PS3
  * runs a disc game that has a patch on the HDD. cellGameBootCheck then sets

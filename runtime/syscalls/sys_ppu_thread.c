@@ -25,9 +25,11 @@ static PPU_TLS int     s_exit_armed = 0;
 #include <stddef.h>
 #include "sys_ppu_thread.h"
 #include "../platform/win32_compat.h"   /* GetCurrentThreadId on POSIX */
+#include "ps3emu/ps3_ftrace.h"           /* PS3_FTRACE: thread names for the report */
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>   /* getenv (else return value truncated to int on x64) */
+#include "ps3emu/log_first.h"
 #ifndef _WIN32
 #include <errno.h>
 #endif
@@ -279,8 +281,21 @@ static void* ppu_host_thread_proc(void* param)
     HANDLE done = info->finish_event;     /* read before the slot can be anyone else's */
 #endif
     if (info->state == PPU_THREAD_STATE_DETACHED) {
-        /* Detached threads self-clean */
+        /* Detached threads self-clean (made without SYS_PPU_THREAD_CREATE_JOINABLE,
+         * or detached since): nobody joins them, so their sync objects go too,
+         * under the table lock -- once the slot is FREE a new
+         * sys_ppu_thread_create may reuse it and create its own. */
         stack_give(info);
+#ifdef _WIN32
+        if (info->finish_event) CloseHandle(info->finish_event);
+        if (info->host_thread) CloseHandle(info->host_thread);
+        info->finish_event = NULL;
+        info->host_thread = NULL;
+        done = NULL;
+#else
+        pthread_mutex_destroy(&info->finish_mutex);
+        pthread_cond_destroy(&info->finish_cond);
+#endif
         info->state = PPU_THREAD_STATE_FREE;
     } else if (info->state == PPU_THREAD_STATE_RUNNING) {
         /* It returned from its entry. */
@@ -357,6 +372,7 @@ uint64_t ppu_thread_register_main(void)
         t->state    = PPU_THREAD_STATE_RUNNING;
         t->joinable = 0;                    /* nobody joins the main thread */
         strncpy(t->name, "main", sizeof(t->name) - 1);
+        ps3_ft_name(1, "main");
 #ifdef _WIN32
         t->finish_event = CreateEventA(NULL, TRUE, FALSE, NULL);
 #else
@@ -537,6 +553,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
         const char* name = (const char*)vm_to_host(name_addr);
         strncpy(t->name, name, sizeof(t->name) - 1);
         t->name[sizeof(t->name) - 1] = '\0';
+        ps3_ft_name((uint32_t)(t - g_ppu_threads) + 1u, t->name);
     }
 
     /* Create synchronization for join */
@@ -733,7 +750,7 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
 {
     uint64_t tid          = LV2_ARG_U64(ctx, 0);
     uint32_t status_addr  = LV2_ARG_PTR(ctx, 1);
-    { static int n=0; if (n < 30 && ++n) fprintf(stderr,"[WAIT] ppu_thread_join(tid=%llu)\n", (unsigned long long)tid); }
+    { static int n=0; if(PS3_LOG_FIRST(n, 30)) fprintf(stderr,"[WAIT] ppu_thread_join(tid=%llu)\n", (unsigned long long)tid); }
 
     table_lock();
     ppu_thread_info* t = find_thread(tid);
@@ -1399,6 +1416,7 @@ int64_t sys_ppu_thread_rename(ppu_context* ctx)
         const char* name = (const char*)vm_to_host(name_addr);
         strncpy(t->name, name, sizeof(t->name) - 1);
         t->name[sizeof(t->name) - 1] = '\0';
+        ps3_ft_name((uint32_t)(t - g_ppu_threads) + 1u, t->name);
     }
 
     table_unlock();

@@ -43,6 +43,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stddef.h>
+#include "ps3emu/log_first.h"
 
 /* Environment switches are read where they are used, some of them per call:
  * answer from the pointer-keyed cache (ps3emu/env_cache.h). */
@@ -153,6 +154,12 @@ SPURS_JOB_TLS uint32_t g_spurs_job_mbox, g_spurs_job_mbox_intr;
  * expects an answer back through the completion event. */
 SPURS_JOB_TLS uint32_t g_spurs_job_cmd;
 SPURS_JOB_TLS int g_spurs_job_mbox_valid;
+/* The SPU number a job sees (cellSpursGetCurrentSpuId, kernel LS 0x1C8). A host
+ * thread that runs jobs concurrently with others must claim its own: titles
+ * key per-SPU resources on it (Edge output rings, one RSX label per SPU), and
+ * two jobs that both think they are SPU 0 corrupt each other's ring. */
+SPURS_JOB_TLS uint32_t g_spurs_job_spu_num;
+void spurs_job_set_spu_num(uint32_t n) { g_spurs_job_spu_num = n; }
 
 /* One context per host thread, reused across jobs. Each job used to pay a
  * 256 KB calloc, the 256 KB+ memset of a stack-local context, a 256 KB copy
@@ -351,8 +358,29 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
         ls32(ls, ctx_ls + JC_CACHE_BUFFER + (uint32_t)i * 4u, cache_ls[i]);
     /* sizeJobDescriptor:4 is the first bitfield of a big-endian u32, so it
      * occupies the TOP 4 bits. 0 means 64 bytes, otherwise n*128. */
+    /* The low 28 bits are not padding to a "JOBCRT Ver13" crt (WWS/Edge jobs,
+     * Twisted Metal's JobQueue jobs): jm2 parks an LS pointer to its kernel
+     * block there, and the crt returns 0x80410A11 and STOPs before main when
+     * it is 0 -- so the job never runs and never clears its completion
+     * counter. Hand it the free 16 bytes after the context (zeroed); the crt
+     * only stashes the pointer and clears the field again. */
+    uint32_t jm_iface = memcmp(ls + 0x30, "JOBCRT Ver13", 12) == 0 ? ctx_ls + 0x30 : 0;
+    /* The same crt also reads the SPURS kernel context with ABSOLUTE loads
+     * (lqa): spuNum at 0x1C8 (cellSpursGetCurrentSpuId), the trace buffer at
+     * 0x210, a trace-enable byte at 0x175. On hardware the kernel owns
+     * 0x100-0x2FF; here the job is loaded at 0, so those reads returned the
+     * job's own instruction words and it indexed per-SPU tables with an opcode
+     * and halted. The lifted code never reads those bytes as data, so overlay
+     * the kernel's view: SPU 0, our DMA tag, tracing off. */
+    if (jm_iface) {
+        memset(ls + 0x170, 0, 0x10);
+        memset(ls + 0x1C0, 0, 0x10);
+        ls32(ls, 0x1C8, g_spurs_job_spu_num);
+        ls32(ls, 0x1CC, JOB_DMA_TAG);
+        memset(ls + 0x210, 0, 0x10);
+    }
     ls32(ls, ctx_ls + JC_SIZE_JOB_DESC,
-         (dsz == 64 ? 0u : (dsz / 128u) & 0xFu) << 28);
+         ((dsz == 64 ? 0u : (dsz / 128u) & 0xFu) << 28) | jm_iface);
     ls16(ls, ctx_ls + JC_NUM_IO_BUFFER,    (uint16_t)n_dma);
     ls16(ls, ctx_ls + JC_NUM_CACHE_BUFFER, (uint16_t)n_cache);
     ls32(ls, ctx_ls + JC_O_BUFFER, out_ls);
@@ -362,7 +390,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     ls32(ls, ctx_ls + JC_EA_JOB_DESCRIPTOR + 4, job_ea);
 
     { static int _n = 0;
-      if (_n < 4 && ++_n)
+      if (PS3_LOG_FIRST(_n, 4))
           fprintf(stderr,
               "[spurs-job] job 0x%08X: bin 0x%08X+%u -> LS 0 | io=0x%05X(%u, %u dma, %u used)"
               " out=0x%05X(%u) scratch=0x%05X(%u) stack_top=0x%05X(%u) cache=%u"
@@ -375,7 +403,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
      * its DMA and atomic EAs from these words, so when a job spins on a
      * lock-line address that is not backed, this is what to read first. */
     { static int _d = 0;
-      if (s_dd && (_d < 4 && ++_d)) {
+      if (s_dd && PS3_LOG_FIRST(_d, 4)) {
           fprintf(stderr, "[spurs-job] desc @0x%08X (%u bytes):", job_ea, dsz);
           for (uint32_t o = 0; o < dsz && o < 128; o += 4) {
               if ((o & 31) == 0) fprintf(stderr, "\n    +%02X:", o);
@@ -440,7 +468,14 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     }
 
     /* ---- enter the job -------------------------------------------------- */
-    ctx->gpr[1]._u32[0] = (stack_top - 16u) & ~15u;   /* SPU stack grows down */
+    /* SPU stack grows down. A function saves its link register in its
+     * caller's frame, at 16($sp), so the entry's first store lands 16 bytes
+     * above $sp. The cache buffers start right at stack_top: with $sp at
+     * stack_top - 16 that save overwrote the first quadword of
+     * cacheBuffer[0] (Twisted Metal's Edge jobs read their viewport there and
+     * got width = height = 0). Leave the caller's 32-byte frame inside the
+     * stack. */
+    ctx->gpr[1]._u32[0] = (stack_top - 32u) & ~15u;
     /* Link register: where the job returns when it is done. The job manager
      * would pass an address inside itself; 0 makes the job re-enter its own
      * entry at LS 0 and run a bogus second lap. */
@@ -449,7 +484,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     ctx->gpr[4]._u32[0] = desc_ls;                    /* CellSpursJob256*      */
 
     { static int _n = 0;
-      if (_n < 4 && ++_n)
+      if (PS3_LOG_FIRST(_n, 4))
           fprintf(stderr, "[spurs-job] ENTER r3=%08X r4=%08X r1=%08X entry-fn image=%d\n",
                   ctx->gpr[3]._u32[0], ctx->gpr[4]._u32[0], ctx->gpr[1]._u32[0],
                   image_id); }
@@ -467,6 +502,23 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
      * comment here claimed they carried the title's bus counts; they do not,
      * and feeding them into the completion event turned 0x40000000 into a 1 GB
      * allocation request. Kept because the printf service needs them. */
+    /* TEMP SPURS_JOB_LSWORD=<img>:<lsa>: after a job of that image, print the
+     * LS word at lsa and every other LS offset holding the same value. */
+    { static int img = -2; static uint32_t lsa; static int n = 0;
+      if (img == -2) { const char* e = getenv("SPURS_JOB_LSWORD"); img = -1;
+          if (e) { img = atoi(e); const char* c = strchr(e, ':'); lsa = c ? (uint32_t)strtoul(c + 1, 0, 16) : 0; } }
+      if (img == image_id && PS3_LOG_FIRST(n, 3)) {
+          const uint8_t* q = ctx->ls + (lsa & 0x3FFFC);
+          uint32_t v = ((uint32_t)q[0] << 24) | ((uint32_t)q[1] << 16) | ((uint32_t)q[2] << 8) | q[3];
+          fprintf(stderr, "[lsword] img=%d job=0x%08X LS[0x%05X]=0x%08X io=0x%05X also at:", image_id, job_ea, lsa, v, io_ls);
+          for (uint32_t o = 0; o + 4 <= SPU_LS_SIZE; o += 4) {
+              const uint8_t* p = ctx->ls + o;
+              if (o != (lsa & 0x3FFFC) && ((uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]) == v)
+                  fprintf(stderr, " 0x%05X", o);
+          }
+          fprintf(stderr, "\n");
+      } }
+
     g_spurs_job_mbox      = spu_channel_has_data(&ctx->ch_out_mbox)
                           ? ctx->ch_out_mbox.value : 0;
     g_spurs_job_mbox_intr = spu_channel_has_data(&ctx->ch_out_intr_mbox)
@@ -482,7 +534,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
       g_spurs_job_cmd = _cb ? (g32(_cb) >> 16) : 0; }
     { static int s_t = -1; if (s_t < 0) s_t = getenv("SPURS_JOB_MBOX") ? 1 : 0;
       static int n = 0;
-      if (s_t && (n < 16 && ++n) && g_spurs_job_mbox_valid)
+      if (s_t && PS3_LOG_FIRST(n, 16) && g_spurs_job_mbox_valid)
           fprintf(stderr, "[spurs-job] job 0x%08X posted mbox=0x%08X intr=0x%08X\n",
                   job_ea, g_spurs_job_mbox, g_spurs_job_mbox_intr); }
 

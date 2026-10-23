@@ -97,6 +97,9 @@ static void guard_fault(int sig)
 /* The lv2 SPU thread-group layer, handlers and all. Compiled in rather than
  * linked so the test can call the static syscall handlers directly and read
  * the group and thread tables to check what they did. */
+/* Syscall 14's classifier (#341) lives in lv2_lock_line.c, which pulls in the
+ * VM map table; nothing here issues syscall 14. */
+int64_t lv2_spu_lock_line_classify(uint32_t a, uint64_t f) { (void)a; (void)f; return 0; }
 #include "../../syscalls/lv2_register.c"
 #include "../spu_helpers.h"
 void spu_wrch(spu_context*, uint32_t, u128);

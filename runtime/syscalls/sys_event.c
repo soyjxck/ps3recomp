@@ -9,6 +9,7 @@
 #include "../spu/spu_workload.h"   /* spu_elf_image_size, spu_workload_dispatch_async */
 #include <string.h>
 #include <stdlib.h>               /* getenv */
+#include "ps3emu/log_first.h"
 
 /* Environment switches are read where they are used, some of them per call:
  * answer from the pointer-keyed cache (ps3emu/env_cache.h). */
@@ -67,6 +68,10 @@ static void write_be32(uint32_t addr, uint32_t val)
 #endif
     *p = val;
 }
+
+/* Last event pushed to each queue, for EVT_RECV_KICK. */
+static sys_event_t s_last_evt[SYS_EVENT_QUEUE_MAX];
+static int s_have_last_evt[SYS_EVENT_QUEUE_MAX];
 
 static uint64_t bswap64(uint64_t v)
 {
@@ -528,7 +533,7 @@ static int64_t sys_event_queue_receive_impl(ppu_context* ctx)
      * function + the value it waits on. Fires a few times. YDKJ_Q23STACK. */
     if ((queue_id == 2 || queue_id == 3) && getenv("YDKJ_Q23STACK")) {
 #ifdef _WIN32
-        static int _gs23 = 0; if (_gs23 < 4 && ++_gs23) {
+        static int _gs23 = 0; if (PS3_LOG_FIRST(_gs23, 4)) {
             void* fr[48]; unsigned short n=RtlCaptureStackBackTrace(0,48,fr,0);
             char* base=(char*)GetModuleHandleA(0);
             char ln[1000]; int p=snprintf(ln,sizeof ln,"[Q23STACK q=%u] host RVAs:",queue_id);
@@ -562,6 +567,33 @@ static int64_t sys_event_queue_receive_impl(ppu_context* ctx)
 #ifdef _WIN32
     EnterCriticalSection(&q->lock);
 
+    /* EVT_RECV_KICK=<qid>:<ms>: an infinite wait on that queue that sees
+     * nothing for <ms> gets the last event pushed to the queue re-delivered.
+     * For a completion queue whose producer intermittently loses a wakeup:
+     * the waiter re-checks its own state and waits again if it was not done.
+     * ponytail: papers over a lost SPU completion; find the loss to remove it. */
+    static int s_kq = -1; static DWORD s_kms = 0;
+    if (s_kq < 0) { const char* e = getenv("EVT_RECV_KICK"); s_kq = 0;
+        if (e) { s_kq = atoi(e); const char* c = strchr(e, ':'); s_kms = c ? (DWORD)atoi(c + 1) : 500; } }
+    if (timeout_us == 0 && s_kq == (int)queue_id && s_have_last_evt[queue_id - 1]) {
+        while (q->count == 0 && q->active && !q->cancelled) {
+            if (!SleepConditionVariableCS(&q->not_empty, &q->lock, s_kms) && q->count == 0) {
+                sys_event_t evt = s_last_evt[queue_id - 1];
+                LeaveCriticalSection(&q->lock);
+                { static int n = 0; if (PS3_LOG_FIRST(n, 16))
+                    fprintf(stderr, "[evt] EVT_RECV_KICK: q=%u idle %lu ms -> re-delivered last event\n",
+                            queue_id, (unsigned long)s_kms); }
+                ctx->gpr[4] = evt.source; ctx->gpr[5] = evt.data1;
+                ctx->gpr[6] = evt.data2;  ctx->gpr[7] = evt.data3;
+                if (event_addr) {
+                    uint64_t* out = (uint64_t*)vm_to_host(event_addr);
+                    out[0] = bswap64(evt.source); out[1] = bswap64(evt.data1);
+                    out[2] = bswap64(evt.data2);  out[3] = bswap64(evt.data3);
+                }
+                return CELL_OK;
+            }
+        }
+    }
     if (timeout_us == 0) {
         while (q->count == 0 && q->active && !q->cancelled) {
             SleepConditionVariableCS(&q->not_empty, &q->lock, INFINITE);
@@ -664,7 +696,7 @@ static int64_t sys_event_queue_receive_impl(ppu_context* ctx)
       if (s_lq >= 0 && (long)queue_id == s_lq) { static int n = 0; if (n < 600 && ++n)
           fprintf(stderr, "[evt-recv] q=%u tid=%u r4=0x%llX r5=0x%llX r6=0x%llX r7=0x%llX\n", queue_id, (unsigned)ctx->thread_id,
                   (unsigned long long)ctx->gpr[4], (unsigned long long)ctx->gpr[5], (unsigned long long)ctx->gpr[6], (unsigned long long)ctx->gpr[7]); } }
-    { static int _r=0; if (getenv("PS3_EVT_RECV_TRACE") && (_r < 60 && ++_r)) fprintf(stderr,
+    { static int _r=0; if (getenv("PS3_EVT_RECV_TRACE") && PS3_LOG_FIRST(_r, 60)) fprintf(stderr,
         "[RECV] q=%u source=0x%llX data1=0x%llX data2=0x%llX\n", queue_id,
         (unsigned long long)evt.source, (unsigned long long)evt.data1,
         (unsigned long long)evt.data2); }
@@ -691,7 +723,7 @@ static int64_t sys_event_queue_receive_impl(ppu_context* ctx)
                           _sel = !e ? 1 : (strcmp(e, "all") == 0 ? -1 : atoi(e)); }
     if (_sel == -1 || (int)queue_id == _sel) {
         static int _r = 0;
-        if (_r < 64 && ++_r)
+        if (PS3_LOG_FIRST(_r, 64))
             fprintf(stderr, "[evt] q=%u receive RETURNED to tid=%llu: src=0x%llX d1=0x%llX d2=0x%llX d3=0x%llX (qcount now %u)\n",
                     queue_id,
                     (unsigned long long)ctx->thread_id, (unsigned long long)evt.source,
@@ -792,6 +824,15 @@ static int event_queue_push(sys_event_queue_info* q, const sys_event_t* evt)
 #ifdef _WIN32
     if (evq_who_on()) evq_who_add((unsigned)(q - g_sys_event_queues) + 1u, 1, 0.0);
 #endif
+    { const int qi = (int)(q - g_sys_event_queues);
+      if (qi >= 0 && qi < SYS_EVENT_QUEUE_MAX) { s_last_evt[qi] = *evt; s_have_last_evt[qi] = 1; } }
+    /* EVT_PUSHLOG=<qid>: log every push to that queue with the host caller, to
+     * find which producer feeds a queue when nothing logs a port_send. */
+    { static int s_q = -1; if (s_q < 0) { const char* e = getenv("EVT_PUSHLOG"); s_q = e ? atoi(e) : 0; }
+      if (s_q && q == &g_sys_event_queues[s_q - 1]) { static int s_n = 0;
+        if (PS3_LOG_FIRST(s_n, 200)) fprintf(stderr, "[evt-push] q=%d src=0x%llX d=0x%llX/0x%llX/0x%llX ra=%p\n",
+                s_q, (unsigned long long)evt->source, (unsigned long long)evt->data1,
+                (unsigned long long)evt->data2, (unsigned long long)evt->data3, __builtin_return_address(0)); } }
     /* PS3_EVQSTAT=<n>: every n pushes, report each live queue's push count and
      * how many events are sitting in it unread.
      *
@@ -1225,9 +1266,9 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
     uint64_t bitpat     = LV2_ARG_U64(ctx, 1);
     uint32_t mode       = LV2_ARG_U32(ctx, 2);
     uint32_t result_addr = LV2_ARG_PTR(ctx, 3);
-    { static int n=0; if (n < 30 && ++n) fprintf(stderr,"[WAIT] event_flag_wait(flag=%u pat=0x%llX mode=%u)\n", flag_id,(unsigned long long)bitpat,mode); }
+    { static int n=0; if(PS3_LOG_FIRST(n, 30)) fprintf(stderr,"[WAIT] event_flag_wait(flag=%u pat=0x%llX mode=%u)\n", flag_id,(unsigned long long)bitpat,mode); }
     uint64_t timeout_us = LV2_ARG_U64(ctx, 4);
-    { static int _w=0; if (_w < 40 && ++_w) fprintf(stderr, "[WAIT] event_flag_wait(flag=%u bits=0x%llX timeout=%llu)\n", flag_id, (unsigned long long)bitpat, (unsigned long long)timeout_us); }
+    { static int _w=0; if (PS3_LOG_FIRST(_w, 40)) fprintf(stderr, "[WAIT] event_flag_wait(flag=%u bits=0x%llX timeout=%llu)\n", flag_id, (unsigned long long)bitpat, (unsigned long long)timeout_us); }
     /* SPU-completion shim (targeted): the main thread spins in func_003319D0 until
      * *(r29+0x24) (a completion counter the SPU would increment) reaches the target
      * *(r29). Since we don't yet run the SPU workload, satisfy that counter so the
@@ -1240,7 +1281,7 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
         uint32_t obj = (uint32_t)ctx->gpr[29];
         uint8_t* tgt = (uint8_t*)vm_to_host(obj);
         uint8_t* cur = (uint8_t*)vm_to_host(obj + 0x24);
-        static int _n=0; if (_n < 12 && ++_n)
+        static int _n=0; if (PS3_LOG_FIRST(_n, 12))
             fprintf(stderr, "[evt] SPU-completion shim: flag=%u r29=0x%08X target=%02X%02X%02X%02X cur=%02X%02X%02X%02X -> satisfied\n",
                     flag_id, obj, tgt[0],tgt[1],tgt[2],tgt[3], cur[0],cur[1],cur[2],cur[3]);
         cur[0]=tgt[0]; cur[1]=tgt[1]; cur[2]=tgt[2]; cur[3]=tgt[3];
@@ -1248,7 +1289,7 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
     }
 
     if (flag_id == 0 || flag_id > SYS_EVENT_FLAG_MAX) {
-        { static int _e=0; if (_e < 8 && ++_e) fprintf(stderr,"[evt] flag_wait flag=%u OUT-OF-RANGE (max=%d) -> ESRCH\n", flag_id, SYS_EVENT_FLAG_MAX); }
+        { static int _e=0; if(PS3_LOG_FIRST(_e, 8)) fprintf(stderr,"[evt] flag_wait flag=%u OUT-OF-RANGE (max=%d) -> ESRCH\n", flag_id, SYS_EVENT_FLAG_MAX); }
         return (int64_t)(int32_t)CELL_ESRCH;
     }
 
@@ -1259,13 +1300,13 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
      * real render code. Diagnostic only; identifies whether the spin is the gate. */
     { static int s_f = -1; if (s_f < 0) s_f = getenv("PS3_EVF_OK_IF_MISSING") ? 1 : 0;
       if (s_f && !g_sys_event_flags[flag_id-1].active) {
-        static int _n=0; if (_n < 4 && ++_n) fprintf(stderr,"[evt] PS3_EVF_OK_IF_MISSING: flag=%u -> return CELL_OK (break spin)\n", flag_id);
+        static int _n=0; if(PS3_LOG_FIRST(_n, 4)) fprintf(stderr,"[evt] PS3_EVF_OK_IF_MISSING: flag=%u -> return CELL_OK (break spin)\n", flag_id);
         if (result_addr != 0) { write_be32(result_addr, (uint32_t)(bitpat>>32)); write_be32(result_addr+4, (uint32_t)bitpat); }
         return CELL_OK;
       } }
     sys_event_flag_info* f = &g_sys_event_flags[flag_id - 1];
     if (!f->active) {
-        { static int _e=0; if (_e < 8 && ++_e) {
+        { static int _e=0; if(PS3_LOG_FIRST(_e, 8)) {
             uint32_t r29=(uint32_t)ctx->gpr[29], r30=(uint32_t)ctx->gpr[30], r31=(uint32_t)ctx->gpr[31], r3g=(uint32_t)ctx->gpr[3];
             fprintf(stderr,"[evt] flag_wait flag=%u NOT ACTIVE -> ESRCH; r3=0x%08X r29=0x%08X r30=0x%08X r31=0x%08X\n", flag_id, r3g, r29, r30, r31);
             /* dump the loop's likely counter object (r29-relative, like the flag=1000 shim's *(r29)/*(r29+0x24)) */
@@ -1286,7 +1327,7 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
 #endif
         return (int64_t)(int32_t)CELL_ESRCH;
     }
-    { static int _a=0; if (_a < 8 && ++_a) fprintf(stderr,"[evt] flag_wait flag=%u ACTIVE, pattern=0x%llX awaiting bits=0x%llX -> BLOCK\n", flag_id,(unsigned long long)f->pattern,(unsigned long long)bitpat); }
+    { static int _a=0; if(PS3_LOG_FIRST(_a, 8)) fprintf(stderr,"[evt] flag_wait flag=%u ACTIVE, pattern=0x%llX awaiting bits=0x%llX -> BLOCK\n", flag_id,(unsigned long long)f->pattern,(unsigned long long)bitpat); }
 
     if (bitpat == 0)
         return (int64_t)(int32_t)CELL_EINVAL;
@@ -1298,7 +1339,7 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
      * identifies the gate. */
     { static int s_fe = -1; if (s_fe < 0) s_fe = getenv("PS3_EVF_FORCE") ? 1 : 0;
       if (s_fe && f->active && !flag_check(f->pattern, bitpat, mode)) {
-        static int _n = 0; if (_n < 20 && ++_n)
+        static int _n = 0; if (PS3_LOG_FIRST(_n, 20))
             fprintf(stderr, "[evt] PS3_EVF_FORCE: force-satisfy flag=%u bits=0x%llX mode=%u\n",
                     flag_id, (unsigned long long)bitpat, mode);
 #ifdef _WIN32
@@ -1476,7 +1517,7 @@ int64_t sys_event_flag_set(ppu_context* ctx)
     uint32_t flag_id = LV2_ARG_U32(ctx, 0);
     uint64_t bitpat  = LV2_ARG_U64(ctx, 1);
 
-    { static int _n=0; if (_n < 200 && ++_n) fprintf(stderr,"[evt] flag_set(flag=%u bits=0x%llX)\n",
+    { static int _n=0; if(PS3_LOG_FIRST(_n, 200)) fprintf(stderr,"[evt] flag_set(flag=%u bits=0x%llX)\n",
         flag_id,(unsigned long long)bitpat); }
 
     if (flag_id == 0 || flag_id > SYS_EVENT_FLAG_MAX)

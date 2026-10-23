@@ -62,10 +62,18 @@ jobs:
       - name: Build
         run: cmake --build build --target ps3recomp_host
 
+      # The HLSL -> SPIR-V translation cache: a repeat is served from memory,
+      # PS3RECOMP_SPIRV_CACHE's files serve the next run, a damaged file is a
+      # miss. Needs glslang, which configure has already checked for.
+      - name: SPIR-V translation cache test
+        run: |
+          cmake --build build --target test_shader_spirv
+          ./build/test_shader_spirv
+
       - name: Fixed-function path (no guest programs)
         run: |
           fail=0
-          for m in "" "--draw" "--draw --frames=60" "--depth" "--tex" "--tex-io" "--quads" "--threads"; do
+          for m in "" "--draw" "--draw --frames=60" "--depth" "--tex" "--tex-io" "--quads" "--threads" "--split-present"; do
             rc=0; ./build/ps3recomp_host $m > run.log 2>&1 || rc=$?
             echo "::group::ps3recomp_host ${m:-(default)} -> exit $rc"; cat run.log; echo "::endgroup::"
             [ "$rc" -eq 0 ] || { echo "::error::${m:-default}: exit $rc"; fail=1; }
@@ -82,7 +90,7 @@ jobs:
           # before any backend exists (the first pass still runs it).
           for m in "" "--draw" "--depth" "--quads" "--shader" \
                    "--tex" "--tex-io" "--mip" "--rtt" "--depthtex" "--mrt" "--mrt-a" \
-                   "--depthbounds"; do
+                   "--depthbounds" "--split-present" "--feedback"; do
             rc=0; ./build/ps3recomp_host $m > run.log 2>&1 || rc=$?
             name=${m:-default}
             echo "::group::ps3recomp_host $name -> exit $rc"; cat run.log; echo "::endgroup::"

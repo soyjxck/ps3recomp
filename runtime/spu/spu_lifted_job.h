@@ -21,6 +21,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+void spu_mfc_release(spu_context* ctx);   /* spu_channels.c */
+
 typedef void (*spu_lifted_entry_fn)(spu_context*);
 /* Guest RAM base, for decoding a raw SPU thread's argument block. */
 extern uint8_t* vm_base;

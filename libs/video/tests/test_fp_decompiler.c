@@ -12,8 +12,10 @@
  * how many SV_TARGETs a program that writes more than one export gets.
  */
 
+#define _POSIX_C_SOURCE 200809L   /* setenv */
 #include "../rsx_fp_decompiler.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int g_pass = 0, g_fail = 0;
@@ -89,6 +91,39 @@ static void check_true(const char* test, int cond)
 int main(void)
 {
     char hlsl[16384];
+
+    /* RSX_FP_DEBUG=<hash>:<n>:<reg>: the named register, captured after the
+     * program's n-th instruction, becomes colour target 0 with alpha 1 --
+     * in that program only. The variable is read once, on the first
+     * decompile, so this runs first. */
+    {
+        u8 prog[32];
+        u32 mask_xy = (1u<<9)|(1u<<10);
+        put_word(prog + 0, OPC(0x02) | mask_xy | OUTREG(1));          /* MUL r1.xy, r0, r0 */
+        put_word(prog + 4, T_TEMP | REG(0) | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, T_TEMP | REG(0) | SWZ_IDENT);
+        put_word(prog + 12, 0);
+        put_word(prog + 16, OPC(0x01) | OUTMASK_ALL | INSRC(1) | END); /* MOV r0, COL0 */
+        put_word(prog + 20, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 24, 0);
+        put_word(prog + 28, 0);
+        char spec[64];
+        snprintf(spec, sizeof spec, "%llx:1:r1.xyyy", (unsigned long long)
+                 rsx_fp_structural_hash(prog, sizeof prog, 1469598103934665603ull));
+        setenv("RSX_FP_DEBUG", spec, 1);
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check("fp_debug_capture", hlsl,
+              "r[1].xy = _v.xy; }\n"
+              "    _rsx_dbg = (float4)((r[1]).xyyy);\n"
+              "    { float4 _v = (float4)((input.col0).xyzw);");
+        check("fp_debug_export", hlsl, "_d.w = 1.0; r[0] = _d; h[0] = _d; }\n"
+                                       "    float4 _o = r[0];");
+        u8 other[16];
+        memcpy(other, prog + 16, sizeof other);
+        rsx_fp_decompile(other, sizeof(other), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check_absent("fp_debug_other_program", hlsl, "_rsx_dbg");
+        unsetenv("RSX_FP_DEBUG");
+    }
 
     /* Test 1: MOV r0, COL0  (write all, END). */
     {
@@ -300,6 +335,30 @@ int main(void)
         check_absent("lif_handled", hlsl, "unhandled FP opcode");
     }
 
+    /* A unit bound to a 3D texture (SET_TEXTURE_FORMAT dimension 3) is
+     * declared Texture3D and sampled with three coordinates; TXP divides
+     * them by w. inFAMOUS 2's occlusion volumes look up an 8x8x8 cone LUT. */
+    {
+        u8 prog[16];
+        put_word(prog + 0, OPC(0x17) | OUTMASK_ALL | INSRC(4) | TEXU(0) | END); /* TEX TC0 */
+        put_word(prog + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 0);
+        rsx_fp_set_volume_units(1u);
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check("vol_decl",   hlsl, "Texture3D   rsx_tex0 : register(t0);");
+        check("vol_sample", hlsl, "rsx_tex0.Sample(rsx_samp[0], ((input.tc0).xyzw).xyz)");
+        put_word(prog + 0, OPC(0x18) | OUTMASK_ALL | INSRC(4) | TEXU(0) | END); /* TXP TC0 */
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check("vol_txp", hlsl, "rsx_tex0.Sample(rsx_samp[0], ((input.tc0).xyzw).xyz / ((input.tc0).xyzw).w)");
+        /* No volume units: the array declaration and 2D sample as before. */
+        rsx_fp_set_volume_units(0);
+        put_word(prog + 0, OPC(0x17) | OUTMASK_ALL | INSRC(4) | TEXU(0) | END);
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check("vol_none", hlsl, "rsx_tex[0].Sample(rsx_samp[0], ((input.tc0).xyzw).xy)");
+        check_absent("vol_none_decl", hlsl, "Texture3D");
+    }
+
     /* A predicated write is a select, not a blend: MOV r0, COL0 executed
      * only where CC0 > 0 must keep r0 bit for bit in the other components.
      * lerp(r0, v, mask) is arithmetic, so an Inf/NaN in either operand
@@ -315,6 +374,79 @@ int main(void)
         check("pred_select", hlsl,
               "r[0].xyzw = (_p.xyzw != 0.0) ? _v.xyzw : r[0].xyzw;");
         check_absent("pred_no_lerp", hlsl, "lerp(");
+    }
+
+    /* EXP_TEX (OPDEST bit 21, the _bx2 modifier) returns the fetch as x*2-1
+     * on every lane, on any unit, and the unit's own texel conversions step
+     * aside for it (RPCS3 _process_texel). inFAMOUS 2 reads its tangent-space
+     * normal maps that way; read unexpanded, every normal leaned towards
+     * (1,1,1). */
+    {
+        u8 prog[16];
+        u32 ops[16] = {0};
+        put_word(prog + 0, OPC(0x17) | OUTMASK_ALL | INSRC(4) | TEXU(0) | (1u << 21) | END); /* TEX TC0, EXP_TEX */
+        put_word(prog + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 0);
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check("bx2_expanded", hlsl, "((rsx_tex[0].Sample(rsx_samp[0], ((input.tc0).xyzw).xy)) * 2.0 - 1.0)");
+
+        /* Gamma and the biased remap on every lane of the unit: a _bx2 fetch
+         * still comes back as x*2-1, not through the unit's conversions. */
+        ops[0] = 0xFFu;
+        rsx_fp_set_texel_ops(ops);
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        rsx_fp_set_texel_ops(NULL);
+        check("bx2_over_texop", hlsl, "((rsx_tex[0].Sample(rsx_samp[0], ((input.tc0).xyzw).xy)) * 2.0 - 1.0)");
+        check_absent("bx2_no_texop_call", hlsl, "rsx_texop0(rsx_tex");
+
+        /* Without the bit the unit's conversions apply, as before. */
+        put_word(prog + 0, OPC(0x17) | OUTMASK_ALL | INSRC(4) | TEXU(0) | END);
+        rsx_fp_set_texel_ops(ops);
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        rsx_fp_set_texel_ops(NULL);
+        check("texop_without_bx2", hlsl, "rsx_texop0(rsx_tex[0].Sample(rsx_samp[0], ((input.tc0).xyzw).xy))");
+        check_absent("texop_without_bx2_math", hlsl, "* 2.0 - 1.0");
+    }
+
+    /* SRC2 bit 31 (perspective_corr) on a texcoord read multiplies the input
+     * by 1/w (RPCS3 FragmentProgramDecompiler: "Perspective correct flag
+     * multiplies the result by 1/w"). inFAMOUS 2's water writes uv*w from the
+     * vertex program and samples TC2 with the flag set; read raw, uv*w lands
+     * far outside the screen copy and the river samples black. The helper
+     * takes the whole input, so the program does not name input.position
+     * (which would give it a WPOS-scaled build of its own). */
+    {
+        u8 prog[16];
+        put_word(prog + 0, OPC(0x17) | OUTMASK_ALL | INSRC(6) | TEXU(0) | END); /* TEX TC2 */
+        put_word(prog + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 1u << 31);
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check("persp_tc_scaled", hlsl, "(input.tc2 * _rsx_inv_w(input))");
+        check("persp_helper",    hlsl, "#define _rsx_inv_w(i)");
+        check_absent("persp_no_wpos", hlsl, "input.position");
+
+        put_word(prog + 12, 0);
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check("persp_off_raw",    hlsl, "((input.tc2).xyzw).xy");
+        check_absent("persp_off_no_helper", hlsl, "_rsx_inv_w");
+    }
+
+    /* FACING (input 0xE) is +1 on a front face and -1 on a back face; the
+     * face flag is declared only in a program that reads it. */
+    {
+        u8 prog[16];
+        put_word(prog + 0, OPC(0x01) | OUTMASK_ALL | INSRC(0xE) | END); /* MOV r0, FACING */
+        put_word(prog + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 0);
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check("facing_decl", hlsl, "    bool _rsx_front : SV_IsFrontFace;\n");
+        check("facing_read", hlsl, "(input._rsx_front ? float4(1,1,1,1) : float4(-1,-1,-1,-1))");
+        put_word(prog + 0, OPC(0x01) | OUTMASK_ALL | INSRC(1) | END);   /* MOV r0, COL0 */
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check_absent("facing_not_declared", hlsl, "SV_IsFrontFace");
     }
 
     printf("\n===========================================\n");

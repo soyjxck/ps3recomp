@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>   /* getenv -- sync_trace(); pulled in transitively by windows.h, absent on POSIX */
 #include <string.h>
+#include "ps3emu/log_first.h"
 
 /* Yield hint for spin-wait loops */
 #ifdef _WIN32
@@ -58,7 +59,7 @@ static int sync_trace(void){ static int v=-1; if(v<0){const char*e=getenv("SYNC_
  * before the op, so a PPU re-initialise under an SPU waiter is visible. */
 static uint32_t sync_watch(void){ static int64_t v=-2; if(v==-2){const char*e=getenv("SYNC_WATCH"); v=e?(int64_t)strtoul(e,0,16):-1;} return v<0?0u:(uint32_t)v; }
 #define SYNC_WATCH_LOG(op, ea, m) do { if ((ea) && (ea) == sync_watch()) { \
-        static int _c; if (_c < 400 && ++_c) fprintf(stderr, "[SYNCW] %s ea=0x%08X word=%08X tid=%lu\n", op, (ea), \
+        static int _c; if (PS3_LOG_FIRST(_c, 400)) fprintf(stderr, "[SYNCW] %s ea=0x%08X word=%08X tid=%lu\n", op, (ea), \
             sync_bswap32(atomic_load(&(m)->lock)), SYNC_TID()); } } while (0)
 
 /* The mutex word is shared with SPU code that takes it with GETLLAR/PUTLLC.

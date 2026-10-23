@@ -656,7 +656,9 @@ static int rsx_vp_decompile_impl(
     if (has_flow) emit(&o, "    }\n");
 
     /* Output register map (see header comment): o0 = HPOS through the RSX
-     * viewport transform, o1/o2 = colors, o5.x = fog, o7..o14 = TEX0..7. */
+     * viewport transform, o1/o2 = colors, o5.x = fog, o7..o14 = TEX0..7,
+     * o15 = TEX8, o6 = TEX9 (RPCS3's reg_table: TEX9 shares the point-size
+     * register). */
     emit(&o,
         "    VSOutput Out;\n"
         "    float4 _p = o[0];\n"

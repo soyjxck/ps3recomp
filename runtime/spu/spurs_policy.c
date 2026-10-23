@@ -30,6 +30,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "ps3emu/log_first.h"
 
 extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
 
@@ -217,7 +218,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
                resident->entry != entry || resident->image_id != image_id) {
         if (!s_fresh) {
             static SPU_THREAD_LOCAL int _n = 0;
-            if (_n < 8 && ++_n)
+            if (PS3_LOG_FIRST(_n, 8))
                 fprintf(stderr, "[spurs-pm] wid=%u spu=%u workload data changed "
                         "0x%llX -> 0x%llX: fresh PM context\n", wid, spu_num,
                         (unsigned long long)resident->data,
@@ -346,7 +347,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     if (tracing) {
         g_pm_flow_n = 0;
         s_flow_arm_ms = ps3_ms_now();
-        { static SPU_THREAD_LOCAL int _a = 0; if (_a < 8 && ++_a) {
+        { static SPU_THREAD_LOCAL int _a = 0; if (PS3_LOG_FIRST(_a, 8)) {
             fprintf(stderr, "[pm-flow] ARM wid=%u spu=%u (watch=0x%08X)\n",
                     wid, spu_num, g_barrier_sync_watch); fflush(stderr); } }
         /* Watchdog: the traced run has been observed to HANG the jobmanager
@@ -408,7 +409,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
         unsigned stages = g_wws_batch_gets - batch_before;
         if (claims || stages) {
             static SPU_THREAD_LOCAL unsigned s_cl = 0;
-            if (s_cl++ < 64) {
+            if (PS3_LOG_FIRST(s_cl, 64)) {
                 const uint8_t* L = ctx->ls;
                 #define W(o)  ((L[(o)]<<24)|(L[(o)+1]<<16)|(L[(o)+2]<<8)|L[(o)+3])
                 fprintf(stderr, "[pm-claim] wid=%u spu=%u first=%d claims=%u stages=%u%s halt_pc=0x%05X "

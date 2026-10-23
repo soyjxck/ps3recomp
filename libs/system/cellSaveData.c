@@ -53,15 +53,25 @@
  * -----------------------------------------------------------------------*/
 
 static char s_save_root[1024] = "./gamedata/dev_hdd0/home/00000001/savedata";
-/* PS3_SAVEDATA_ROOT=<dir>: keep save data somewhere else -- a test harness
- * can then run from a snapshot without touching the player's own saves. */
-static void save_root_init(void)
+
+/* $PS3_GAMEDATA_ROOT replaces the cwd-relative "./gamedata", so a port can keep
+ * the player's saves in one fixed place (e.g. ~/Library/Application Support/...)
+ * no matter which directory the game was launched from.
+ * $PS3_SAVEDATA_ROOT=<dir> names the savedata directory itself and wins over
+ * PS3_GAMEDATA_ROOT -- a test harness can then run from a snapshot without
+ * touching the player's own saves. */
+static void adopt_gamedata_root(void)
 {
-    static int done = 0;
-    if (done) return;
-    done = 1;
-    const char* e = getenv("PS3_SAVEDATA_ROOT");
-    if (e && *e) { strncpy(s_save_root, e, sizeof s_save_root - 1); s_save_root[sizeof s_save_root - 1] = 0; }
+    static int s_done = 0;
+    if (s_done) return;
+    s_done = 1;
+    const char* save = getenv("PS3_SAVEDATA_ROOT");
+    const char* env = getenv("PS3_GAMEDATA_ROOT");
+    if (save && *save) {
+        strncpy(s_save_root, save, sizeof s_save_root - 1);
+        s_save_root[sizeof s_save_root - 1] = 0;
+    } else if (env && *env)
+        snprintf(s_save_root, sizeof(s_save_root), "%s/dev_hdd0/home/00000001/savedata", env);
 }
 
 /* Ensure directory (and parents) exist */
@@ -84,7 +94,7 @@ static void ensure_dirs(const char* path)
 
 static void build_save_path(char* buf, size_t buf_size, const char* dirName)
 {
-    save_root_init();
+    adopt_gamedata_root();
     snprintf(buf, buf_size, "%s/%s", s_save_root, dirName);
 #ifdef _WIN32
     for (char* p = buf; *p; p++) {
@@ -449,7 +459,7 @@ static u32 enumerate_save_dirs(const char* prefix, CellSaveDataDirList* dirList,
 {
     u32 count = 0;
 
-    save_root_init();
+    adopt_gamedata_root();
     ensure_dirs(s_save_root);
 
 #ifdef _WIN32

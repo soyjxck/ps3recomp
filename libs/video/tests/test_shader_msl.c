@@ -153,6 +153,49 @@ int main(int argc, char** argv)
             check("swizzled FP MSL", g_msl, "fragment ");
     }
 
+    /* ---- fragment program: MOV r0, FACING ---------------------------------
+     * Input 0xE is the face flag, +1 front / -1 back. Two-sided materials
+     * multiply the normal by it; it used to read as zero. */
+    {
+        u8 fp[16];
+        rsx_test_fp_instr(fp,
+                          RSX_TEST_FP_OPC(RSX_TEST_FP_OP_MOV) | RSX_TEST_FP_MASK_XYZW |
+                          RSX_TEST_FP_INSRC(0xE) | RSX_TEST_FP_END,
+                          RSX_TEST_FP_SRC_INPUT | RSX_TEST_FP_SWZ_IDENT);
+        check_count("FACING FP",
+                    rsx_fp_decompile_buffered_ex(fp, sizeof fp, 0x40u, 0,
+                                                 g_hlsl, sizeof g_hlsl, NULL), 1);
+        check("FACING FP HLSL", g_hlsl, "bool _rsx_front : SV_IsFrontFace;");
+        check("FACING FP HLSL", g_hlsl, "input._rsx_front ? float4(1,1,1,1) : float4(-1,-1,-1,-1)");
+        if (translate("FACING FP", RSX_SHADER_STAGE_FRAGMENT) == 0)
+            check("FACING FP MSL", g_msl, "[[front_facing]]");
+    }
+
+    /* ---- fragment program: MOV r0, TC8 / TC9 ------------------------------
+     * They follow TEXCOORD7 (locn10), and the VP writes them from o15 / o6. */
+    for (u32 n = 8; n <= 9; n++) {
+        u8 fp[16];
+        rsx_test_fp_instr(fp,
+                          RSX_TEST_FP_OPC(RSX_TEST_FP_OP_MOV) | RSX_TEST_FP_MASK_XYZW |
+                          RSX_TEST_FP_INSRC(0xC + (n - 8)) | RSX_TEST_FP_END,
+                          RSX_TEST_FP_SRC_INPUT | RSX_TEST_FP_SWZ_IDENT);
+        check_count("TC8/9 FP",
+                    rsx_fp_decompile_buffered_ex(fp, sizeof fp, 0x40u, 0,
+                                                 g_hlsl, sizeof g_hlsl, NULL), 1);
+        check("TC8/9 FP HLSL", g_hlsl, n == 8 ? "(input.tc8).xyzw" : "(input.tc9).xyzw");
+        check("TC8/9 FP HLSL", g_hlsl, "float4 tc8:TEXCOORD8; float4 tc9:TEXCOORD9;");
+        if (translate("TC8/9 FP", RSX_SHADER_STAGE_FRAGMENT) == 0)
+            check("TC8/9 FP MSL", g_msl, n == 8 ? "[[user(locn11)]]" : "[[user(locn12)]]");
+    }
+    {
+        u8 vp[16];
+        rsx_test_vp_mov_out(vp, 0, RSX_TEST_VP_SWZ_IDENT, 15, 1);   /* MOV o15, v0, END */
+        rsx_vp_decompile(vp, sizeof vp, g_hlsl, sizeof g_hlsl);
+        check("TC8 VP HLSL", g_hlsl, "Out.t8=o[15]; Out.t9=o[6];");
+        if (translate("TC8 VP", RSX_SHADER_STAGE_VERTEX) == 0)
+            check("TC8 VP MSL", g_msl, "[[user(locn11)]]");
+    }
+
     /* ---- fragment program: TEX r0, TC0 (unit 0) --------------------------- */
     {
         u8 fp[16];
@@ -236,6 +279,57 @@ int main(int argc, char** argv)
         }
     }
 
+    /* ---- fragment program: TEX r0, TC0 on a 3D unit ------------------------
+     * A volume texture (SET_TEXTURE_FORMAT dimension 3): Texture3D in HLSL,
+     * texture3d in MSL, sampled with three coordinates -- inFAMOUS 2's
+     * occlusion volumes look their 8x8x8 cone LUT up this way. */
+    {
+        u8 fp[16];
+        rsx_test_fp_tex_r0_tc0(fp, 0);
+        check_count("3D TEX FP",
+                    rsx_fp_decompile_buffered_shadow_color_expand_vol_ex(fp, sizeof fp, 0x40u,
+                        0, 1u /* unit 0 is 3D */, NULL, NULL, NULL, g_hlsl, sizeof g_hlsl, NULL), 1);
+        check("3D TEX FP HLSL", g_hlsl, "Texture3D   rsx_tex0 : register(t0);");
+        check("3D TEX FP HLSL", g_hlsl, "rsx_tex0.Sample(rsx_samp[0]");
+        if (translate("3D TEX FP", RSX_SHADER_STAGE_FRAGMENT) == 0)
+            check("3D TEX FP MSL", g_msl, "texture3d");
+    }
+
+    /* ---- fragment program: TEX r0, TC0 with EXP_TEX on a biased unit -----
+     * The _bx2 fetch: the lanes the unit's biased remap names come back as
+     * x*2-1. The helper must survive glslang/spirv-cross intact. */
+    {
+        u8 fp[16];
+        u8 expand[16] = {0};
+        expand[0] = 0x7;
+        rsx_test_fp_instr(fp, RSX_TEST_FP_OPC(RSX_TEST_FP_OP_TEX) | RSX_TEST_FP_MASK_XYZW |
+                              RSX_TEST_FP_INSRC_TC0 | RSX_TEST_FP_TEXU(0) | (1u << 21) | RSX_TEST_FP_END,
+                              RSX_TEST_FP_SRC_INPUT | RSX_TEST_FP_SWZ_IDENT);
+        check_count("expand TEX FP", rsx_fp_decompile_buffered_shadow_color_expand_ex(fp, sizeof fp, 0x40u, 0,
+                        NULL, NULL, expand, g_hlsl, sizeof g_hlsl, NULL), 1);
+        check("expand TEX FP HLSL", g_hlsl, "_rsx_expand_input(rsx_tex[0].Sample(rsx_samp[0], ((input.tc0).xyzw).xy), 15u, true)");
+        if (translate("expand TEX FP", RSX_SHADER_STAGE_FRAGMENT) == 0)
+            check("expand TEX FP MSL", g_msl, "* 2.0");
+    }
+
+    /* ---- fragment program: TEX r0, TC0 with perspective_corr --------------
+     * SRC2 bit 31 scales the texcoord by 1/w. Through glslang SV_POSITION.w
+     * becomes FragCoord.w, which is already 1/w, so the helper must resolve
+     * to the bare .w here (RSX_FRAGCOORD_W_IS_RCP) -- a division would undo
+     * the correction and inFAMOUS 2's river would sample outside its copy. */
+    {
+        u8 fp[16];
+        rsx_test_fp_tex_r0_tc0(fp, 0);
+        rsx_test_fp_put_word(fp + 12, 1u << 31);
+        check_count("persp TEX FP", rsx_fp_decompile_buffered_ex(fp, sizeof fp, 0x40u, 0,
+                                                                 g_hlsl, sizeof g_hlsl, NULL), 1);
+        check("persp TEX FP HLSL", g_hlsl, "(input.tc0 * _rsx_inv_w(input.position))");
+        if (translate("persp TEX FP", RSX_SHADER_STAGE_FRAGMENT) == 0) {
+            check("persp TEX FP MSL", g_msl, "gl_FragCoord.w");
+            check_absent("persp TEX FP MSL", g_msl, "1.0 / gl_FragCoord.w");
+        }
+    }
+
     /* ---- fragment program writing TWO colour targets ---------------------
      * MOV r0, COL0 ; MOV r2, COL0.zyxw (END). With 32-bit exports r0 is
      * target A and r2 is target B, so the decompiler returns a struct of two
@@ -261,6 +355,24 @@ int main(int argc, char** argv)
             check("MRT FP MSL", g_msl, "fragment ");
             check("MRT FP MSL", g_msl, "[[color(0)]]");
             check("MRT FP MSL", g_msl, "[[color(1)]]");
+        }
+    }
+
+    /* ---- max/min/clamp/normalize come out as precise:: math ------------- *
+     * spirv-cross writes them as fast::, whose NaN results Metal leaves
+     * undefined; D3D's max/min return the number when one side is NaN, and
+     * the guest programs rely on it. rsx_hlsl_to_msl respells them precise::
+     * unless PS3RECOMP_MSL_FAST is set. */
+    if (!getenv("PS3RECOMP_MSL_FAST")) {
+        snprintf(g_hlsl, sizeof g_hlsl,
+                 "float4 main(float4 c : COLOR0) : SV_TARGET0 {\n"
+                 "    float3 n = normalize(c.xyz);\n"
+                 "    return float4(max(n, c.www), min(c.w, 0.5)) * clamp(c.x, 0.1, 0.9);\n"
+                 "}\n");
+        if (translate("precise math FP", RSX_SHADER_STAGE_FRAGMENT) == 0) {
+            check("precise math FP MSL", g_msl, "precise::max");
+            check("precise math FP MSL", g_msl, "precise::normalize");
+            check_absent("precise math FP MSL", g_msl, "fast::");
         }
     }
 

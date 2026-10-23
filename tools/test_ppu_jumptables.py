@@ -324,6 +324,38 @@ def test_multi_toc_prefers_targets_near_the_dispatcher():
           tables.get(insns[-1].addr), [0x11100, 0x11200])
 
 
+def w_ori(ra, rs, ui):     return (24 << 26) | (rs << 21) | (ra << 16) | (ui & 0xFFFF)
+
+
+def test_bound_compare_beyond_window():
+    """The bounds compare sits more than 30 instructions before the bctr.
+
+        cmplwi cr0, r3, 299     <- the bound: 300 entries
+        lwz    r11, 16(r2)      <- the table base
+        ori    r20, r20, k      <- x31: case setup that does not touch r3/r11
+        slwi r9,r3,2; lwzx r0,r9,r11; add r0,r0,r11; mtctr r0; bctr
+
+    Toro Lets Party (BCAS20087) func_000A2EC8, a 292-entry script-opcode
+    dispatcher: `cmplwi r29,0x123` is 33 instructions before its bctr. The count
+    was read from the 30 instructions before the bctr only; with no compare
+    found it fell back to 256, so entries 256+ were never read and their cases
+    lifted to unresolved indirect calls. The compare is now also looked for in
+    the function-bounded window the base search already uses.
+    """
+    n, table = 300, 0x11000
+    first = table + 4 * n                            # cases right after the table
+    mem = {TOC + 16: table}
+    for k in range(n):
+        mem[table + 4 * k] = first + 4 * k - table   # offsets from the table base
+    words = ([w_cmplwi(0, 3, n - 1), w_lwz(11, 2, 16)]
+             + [w_ori(20, 20, k) for k in range(31)]
+             + [w_slwi(9, 3, 2), w_lwzx(0, 9, 11), w_add(0, 0, 11),
+                w_mtctr(0), w_bctr()])
+    got = discover(words, mem)
+    check("bound compare beyond the 30-instruction window", got,
+          [first + 4 * k for k in range(n)])
+
+
 def main() -> int:
     test_encodings()
     test_absolute_base_is_second_operand()
@@ -337,6 +369,7 @@ def main() -> int:
     test_const_base_no_table()
     test_const_base_needs_constant()
     test_multi_toc_prefers_targets_near_the_dispatcher()
+    test_bound_compare_beyond_window()
     if FAILS:
         print(f"FAILED: {', '.join(FAILS)}")
         return 1

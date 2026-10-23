@@ -20,6 +20,20 @@
 #include <math.h>
 #include "../../runtime/platform/win32_compat.h"   /* GetTickCount64 on POSIX */
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host */
+#include "ps3emu/log_first.h"
+
+/* PAD_CLOCK=flips: PAD_SCRIPT and PAD_STICK times count guest flips instead of
+ * wall-clock seconds. A loaded machine runs a title at a third of its usual
+ * frame rate, and a wall-clock schedule then presses START on the logos; a
+ * flip schedule replays the same screens however slow the run is. */
+extern u32 cellGcm_flip_request_count(void);
+static double pad_clock(unsigned long long t0_ms)
+{
+    static int flips = -1;
+    if (flips < 0) { const char* e = getenv("PAD_CLOCK"); flips = e && !strcmp(e, "flips"); }
+    return flips ? (double)cellGcm_flip_request_count()
+                 : (double)(GetTickCount64() - t0_ms) / 1000.0;
+}
 
 /* ---------------------------------------------------------------------------
  * Backend selection
@@ -119,6 +133,39 @@ int cellPad_host_kind(u32 port)
     if (port >= PAD_MAX_HOST_PORTS) return CELL_PAD_HOST_NONE;
     if (port == 0 && s_host_input_fn && (s_host_keyboard_last || !s_host_pad0)) return CELL_PAD_HOST_NONE;
     return s_host_kind[port];
+}
+
+/* ---------------------------------------------------------------------------
+ * Rumble (cellPadSetActDirect)
+ *
+ * A DualShock 3 has two motors: the small one (motor[0]) is on or off, the
+ * large one (motor[1]) takes 0-255. A title sets them and they stay that way
+ * until it sets them again; some titles only call when the value changes.
+ * SDL's rumble runs for a duration instead, so the last request per port is
+ * kept and renewed while it is non-zero: by the pad thread (see the SDL2
+ * backend), or from the pad poll where that thread is not running. Only while
+ * the title polls the pad: if it stops (a hang, a closed window), the motors
+ * stop within PAD_RUMBLE_HOLD_MS. Large -> the host's low-frequency motor,
+ * small -> the high-frequency one, which is how DualShock 4, DualSense and
+ * Xbox pads are laid out too.
+ * -------------------------------------------------------------------------*/
+
+#define PAD_RUMBLE_HOLD_MS     1000   /* one SDL request lasts this long ... */
+#define PAD_RUMBLE_RENEW_MS     400   /* ... and is renewed this often */
+
+typedef struct {
+    u16 lo, hi;                 /* what the host motors were last asked for */
+    unsigned long long sent_ms; /* when (pad_now_ms), 0 = nothing to renew */
+} PadRumble;
+static PadRumble s_rumble[PAD_MAX_HOST_PORTS];
+
+static unsigned long long pad_now_ms(void);
+
+/* The two host motor levels (0-65535) for a PS3 actuator request. */
+static void pad_rumble_levels(u8 small_on, u8 large, u16* lo, u16* hi)
+{
+    *lo = (u16)(large * 257u);
+    *hi = small_on ? 0xFFFFu : 0u;
 }
 
 /* ---------------------------------------------------------------------------
@@ -252,13 +299,17 @@ static void pad_shutdown_backend(void)
  * thread polls every PAD_POLL_INTERVAL_MS, keeps the latest state of every
  * port in s_sdl_state and applies the rumble the guest asked for; the guest's
  * poll copies that snapshot and its actuator call leaves a request, both under
- * s_sdl_lock, which the pad thread holds only for the copy. */
+ * s_sdl_lock, which the pad thread holds only for the copy and the rumble.
+ *
+ * Should the thread fail to start, the guest's poll does the sweep itself, as
+ * it did before the thread existed. */
 static SDL_mutex*          s_sdl_lock;
 static SDL_Thread*         s_sdl_thread;
 static volatile int        s_sdl_quit;
 static PadHostState        s_sdl_state[PAD_MAX_HOST_PORTS];      /* under s_sdl_lock */
-static u8                  s_sdl_rumble[PAD_MAX_HOST_PORTS][2];  /* large, small; under s_sdl_lock */
+/* s_rumble (above) is under s_sdl_lock too while the thread runs */
 static int                 s_sdl_rumble_new[PAD_MAX_HOST_PORTS]; /* under s_sdl_lock */
+static unsigned long long  s_sdl_guest_ms;                       /* the title's last poll; under s_sdl_lock */
 /* The pad thread's own */
 static SDL_GameController* s_sdl_controllers[PAD_MAX_HOST_PORTS];
 
@@ -279,6 +330,17 @@ static u8 pad_sdl_trigger_to_u8(int raw)
     if (val < 0) val = 0;
     if (val > 255) val = 255;
     return (u8)val;
+}
+
+/* Send port i's rumble state to its controller, with a fresh duration. */
+static void pad_sdl_rumble_send(int i)
+{
+    SDL_GameController* gc = s_sdl_controllers[i];
+    if (!gc) return;
+    PadRumble* r = &s_rumble[i];
+    const int on = r->lo || r->hi;
+    SDL_GameControllerRumble(gc, r->lo, r->hi, on ? PAD_RUMBLE_HOLD_MS : 0);
+    r->sent_ms = on ? pad_now_ms() : 0;
 }
 
 /* The subsystem, started on the pad thread. */
@@ -398,6 +460,7 @@ static void pad_sdl_read(PadHostState* st)
             SDL_GameControllerClose(gc);
             s_sdl_controllers[i] = NULL;
             s_host_kind[i] = CELL_PAD_HOST_NONE;
+            /* its rumble is dropped by pad_sdl_rumble_apply */
         }
     }
     pad_sdl_open_new();
@@ -458,22 +521,37 @@ static void pad_sdl_read(PadHostState* st)
     }
 }
 
-/* With s_sdl_lock held. A request is sent as it arrives, and a non-zero one
- * again every 50 ms: SDL's rumble has a duration, the guest's actuator call
- * does not (a DS3 rumbles until told otherwise). */
+/* With s_sdl_lock held (when the pad thread runs). A request is sent as it
+ * arrives, and a non-zero one renewed every PAD_RUMBLE_RENEW_MS while the
+ * title keeps polling the pad: SDL's rumble has a duration, the guest's
+ * actuator call does not (a DS3 rumbles until told otherwise). A port with no
+ * pad drops its request. */
 static void pad_sdl_rumble_apply(void)
 {
-    static Uint32 last[PAD_MAX_HOST_PORTS];
-    const Uint32 now = SDL_GetTicks();
+    const unsigned long long now = pad_now_ms();
     for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
-        SDL_GameController* gc = s_sdl_controllers[i];
-        if (!gc) continue;
-        const int on = s_sdl_rumble[i][0] || s_sdl_rumble[i][1];
-        if (!s_sdl_rumble_new[i] && !(on && now - last[i] >= 50)) continue;
+        if (!s_sdl_controllers[i]) {
+            memset(&s_rumble[i], 0, sizeof s_rumble[i]);
+            s_sdl_rumble_new[i] = 0;
+            continue;
+        }
+        const int renew = s_rumble[i].sent_ms && now - s_rumble[i].sent_ms >= PAD_RUMBLE_RENEW_MS &&
+                          now - s_sdl_guest_ms < PAD_RUMBLE_HOLD_MS;
+        if (!s_sdl_rumble_new[i] && !renew) continue;
         s_sdl_rumble_new[i] = 0;
-        last[i] = now;
-        SDL_GameControllerRumble(gc, (Uint16)(s_sdl_rumble[i][0] * 257),
-                                 (Uint16)(s_sdl_rumble[i][1] * 257), 100);
+        pad_sdl_rumble_send(i);
+    }
+}
+
+/* Stop the motors and close every pad. */
+static void pad_sdl_close_all(void)
+{
+    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
+        if (s_sdl_controllers[i]) {
+            SDL_GameControllerRumble(s_sdl_controllers[i], 0, 0, 0);
+            SDL_GameControllerClose(s_sdl_controllers[i]);
+            s_sdl_controllers[i] = NULL;
+        }
     }
 }
 
@@ -502,21 +580,25 @@ static int SDLCALL pad_sdl_thread_main(void* arg)
         }
         SDL_Delay(PAD_POLL_INTERVAL_MS);
     }
-    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
-        if (s_sdl_controllers[i]) {
-            SDL_GameControllerClose(s_sdl_controllers[i]);
-            s_sdl_controllers[i] = NULL;
-        }
-    }
+    pad_sdl_close_all();
     return 0;
 }
 
-/* The guest's side: the latest snapshot. */
+/* The guest's side: the latest snapshot. With no pad thread, the sweep and
+ * the rumble from here. */
 static void pad_poll_sdl2(void)
 {
-    if (!s_sdl_lock) return;
+    if (!s_sdl_thread) {
+        PadHostState st[PAD_MAX_HOST_PORTS];
+        pad_sdl_read(st);
+        memcpy(s_host_state, st, sizeof st);
+        s_sdl_guest_ms = pad_now_ms();
+        pad_sdl_rumble_apply();
+        return;
+    }
     SDL_LockMutex(s_sdl_lock);
     memcpy(s_host_state, s_sdl_state, sizeof s_sdl_state);
+    s_sdl_guest_ms = pad_now_ms();
     SDL_UnlockMutex(s_sdl_lock);
 }
 
@@ -524,23 +606,29 @@ static void pad_init_backend(void)
 {
     if (!s_sdl_lock) s_sdl_lock = SDL_CreateMutex();
     memset(s_sdl_state, 0, sizeof s_sdl_state);
-    memset(s_sdl_rumble, 0, sizeof s_sdl_rumble);
+    memset(s_rumble, 0, sizeof s_rumble);
     memset(s_sdl_rumble_new, 0, sizeof s_sdl_rumble_new);
     if (s_sdl_thread) return;
     s_sdl_quit = 0;
-    s_sdl_thread = SDL_CreateThread(pad_sdl_thread_main, "cellPad", NULL);
+    s_sdl_thread = s_sdl_lock ? SDL_CreateThread(pad_sdl_thread_main, "cellPad", NULL) : NULL;
     if (!s_sdl_thread) {
-        printf("[cellPad] SDL_CreateThread failed: %s\n", SDL_GetError());
+        printf("[cellPad] SDL_CreateThread failed: %s -- the pad is polled from the title's threads\n",
+               SDL_GetError());
         fflush(stdout);
+        pad_sdl_start();
     }
 }
 
 static void pad_shutdown_backend(void)
 {
-    if (!s_sdl_thread) return;
-    s_sdl_quit = 1;
-    SDL_WaitThread(s_sdl_thread, NULL);
-    s_sdl_thread = NULL;
+    if (s_sdl_thread) {
+        s_sdl_quit = 1;
+        SDL_WaitThread(s_sdl_thread, NULL);   /* it stops the motors and closes the pads */
+        s_sdl_thread = NULL;
+    } else {
+        pad_sdl_close_all();
+    }
+    memset(s_rumble, 0, sizeof s_rumble);
 }
 
 #endif /* PAD_BACKEND_SDL2 */
@@ -953,7 +1041,7 @@ skip_inject: ;
       } }
 
     /* PAD_SCRIPT="<sec>:<mask>,<sec>:<mask>,..." -- press a NAMED button at a
-     * given wall-clock second, each held ~250 ms. PAD_AUTOPRESS only pulses
+     * given wall-clock second (or flip, under PAD_CLOCK=flips), each held ~250 ms. PAD_AUTOPRESS only pulses
      * CROSS and START, which is enough to clear a "press start" screen but not
      * to navigate a menu: You Don't Know Jack needs DOWN to move off its name
      * field before CROSS means anything. Masks are CELL_PAD_CTRL_* packed as
@@ -961,7 +1049,7 @@ skip_inject: ;
      * LEFT 0x0080, RIGHT 0x0020, CROSS 0x4000, CIRCLE 0x2000, TRIANGLE 0x1000.
      * Legit input simulation on the same footing as PAD_AUTOPRESS/PAD_STICK. */
     { static int s_sc = -1;
-      static struct { double t; unsigned mask; } ev[32]; static int n_ev = 0;
+      static struct { double t; unsigned mask; } ev[256]; static int n_ev = 0;
       static unsigned long long t0 = 0;   /* not ULONGLONG: this builds on POSIX too */
       if (s_sc < 0) {
           s_sc = 0;
@@ -969,32 +1057,33 @@ skip_inject: ;
           if (e && *e) {
               s_sc = 1; t0 = GetTickCount64();
               const char* p = e;
-              while (*p && n_ev < 32) {
+              while (*p && n_ev < 256) {
                   double t = strtod(p, (char**)&p);
                   if (*p == ':') p++;
                   unsigned m = (unsigned)strtoul(p, (char**)&p, 0);
                   ev[n_ev].t = t; ev[n_ev].mask = m; n_ev++;
                   while (*p == ',' || *p == ' ') p++;
               }
-              printf("[cellPad] PAD_SCRIPT: %d event(s)\n", n_ev);
+              printf("[cellPad] PAD_SCRIPT: %d event(s)%s\n", n_ev,
+                     *p ? " -- TRUNCATED at 256, the rest are ignored" : "");
           }
       }
       if (s_sc && port_no == 0) {
-          double now = (double)(GetTickCount64() - t0) / 1000.0;
+          double now = pad_clock(t0);
           /* Latch, do not window. A fixed time window is missed whenever the
            * title stops polling the pad for longer than the window (it does
            * exactly that on a loading screen), so the press silently never
            * happens. Fire on the first poll at or after the event time and
            * hold it for a fixed number of polls, which is what a real press
            * looks like regardless of poll rate. */
-          static int fired[32], held[32];
+          static int fired[256], held[256];
           for (int i = 0; i < n_ev; i++) {
               if (!fired[i] && now >= ev[i].t) { fired[i] = 1; held[i] = 40; }
               if (held[i] > 0) {
                   held[i]--;
                   data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(ev[i].mask & 0xFF);
                   data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((ev[i].mask >> 8) & 0xFF);
-                  static int said[32];
+                  static int said[256];
                   if (!said[i]) { said[i] = 1;
                       printf("[cellPad] PAD_SCRIPT t=%.1fs press 0x%04X\n", ev[i].t, ev[i].mask); }
               }
@@ -1062,7 +1151,7 @@ skip_inject: ;
                  sscanf(e, "%d,%d,%d,%d,%lf,%lf", &a,&b,&c,&d,&s_from,&s_until);
                  s_v[0]=(unsigned char)a; s_v[1]=(unsigned char)b;
                  s_v[2]=(unsigned char)c; s_v[3]=(unsigned char)d; } }
-      if (s_st && (double)(GetTickCount64() - s_t0) / 1000.0 >= s_from && (double)(GetTickCount64() - s_t0) / 1000.0 < s_until) { hs->analog_lx = s_v[0]; hs->analog_ly = s_v[1];
+      if (s_st && pad_clock(s_t0) >= s_from && pad_clock(s_t0) < s_until) { hs->analog_lx = s_v[0]; hs->analog_ly = s_v[1];
                   hs->analog_rx = s_v[2]; hs->analog_ry = s_v[3];
                   hs->connected = 1; }
       /* PAD_STICK_FILE=<path>: hold the sticks while that file exists (at the
@@ -1362,7 +1451,7 @@ s32 cellPadPeriphGetInfo(CellPadPeriphInfo* info_guest)
           vm_write32((unsigned long long)ea + _o, *(u32*)((char*)info + _o)); }
 
     { static int _n = 0;
-      if (_n < 2 && ++_n)
+      if (PS3_LOG_FIRST(_n, 2))
           printf("[cellPad] PeriphGetInfo(max=%u now=%u) -> STANDARD class\n",
                  info->max_connect, connected); }
     return CELL_OK;
@@ -1448,23 +1537,37 @@ s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param)
 
     param = GUEST_PTR(param, CellPadActParam*);
 
+    if (port_no >= PAD_MAX_HOST_PORTS)
+        return CELL_OK;
+
+    u16 lo, hi;
+    pad_rumble_levels(param->motor[CELL_PAD_ACTUATOR_PARAM_SMALL],
+                      param->motor[CELL_PAD_ACTUATOR_PARAM_LARGE], &lo, &hi);
+
 #if PAD_BACKEND_XINPUT
-    /* Map to XInput vibration */
-    if (port_no < PAD_MAX_HOST_PORTS && s_host_state[port_no].connected) {
+    s_rumble[port_no].lo = lo;
+    s_rumble[port_no].hi = hi;
+    /* XInput keeps the motors at what they were last set to: no renewal. */
+    if (s_host_state[port_no].connected) {
         XINPUT_VIBRATION vib;
-        vib.wLeftMotorSpeed  = (WORD)(param->motor[CELL_PAD_ACTUATOR_PARAM_LARGE] * 257);
-        vib.wRightMotorSpeed = (WORD)(param->motor[CELL_PAD_ACTUATOR_PARAM_SMALL] * 257);
+        vib.wLeftMotorSpeed  = (WORD)lo;
+        vib.wRightMotorSpeed = (WORD)hi;
         XInputSetState((DWORD)port_no, &vib);
     }
 #endif
 
 #if PAD_BACKEND_SDL2
-    if (port_no < PAD_MAX_HOST_PORTS && s_sdl_lock) {
+    if (s_sdl_thread) {
+        /* The pad thread sends it (pad_sdl_rumble_apply). */
         SDL_LockMutex(s_sdl_lock);
-        s_sdl_rumble[port_no][0] = (u8)param->motor[CELL_PAD_ACTUATOR_PARAM_LARGE];
-        s_sdl_rumble[port_no][1] = (u8)param->motor[CELL_PAD_ACTUATOR_PARAM_SMALL];
+        s_rumble[port_no].lo = lo;
+        s_rumble[port_no].hi = hi;
         s_sdl_rumble_new[port_no] = 1;
         SDL_UnlockMutex(s_sdl_lock);
+    } else {
+        s_rumble[port_no].lo = lo;
+        s_rumble[port_no].hi = hi;
+        pad_sdl_rumble_send((int)port_no);
     }
 #endif
 

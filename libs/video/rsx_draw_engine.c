@@ -33,6 +33,7 @@
 #include "ps3emu/vm_watch.h"
 #include "ps3emu/env_cache.h"
 #define getenv(name) ps3_env(name)
+#include "ps3emu/log_first.h"
 
 /* Guest memory and the RSX offset resolvers, declared the way every backend
  * that reads guest data declares them (rsx_vertex_fetch.h). */
@@ -103,6 +104,7 @@ extern u32 ppu_vm_size;
 typedef struct {
     u32 location, offset;
     u32 w, h;
+    u32 pitch;              /* guest bytes per row, from SET_SURFACE_PITCH */
     rsx_be_format fmt;
     u32 handle;
 } eng_surface;
@@ -133,6 +135,7 @@ typedef struct {
     const void* standin;   /* the stand-in's bytes it was uploaded from, or NULL  */
     u32 span;              /* eng_texture_span for span_levels - 1 mip levels     */
     u32 span_levels;       /* the levels it was worked out for, + 1; 0 none       */
+    u32 depth;             /* slices of a 3D texture, else 1                      */
 } eng_texture;
 
 struct eng_pipe_job;
@@ -308,6 +311,8 @@ void rsx_draw_engine_decode_render_state(const rsx_dispatch* rsx,
      * (a depth-prime pass), and rsx_dispatch_init seeds the nv40 reset value
      * so never-written reads as all-on. */
     rs->color_mask  = rsx_dsp_reg(rsx, M_COLOR_MASK);
+    rs->color_mask_mrt = rsx_dsp_reg(rsx, 0x0370) & 0xFFF0u;
+    rs->blend_mrt      = rsx_dsp_reg(rsx, 0x036C) & 0xEu;
     rs->stencil_enable    = rsx_dsp_reg(rsx, M_STENCIL_TEST_ENABLE) & 1;
     rs->stencil_two_sided = rsx_dsp_reg(rsx, M_TWO_SIDED_STENCIL) & 1;
     rs->s_func       = rsx_dsp_reg(rsx, M_STENCIL_FUNC);
@@ -353,6 +358,8 @@ u64 rsx_draw_engine_hash_render_state(const rsx_be_render_state* rs, u64 hash)
     ENG_HASH_FIELD(cull_face);
     ENG_HASH_FIELD(front_face);
     ENG_HASH_FIELD(color_mask);
+    ENG_HASH_FIELD(color_mask_mrt);
+    ENG_HASH_FIELD(blend_mrt);
     ENG_HASH_FIELD(rt_fp16);
     ENG_HASH_FIELD(stencil_enable);
     ENG_HASH_FIELD(stencil_two_sided);
@@ -573,9 +580,16 @@ static const void* eng_surface_seed(u32 location, u32 offset, u32 w, u32 h,
 
 /* The colour target for this (location, offset), created or reallocated when
  * the size or format moved. Returns a slot index, or ENG_INVALID.
- * rsx_live_draw.c's surface_get (2605-2690). */
+ * rsx_live_draw.c's surface_get (2605-2690).
+ *
+ * A smaller clip on the same rows is the same memory, not a new surface: with
+ * the same format and pitch, RSX draws into the top-left of what is already
+ * there. God of War: Ascension renders its scene into a 1280x720 target, then
+ * runs a 640x360 pass at the same address and pitch and copies the full
+ * 1280x720 out for its SPU anti-aliasing; recreating the target at 640x360
+ * lost the scene and left that quarter of the frame black. */
 static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
-                          rsx_be_format want_fmt)
+                          rsx_be_format want_fmt, u32 pitch)
 {
     if (!want_w) want_w = g.width;
     if (!want_h) want_h = g.height;
@@ -583,8 +597,10 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     u32 slot = ENG_MAX_SURFACES;
     for (u32 i = 0; i < g.n_surfaces; i++)
         if (g.surfaces[i].location == location && g.surfaces[i].offset == offset) {
-            if (g.surfaces[i].w == want_w && g.surfaces[i].h == want_h &&
-                g.surfaces[i].fmt == want_fmt)
+            const eng_surface* s = &g.surfaces[i];
+            if (s->fmt == want_fmt &&
+                ((s->w == want_w && s->h == want_h) ||
+                 (pitch && s->pitch == pitch && s->w >= want_w && s->h >= want_h)))
                 return i;
             slot = i;
             break;
@@ -594,7 +610,7 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
      * decoded a guest pointer as clip dimensions. */
     if (want_w > ENG_MAX_SURFACE_DIM || want_h > ENG_MAX_SURFACE_DIM) {
         static u32 logs = 0;
-        if (logs++ < 8)
+        if (PS3_LOG_FIRST(logs, 8))
             fprintf(stderr, "[rsx engine] rejected implausible surface 0x%X %ux%u;"
                             " keeping the %s target\n", offset, want_w, want_h,
                     slot < ENG_MAX_SURFACES ? "existing" : "absent");
@@ -619,7 +635,7 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     s->w = want_w; s->h = want_h; s->fmt = want_fmt;
     s->handle = handle;
     if (slot == g.n_surfaces) g.n_surfaces++;
-    { static u32 logs = 0; if (logs++ < 16)
+    { static u32 logs = 0; if (PS3_LOG_FIRST(logs, 16))
         fprintf(stderr, "[rsx engine] surface %u:0x%08X %ux%u fmt %d%s\n",
                 location, offset, want_w, want_h, (int)want_fmt,
                 seed ? " (seeded from guest memory)" : ""); }
@@ -641,8 +657,9 @@ static u32 eng_current_target_set(u32 slots[RSX_BE_MAX_COLOR_TARGETS])
     const u32 sel = (sf.color_target == CELL_GCM_SURFACE_TARGET_1) ? 1u : 0u;
     const rsx_be_format fmt = eng_surface_format(sf.color_format);
     const u32 first = eng_surface_get(sf.color_location[sel], sf.color_offset[sel],
-                                      sf.clip_w, sf.clip_h, fmt);
+                                      sf.clip_w, sf.clip_h, fmt, sf.color_pitch[sel]);
     if (first == ENG_INVALID) return 0;
+    g.surfaces[first].pitch = sf.color_pitch[sel];
     slots[0] = first;
     u32 n = 1;
 
@@ -652,10 +669,14 @@ static u32 eng_current_target_set(u32 slots[RSX_BE_MAX_COLOR_TARGETS])
     };
     for (u32 i = 0; i < 3; i++) {
         if (sf.color_target < mrt_from[i]) break;
+        /* At A's size, which may be larger than the clip (see above): the
+         * framebuffer takes A's extent, and every attachment must cover it. */
         const u32 slot = eng_surface_get(sf.color_location[i + 1],
                                          sf.color_offset[i + 1],
-                                         sf.clip_w, sf.clip_h, fmt);
+                                         g.surfaces[first].w, g.surfaces[first].h, fmt,
+                                         sf.color_pitch[i + 1]);
         if (slot == ENG_INVALID) break;
+        g.surfaces[slot].pitch = sf.color_pitch[i + 1];
         /* A set naming one buffer twice would attach the same target twice,
          * which no host API allows. */
         int seen = 0;
@@ -828,9 +849,10 @@ static inline int eng_slow(void)
 }
 
 static inline u32 eng_tex_key_hash(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
-                                   u32 pitch, u32 remap, u32 cube)
+                                   u32 pitch, u32 remap, u32 cube, u32 depth)
 {
-    const u64 a = ((u64)offset << 32) ^ ((u64)location << 28) ^ ((u64)cube << 27) ^ fmt;
+    const u64 a = ((u64)offset << 32) ^ ((u64)location << 28) ^ ((u64)cube << 27) ^
+                  ((u64)depth << 8) ^ fmt;
     const u64 b = ((u64)w << 48) ^ ((u64)h << 32) ^ ((u64)pitch << 20) ^ remap;
     u64 x = a * 0x9E3779B97F4A7C15ull ^ b * 0xC2B2AE3D27D4EB4Full;
     x ^= x >> 31;
@@ -838,16 +860,16 @@ static inline u32 eng_tex_key_hash(u32 location, u32 offset, u32 fmt, u32 w, u32
 }
 
 static eng_texture* eng_tex_find(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
-                                 u32 pitch, u32 remap, u32 cube)
+                                 u32 pitch, u32 remap, u32 cube, u32 depth)
 {
     const u32 m = ENG_TEX_INDEX - 1u;
-    for (u32 i = eng_tex_key_hash(location, offset, fmt, w, h, pitch, remap, cube) & m;; i = (i + 1u) & m) {
+    for (u32 i = eng_tex_key_hash(location, offset, fmt, w, h, pitch, remap, cube, depth) & m;; i = (i + 1u) & m) {
         const u32 v = g.tex_index[i];
         if (!v) return NULL;
         eng_texture* e = &g.textures[v - 1u];
         if (e->location == location && e->offset == offset && e->format == fmt &&
             e->width == w && e->height == h && e->pitch == pitch && e->remap == remap &&
-            e->cubemap == cube)
+            e->cubemap == cube && e->depth == depth)
             return e;
     }
 }
@@ -857,7 +879,7 @@ static void eng_tex_index_add(u32 index)
     const eng_texture* e = &g.textures[index];
     const u32 m = ENG_TEX_INDEX - 1u;
     u32 i = eng_tex_key_hash(e->location, e->offset, e->format, e->width, e->height,
-                             e->pitch, e->remap, e->cubemap) & m;
+                             e->pitch, e->remap, e->cubemap, e->depth) & m;
     while (g.tex_index[i]) i = (i + 1u) & m;
     g.tex_index[i] = index + 1u;
 }
@@ -898,6 +920,42 @@ static u32 eng_fp_reads(void);
 static inline int eng_tex_unit_on(u32 u, u32 reads)
 {
     return (int)(rsx_dsp_reg(&g.rsx, 0x1A00u + u * 0x20u + 0x0Cu) >> 31) & (int)((reads >> u) & 1u);
+}
+
+/* A 3D texture: each level is `depth` slices (halving with the level), one
+ * face_bytes each -- consecutive for a linear image, one Morton block for a
+ * swizzled one. */
+static u32 eng_texture_span_3d(u32 fmt, u32 w, u32 h, u32 depth, u32 levels, u32 pitch)
+{
+    rsx_tex_level lv[RSX_MAX_TEXTURE_LEVELS];
+    const u32 n = rsx_texture_mip_chain(fmt, w, h, levels, pitch, lv);
+    if (!n) return 0;
+    u32 total = 0, d = depth ? depth : 1u;
+    for (u32 m = 0; m < n; m++) { total += lv[m].tl.face_bytes * d; if (d > 1) d >>= 1; }
+    return total;
+}
+
+/* Slice z of a swizzled 3D level, de-interleaved into row-major rows of
+ * w * bpp bytes, so the 2D decode can convert it as a linear image. */
+static void eng_deswizzle_3d_slice(u8* dst, const u8* src, u32 w, u32 h, u32 d, u32 z, u32 bpp)
+{
+    u32 lw = 0, lh = 0, ld = 0;
+    while ((1u << lw) < w) lw++;
+    while ((1u << lh) < h) lh++;
+    while ((1u << ld) < d) ld++;
+    for (u32 y = 0; y < h; y++)
+        for (u32 x = 0; x < w; x++)
+            memcpy(dst + ((size_t)y * w + x) * bpp,
+                   src + (size_t)rsx_swizzle_offset_3d(x, y, z, lw, lh, ld) * bpp, bpp);
+}
+
+/* What eng_texture_slot hashes and watches: the whole volume for a 3D
+ * texture, as its cache key carries the depth. */
+static u32 eng_texture_slot_span(u32 fmt, u32 w, u32 h, u32 levels, u32 pitch,
+                                 int cube, u32 depth)
+{
+    return depth > 1 ? eng_texture_span_3d(fmt, w, h, depth, levels, pitch)
+                     : eng_texture_span(fmt, w, h, levels, pitch, cube);
 }
 
 /* One hash per cached texture per presented frame. FNV-style over the whole
@@ -1057,7 +1115,7 @@ static int eng_standin_ask(u32 fmt, u32 w, u32 h, u32 levels, const u8* src,
 }
 
 static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
-                              u32 levels, u32 pitch, int cube, u32 remap)
+                              u32 levels, u32 pitch, int cube, u32 remap, u32 depth)
 {
     const u32 span = eng_texture_span(fmt, w, h, levels, pitch, cube);
     const u8* src = eng_guest_ptr(NULL, location, offset, span);
@@ -1066,10 +1124,11 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     if ((fmt & 0x9Fu) == 0x81u /* CELL_GCM_TEXTURE_B8 */ && w >= 256) g_rsx_video_plane_uploads++;
 
     /* The port's stand-in, if it has one for these bytes: from here on the
-     * texture is the stand-in's, under the guest's place in the cache. */
+     * texture is the stand-in's, under the guest's place in the cache. A
+     * stand-in is a 2D texture; a volume is never asked about. */
     s_upload_standin = NULL;
     { rsx_texture_standin sub;
-      if (eng_standin_ask(fmt, w, h, levels, src, span, cube, &sub)) {
+      if (depth <= 1 && eng_standin_ask(fmt, w, h, levels, src, span, cube, &sub)) {
           s_upload_standin = src = sub.bytes;
           fmt = sub.fmt; w = sub.w; h = sub.h;
           levels = sub.levels ? sub.levels : 1; pitch = sub.pitch;
@@ -1078,6 +1137,46 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     rsx_tex_level lv[RSX_MAX_TEXTURE_LEVELS];
     const u32 nlv = rsx_texture_mip_chain(fmt, w, h, levels, pitch, lv);
     if (!nlv || !lv[0].tl.face_bytes) return 0;
+    /* A volume: every slice of every level decoded and uploaded on its own.
+     * inFAMOUS 2's occlusion volumes read an 8x8x8 cone LUT; uploaded as its
+     * first slice and sampled in 2D it darkened whole boxes round every prop. */
+    if (depth > 1 && !cube && g.be->texture_create_3d && g.be->texture_upload_3d &&
+        !lv[0].tl.compressed && lv[0].tl.bytes_per_texel) {
+        const u32 span = eng_texture_span_3d(fmt, w, h, depth, levels, pitch);
+        const u8* src = eng_guest_ptr(NULL, location, offset, span);
+        if (!src) return 0;
+        const u32 handle = g.be->texture_create_3d(g.be->user, eng_texfmt(lv[0].tl.fmt),
+                                                   w, h, depth, nlv, remap, fmt);
+        if (!handle) return 0;
+        const u8* level_src = src;
+        u32 d = depth;
+        for (u32 m = 0; m < nlv; m++) {
+            const rsx_tex_layout* tl = &lv[m].tl;
+            const u32 lin_bytes = tl->swizzled ? tl->row_bytes * tl->rows : 0u;
+            if (!eng_staging_reserve(tl->dst_row_bytes * tl->rows + lin_bytes)) {
+                g.be->texture_release(g.be->user, handle);
+                return 0;
+            }
+            for (u32 z = 0; z < d; z++) {
+                if (tl->swizzled) {
+                    u8* lin = g.tex_staging + tl->dst_row_bytes * tl->rows;
+                    eng_deswizzle_3d_slice(lin, level_src, lv[m].w, lv[m].h, d, z, tl->bytes_per_texel);
+                    rsx_tex_layout ltl = *tl; ltl.swizzled = 0;
+                    rsx_texture_decode(g.tex_staging, tl->dst_row_bytes, lin, lv[m].w, lv[m].h,
+                                       &ltl, rsx_texture_argb_is_rgba());
+                } else {
+                    rsx_texture_decode(g.tex_staging, tl->dst_row_bytes,
+                                       level_src + (size_t)z * tl->face_bytes, lv[m].w, lv[m].h,
+                                       tl, rsx_texture_argb_is_rgba());
+                }
+                g.be->texture_upload_3d(g.be->user, handle, z, m, lv[m].w, lv[m].h,
+                                        g.tex_staging, tl->dst_row_bytes);
+            }
+            level_src += (size_t)tl->face_bytes * d;
+            if (d > 1) d >>= 1;
+        }
+        return handle;
+    }
     const u32 faces = cube ? 6u : 1u;
     const u32 face_stride = cube
         ? rsx_texture_cube_face_stride(fmt, w, h, levels, pitch) : 0u;
@@ -1204,35 +1303,36 @@ static int eng_tex_watch_arm(u32 location, u32 offset, u32 span, u64* stamp)
 }
 
 static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
-                            u32 levels, u32 pitch, int cube, u32 remap)
+                            u32 levels, u32 pitch, int cube, u32 remap, u32 depth)
 {
     if (!w || !h || w > ENG_MAX_TEX_DIM || h > ENG_MAX_TEX_DIM) return 0;
+    if (!depth) depth = 1;
     const int slow = eng_slow();
     u32 span = 0;
     eng_texture* e = NULL;
     if (slow) {
-        span = eng_texture_span(fmt, w, h, levels, pitch, cube);
+        span = eng_texture_slot_span(fmt, w, h, levels, pitch, cube, depth);
         if (!span) return 0;
         for (u32 i = 0; i < g.n_textures && !e; i++) {
             eng_texture* c = &g.textures[i];
             if (c->location == location && c->offset == offset &&
                 c->format == fmt && c->width == w && c->height == h &&
                 c->pitch == pitch && c->remap == remap &&
-                c->cubemap == (u32)(cube != 0))
+                c->cubemap == (u32)(cube != 0) && c->depth == depth)
                 e = c;
         }
     } else {
-        e = eng_tex_find(location, offset, fmt, w, h, pitch, remap, (u32)(cube != 0));
+        e = eng_tex_find(location, offset, fmt, w, h, pitch, remap, (u32)(cube != 0), depth);
         if (e) {
             /* The span depends on the level count, which is not part of the
              * key: work it out again only when that changes. */
             if (e->span_levels != levels + 1u) {
-                e->span = eng_texture_span(fmt, w, h, levels, pitch, cube);
+                e->span = eng_texture_slot_span(fmt, w, h, levels, pitch, cube, depth);
                 e->span_levels = levels + 1u;
             }
             span = e->span;
         } else {
-            span = eng_texture_span(fmt, w, h, levels, pitch, cube);
+            span = eng_texture_slot_span(fmt, w, h, levels, pitch, cube, depth);
         }
         if (!span) return 0;
     }
@@ -1241,7 +1341,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
         /* The port's stand-ins changed: ask about this texture again, and
          * upload it again only if the answer is another one. */
         const u32 standin_gen = s_standin_gen;
-        if (e->handle && e->standin_gen != standin_gen) {
+        if (e->handle && e->standin_gen != standin_gen && depth <= 1) {
             e->standin_gen = standin_gen;
             const u8* src = eng_guest_ptr(NULL, location, offset, span);
             rsx_texture_standin sub;
@@ -1249,7 +1349,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                               ? (const void*)sub.bytes : NULL;
             if (src && now != e->standin) {
                 const u32 fresh = eng_texture_upload(location, offset, fmt, w, h,
-                                                     levels, pitch, cube, remap);
+                                                     levels, pitch, cube, remap, depth);
                 if (fresh) {
                     g.be->texture_release(g.be->user, e->handle);
                     e->handle = fresh;
@@ -1295,7 +1395,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
             const u64 hash = need_hash ? eng_texture_content_hash(location, offset, span, &readable) : 0;
             if (need_hash && readable && hash != e->content_hash) {
                 const u32 fresh = eng_texture_upload(location, offset, fmt, w, h,
-                                                     levels, pitch, cube, remap);
+                                                     levels, pitch, cube, remap, depth);
                 if (fresh) {
                     g.be->texture_release(g.be->user, e->handle);
                     e->handle = fresh;
@@ -1326,7 +1426,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     e.location = location; e.offset = offset; e.format = fmt;
     e.width = w; e.height = h; e.pitch = pitch;
     e.remap = remap; e.cubemap = (u32)(cube != 0);
-    e.span = span; e.span_levels = levels + 1u;
+    e.span = span; e.span_levels = levels + 1u; e.depth = depth;
     e.last_hash_frame = g.frames;
     e.last_use_serial = ++g.texture_use_serial;
     if (eng_tex_watch_on()) { u64 st = 0; e.watched = (u32)eng_tex_watch_arm(location, offset, span, &st); e.watch_stamp = st; }
@@ -1334,7 +1434,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
       e.content_hash = eng_texture_content_hash(location, offset, span, &readable); }
     e.standin_gen = s_standin_gen;
     e.handle = eng_texture_upload(location, offset, fmt, w, h, levels, pitch,
-                                  cube, remap);
+                                  cube, remap, depth);
     e.standin = s_upload_standin;
     if (e.handle && evicted) g.be->texture_release(g.be->user, evicted);
     if (e.handle || !evicted) {
@@ -1486,6 +1586,32 @@ static u32 eng_shadow_units(u8 funcs[16])
         const u32 zf = (t.wrap >> 28) & 0xFu;
         if (!zf || zf > 7u) continue;
         mask |= 1u << u; funcs[u] = (u8)zf;
+    }
+    return mask;
+}
+
+/* Units bound to a 3D texture (SET_TEXTURE_FORMAT dimension 3 with a
+ * depth), declared Texture3D and sampled with three coordinates. Only when
+ * the backend can create one: otherwise the first slice stays a 2D texture
+ * and the program samples it in 2D, as before. The units sink_bind_textures
+ * binds, under eng_texture_upload's own test, so the program declares a
+ * Texture3D exactly where one is bound (a compressed volume is uploaded as
+ * its first slice). */
+static u32 eng_volume_mask(void)
+{
+    if (!g.be->texture_create_3d || !g.be->texture_upload_3d) return 0;
+    u32 mask = 0;
+    const u32 reads = eng_fp_reads();
+    for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
+        if (!eng_tex_unit_on(u, reads)) continue;
+        rsx_dsp_texture t;
+        rsx_dsp_get_texture(&g.rsx, u, &t);
+        if (!t.enabled || t.cubemap || t.dimension != 3 || t.depth <= 1 || !t.width || !t.height)
+            continue;
+        rsx_tex_level lv[RSX_MAX_TEXTURE_LEVELS];
+        if (rsx_texture_mip_chain(t.format, t.width, t.height, t.mipmaps, t.pitch, lv) &&
+            !lv[0].tl.compressed && lv[0].tl.bytes_per_texel)
+            mask |= 1u << u;
     }
     return mask;
 }
@@ -1946,6 +2072,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
 
     const u32 fp_ctrl  = rsx_dsp_shader_control(&g.rsx);
     const u32 cube_mask = eng_cube_mask();
+    const u32 vol_mask = eng_volume_mask();
     const u32 vtex_mask = eng_vtex_mask();
     u8 shadow_funcs[16];
     const u32 shadow_mask = eng_shadow_units(shadow_funcs);
@@ -1965,7 +2092,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
       for (u32 u = 0; !off && u < RSX_DSP_NUM_TEXTURES && u < 16; u++) {
           if (!eng_tex_unit_on(u, reads)) continue;
           rsx_dsp_texture t; rsx_dsp_get_texture(&g.rsx, u, &t);
-          if (!t.enabled || !(t.format & RSX_TEX_FMT_UNNORM) || ((cube_mask >> u) & 1u)) continue;
+          if (!t.enabled || !(t.format & RSX_TEX_FMT_UNNORM) || (((cube_mask | vol_mask) >> u) & 1u)) continue;
           if (!t.width || !t.height) continue;
           unnorm_mask |= 1u << u; unnorm_dim[u][0] = t.width; unnorm_dim[u][1] = t.height;
       } }
@@ -1988,7 +2115,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     /* Identity: the vertex program's own bytes, the fragment program's
      * STRUCTURE (its inline constants are hoisted into the buffered block, so
      * a constant change must not be a new pipeline), the export-width bit of
-     * SHADER_CONTROL, the cube and vertex-texture masks, the input layout,
+     * SHADER_CONTROL, the cube, volume and vertex-texture masks, the input layout,
      * and the structural render state. */
     /* Consecutive draws nearly always repeat every input of the key: reuse
      * the last key while they all compare equal (after NoahBPeterson's fork,
@@ -1998,7 +2125,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     static struct {
         int valid, fixed;
         u64 vp_key, fp_key;
-        u32 fp_ctrl, cube_mask, vtex_mask, shadow_mask, unnorm_mask, texop_mask;
+        u32 fp_ctrl, cube_mask, vol_mask, vtex_mask, shadow_mask, unnorm_mask, texop_mask;
         u8 shadow_funcs[16]; u32 unnorm_dim[16][2]; u32 texel_ops[16];
         u32 layout_mask, layout_stride, rt_count;
         rsx_be_format rt_fmt;
@@ -2009,7 +2136,8 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     const u64 in_vp = fixed ? 0 : (s_vpi.valid && s_vpi.hash_valid ? s_vpi.hash : 0);
     const int memo = !slow && !fixed && in_vp && fp_key;
     if (memo && km.valid && !km.fixed && km.vp_key == in_vp && km.fp_key == fp_key &&
-        km.fp_ctrl == (fp_ctrl & 0x40u) && km.cube_mask == cube_mask && km.vtex_mask == vtex_mask &&
+        km.fp_ctrl == (fp_ctrl & 0x40u) && km.cube_mask == cube_mask && km.vol_mask == vol_mask &&
+        km.vtex_mask == vtex_mask &&
         km.shadow_mask == shadow_mask && km.unnorm_mask == unnorm_mask && km.texop_mask == texop_mask &&
         !memcmp(km.shadow_funcs, shadow_funcs, sizeof km.shadow_funcs) &&
         !memcmp(km.unnorm_dim, unnorm_dim, sizeof km.unnorm_dim) &&
@@ -2040,6 +2168,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         key = eng_fnv1a(&fp_ctrl_key, sizeof fp_ctrl_key, key);
         key = eng_fnv1a(&cube_mask, sizeof cube_mask, key);
         key = eng_fnv1a(&vtex_mask, sizeof vtex_mask, key);
+        if (vol_mask) key = eng_fnv1a(&vol_mask, sizeof vol_mask, key);
         if (shadow_mask) {
             key = eng_fnv1a(&shadow_mask, sizeof shadow_mask, key);
             key = eng_fnv1a(shadow_funcs, sizeof shadow_funcs, key);
@@ -2063,7 +2192,8 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     km.valid = memo;
     if (memo) {
         km.fixed = 0; km.vp_key = in_vp; km.fp_key = fp_key; km.fp_ctrl = fp_ctrl & 0x40u;
-        km.cube_mask = cube_mask; km.vtex_mask = vtex_mask; km.shadow_mask = shadow_mask;
+        km.cube_mask = cube_mask; km.vol_mask = vol_mask; km.vtex_mask = vtex_mask;
+        km.shadow_mask = shadow_mask;
         km.unnorm_mask = unnorm_mask; km.texop_mask = texop_mask;
         memcpy(km.shadow_funcs, shadow_funcs, sizeof km.shadow_funcs);
         memcpy(km.unnorm_dim, unnorm_dim, sizeof km.unnorm_dim);
@@ -2105,12 +2235,14 @@ key_done:;
         rsx_fp_set_unnorm_units(unnorm_mask, unnorm_dim);
         rsx_fp_set_texel_ops(texop_mask ? texel_ops : NULL);
         rsx_fp_set_saturate_alpha(eng_fp_sat_alpha(fp_uc, fp_size));
+        rsx_fp_set_volume_units(vol_mask);
         fi = rsx_fp_decompile_buffered_ex(fp_uc, fp_size, fp_ctrl, cube_mask,
                                           s_ps_hlsl, sizeof s_ps_hlsl, &nconst);
         rsx_fp_set_shadow_units(0, NULL);
         rsx_fp_set_unnorm_units(0, NULL);
         rsx_fp_set_texel_ops(NULL);
         rsx_fp_set_saturate_alpha(0);
+        rsx_fp_set_volume_units(0);
         if (unnorm_mask) { static int n = 0; if (n < 6 && ++n)
             fprintf(stderr, "[rsx engine] unnormalised units 0x%X (unit %u %ux%u)\n", unnorm_mask,
                     __builtin_ctz(unnorm_mask), unnorm_dim[__builtin_ctz(unnorm_mask)][0], unnorm_dim[__builtin_ctz(unnorm_mask)][1]); }
@@ -3118,7 +3250,8 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
         }
         textures[u] = eng_texture_slot(t.location, t.offset, t.format,
                                        t.width, t.height, t.mipmaps, t.pitch,
-                                       (int)t.cubemap, t.remap & 0xFFFFu);
+                                       (int)t.cubemap, t.remap & 0xFFFFu,
+                                       (t.dimension == 3 && !t.cubemap) ? t.depth : 1u);
     }
     return mask;
 }
@@ -3136,7 +3269,7 @@ static u32 sink_bind_vertex_textures(
         /* A vertex unit has no crossbar, so its remap is the identity. */
         textures[u] = eng_texture_slot(vt.location, vt.offset, vt.format,
                                        vt.width, vt.height, vt.mipmaps,
-                                       vt.pitch, 0, 0xAAE4u);
+                                       vt.pitch, 0, 0xAAE4u, 1u);
         if (textures[u]) bound |= 1u << u;
     }
     return bound;

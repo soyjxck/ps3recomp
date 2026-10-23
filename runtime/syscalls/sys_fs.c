@@ -127,6 +127,10 @@ static void ps3_vfs_overlay(char* path, size_t cap)
  * The title's own hook runs around it (below). */
 static void ps3game_fallback(char* path, size_t cap);
 
+/* cellGame.c; weak so fixtures that link sys_fs.c without it still link. The
+ * only weak reference to it: under COFF each one emits its own fallback. */
+extern __attribute__((weak)) const char* cellGame_get_hdd_title_id(void);
+
 /* The title's own hook, if it sets one: a port that serves some files from
  * elsewhere -- a mod's, files chosen by what the title is doing -- rewrites
  * the host path there. It is asked before the PS3_GAME fallback, which would
@@ -150,6 +154,29 @@ static void ps3game_fallback(char* path, size_t cap)
     struct stat st;
     if (stat(path, &st) == 0)
         return;
+    /* An HDD game (a PSN title, CATEGORY "HG") boots from /dev_hdd0/game/<id>/,
+     * so that directory is the booted game tree: <root>/game/<id>/X is
+     * <boot>/PS3_GAME/X when the former does not exist. Simpsons Arcade reads
+     * /dev_hdd0/game/NPUB30563/USRDIR/0B/SIMPSONS.SR once cellGameBootCheck
+     * reports it as HDD (#359). Disc titles are left alone: their
+     * /dev_hdd0/game/<id>/ is the update dir, and a miss there is meaningful. */
+    {
+        const char* id = cellGame_get_hdd_title_id ? cellGame_get_hdd_title_id() : NULL;
+        char key[48];
+        char* g;
+        if (id && snprintf(key, sizeof key, "/game/%s/", id) < (int)sizeof key
+            && ((g = strstr(path, key)) != NULL
+                || (snprintf(key, sizeof key, "\\game\\%s\\", id), g = strstr(path, key)) != NULL)) {
+            char alt[1024];
+            const size_t head = (size_t)(g - path);
+            if (head + 10 + strlen(g + strlen(key)) < sizeof alt) {
+                memcpy(alt, path, head);
+                snprintf(alt + head, sizeof alt - head, "/PS3_GAME/%s", g + strlen(key));
+                fs_normalize_sep(alt);
+                if (stat(alt, &st) == 0) { snprintf(path, cap, "%s", alt); return; }
+            }
+        }
+    }
     char* p = strstr(path, "/PS3_GAME/");
     if (!p) {
         /* The reverse: sys_fs flattens any "USRDIR/" path to <root>/USRDIR/...,
@@ -195,6 +222,19 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
         if (!hdd0_init) { hdd0_root = getenv("PS3_HDD0_ROOT"); hdd0_init = 1; }
         if (hdd0_root && strncmp(ps3_path, "/dev_hdd0/", 10) == 0) {
             snprintf(host_path, (size_t)host_path_size, "%s/%s", hdd0_root, ps3_path + 10);
+            fs_normalize_sep(host_path);
+            return;
+        }
+    }
+
+    /* /dev_hdd1 overlays the CACHE partition, the same way ppu_fs.cpp host_path
+     * maps it: /dev_hdd0/... is the installed-update dir, /dev_hdd1/... the
+     * writable cache. PS3_HDD1_ROOT = host dir that /dev_hdd1 maps into. */
+    {
+        static const char* hdd1_root = NULL; static int hdd1_init = 0;
+        if (!hdd1_init) { hdd1_root = getenv("PS3_HDD1_ROOT"); hdd1_init = 1; }
+        if (hdd1_root && *hdd1_root && strncmp(ps3_path, "/dev_hdd1/", 10) == 0) {
+            snprintf(host_path, (size_t)host_path_size, "%s/%s", hdd1_root, ps3_path + 10);
             fs_normalize_sep(host_path);
             return;
         }

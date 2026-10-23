@@ -5,6 +5,7 @@
  * spu_<mnemonic> helpers the lifter emits, so interpreted and lifted code are
  * bit-identical. Uncommon opcodes trap loudly (never silently wrong).
  */
+#include <time.h>
 #include "spu_interp.h"
 #include "spu_helpers.h"
 #include <stdio.h>
@@ -444,6 +445,47 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
         }
         if (_tr>0) { ring[rc&63]=ctx->pc; rc++; if(rn<64)rn++; }
         steps++;
+        /* SPU_INTERP_STATS=<seconds>: how much SPU code runs interpreted, by
+         * image and 1 KB page of local store. A job module streamed in at an
+         * address nothing was lifted for runs here at a fraction of the
+         * compiled speed, and from the outside that only looks like a
+         * workload that is slow for no reason (late audio, slow decode). */
+        { static long s_is = -1;
+          if (s_is < 0) { const char* e = getenv("SPU_INTERP_STATS"); s_is = e ? atol(e) : 0; }
+          if (s_is > 0) {
+            enum { IS_N = 64 };
+            static volatile long long s_tot;
+            static int s_img[IS_N]; static uint32_t s_page[IS_N]; static volatile long long s_cnt[IS_N];
+            static unsigned long long s_t0;
+            uint32_t page = ctx->pc & ~0x3FFu;
+            int k;
+            for (k = 0; k < IS_N && s_cnt[k]; k++)
+                if (s_img[k] == ctx->image_id && s_page[k] == page) break;
+            if (k < IS_N) {
+                if (!s_cnt[k]) { s_img[k] = ctx->image_id; s_page[k] = page; }
+                s_cnt[k]++;
+            }
+            s_tot++;
+            if ((s_tot & 0xFFFF) == 0) {
+                struct timespec ts; timespec_get(&ts, TIME_UTC);   /* stdlib: fixtures link this file alone */
+                unsigned long long now = (unsigned long long)ts.tv_sec * 1000ull + (unsigned long long)ts.tv_nsec / 1000000ull;
+                if (!s_t0) s_t0 = now;
+                else if (now - s_t0 >= (unsigned long long)s_is * 1000ull) {
+                    fprintf(stderr, "[spu-interp] %.1fM steps/s over %lds; top pages:\n",
+                            s_tot / 1e6 / (double)s_is, s_is);
+                    for (int r = 0; r < 6; r++) {
+                        int best = -1;
+                        for (int j = 0; j < IS_N; j++)
+                            if (s_cnt[j] > 0 && (best < 0 || s_cnt[j] > s_cnt[best])) best = j;
+                        if (best < 0) break;
+                        fprintf(stderr, "  img=0x%08X ls=0x%05X  %lld steps\n",
+                                (uint32_t)s_img[best], s_page[best], s_cnt[best]);
+                        s_cnt[best] = -s_cnt[best];
+                    }
+                    for (int j = 0; j < IS_N; j++) { s_cnt[j] = 0; }
+                    s_tot = 0; s_t0 = now;
+                }
+            } } }
         /* SPU_STEPCAP=N: a task that never halts (infinite work/wait loop) never
          * dumps its ring. Force a one-shot dump after N steps to see where it loops. */
         if (_tr>0 && _cap && steps == _cap) {

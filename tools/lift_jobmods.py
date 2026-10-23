@@ -135,6 +135,10 @@ def main():
     ap.add_argument("--symbol-prefix", default="port", metavar="NAME",
                     help="C symbol prefix for the registration functions, so two "
                          "ports linked in one tree cannot collide (default: port).")
+    ap.add_argument("--merge-chunks", action="store_true",
+                    help="Pass --merge-chunks to spu_lifter.py: each run of chunks "
+                         "between call targets becomes one C function with gotos "
+                         "instead of chunks linked by trampolines.")
     args = ap.parse_args()
     JOBMODS = args.jobmods
     OUTDIR  = args.out
@@ -168,6 +172,8 @@ def main():
                "--source-name", "spu_recomp.c", "--header-name", "spu_recomp.h"]
         if name in CODE_END:
             cmd += ["--code-end", hex(CODE_END[name])]
+        if args.merge_chunks:
+            cmd += ["--merge-chunks"]
         # Only offer addresses that fall inside THIS module's image.
         inside = [a for a in EXTRA_FUNCS if BASE <= int(a, 0) < BASE + len(raw)]
         # The module's first function starts right after the 0x30-byte header

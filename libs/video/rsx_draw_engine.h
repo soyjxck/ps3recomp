@@ -79,6 +79,10 @@ typedef struct rsx_be_render_state {
     u32 depth_test, depth_write, depth_func;
     u32 cull_enable, cull_face, front_face;
     u32 color_mask;
+    /* Targets 1..3 of an MRT set: COLOR_MASK_MRT (0x0370), one nibble per
+     * target at [4i..4i+3] = A,R,G,B, and BLEND_ENABLE_MRT (0x036C), bit i.
+     * Target 0 keeps color_mask/blend_enable. Both reset to 0 (RPCS3). */
+    u32 color_mask_mrt, blend_mrt;
     u32 rt_fp16;                    /* the target is an FP16 HDR surface */
     u32 stencil_enable, stencil_two_sided;
     u32 s_func, s_func_mask, s_write_mask, s_fail, s_zfail, s_zpass;
@@ -247,6 +251,15 @@ typedef struct rsx_draw_backend {
     void (*present)(void* user, u32 surface);
     void (*readback)(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
                      void* out, u32 out_pitch);
+
+    /* Optional. 3D textures (SET_TEXTURE_FORMAT dimension 3, CONTROL3 depth):
+     * a volume of `depth` slices per level, each slice one upload of decoded
+     * rows. A backend that leaves these NULL gets the first slice as a 2D
+     * texture through texture_create/texture_upload, as before. */
+    u32  (*texture_create_3d)(void* user, rsx_be_format fmt, u32 w, u32 h,
+                              u32 depth, u32 mips, u32 remap, u32 rsx_fmt);
+    void (*texture_upload_3d)(void* user, u32 texture, u32 z, u32 mip,
+                              u32 w, u32 h, const void* src, u32 row_bytes);
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */

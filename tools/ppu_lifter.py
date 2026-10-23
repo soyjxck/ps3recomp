@@ -5239,6 +5239,23 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
                             continue
                         if count is None or _c > count:
                             count = _c
+            # No compare in the 30-insn window: look for it in the function-bounded
+            # window the base search already uses. The bound can sit further from
+            # the bctr (Toro Lets Party func_000A2EC8: `cmplwi r29,0x123` 33 insns
+            # before its bctr), and the 256 fallback then cut that 292-entry table:
+            # cases 256+ lifted to unresolved indirect calls.
+            if count is None:
+                for w in reversed(win_cand):
+                    if w.mnemonic in ('cmplwi', 'cmpwi'):
+                        a = [x.strip() for x in w.operands.split(',')]
+                        _cmp_reg = a[1] if (a and a[0].startswith('cr')) else (a[0] if a else None)
+                        if _cmp_reg == _raw_idx:
+                            try:
+                                _c = int(a[-1], 0)
+                            except ValueError:
+                                continue
+                            if count is None or _c > count:
+                                count = _c
             if count is None or count < 0 or count > 4096:
                 count = 256
             # The cmp-derived count is a HINT, never a hard cap. It keeps UNDER-

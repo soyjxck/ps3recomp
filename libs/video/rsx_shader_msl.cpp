@@ -27,6 +27,7 @@
  */
 #include "rsx_shader_msl.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #if defined(PS3RECOMP_HAVE_MSL_TRANSLATION)
@@ -69,6 +70,9 @@ bool hlsl_to_spirv(const char* hlsl, EShLanguage lang, std::vector<unsigned int>
     shader.setEnvInput(glslang::EShSourceHlsl, lang, glslang::EShClientVulkan, 100);
     shader.setEnvClient(glslang::EShClientVulkan, glslang::EShTargetVulkan_1_1);
     shader.setEnvTarget(glslang::EShTargetSpv, glslang::EShTargetSpv_1_3);
+    /* SPIR-V FragCoord.w is 1/w (FXC's SV_POSITION.w is w): tells the FP
+     * decompiler's _rsx_inv_w helper which one it gets. */
+    shader.setPreamble("#define RSX_FRAGCOORD_W_IS_RCP 1\n");
     shader.setEntryPoint("main");
     shader.setAutoMapBindings(true);
     shader.setAutoMapLocations(true);
@@ -141,12 +145,25 @@ bool spirv_to_msl(const std::vector<unsigned int>& spirv, char* out, u32 out_siz
         goto done;
     }
     {
-        const size_t len = strlen(msl);
-        if (len + 1 > out_size) {
+        /* spirv-cross spells GLSL.std.450 FMax/FMin/FClamp/Normalize as
+         * fast::max/min/clamp/normalize, whose NaN behaviour Metal leaves
+         * undefined even under MTLMathModeSafe. D3D's max/min return the
+         * number when one operand is NaN and saturate(NaN) is 0, and the
+         * guest programs were written against hardware that never produced
+         * NaN from those. inFAMOUS 2's sky/bloom pass did, only on Metal.
+         * The precise:: overloads follow IEEE fmax/fmin. PS3RECOMP_MSL_FAST=1
+         * keeps the fast:: spelling. */
+        static int keep_fast = -1;
+        if (keep_fast < 0) keep_fast = getenv("PS3RECOMP_MSL_FAST") ? 1 : 0;
+        std::string text(msl);
+        if (!keep_fast)
+            for (size_t at = 0; (at = text.find("fast::", at)) != std::string::npos; at += 9)
+                text.replace(at, 6, "precise::");
+        if (text.size() + 1 > out_size) {
             put_log(log, log_size, "MSL output buffer too small", nullptr);
             goto done;
         }
-        memcpy(out, msl, len + 1);
+        memcpy(out, text.c_str(), text.size() + 1);
     }
     ok = true;
 done:

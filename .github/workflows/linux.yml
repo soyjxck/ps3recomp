@@ -105,6 +105,18 @@ jobs:
             -o /tmp/test_spu_helpers runtime/spu/tests/test_spu_helpers.c -lm
           /tmp/test_spu_helpers
 
+      # The AVX2 single-precision fast path must match the exact scalar path bit for bit.
+      - name: Run the SPU float fast-path test (AVX2)
+        run: |
+          if grep -q avx2 /proc/cpuinfo; then
+            ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} \
+              -std=gnu17 -O2 -mavx2 -mfma -I include -I runtime/spu \
+              -o /tmp/test_spu_float_neon runtime/spu/tests/test_spu_float_neon.c -lm
+            /tmp/test_spu_float_neon
+          else
+            echo "no AVX2 on this runner: skipped"
+          fi
+
       # cellFontInitializeWithRevision initialises the library the way cellFontInit does.
       - name: Run the cellFont init test
         run: |
@@ -132,6 +144,13 @@ jobs:
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_np_identity libs/network/tests/test_np_identity.c
           /tmp/test_np_identity
 
+      # cellVideoOutSetGamma's float argument comes from f1, and the value
+      # reaches the presenter.
+      - name: Run the video out gamma test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_avconf_gamma libs/misc/tests/test_avconf_gamma.c
+          /tmp/test_avconf_gamma
+
       # NAT traversal: probing psnr from the P2P socket, dropping psnr's
       # packets before the title sees them, punching toward peers.
       - name: Run the NAT traversal test
@@ -144,6 +163,13 @@ jobs:
         run: |
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_np_commerce2 libs/network/tests/test_np_commerce2.c
           /tmp/test_np_commerce2
+
+      # cellPadSetActDirect: the small motor is on/off at full strength, and
+      # a rumble lasts until the title changes it (renewed from the pad poll).
+      - name: Run the pad rumble test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include $(sdl2-config --cflags) -o /tmp/test_pad_rumble libs/input/tests/test_pad_rumble.c $(sdl2-config --libs) -lm
+          /tmp/test_pad_rumble
 
 
       # Guest vertex and fragment programs through the decompilers, glslang
@@ -286,6 +312,11 @@ jobs:
           # 32 dwords and the registers after it are not constants.
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_rsx_transform_constants libs/video/tests/test_rsx_transform_constants.c libs/video/rsx_commands.c
           /tmp/test_rsx_transform_constants
+          # Texture offsets are 31 bits; bit 31 is not an address bit.
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_rsx_texture_offset libs/video/tests/test_rsx_texture_offset.c libs/video/rsx_dispatch.c
+          /tmp/test_rsx_texture_offset
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_rsx_command_texture_offset libs/video/tests/test_rsx_command_texture_offset.c libs/video/rsx_commands.c
+          /tmp/test_rsx_command_texture_offset
 
       # The Win32 shim every POSIX host runs the runtime through: interlocked
       # widths and return conventions, SRW/CS/condition variables, events,
@@ -374,6 +405,42 @@ jobs:
             -lpthread -lm
           /tmp/test_spu_taskset_wake
 
+      # The host setting or consuming a task's signal bit against an SPU commit
+      # to the same word. The read was outside the lock-line lock, so a commit
+      # between the read and the write was lost and that task never woke.
+      - name: Run the SPURS signalled-bit atomicity test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I runtime/spu -I runtime/platform \
+            -o /tmp/test_spurs_signalled_atomic \
+            runtime/spu/tests/test_spurs_signalled_atomic.c \
+            runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
+            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
+            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
+            runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
+            runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+            runtime/platform/win32_compat.c \
+            runtime/platform/env_cache.c runtime/spu/tests/fork_runtime_standins.c \
+            -lpthread -lm
+          /tmp/test_spurs_signalled_atomic
+
+      # The host's task-id search, task registration and task exit against each
+      # other on the taskset's bitset line. A plain read then write undid a task
+      # exit, so the exited task's enabled bit came back and JoinTask2 hung.
+      - name: Run the SPURS taskset bitset atomicity test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I runtime/spu -I runtime/platform \
+            -o /tmp/test_spurs_taskset_bits_atomic \
+            runtime/spu/tests/test_spurs_taskset_bits_atomic.c libs/spurs/spurs_taskset.c \
+            runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
+            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
+            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
+            runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
+            runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+            runtime/platform/win32_compat.c \
+            runtime/platform/env_cache.c runtime/spu/tests/fork_runtime_standins.c \
+            -lpthread -lm
+          /tmp/test_spurs_taskset_bits_atomic
+
       # A thread group starting its threads on their image's LIFTED code. This
       # is the path a real title needs and the one that used to be missing: the
       # group's threads completed instantly with status 0, the group reported a
@@ -420,3 +487,22 @@ jobs:
             runtime/platform/win32_compat.c \
             -lpthread -lm
           /tmp/test_spu_mfc_slots
+
+      # A SPURS job's entry saves its link register at 16($sp), in the caller's
+      # frame. The runner put $sp 16 bytes under the stack top, where the cache
+      # buffers start, so that save overwrote the first quadword of
+      # cacheBuffer[0]: Twisted Metal's Edge jobs lost their viewport there.
+      - name: Run the SPURS job stack frame test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I runtime/spu -I runtime/platform \
+            -o /tmp/test_spurs_job_stack \
+            runtime/spu/tests/test_spurs_job_stack.c \
+            runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
+            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
+            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
+            runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
+            runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+            runtime/platform/win32_compat.c \
+            runtime/platform/env_cache.c runtime/spu/tests/fork_runtime_standins.c \
+            -lpthread -lm
+          /tmp/test_spurs_job_stack

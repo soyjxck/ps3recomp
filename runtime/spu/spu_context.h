@@ -11,6 +11,7 @@
 #define SPU_CONTEXT_H
 
 #include "../../include/ps3emu/ps3types.h"
+#include "../../include/ps3emu/log_first.h"
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
@@ -632,7 +633,7 @@ static __attribute__((noinline, cold)) void spu_ls_write_probe_smc(spu_context* 
         const char* h = getenv("SPU_SMC_HI"); hi = h ? (uint32_t)strtoul(h,0,0) : 0x3700; }
       if (s >= 0 && (uint32_t)ctx->image_id == img && lsa >= lo && lsa < hi) {
           static int _n = 0;
-          if (_n < 48 && ++_n)
+          if (PS3_LOG_FIRST(_n, 48))
               fprintf(stderr, "[spu-SMC] img=%d WROTE CODE @0x%05X (pc=0x%05X) = %02X%02X%02X%02X\n",
                       ctx->image_id, lsa, (uint32_t)ctx->pc & SPU_LS_MASK,
                       p[0], p[1], p[2], p[3]);

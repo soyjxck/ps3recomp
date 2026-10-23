@@ -70,10 +70,10 @@ Quick orientation for newcomers. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md
 ps3recomp/
 ├── tools/          # Python pipeline: ELF parsing → disassembly → code lifting
 ├── runtime/        # Core C runtime: PPU/SPU contexts, virtual memory, LV2 syscalls
-├── libs/           # 93 HLE module implementations (the bulk of the code)
+├── libs/           # HLE modules, one row each in docs/MODULE_STATUS.md (the bulk of the code)
 ├── include/ps3emu/ # Public API headers for game projects
 ├── templates/      # Starter project template
-└── docs/           # 11+ documentation files
+└── docs/           # Documentation (one Markdown file per topic)
 ```
 
 **Data flow:** PS3 ELF → `tools/` analyzes and lifts to C → game project links against `runtime/` + `libs/` → native executable.

@@ -13,6 +13,7 @@
 #include "rsx_fp_decompiler.h"
 #include <stdio.h>
 #include <string.h>
+#include "ps3emu/log_first.h"
 
 /* ---- DWORD 0 (OPDEST) --------------------------------------------------- */
 #define FP_END              (1u << 0)
@@ -405,23 +406,41 @@ static const char* input_expr(u32 input_src)
     case 0x1: return "input.col0";     /* COL0 */
     case 0x2: return "input.col1";     /* COL1 */
     case 0x3: return "input.fog";      /* FOGC */
+    case 0xC: return "input.tc8";      /* TC8 (VP o15) */
+    case 0xD: return "input.tc9";      /* TC9 (VP o6) */
+    /* FACING: +1 on a front face, -1 on a back face (RPCS3's `ssa`). Two-sided
+     * materials multiply the interpolated normal by it; read as zero, inFAMOUS
+     * 2's foliage and character heads normalised a null vector into the
+     * G-buffer and lit black. */
+    case 0xE: return "(input._rsx_front ? float4(1,1,1,1) : float4(-1,-1,-1,-1))";
     default:
         if (input_src >= 0x4 && input_src <= 0xB) return tc[input_src - 0x4]; /* TC0..7 */
-        if (input_src == 0xC) return "input.tc8";
-        if (input_src == 0xD) return "input.tc9";
-        return "float4(0,0,0,0)";      /* FACING not plumbed */
+        return "float4(0,0,0,0)";
     }
 }
 
 /* Build the swizzled/negated/abs'd HLSL for one source into `buf`. */
-static void emit_src(const Src* s, u32 input_src, const float* k, int has_k,
+static void emit_src(const Src* s, u32 input_src, int persp, const float* k, int has_k,
                      int buffered, u32 constant_slot, char* buf, u32 bufsz)
 {
     char base[96];
     if (s->type == FP_REG_TYPE_TEMP) {
         snprintf(base, sizeof(base), "%s[%u]", s->half ? "h" : "r", s->index);
     } else if (s->type == FP_REG_TYPE_INPUT) {
-        snprintf(base, sizeof(base), "%s", input_expr(input_src));
+        /* SRC2.perspective_corr on a texcoord read (TC0..TC9) multiplies it
+         * by 1/w (RPCS3 FragmentProgramDecompiler: "Perspective correct flag
+         * multiplies the result by 1/w"). A vertex program that writes uv*w
+         * relies on it: inFAMOUS 2's water samples its screen copy that way,
+         * and read raw it lands far outside the copy and the river is black.
+         * The helper takes the whole input, not input.position: the D3D12 and
+         * Metal engines give every program that names input.position a
+         * second, WPOS-scaled build at a raised internal resolution, and the
+         * w this reads is the same in both. */
+        if (persp && input_src >= 0x4 && input_src <= 0xD)
+            snprintf(base, sizeof(base), "(%s * _rsx_inv_w(input))",
+                     input_expr(input_src));
+        else
+            snprintf(base, sizeof(base), "%s", input_expr(input_src));
     } else { /* CONST */
         if (buffered && has_k)
             snprintf(
@@ -543,6 +562,11 @@ void rsx_fp_set_shadow_units(u32 mask, const u8* funcs)
     for (u32 u = 0; u < 16; u++) s_shadow_func[u] = funcs ? (u8)(funcs[u] & 7u) : 0;
 }
 
+/* Volume (3D texture) units for the next decompile; see
+ * rsx_fp_set_volume_units in the header. */
+static u32 s_vol_mask;
+void rsx_fp_set_volume_units(u32 mask) { s_vol_mask = mask & 0xFFFFu; }
+
 /* A shadow unit's comparison written as "reference OP texel" (GL order); the
  * helper below flips it to the RSX's "texel OP reference" by default. */
 static const char* fp_shadow_op(u32 f)
@@ -557,6 +581,9 @@ static int rsx_fp_decompile_internal(
 {
     if (!ucode || !out || out_size == 0) return -1;
     memset(&g_rsx_fp_stats, 0, sizeof g_rsx_fp_stats);
+    /* Cube and volume units are declared on their own t-register; with none
+     * the 2D array keeps every 2D-only program byte-identical. */
+    const u32 tex_sep_mask = tex_cube_mask | s_vol_mask;
 
     u32 buffered_constant_count = 0;
     if (buffered) {
@@ -586,6 +613,30 @@ static int rsx_fp_decompile_internal(
         /* Condition-code registers for exec_if predication / set_cond. Reset
          * to 0 (NV40 CC power-up state). Dead in non-predicated programs. */
         "    float4 cc0 = (float4)0; float4 cc1 = (float4)0;\n");
+    /* RSX_FP_DEBUG=<structural hash hex>:<n>:<reg[.swz]>: in the program
+     * with that structural hash (rsx_fp_structural_hash with the FNV offset
+     * basis as seed, the "fp-struct=" the engine's pipeline log prints),
+     * copy register <reg> (r3, h1, h1.wwww ...) right after its <n>-th
+     * translated instruction and export it as colour target 0 with alpha 1.
+     * An intermediate of a long shader is then seen on screen instead of
+     * reasoned out from the listing. */
+    static long dbg_n = -2; static char dbg_reg[32]; static u64 dbg_hash;
+    if (dbg_n == -2) {
+        dbg_n = -1;
+        const char* e = getenv("RSX_FP_DEBUG");
+        if (e) {
+            char* d;
+            dbg_hash = strtoull(e, &d, 16);
+            if (*d == ':') dbg_n = strtol(d + 1, &d, 10);
+            if (*d == ':') snprintf(dbg_reg, sizeof dbg_reg, "%s", d + 1);
+            if (!(dbg_reg[0] == 'r' || dbg_reg[0] == 'h')) dbg_n = -1;
+        }
+    }
+    const int dbg_here = dbg_n >= 0 &&
+        rsx_fp_structural_hash(ucode, max_bytes, 1469598103934665603ull) == dbg_hash;
+    u32 dbg_count = 0;
+    int dbg_done = 0;
+    if (dbg_here) out_puts(&o, "    float4 _rsx_dbg = (float4)0;\n");
 
     /* Which colour export each register file received a write to, indexed
      * [half][target]. The whole file is tracked, not just target 0, because
@@ -686,15 +737,19 @@ static int rsx_fp_decompile_internal(
             has_k = 1;
         }
 
+        /* SRC2 bit 31 is perspective_corr for the instruction's input read
+         * (RPCS3 RSXFragmentProgram.h SRC2); on a branch the word is an
+         * address instead. */
+        const int persp = !is_branch && (w3 >> 31) != 0;
         char a[200], b[200], c[200];
         emit_src(
-            &s0, input_src, k, has_k, buffered, constant_slot,
+            &s0, input_src, persp, k, has_k, buffered, constant_slot,
             a, sizeof(a));
         emit_src(
-            &s1, input_src, k, has_k, buffered, constant_slot,
+            &s1, input_src, persp, k, has_k, buffered, constant_slot,
             b, sizeof(b));
         emit_src(
-            &s2, input_src, k, has_k, buffered, constant_slot,
+            &s2, input_src, persp, k, has_k, buffered, constant_slot,
             c, sizeof(c));
         if (has_k)
             constant_slot++;
@@ -756,6 +811,16 @@ static int rsx_fp_decompile_internal(
             continue;
         }
 
+        if (dbg_here && !dbg_done && dbg_count == (u32)dbg_n) {
+            /* "h1" -> (h[1]), "h1.wwww" -> (h[1]).wwww */
+            const char* dot = strchr(dbg_reg, '.');
+            const unsigned idx = (unsigned)strtoul(dbg_reg + 1, NULL, 10);
+            char line[96];
+            snprintf(line, sizeof line, "    _rsx_dbg = (float4)((%c[%u])%s);\n",
+                     dbg_reg[0], idx < 48u ? idx : 0u, dot ? dot : "");
+            out_puts(&o, line);
+            dbg_done = 1;
+        }
         /* Build the RHS expression for this opcode. */
         char rhs[640];
         int handled = 1;
@@ -837,11 +902,11 @@ static int rsx_fp_decompile_internal(
             fp_coord2(tex_unit, xy, c2, sizeof c2);
             if ((s_shadow_mask >> tex_unit) & 1u)
                 snprintf(rhs, sizeof(rhs), "rsx_shadow%u(float3(%s, (%s).z))", tex_unit, c2, a);
-            else if ((tex_cube_mask >> tex_unit) & 1u)
-                /* Cubemap: sample with the full 3-component direction vector. */
+            else if ((tex_sep_mask >> tex_unit) & 1u)
+                /* Cubemap or volume: sample with all three coordinates. */
                 snprintf(rhs, sizeof(rhs),
                          "rsx_tex%u.Sample(rsx_samp[%u], (%s).xyz)", tex_unit, tex_unit, a);
-            else if (tex_cube_mask)
+            else if (tex_sep_mask)
                 snprintf(rhs, sizeof(rhs),
                          "rsx_tex%u.Sample(rsx_samp[%u], %s)", tex_unit, tex_unit, c2);
             else
@@ -860,7 +925,11 @@ static int rsx_fp_decompile_internal(
                  * the direction directly. */
                 snprintf(rhs, sizeof(rhs),
                          "rsx_tex%u.Sample(rsx_samp[%u], (%s).xyz)", tex_unit, tex_unit, a);
-            else if (tex_cube_mask)
+            else if ((s_vol_mask >> tex_unit) & 1u)
+                snprintf(rhs, sizeof(rhs),
+                         "rsx_tex%u.Sample(rsx_samp[%u], (%s).xyz / (%s).w)",
+                         tex_unit, tex_unit, a, a);
+            else if (tex_sep_mask)
                 snprintf(rhs, sizeof(rhs),
                          "rsx_tex%u.Sample(rsx_samp[%u], %s)", tex_unit, tex_unit, c2);
             else
@@ -876,11 +945,11 @@ static int rsx_fp_decompile_internal(
                 snprintf(rhs, sizeof(rhs), "rsx_shadow%u(float3(%s, (%s).z))", tex_unit, c2, a);
                 break;
             }
-            if (((s_unnorm_mask >> tex_unit) & 1u) && !((tex_cube_mask >> tex_unit) & 1u)) {
+            if (((s_unnorm_mask >> tex_unit) & 1u) && !((tex_sep_mask >> tex_unit) & 1u)) {
                 char xy[160], c2[256], tn[32];
                 snprintf(xy, sizeof xy, "(%s).xy", a);
                 fp_coord2(tex_unit, xy, c2, sizeof c2);
-                snprintf(tn, sizeof(tn), tex_cube_mask ? "rsx_tex%u" : "rsx_tex[%u]", tex_unit);
+                snprintf(tn, sizeof(tn), tex_sep_mask ? "rsx_tex%u" : "rsx_tex[%u]", tex_unit);
                 snprintf(rhs, sizeof(rhs), "%s.%s(rsx_samp[%u], %s, (%s).x)", tn,
                          opcode == OP_TXB ? "SampleBias" : "SampleLevel", tex_unit, c2, b);
                 break;
@@ -889,9 +958,9 @@ static int rsx_fp_decompile_internal(
             /* Biased / explicit-LOD sample; bias or LOD is src1.x (RPCS3
              * TEXTURE_SAMPLE2D_BIAS / _LOD). GH3's fret buttons and fret lines
              * are TXB: unhandled, they sampled nothing and output alpha 0. */
-            const int cube = (tex_cube_mask >> tex_unit) & 1u;
+            const int cube = (tex_sep_mask >> tex_unit) & 1u;   /* cube or volume: xyz */
             char tn[32];
-            snprintf(tn, sizeof(tn), tex_cube_mask ? "rsx_tex%u" : "rsx_tex[%u]", tex_unit);
+            snprintf(tn, sizeof(tn), tex_sep_mask ? "rsx_tex%u" : "rsx_tex[%u]", tex_unit);
             snprintf(rhs, sizeof(rhs), "%s.%s(rsx_samp[%u], (%s).%s, (%s).x)", tn,
                      opcode == OP_TXB ? "SampleBias" : "SampleLevel", tex_unit, a,
                      cube ? "xyz" : "xy", b);
@@ -934,9 +1003,27 @@ static int rsx_fp_decompile_internal(
             break;
         }
 
+        /* EXP_TEX (OPDEST bit 21, the _bx2 modifier) belongs to the
+         * instruction, not the texture: the fetch comes back as x*2-1 on
+         * every lane, whatever unit it reads, and the unit's own texel
+         * conversions (gamma, biased remap) step aside for it (RPCS3
+         * _enable_texture_expand / _process_texel). inFAMOUS 2 reads its
+         * tangent-space normal maps with TEX_bx2; unexpanded, every normal
+         * leaned towards (1,1,1). A comparison fetch has nothing to expand.
+         * RSX_NO_FP_BX2=1 reads such fetches unexpanded, as before. */
+        static int no_bx2 = -1;
+        if (no_bx2 < 0) no_bx2 = getenv("RSX_NO_FP_BX2") ? 1 : 0;
+        const int bx2 = handled && rhs[0] && (w0 & (1u << 21)) && !no_bx2 &&
+                        !((s_shadow_mask >> tex_unit) & 1u) &&
+                        (opcode == OP_TEX || opcode == OP_TXP || opcode == OP_TXB || opcode == OP_TXL);
+        if (bx2) {
+            char wrapped[sizeof rhs];
+            if (snprintf(wrapped, sizeof wrapped, "((%s) * 2.0 - 1.0)", rhs) < (int)sizeof wrapped)
+                memcpy(rhs, wrapped, sizeof rhs);
+        }
         /* A unit with texel conversions returns its sample through
          * rsx_texop<u> (gamma / biased expansion, emitted in the prologue). */
-        if (handled && rhs[0] && ((s_texop_mask >> tex_unit) & 1u) && !((s_shadow_mask >> tex_unit) & 1u) &&
+        if (!bx2 && handled && rhs[0] && ((s_texop_mask >> tex_unit) & 1u) && !((s_shadow_mask >> tex_unit) & 1u) &&
             (opcode == OP_TEX || opcode == OP_TXP || opcode == OP_TXB || opcode == OP_TXL)) {
             char wrapped[sizeof rhs];
             if (snprintf(wrapped, sizeof wrapped, "rsx_texop%u(%s)", tex_unit, rhs) < (int)sizeof wrapped)
@@ -944,6 +1031,7 @@ static int rsx_fp_decompile_internal(
         }
 
         int has_dest = !(w0 & FP_OUT_NONE);
+        if (dbg_here && handled && !dbg_done) dbg_count++;
         if (handled && (has_dest || set_cond)) {
             u32 dst_idx = (w0 & FP_OUT_REG_MASK) >> FP_OUT_REG_SHIFT;
             int dst_half = (w0 & FP_OUT_HALF) ? 1 : 0;
@@ -1092,6 +1180,16 @@ static int rsx_fp_decompile_internal(
     for (u32 t = FP_MAX_COLOR_TARGETS; t-- > 1; )
         if (wrote[half_exports][t]) { targets = t + 1; break; }
 
+    if (dbg_here) {
+        static u32 reported;
+        if (PS3_LOG_FIRST(reported, 8))
+            fprintf(stderr, "[RSX fp] RSX_FP_DEBUG %016llx: %s after instruction %ld%s\n",
+                    (unsigned long long)dbg_hash, dbg_reg, dbg_n,
+                    dbg_done ? "" : " not reached (program is shorter)");
+        if (dbg_done)
+            out_puts(&o, "    { float4 _d = _rsx_dbg; _d.w = 1.0;"
+                         " r[0] = _d; h[0] = _d; }\n");
+    }
     if (targets == 1) {
         char tail[160];
         snprintf(tail, sizeof(tail),
@@ -1134,19 +1232,37 @@ static int rsx_fp_decompile_internal(
         "    float4 fog : FOG;\n"
         "    float4 tc0:TEXCOORD0; float4 tc1:TEXCOORD1; float4 tc2:TEXCOORD2; float4 tc3:TEXCOORD3;\n"
         "    float4 tc4:TEXCOORD4; float4 tc5:TEXCOORD5; float4 tc6:TEXCOORD6; float4 tc7:TEXCOORD7;\n"
-        "    float4 tc8:TEXCOORD8; float4 tc9:TEXCOORD9;\n"
-        "};\n");
+        "    float4 tc8:TEXCOORD8; float4 tc9:TEXCOORD9;\n");
+    /* The face flag only where the body reads FACING, so every other program
+     * stays byte-identical (and keeps its cached pipeline). A system value:
+     * the vertex stage does not write it. */
+    if (strstr(o.p, "input._rsx_front"))
+        out_puts(&p, "    bool _rsx_front : SV_IsFrontFace;\n");
+    out_puts(&p, "};\n");
+    /* 1/w of the fragment for perspective_corr reads. SV_POSITION.w is the
+     * clip w under FXC (D3D12) but already 1/w once glslang lowers it to
+     * SPIR-V FragCoord (Vulkan, and Metal's [[position]] is (x, y, z, 1/w));
+     * the glslang paths define RSX_FRAGCOORD_W_IS_RCP. Emitted only where the
+     * body uses it, so every other program stays byte-identical. */
+    if (strstr(o.p, "_rsx_inv_w("))
+        out_puts(&p,
+            "#ifdef RSX_FRAGCOORD_W_IS_RCP\n"
+            "#define _rsx_inv_w(i) ((i).position.w)\n"
+            "#else\n"
+            "#define _rsx_inv_w(i) (1.0 / (i).position.w)\n"
+            "#endif\n");
     /* Texture bank. With no cube units (the default) emit the exact legacy
      * array declaration so 2D-only programs are byte-identical. When any unit
      * is a cubemap, declare each unit individually at its t-register so the
      * cube units can be TextureCube while the rest stay Texture2D. */
-    if (tex_cube_mask == 0) {
+    if (tex_sep_mask == 0) {
         out_puts(&p, "Texture2D    rsx_tex[16] : register(t0);\n");
     } else {
         char decl[64];
         for (u32 u = 0; u < 16; u++) {
             snprintf(decl, sizeof(decl), "%s rsx_tex%u : register(t%u);\n",
-                     ((tex_cube_mask >> u) & 1u) ? "TextureCube" : "Texture2D  ", u, u);
+                     ((tex_cube_mask >> u) & 1u) ? "TextureCube" :
+                     ((s_vol_mask >> u) & 1u)    ? "Texture3D  " : "Texture2D  ", u, u);
             out_puts(&p, decl);
         }
     }
@@ -1161,9 +1277,9 @@ static int rsx_fp_decompile_internal(
      * the results bilinearly. Sampled as plain depth, Drakengard 3's shadow
      * projections came out as solid dark rectangles, and whole floors black. */
     for (u32 u = 0; u < 16; u++) {
-        if (!((s_shadow_mask >> u) & 1u) || ((tex_cube_mask >> u) & 1u)) continue;
+        if (!((s_shadow_mask >> u) & 1u) || ((tex_sep_mask >> u) & 1u)) continue;
         char tn[24], fn[1400];
-        snprintf(tn, sizeof tn, tex_cube_mask ? "rsx_tex%u" : "rsx_tex[%u]", u);
+        snprintf(tn, sizeof tn, tex_sep_mask ? "rsx_tex%u" : "rsx_tex[%u]", u);
         const char* op = fp_shadow_op(s_shadow_func[u]);
         /* RSX_SHADOW_FORWARD=1: the GL order, "reference OP texel". The
          * default is the RSX's own, "texel OP reference" (RPCS3 builds its

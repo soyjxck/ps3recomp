@@ -43,6 +43,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef _WIN32
+#include <sys/mman.h>   /* mmap: the guest arena, see alloc_guest_vm */
+#endif
+
 #ifdef _WIN32
 /* timeBeginPeriod: <windows.h> arrives with WIN32_LEAN_AND_MEAN set, which
  * excludes the multimedia timer API, so it is asked for by name -- and after
@@ -291,11 +295,19 @@ static bool alloc_guest_vm(void)
     vm_base = (uint8_t*)VirtualAlloc(NULL, VM_SIZE, MEM_RESERVE, PAGE_READWRITE);
     ppu_vm_size = 0;              /* the whole space is backed; no OOB guard needed */
 #else
-    /* No vectored exception handlers off Windows, so the arena is committed up
+    /* No vectored exception handlers off Windows, so the arena is mapped up
      * front and lazily backed by the OS: only pages the title touches cost
      * anything. It stops below the 0xE0000000 mark, so ppu_vm_size arms the
-     * loader's bounds check for what is left. */
-    vm_base = (uint8_t*)calloc(1, 0xE0000000u);
+     * loader's bounds check for what is left.
+     *
+     * mmap, not calloc: vm_commit() hands vm_base + addr to mprotect, which
+     * takes page-aligned addresses only. glibc serves an allocation this big
+     * from its own mmap chunk and returns a pointer 16 bytes past the page
+     * start, so every commit failed with EINVAL and sys_memory_allocate
+     * answered ENOMEM to every call. mmap's base is page-aligned and zeroed. */
+    void* p = mmap(NULL, 0xE0000000u, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    vm_base = (p == MAP_FAILED) ? nullptr : (uint8_t*)p;
     ppu_vm_size = 0xE0000000u;
 #endif
     return vm_base != nullptr;

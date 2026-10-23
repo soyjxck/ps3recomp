@@ -131,6 +131,12 @@ void rsx_fp_set_texel_ops(const u32* ops);
  * [0, 1] (a per-title correction the engine applies by program; see
  * RSX_FP_SAT_ALPHA in rsx_draw_engine.c). Reset to 0 after. */
 void rsx_fp_set_saturate_alpha(int on);
+/* Volume units for the NEXT decompile call: bit u of mask means unit u is
+ * bound to a 3D texture (SET_TEXTURE_FORMAT dimension 3), so it is declared
+ * Texture3D on its own t-register and sampled with three coordinates (TXP
+ * divides all three by w), as a cube unit is. Only for a backend that binds
+ * 3D textures; key the pipeline on it, reset to 0 after. */
+void rsx_fp_set_volume_units(u32 mask);
 int rsx_fp_decompile_ex(const u8* ucode, u32 max_bytes, u32 ctrl,
                         u32 tex_cube_mask, char* out, u32 out_size);
 

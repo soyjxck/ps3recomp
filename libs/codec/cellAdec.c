@@ -15,6 +15,7 @@
 #include "../guest_struct.h"   /* GUEST_EA, guest_struct_load/store */
 #include "ps3emu/guest_call.h" /* g_ps3_guest_caller -- cbFunc is a GUEST OPD */
 #include "../../runtime/memory/vm.h"     /* VM_HLE_INJECT_BASE */
+#include "ps3emu/log_first.h"
 
 /* CellAdecPcmItem as the guest reads it, from RPCS3 Modules/cellAdec.h:339.
  * ps1_netemu copies the whole thing out with six 8-byte loads from offsets
@@ -97,7 +98,7 @@ static void adec_notify(CellAdecHandle handle, u32 msg_type, s32 msg_data)
     if (handle >= MAX_ADEC || !s_adec[handle].in_use) return;
     const AdecSlot* a = &s_adec[handle];
     { static int _n = 0;
-      if (_n < 4 && ++_n)
+      if (PS3_LOG_FIRST(_n, 4))
           printf("[cellAdec] notify h=%u msg=%u data=0x%X cb=0x%08X arg=0x%08X caller=%d\n",
                  handle, msg_type, (unsigned)msg_data, a->cbFunc, a->cbArg,
                  g_ps3_guest_caller ? 1 : 0); }
@@ -285,7 +286,7 @@ s32 cellAdecDecodeAu(CellAdecHandle handle, const CellAdecAuInfo* auInfo)
 
 s32 cellAdecGetPcm(CellAdecHandle handle, void* outBuffer)
 {
-    { static int _n = 0; if (_n < 6 && ++_n)
+    { static int _n = 0; if (PS3_LOG_FIRST(_n, 6))
         printf("[cellAdec] GetPcm(handle=%u out=0x%08X)\n",
                handle, GUEST_EA(outBuffer)); }
     if (handle >= MAX_ADEC || !s_adec[handle].in_use)
@@ -305,7 +306,7 @@ s32 cellAdecGetPcm(CellAdecHandle handle, void* outBuffer)
 
 s32 cellAdecGetPcmItem(CellAdecHandle handle, const CellAdecPcmItem** pcmItem)
 {
-    { static int _n = 0; if (_n < 6 && ++_n)
+    { static int _n = 0; if (PS3_LOG_FIRST(_n, 6))
         printf("[cellAdec] GetPcmItem(handle=%u out=0x%08X hasPcm=%d)\n",
                handle, GUEST_EA(pcmItem),
                handle < MAX_ADEC ? s_adec[handle].hasPcm : -1); }

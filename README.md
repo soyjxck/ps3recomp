@@ -217,7 +217,7 @@ tests (`runtime/spu/tests/`: sum, shufb, DMA, brsl-return).
 
 ## Module Status
 
-HLE implementations of the PS3 system libraries, written for this project. RPCS3 is a behavioural reference, not a code source. **About 93 modules complete and 5 partial** (media decode, SPURS), in roughly 260 files and 100,000 lines under `libs/`.
+HLE implementations of the PS3 system libraries, written for this project. RPCS3 is a behavioural reference, not a code source. Most modules are complete. The ones still marked Partial are the media decoders (cellVdec, cellAdec, cellDmux, cellAtrac, cellAdecAtrac3p) and cellSpurs. [docs/MODULE_STATUS.md](docs/MODULE_STATUS.md) has one row per module and is the source for the counts.
 
 | Category | Modules | Status |
 |----------|---------|--------|
@@ -238,7 +238,7 @@ HLE implementations of the PS3 system libraries, written for this project. RPCS3
 | **System** | cellRtc, cellMsgDialog, cellOskDialog, cellUserInfo, cellGameExec | ✅ Complete |
 | **Localization** | cellL10n (UTF-8/16/32/UCS-2, ISO-8859-1, generic converter) | ✅ Complete |
 | **Resolution** | cellResc (display modes, scaling, interlace, aspect ratio) | ✅ Complete |
-| **Fibers** | cellFiber (PPU fibers via Windows Fibers/ucontext) | ✅ Complete |
+| **Fibers** | cellFiber (PPU fiber scheduler via Windows Fibers/ucontext) | ✅ Complete |
 | **AV Config** | cellAvconfExt (audio output info, gamma, sound availability) | ✅ Complete |
 | **Input Util** | cellKey2char (HID scancode → Unicode, US-101 layout) | ✅ Complete |
 | **Graphics** | cellGcmSys (cmd buffer, IO mapping, tile/zcull, flip handlers, timestamps, FIFO walker + ring recycle), RSX command processor (NV47xx parsing, state tracking, backend callbacks), **live D3D12 backend** (executes the title's real NV4097 vertex/fragment programs — indexed draws, per-draw VP constants + textures, render-to-texture, MRT, FP predication), null backend (Win32 window) | ✅ Complete |
@@ -357,9 +357,10 @@ Ports other people are running on ps3recomp, whose fixes come back upstream:
 - **Twisted Metal** ([@Kurtisone](https://github.com/Kurtisone)): menus on
   Linux/Vulkan, the deferred renderer's lighting and post-FX included. Most of
   v0.14.0's draw-engine and Vulkan work came out of this port.
-- **Killzone 3** ([@undecuple](https://github.com/undecuple)): reaches the
-  first level with geometry, lighting, shadows and depth of field (Windows
-  build, run under Proton). 33 of its general fixes landed in v0.15.0 (#214).
+- **Killzone 3** ([@undecuple](https://github.com/undecuple)): all nine
+  chapters load and run five minutes of scripted play, and one chapter has
+  been played by hand to its end (Windows build, run under Proton). Its
+  general fixes went upstream through #214 and the PRs that followed it.
 - *LittleBigPlanet* ([@sagemono](https://github.com/sagemono)), *Yakuza: Dead
   Souls* ([@canersaka](https://github.com/canersaka)), *God of War II HD* and
   *Ben 10 Omniverse* ([@andrebrumdev](https://github.com/andrebrumdev)), and
@@ -415,6 +416,123 @@ MIT License. See [LICENSE](LICENSE) for details.
 
 
 ## Changelog
+
+### v0.17.0 — *"Thirty-Three"* (October 2026)
+
+*33 pull requests from seven contributors, merged in #413. Most of them come
+from two new God of War ports (HD and Ascension), plus Killzone 3, Twisted
+Metal and SoulCalibur II HD.*
+
+**RSX and graphics**
+- God of War HD on D3D12 (*[@rigaz29](https://github.com/rigaz29)*, new):
+  depth/stencil-only clears no longer wipe the scene (#393). Indexed strips
+  keep their winding (#391). The guest-FP pipeline cache is keyed on the code,
+  not the address, which removed a full recompile per draw for programs
+  uploaded to a ring (#392). The FP decompiler is told the draw's export width
+  (#396). A wrapped command ring no longer overwrites commands the RSX hasn't
+  read (#390). `initguid.h` is included in the right place (#389), and new
+  `FP_DUMP=<n>` (#398), `PS3_HLE_TOP=<s>` (#397) and `SPU_INTERP_STATS=<s>`
+  (#394) diagnostics.
+- God of War: Ascension (*[@MaChInEgUn3](https://github.com/MaChInEgUn3)*,
+  new): X16 textures present like B8, so the font atlas shows (#384). A
+  smaller clip on the same rows reuses the surface (#382). The Vulkan pipeline
+  table is as large as the engine's (#378).
+- Killzone 3 (*[@undecuple](https://github.com/undecuple)*): texture offsets
+  are 31 bits (#408). A texture smaller than the surface it aliases samples
+  the surface's top-left (#395). `get` is published past a semaphore RELEASE
+  before its label (#401). Main-memory maps take the first free IO pages, and
+  are refused before `cellGcmInit` (#410).
+
+**SPU, SPURS and threads**
+- The Twisted Metal bring-up runtime is on master, so that port links again
+  (*[@Kurtisone](https://github.com/Kurtisone)*, #381).
+- Taskset bitsets are updated atomically on task create and exit (#388).
+  `cellSpursQueueSize` is answered (#411), and non-joinable PPU threads free
+  their slot when they end (#409) (*@undecuple*).
+- The identical-transfer DMA halt also waits for wall time and backs off,
+  so a job polling an RSX label isn't killed (*@MaChInEgUn3*, #383).
+- `cellFiber` is the SDK's scheduler API, replacing the made-up one
+  (*[@n0madic](https://github.com/n0madic)*, #400, closes #365).
+
+**Memory, codecs and system**
+- LV2 user allocations and mapper reservations are separate domains, and
+  loaded ELF segments are never handed out
+  (*[@tekulvw](https://github.com/tekulvw)*, #296).
+- cellVdec: `QueryAttrEx`/`OpenEx` (#379), and time stamps and frame rate for
+  MPEG-2 pictures (#380). WASAPI shared mode converts the 48 kHz stream, so a
+  44.1 kHz or 5.1 device isn't silent (#385) (*@MaChInEgUn3*).
+- Log caps stop at their limit (`PS3_LOG_FIRST`) instead of wrapping and
+  printing on every call (*@n0madic*, #399, closes #364). MinGW builds the
+  tests and reads the time zone from the system (#402).
+- Lifter: jump-table bounds compares are found beyond the 30-instruction
+  window (*@undecuple*, #387). `lift_jobmods --merge-chunks` is passed through
+  (#386).
+- The project template maps the guest arena with `mmap` on POSIX, so
+  `vm_commit` can `mprotect` it
+  (*[@arnaudaprahamian](https://github.com/arnaudaprahamian)*, new, #412).
+- Docs: stale module counts removed (#405), Killzone 3 entry updated (#407).
+
+### v0.16.0 — *"Forty-Four"* (October 2026)
+
+*44 pull requests from six contributors, merged in #377. They come from
+inFAMOUS 2, Twisted Metal and SoulCalibur II HD, plus Tornado Outbreak.*
+
+**RSX and graphics**
+- **3D textures** in the draw engine (*[@erikomis](https://github.com/erikomis)*, #335).
+  The fragment decompiler also gains FACING, TC8 and TC9 (#328), the
+  perspective-correct flag on texcoord reads (#329), and signed results from
+  biased-remap and `_bx2` fetches (#331). Y16_X16/HILO8 crossbars present
+  R-G-R-G (#332).
+- **A flip in the command stream completes when the RSX reaches it**
+  (*[@Kurtisone](https://github.com/Kurtisone)*, #343), and a late flip
+  completion no longer marks a newer flip done (*@erikomis*, #354). Also:
+  get follows the walker across a JUMP (#347), the semaphore acquire is
+  bounded (#327), and GCM callbacks are delivered at `sys_timer_usleep`/`sleep`
+  (#353).
+- NV3089: the source origin is 12.4 fixed point, and copies were 256 times too
+  short (*[@n0madic](https://github.com/n0madic)*, #358). Unscaled blits copy
+  a row at a time (#334). 2D transfers read FP16 targets (#367) and convert a
+  pixel at a time (#348).
+- Speed: the D3D12 vertex program cache is keyed on the program instead of the
+  store behind it, which took most of the D3DCompile calls off the FIFO thread
+  (*@n0madic*, #361). HLSL to SPIR-V translations are cached (#346), cached
+  textures are re-hashed sparsely (#375), and the per-vertex span is found once
+  per draw (#357).
+- Vulkan: colour feedback snapshots for draws that sample their own target
+  (#352), and present on its own command buffer (#351).
+- Metal: per-MRT colour mask and blend (#330), `PS3_ANISO` (#373),
+  `PS3_AA=fxaa` and `PS3_SHARPEN` (#374), `cellVideoOutSetGamma` (#355), and
+  `precise::` math from spirv-cross (#356).
+- Diagnostics: `PS3_FTRACE`, a frame timeline of who waits for whom (#339), and
+  fragment-program debug knobs keyed by structural hash (#336).
+
+**SPU and SPURS**
+- An SPU thread starts in the lifted image its own bytes identify, instead of
+  whichever image registered first at that entry point (*@n0madic*, #362). An
+  SPU user event finds the port the PPU binds, and waits for it (#363).
+- A task's signalled bit is updated atomically against SPU commits (#340), and
+  a job's first frame stays below its cache buffers (#366)
+  (*@Kurtisone*).
+- Single-precision fast paths run four lanes at a time with AVX2 (#369) and
+  SSE2 (#370).
+- Syscall 14 classifies lock-line addresses by guest segment
+  (*[@kalpakprod](https://github.com/kalpakprod)*, #341).
+
+**System libraries**
+- cellFs: the `CELL_FS_O_*` flag values are corrected, so `O_CREAT` creates
+  (*@kalpakprod*, #349); `/dev_hdd1` maps to a writable host root (#350); and
+  an AIO read keeps the fd's position (*@Kurtisone*, #376).
+- `cellGameBootCheck` reports the game type from PARAM.SFO (#359), and
+  `CELL_MSGDIALOG_BUTTON_NONE`/`INVALID` are no longer swapped (#360)
+  (*@n0madic*). An HDD title's `/dev_hdd0/game/<id>/` now resolves to the
+  booted game tree, which kept Simpsons Arcade reading its data once #359
+  reported it as an HDD game.
+- `PS3_LANG` picks the system language (#333), and `PS3_GAMEDATA_ROOT` moves
+  saves and trophies out of the working directory (#338). The small rumble
+  motor runs at full strength (#372) (*@erikomis*).
+- Guest spinlocks use a 32-bit atomic on LP64 hosts, which fixes a fault on
+  arm64 (*[@tekulvw](https://github.com/tekulvw)*, #326).
+- Tornado Outbreak: the 2x zoomed frames from #281 are fixed (#344).
 
 ### v0.15.0 — *"Seventy-Six"* (October 2026)
 

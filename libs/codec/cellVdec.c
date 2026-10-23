@@ -32,6 +32,7 @@ typedef struct {
     CellVdecPicItem item;
     int pictType;       /* 1 I, 2 P, 3 B, 0 unknown */
     int key;
+    u32 frameTicks;     /* one frame, 90 kHz (0 unknown) */
 } VdecPic;
 
 typedef struct {
@@ -52,6 +53,7 @@ typedef struct {
     u32 qHead, qCount;
     CellVdecAuInfo aus[VDEC_AU_RING];   /* by auCount % VDEC_AU_RING */
     u32 newPics;        /* pictures queued by the current decode call */
+    u64 nextPts;        /* synthesized PTS for an AU that carries none (90 kHz) */
 } VdecSlot;
 
 static VdecSlot s_vdec[MAX_VDEC];
@@ -100,12 +102,19 @@ static void vdec_on_picture(void* ctx, const VdecFfPicture* pic)
     q->yuv = pic->yuv;
     q->pictType = pic->pict_type;
     q->key = pic->key;
+    q->frameTicks = pic->frame_ticks;
     q->item.codecType = v->codecType;
     q->item.startAddr = au->startAddr;
     q->item.size      = au->size;
     q->item.auNum     = pic->token;
-    q->item.pts       = au->pts;
-    q->item.dts       = au->dts;
+    /* An AU without a time stamp (both words 0xFFFFFFFF, as GoW:A's demuxer
+     * sends every one of them) gets the next one on the stream's clock; a
+     * player that paces display by PTS otherwise never shows a second picture. */
+    const u32 ticks = pic->frame_ticks ? pic->frame_ticks : 3003u;
+    const u64 pts = au->pts == ~0ull ? v->nextPts : au->pts;
+    v->nextPts = pts + ticks;
+    q->item.pts       = pts;
+    q->item.dts       = au->dts == ~0ull ? pts : au->dts;
     q->item.userData  = au->userData;
     q->item.status    = 0;
     q->item.picFmt    = CELL_VDEC_PIC_FMT_YUV420P;
@@ -183,6 +192,22 @@ s32 cellVdecOpen(const CellVdecType* type, const CellVdecResource* res,
     return (s32)CELL_VDEC_ERROR_BUSY;
 }
 
+/* The Ex variants take CellVdecTypeEx { s32 codecType; codecSpecificInfo* } and
+ * CellVdecResourceEx (SPURS instead of SPU-thread resources). Only the codec type
+ * is read, and it is the first word of both type structs; the attr layout is the
+ * same. God of War: Ascension's menu video player calls only these; with them
+ * unregistered QueryAttrEx failed and the menu background video never started. */
+s32 cellVdecQueryAttrEx(const CellVdecType* type, void* attr)
+{
+    return cellVdecQueryAttr(type, attr);
+}
+
+s32 cellVdecOpenEx(const CellVdecType* type, const CellVdecResource* res,
+                   const CellVdecCb* cb, CellVdecHandle* handle)
+{
+    return cellVdecOpen(type, res, cb, handle);
+}
+
 s32 cellVdecClose(CellVdecHandle handle)
 {
     printf("[cellVdec] Close(handle=%u)\n", handle);
@@ -210,6 +235,7 @@ s32 cellVdecStartSeq(CellVdecHandle handle)
     if (s_vdec[handle].ff) {
         /* A new sequence: nothing from the last one is shown. */
         vdec_ff_reset(s_vdec[handle].ff);
+        s_vdec[handle].nextPts = 0;
         vdec_queue_clear(&s_vdec[handle]);
     }
     return CELL_OK;
@@ -361,6 +387,23 @@ static void vdec_write_pic_type(CellVdecHandle handle, const VdecPic* q)
         vm_write8(info + 0x05, 3);
         vm_write8(info + 0x06, (u8)(q->key && t == 1));
     } else if (s_vdec[handle].codecType == CELL_VDEC_CODEC_TYPE_MPEG2) {
+        /* CellVdecMpeg2Info: +4 aspect_ratio_information, +5 frame_rate_code,
+         * +6 progressive_sequence. GoW:A's player paces pictures by
+         * time x the rate it looks up from frame_rate_code; left 0
+         * ("forbidden") the rate was 0 and only the first picture was ever
+         * taken. Codes are the MPEG-2 ones: 1 23.976 .. 8 60. */
+        static const u32 code_ticks[9] = { 0, 3754, 3750, 3600, 3003, 3000, 1800, 1502, 1500 };
+        u8 code = 4;                                   /* 29.97 when unknown */
+        u32 best = ~0u;
+        if (q->frameTicks)
+            for (u8 c = 1; c <= 8; c++) {
+                u32 d = q->frameTicks > code_ticks[c] ? q->frameTicks - code_ticks[c]
+                                                      : code_ticks[c] - q->frameTicks;
+                if (d < best) { best = d; code = c; }
+            }
+        vm_write8(info + 0x04, (u8)(q->item.width * 9u == q->item.height * 16u ? 3 : 2));
+        vm_write8(info + 0x05, code);
+        vm_write8(info + 0x06, 1);
         vm_write8(info + 0x12, (u8)(t >= 1 && t <= 3 ? t : 0));
     }
 }
