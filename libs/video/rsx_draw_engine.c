@@ -2059,6 +2059,325 @@ static void eng_pipe_stop(void) {}
 static u32 eng_pipe_poll(eng_pipeline* p) { return p->handle; }
 #endif
 
+/* ---- the guest pipeline list ------------------------------------------------
+ *
+ * A backend's caches (the D3D12 bytecode cache, its pipeline-state list) hold
+ * what the decompilers MADE of the title's programs, so a change to a
+ * decompiler leaves them stale, and only playing everything again refilled
+ * them. This keeps what the title GAVE: every pipeline the engine builds is
+ * written once, by its key, as a line of <dir>/guest_pipelines.txt -- the
+ * programs by hash (their bytes once each in <dir>/guest_programs.bin), every
+ * input the decompilers take, the vertex layout, the target format and the
+ * render state by field name -- with the hashes of the HLSL made of it then.
+ * RSX_GUEST_REBUILD=1 runs the whole list through the decompilers and the
+ * backend's pipeline_create as they are now, when the engine starts, and
+ * exits: the bytecode cache and the backend's pipeline list are made again
+ * without playing, and <dir>/guest_remap.txt says which HLSL hashes became
+ * which. RPCS3 keeps its shader cache the same way (the guest programs and
+ * pipeline descriptions, recompiled when the emulator changes).
+ *
+ * <dir> is PS3RECOMP_GUEST_DIR, else PS3RECOMP_DXBC_CACHE. PS3RECOMP_GUEST_LIST=0
+ * records nothing. */
+#define ENG_RS_FIELDS(X) \
+    X(alpha_test_enable) X(alpha_func) X(alpha_ref_raw) X(alpha_ref_format) \
+    X(blend_enable) X(sf_rgb) X(df_rgb) X(sf_a) X(df_a) X(eq_rgb) X(eq_a) \
+    X(depth_test) X(depth_write) X(depth_func) X(cull_enable) X(cull_face) X(front_face) \
+    X(color_mask) X(color_mask_mrt) X(blend_mrt) X(rt_fp16) X(stencil_enable) X(stencil_two_sided) \
+    X(s_func) X(s_func_mask) X(s_write_mask) X(s_fail) X(s_zfail) X(s_zpass) \
+    X(bs_func) X(bs_fail) X(bs_zfail) X(bs_zpass)
+#define GL_SET_SIZE 65536u   /* power of two */
+#define GL_PROG_MAGIC 0x47505247u
+
+static int s_gl_on = -1;
+static char s_gl_dir[1024];
+static FILE* s_gl_lines;
+static FILE* s_gl_progs;
+static u64* s_gl_keys;       /* pipeline keys listed (open addressing, 0 = empty) */
+static u64* s_gl_progset;    /* program hashes stored, the kind folded in */
+static u32 s_gl_nkeys, s_gl_nprogs;
+
+static const char* eng_guest_dir(void)
+{
+    const char* d = getenv("PS3RECOMP_GUEST_DIR");
+    if (!d || !*d) d = getenv("PS3RECOMP_DXBC_CACHE");
+    return d && *d ? d : NULL;
+}
+
+/* v into the set unless there; 1 when it was added. */
+static int gl_set_add(u64* set, u32* n, u64 v)
+{
+    if (!v) v = 1;
+    if (*n + 1u >= GL_SET_SIZE / 2u) return 0;   /* full enough: stop listing */
+    for (u32 i = (u32)(v ^ (v >> 29)) & (GL_SET_SIZE - 1u);; i = (i + 1u) & (GL_SET_SIZE - 1u)) {
+        if (set[i] == v) return 0;
+        if (!set[i]) { set[i] = v; (*n)++; return 1; }
+    }
+}
+
+static int gl_open(void)
+{
+    if (s_gl_on >= 0) return s_gl_on;
+    s_gl_on = 0;
+    const char* off = getenv("PS3RECOMP_GUEST_LIST");
+    const char* dir = eng_guest_dir();
+    if ((off && off[0] == '0') || !dir) return 0;
+    snprintf(s_gl_dir, sizeof s_gl_dir, "%s", dir);
+    s_gl_keys = (u64*)calloc(GL_SET_SIZE, sizeof(u64));
+    s_gl_progset = (u64*)calloc(GL_SET_SIZE, sizeof(u64));
+    if (!s_gl_keys || !s_gl_progset) return 0;
+    char path[1100];
+    /* What earlier sessions listed. */
+    snprintf(path, sizeof path, "%s/guest_pipelines.txt", s_gl_dir);
+    FILE* f = fopen(path, "r");
+    if (f) {
+        char line[512];   /* only the key at the front of a line matters here */
+        int at_start = 1;
+        while (fgets(line, sizeof line, f)) {
+            unsigned long long k;
+            if (at_start && line[0] == 'P' && sscanf(line, "P %llx", &k) == 1) gl_set_add(s_gl_keys, &s_gl_nkeys, (u64)k);
+            at_start = strchr(line, '\n') != NULL;
+        }
+        fclose(f);
+    }
+    snprintf(path, sizeof path, "%s/guest_programs.bin", s_gl_dir);
+    f = fopen(path, "rb");
+    if (f) {
+        u32 h[4];
+        while (fread(h, 4, 4, f) == 4 && h[0] == GL_PROG_MAGIC) {
+            gl_set_add(s_gl_progset, &s_gl_nprogs, ((u64)h[3] << 32 | h[2]) ^ (u64)(h[1] >> 24));
+            if (fseek(f, (long)(h[1] & 0xFFFFFFu), SEEK_CUR) != 0) break;
+        }
+        fclose(f);
+    }
+    s_gl_progs = fopen(path, "ab");
+    snprintf(path, sizeof path, "%s/guest_pipelines.txt", s_gl_dir);
+    s_gl_lines = fopen(path, "a");
+    s_gl_on = s_gl_lines && s_gl_progs;
+    return s_gl_on;
+}
+
+/* A program's bytes into guest_programs.bin once: magic, kind << 24 | size,
+ * then the 64-bit hash (low word first) and the bytes. */
+static u64 gl_program(char kind, const u8* p, u32 n)
+{
+    const u64 h = eng_fnv1a(p, n, 1469598103934665603ull);
+    if (gl_set_add(s_gl_progset, &s_gl_nprogs, h ^ (u64)(u8)kind)) {
+        const u32 head[4] = { GL_PROG_MAGIC, ((u32)(u8)kind << 24) | (n & 0xFFFFFFu), (u32)h, (u32)(h >> 32) };
+        fwrite(head, 4, 4, s_gl_progs);
+        fwrite(p, 1, n, s_gl_progs);
+        fflush(s_gl_progs);
+    }
+    return h;
+}
+
+static u64 gl_text_hash(const char* s)
+{
+    return eng_fnv1a(s, (u32)strlen(s), 1469598103934665603ull);
+}
+
+/* The inputs of a guest pipeline the engine has just translated, once per key. */
+static void eng_guest_record(u64 key, const u8* vp_uc, u32 vp_instrs, const u8* fp_uc, u32 fp_size,
+                             u32 fp_ctrl, u32 cube_mask, u32 vol_mask, u32 vtex_mask,
+                             u32 shadow_mask, const u8* shadow_funcs, u32 unnorm_mask, u32 unnorm_dim[16][2],
+                             u32 texop_mask, const u32* texel_ops, const rsx_vertex_layout_plan* layout,
+                             rsx_be_format rt_fmt, u32 rt_count, const rsx_be_render_state* rs)
+{
+    if (!gl_open() || !gl_set_add(s_gl_keys, &s_gl_nkeys, key)) return;
+    const u64 vh = gl_program('V', vp_uc, vp_instrs * 16u);
+    const u64 fh = gl_program('F', fp_uc, fp_size);
+    FILE* f = s_gl_lines;
+    fprintf(f, "P %016llx vp=%016llx:%u:%u fp=%016llx:%u ctrl=%x cube=%x vol=%x vtex=%x shadow=%x:",
+            (unsigned long long)key, (unsigned long long)vh, vp_instrs, rsx_dsp_vp_start(&g.rsx),
+            (unsigned long long)fh, fp_size, fp_ctrl, cube_mask, vol_mask, vtex_mask, shadow_mask);
+    for (int i = 0; i < 16; i++) fprintf(f, "%02x", shadow_funcs[i]);
+    fprintf(f, " unnorm=%x:", unnorm_mask);
+    for (int i = 0; i < 16; i++) fprintf(f, "%s%ux%u", i ? "," : "", unnorm_dim[i][0], unnorm_dim[i][1]);
+    fprintf(f, " texop=%x:", texop_mask);
+    for (int i = 0; i < 16; i++) fprintf(f, "%s%x", i ? "," : "", texop_mask ? texel_ops[i] : 0u);
+    fprintf(f, " layout=%x,%u,%u:", layout->mask, layout->stride, (unsigned)layout->count);
+    for (u32 i = 0; i < layout->count && i < RSX_DSP_NUM_VERTEX_ATTR; i++) fprintf(f, "%s%u", i ? "," : "", layout->attrs[i]);
+    fprintf(f, " rt=%u,%u vs=%016llx ps=%016llx rs=", (unsigned)rt_fmt, rt_count,
+            (unsigned long long)gl_text_hash(s_vs_hlsl), (unsigned long long)gl_text_hash(s_ps_hlsl));
+    int first = 1;
+#define GL_PUT(n) fprintf(f, "%s" #n "=%x", first ? "" : ",", rs->n); first = 0;
+    ENG_RS_FIELDS(GL_PUT)
+#undef GL_PUT
+    fputc('\n', f);
+    fflush(f);
+}
+
+/* The decompilers' input for a program pair, as eng_pipeline_get gives it;
+ * the HLSL into s_vs_hlsl / s_ps_hlsl. 0 on success. */
+static int gl_translate(const u8* vp, u32 vp_instrs, const u8* fp, u32 fp_size, u32 fp_ctrl, u32 cube_mask,
+                        u32 vol_mask, u32 vtex_mask, u32 shadow_mask, const u8* shadow_funcs, u32 unnorm_mask,
+                        u32 unnorm_dim[16][2], u32 texop_mask, u32* texel_ops, const rsx_vertex_layout_plan* layout,
+                        const rsx_be_render_state* rs)
+{
+    u64 fp_key = 0;
+    if (rsx_fp_scan(fp, fp_size, &g.fp_constants, &fp_key, NULL) < 0) return -1;
+    const int vi = rsx_vp_decompile_compact_ex(vp, vp_instrs * 16u, vtex_mask, layout->mask, s_vs_hlsl, sizeof s_vs_hlsl);
+    u32 nconst = 0;
+    rsx_fp_set_shadow_units(shadow_mask, shadow_funcs);
+    rsx_fp_set_unnorm_units(unnorm_mask, unnorm_dim);
+    rsx_fp_set_texel_ops(texop_mask ? texel_ops : NULL);
+    rsx_fp_set_saturate_alpha(eng_fp_sat_alpha(fp, fp_size));
+    rsx_fp_set_volume_units(vol_mask);
+    int fi = rsx_fp_decompile_buffered_ex(fp, fp_size, fp_ctrl, cube_mask, s_ps_hlsl, sizeof s_ps_hlsl, &nconst);
+    rsx_fp_set_shadow_units(0, NULL);
+    rsx_fp_set_unnorm_units(0, NULL);
+    rsx_fp_set_texel_ops(NULL);
+    rsx_fp_set_saturate_alpha(0);
+    rsx_fp_set_volume_units(0);
+    if (fi > 0 && nconst != g.fp_constants.count) fi = -1;
+    if (fi > 0 && rs->alpha_test_enable &&
+        rsx_fp_apply_alpha_test_buffered(s_ps_hlsl, sizeof s_ps_hlsl, rs->alpha_func) < 0)
+        fi = -1;
+    return vi > 0 && fi > 0 ? 0 : -1;
+}
+
+/* "name=value" out of a line's field list; 0 when absent. */
+static const char* gl_field(const char* line, const char* name)
+{
+    char pat[32];
+    snprintf(pat, sizeof pat, " %s=", name);
+    const char* p = strstr(line, pat);
+    return p ? p + strlen(pat) : NULL;
+}
+
+/* RSX_GUEST_REBUILD=1: the list through the decompilers and the backend. */
+static void eng_guest_rebuild(void)
+{
+    const char* dir = eng_guest_dir();
+    if (!dir) { fprintf(stderr, "[rsx engine] guest rebuild: no PS3RECOMP_GUEST_DIR / PS3RECOMP_DXBC_CACHE\n"); return; }
+    char path[1100];
+    snprintf(path, sizeof path, "%s/guest_programs.bin", dir);
+    FILE* f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "[rsx engine] guest rebuild: no %s\n", path); return; }
+    fseek(f, 0, SEEK_END); const long size = ftell(f); fseek(f, 0, SEEK_SET);
+    u8* progs = (u8*)malloc((size_t)size + 1);
+    if (!progs || fread(progs, 1, (size_t)size, f) != (size_t)size) { fclose(f); free(progs); return; }
+    fclose(f);
+    snprintf(path, sizeof path, "%s/guest_pipelines.txt", dir);
+    f = fopen(path, "r");
+    if (!f) { free(progs); return; }
+    snprintf(path, sizeof path, "%s/guest_remap.txt", dir);
+    FILE* remap = fopen(path, "w");
+    /* a program's bytes by its hash and kind: a walk of the records (few
+     * thousand, once per line is fine for a tool) */
+    #define GL_FIND(kind, hash, out_p, out_n) do { out_p = NULL; out_n = 0; \
+        for (long o = 0; o + 16 <= size; ) { u32 h4[4]; memcpy(h4, progs + o, 16); \
+            if (h4[0] != GL_PROG_MAGIC) break; const u32 n_ = h4[1] & 0xFFFFFFu; \
+            if ((char)(h4[1] >> 24) == (kind) && (((u64)h4[3] << 32) | h4[2]) == (hash)) { out_p = progs + o + 16; out_n = n_; break; } \
+            o += 16 + (long)n_; } } while (0)
+    static char line[16384];
+    u32 lines = 0, built = 0, failed = 0, missing = 0, changed = 0;
+#if defined(__APPLE__) || defined(_WIN32)
+    eng_pipe_job** jobs = NULL; u32 njobs = 0, capjobs = 0;
+#endif
+    while (fgets(line, sizeof line, f)) {
+        if (line[0] != 'P') continue;
+        lines++;
+        unsigned long long key, vh, fh, ovs = 0, ops = 0;
+        unsigned vp_instrs = 0, vp_start = 0, fp_size = 0;
+        if (sscanf(line, "P %llx vp=%llx:%u:%u fp=%llx:%u", &key, &vh, &vp_instrs, &vp_start, &fh, &fp_size) != 6) { failed++; continue; }
+        const u8 *vp, *fp; u32 vn, fn;
+        GL_FIND('V', (u64)vh, vp, vn);
+        GL_FIND('F', (u64)fh, fp, fn);
+        if (!vp || !fp || vn != vp_instrs * 16u || fn != fp_size) { missing++; continue; }
+        unsigned fp_ctrl = 0, cube = 0, vol = 0, vtex = 0, shadow = 0, unnorm = 0, texop = 0;
+        const char* p;
+        if ((p = gl_field(line, "ctrl"))) sscanf(p, "%x", &fp_ctrl);
+        if ((p = gl_field(line, "cube"))) sscanf(p, "%x", &cube);
+        if ((p = gl_field(line, "vol"))) sscanf(p, "%x", &vol);
+        if ((p = gl_field(line, "vtex"))) sscanf(p, "%x", &vtex);
+        u8 sfuncs[16] = { 0 };
+        if ((p = gl_field(line, "shadow")) && sscanf(p, "%x", &shadow) == 1 && (p = strchr(p, ':')))
+            for (int i = 0; i < 16; i++) { unsigned b = 0; if (sscanf(p + 1 + 2 * i, "%2x", &b) == 1) sfuncs[i] = (u8)b; }
+        u32 udim[16][2]; memset(udim, 0, sizeof udim);
+        if ((p = gl_field(line, "unnorm")) && sscanf(p, "%x", &unnorm) == 1 && (p = strchr(p, ':')))
+            for (int i = 0; i < 16 && p; i++) {
+                unsigned w = 0, h = 0;
+                if (sscanf(p + 1, "%ux%u", &w, &h) == 2) { udim[i][0] = w; udim[i][1] = h; }
+                p = strchr(p + 1, ',');
+            }
+        u32 tops[16]; memset(tops, 0, sizeof tops);
+        if ((p = gl_field(line, "texop")) && sscanf(p, "%x", &texop) == 1 && (p = strchr(p, ':')))
+            for (int i = 0; i < 16 && p; i++) {
+                unsigned v = 0;
+                if (sscanf(p + 1, "%x", &v) == 1) tops[i] = v;
+                p = strchr(p + 1, ',');
+            }
+        rsx_vertex_layout_plan layout;
+        memset(&layout, 0, sizeof layout);
+        memset(layout.slot_by_attr, -1, sizeof layout.slot_by_attr);
+        unsigned lm = 0, ls = 0, lc = 0;
+        if ((p = gl_field(line, "layout")) && sscanf(p, "%x,%u,%u", &lm, &ls, &lc) == 3) {
+            layout.mask = lm; layout.stride = ls; layout.count = (u8)(lc < RSX_DSP_NUM_VERTEX_ATTR ? lc : RSX_DSP_NUM_VERTEX_ATTR);
+            p = strchr(p, ':');
+            for (u32 i = 0; p && i < layout.count; i++) {
+                unsigned a = 0;
+                if (sscanf(p + 1, "%u", &a) == 1 && a < RSX_DSP_NUM_VERTEX_ATTR) { layout.attrs[i] = (u8)a; layout.slot_by_attr[a] = (s8)i; }
+                p = strchr(p + 1, ',');
+            }
+        }
+        unsigned rtf = 0, rtc = 1;
+        if ((p = gl_field(line, "rt"))) sscanf(p, "%u,%u", &rtf, &rtc);
+        if ((p = gl_field(line, "vs"))) sscanf(p, "%llx", &ovs);
+        if ((p = gl_field(line, "ps"))) sscanf(p, "%llx", &ops);
+        rsx_be_render_state rs;
+        memset(&rs, 0, sizeof rs);
+        if ((p = gl_field(line, "rs"))) {
+            char nm[40]; unsigned v; int used;
+            while (sscanf(p, "%39[a-z_0-9]=%x%n", nm, &v, &used) == 2) {
+#define GL_GET(n) if (!strcmp(nm, #n)) rs.n = v;
+                ENG_RS_FIELDS(GL_GET)
+#undef GL_GET
+                p += used;
+                if (*p != ',') break;
+                p++;
+            }
+        }
+        if (gl_translate(vp, vp_instrs, fp, fp_size, fp_ctrl, cube, vol, vtex, shadow, sfuncs, unnorm, udim,
+                         texop, tops, &layout, &rs) != 0) { failed++; continue; }
+        const u64 nvs = gl_text_hash(s_vs_hlsl), nps = gl_text_hash(s_ps_hlsl);
+        if (remap && (nvs != ovs || nps != ops)) {
+            changed++;
+            fprintf(remap, "%016llx %016llx %016llx %016llx\n", ovs, (unsigned long long)nvs, ops, (unsigned long long)nps);
+        }
+#if defined(__APPLE__) || defined(_WIN32)
+        if (eng_async_on()) {
+            eng_pipe_job* j = eng_pipe_submit(s_vs_hlsl, s_ps_hlsl, &rs, &layout, layout.stride, (rsx_be_format)rtf, rtc);
+            if (j) {
+                if (njobs == capjobs) { capjobs = capjobs ? capjobs * 2 : 1024; jobs = (eng_pipe_job**)realloc(jobs, capjobs * sizeof *jobs); }
+                if (jobs) jobs[njobs++] = j;
+                continue;
+            }
+        }
+#endif
+        if (g.be->pipeline_create(g.be->user, s_vs_hlsl, s_ps_hlsl, &rs, &layout, layout.stride,
+                                  (rsx_be_format)rtf, rtc)) built++;
+        else failed++;
+    }
+#undef GL_FIND
+#if defined(__APPLE__) || defined(_WIN32)
+    for (u32 i = 0; i < njobs; i++) {
+        while (!__atomic_load_n(&jobs[i]->done, __ATOMIC_ACQUIRE)) {
+            pj_lock(&s_pj_mu);
+            if (!jobs[i]->done) pj_wait(&s_pj_done, &s_pj_mu);
+            pj_unlock(&s_pj_mu);
+        }
+        if (jobs[i]->handle) built++; else failed++;
+        free(jobs[i]);
+    }
+    free(jobs);
+#endif
+    fclose(f);
+    if (remap) fclose(remap);
+    free(progs);
+    fprintf(stderr, "[rsx engine] guest rebuild: %u pipelines listed, %u built, %u failed, %u with a program missing; "
+                    "%u now translate differently (guest_remap.txt)\n", lines, built, failed, missing, changed);
+}
+
 static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                             const rsx_be_render_state* rs,
                             rsx_be_format rt_fmt, u32 rt_count, int* out_fixed)
@@ -2254,6 +2573,10 @@ key_done:;
             rsx_fp_apply_alpha_test_buffered(s_ps_hlsl, sizeof s_ps_hlsl,
                                              rs->alpha_func) < 0)
             fi = -1;
+        if (vi > 0 && fi > 0)
+            eng_guest_record(key, vp_uc, vp_instrs, fp_uc, fp_size, fp_ctrl, cube_mask, vol_mask, vtex_mask,
+                             shadow_mask, shadow_funcs, unnorm_mask, unnorm_dim, texop_mask, texel_ops,
+                             layout, rt_fmt, rt_count, rs);
     }
     struct eng_pipe_job* job = NULL;
 #if defined(__APPLE__) || defined(_WIN32)
@@ -4392,6 +4715,10 @@ int rsx_draw_engine_init(u32 width, u32 height)
     g.ready = 1;
     fprintf(stderr, "[rsx engine] register-file draw engine up (%ux%u)\n",
             g.width, g.height);
+    /* RSX_GUEST_REBUILD=1: a tool run -- the guest pipeline list made again
+     * through the current decompilers and backend, then the process ends. */
+    { const char* rb = getenv("RSX_GUEST_REBUILD");
+      if (rb && rb[0] == '1') { eng_guest_rebuild(); fflush(stdout); fflush(stderr); exit(0); } }
     return 0;
 }
 
