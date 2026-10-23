@@ -1338,6 +1338,458 @@ static ID3D12PipelineState* eng_helper_pso(ID3DBlob* vs, ID3DBlob* ps, DXGI_FORM
     return pso;
 }
 
+/* ---- the pipeline-state list ------------------------------------------------
+ *
+ * The bytecode cache (eng_shader) saves the HLSL compile, but a pipeline
+ * state is the driver's compile of that bytecode for one GPU -- tens of
+ * milliseconds the first time a machine meets it -- and while the build runs
+ * the draw that wanted it is skipped. The states themselves cannot travel;
+ * the list of them can. Every guest pipeline state the engine builds is
+ * written once to <PS3RECOMP_DXBC_CACHE>/pipelines.bin as a canonical record
+ * (the programs by their DXBC checksum, the description's values, a sample
+ * count above one masked to one with a flag), and at start-up workers at the
+ * lowest priority build every state the list names, in the order the list
+ * met them, so that a draw that first needs one finds it built. A title
+ * ships the list its own play-throughs recorded; a player's sessions add
+ * what they meet. The approach of UnleashedRecomp's precompiled pipelines
+ * (recorded in development, built behind the boot logos, the user's options
+ * masked out of the record), DXVK's state cache and RPCS3's pipeline cache.
+ *
+ * PS3RECOMP_PSO_LIST=0 neither records nor builds ahead; PS3RECOMP_PSO_PREWARM=0
+ * records only. Neither runs with RSX_ASYNC_SHADERS=0 (the replays). */
+#define PSO_REC_WORDS 184
+#define PSO_REC_MSAA  1u           /* w[0]: the state is also built multisampled */
+#define PSO_TAB_SIZE  32768u       /* power of two */
+typedef struct { u32 w[PSO_REC_WORDS]; } EngPsoRec;
+typedef struct { u64 hash; EngPsoRec* rec; ID3D12PipelineState* pso; } EngPsoSlot;
+static const char kPsoMagic[8] = { 'R', 'S', 'X', 'P', 'S', 'O', 0, 1 };
+static EngPsoSlot* s_pso_tab;
+static u32 s_pso_n;
+static SRWLOCK s_pso_lock = SRWLOCK_INIT;
+static FILE* s_pso_file;
+static EngPsoRec** s_pso_list;     /* the records as the file had them, in order */
+static u32 s_pso_list_n;
+static volatile LONG s_pso_next, s_pso_done, s_pso_built, s_pso_had, s_pso_missing, s_pso_quit;
+static HANDLE s_pso_threads[8];
+static u32 s_pso_nthreads;
+static LARGE_INTEGER s_pso_t0;
+
+/* A DXBC container's identity: the checksum in its header. */
+static int pso_dxbc_id(const void* code, SIZE_T n, u32* out)
+{
+    const u8* b = (const u8*)code;
+    if (!b || n < 20 || memcmp(b, "DXBC", 4)) return 0;
+    memcpy(out, b + 4, 16);
+    return 1;
+}
+
+/* The description's values as words; 0 for a state the list does not hold
+ * (another root signature, stages beyond VS/PS, an input element other than
+ * the guest layout's). */
+static int pso_encode(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, EngPsoRec* r)
+{
+    memset(r, 0, sizeof *r);
+    if (pd->pRootSignature != s_rootsig || pd->DS.BytecodeLength || pd->HS.BytecodeLength ||
+        pd->GS.BytecodeLength || pd->StreamOutput.NumEntries || pd->CachedPSO.CachedBlobSizeInBytes ||
+        pd->InputLayout.NumElements > 16)
+        return 0;
+    u32* w = r->w;
+    u32 k = 1;
+    if (!pso_dxbc_id(pd->VS.pShaderBytecode, pd->VS.BytecodeLength, w + k)) return 0;
+    k += 4;
+    if (!pso_dxbc_id(pd->PS.pShaderBytecode, pd->PS.BytecodeLength, w + k)) return 0;
+    k += 4;
+    w[k++] = pd->InputLayout.NumElements;
+    for (u32 i = 0; i < 16; i++, k += 3) {
+        if (i >= pd->InputLayout.NumElements) continue;
+        const D3D12_INPUT_ELEMENT_DESC* e = &pd->InputLayout.pInputElementDescs[i];
+        if (strcmp(e->SemanticName, "ATTR") || e->InputSlot ||
+            e->InputSlotClass != D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA || e->InstanceDataStepRate)
+            return 0;
+        w[k] = e->SemanticIndex; w[k + 1] = (u32)e->Format; w[k + 2] = e->AlignedByteOffset;
+    }
+    const D3D12_BLEND_DESC* bd = &pd->BlendState;
+    w[k++] = (u32)bd->AlphaToCoverageEnable; w[k++] = (u32)bd->IndependentBlendEnable;
+    for (int i = 0; i < 8; i++) {
+        const D3D12_RENDER_TARGET_BLEND_DESC* t = &bd->RenderTarget[i];
+        w[k++] = (u32)t->BlendEnable; w[k++] = (u32)t->LogicOpEnable;
+        w[k++] = (u32)t->SrcBlend; w[k++] = (u32)t->DestBlend; w[k++] = (u32)t->BlendOp;
+        w[k++] = (u32)t->SrcBlendAlpha; w[k++] = (u32)t->DestBlendAlpha; w[k++] = (u32)t->BlendOpAlpha;
+        w[k++] = (u32)t->LogicOp; w[k++] = t->RenderTargetWriteMask;
+    }
+    w[k++] = pd->SampleMask;
+    const D3D12_RASTERIZER_DESC* rd = &pd->RasterizerState;
+    w[k++] = (u32)rd->FillMode; w[k++] = (u32)rd->CullMode; w[k++] = (u32)rd->FrontCounterClockwise;
+    w[k++] = (u32)rd->DepthBias;
+    memcpy(&w[k++], &rd->DepthBiasClamp, 4); memcpy(&w[k++], &rd->SlopeScaledDepthBias, 4);
+    w[k++] = (u32)rd->DepthClipEnable; w[k++] = (u32)rd->MultisampleEnable; w[k++] = (u32)rd->AntialiasedLineEnable;
+    w[k++] = rd->ForcedSampleCount; w[k++] = (u32)rd->ConservativeRaster;
+    const D3D12_DEPTH_STENCIL_DESC* ds = &pd->DepthStencilState;
+    w[k++] = (u32)ds->DepthEnable; w[k++] = (u32)ds->DepthWriteMask; w[k++] = (u32)ds->DepthFunc;
+    w[k++] = (u32)ds->StencilEnable; w[k++] = ds->StencilReadMask; w[k++] = ds->StencilWriteMask;
+    const D3D12_DEPTH_STENCILOP_DESC* f[2] = { &ds->FrontFace, &ds->BackFace };
+    for (int i = 0; i < 2; i++) {
+        w[k++] = (u32)f[i]->StencilFailOp; w[k++] = (u32)f[i]->StencilDepthFailOp;
+        w[k++] = (u32)f[i]->StencilPassOp; w[k++] = (u32)f[i]->StencilFunc;
+    }
+    w[k++] = (u32)pd->IBStripCutValue; w[k++] = (u32)pd->PrimitiveTopologyType; w[k++] = pd->NumRenderTargets;
+    for (int i = 0; i < 8; i++) w[k++] = (u32)pd->RTVFormats[i];
+    w[k++] = (u32)pd->DSVFormat; w[k++] = pd->SampleDesc.Count; w[k++] = pd->SampleDesc.Quality;
+    w[k++] = pd->NodeMask; w[k++] = (u32)pd->Flags;
+    return k <= PSO_REC_WORDS;
+}
+
+/* The description back from a record; the programs and the input elements
+ * are the caller's. */
+static void pso_decode(const EngPsoRec* r, ID3DBlob* vs, ID3DBlob* ps, D3D12_INPUT_ELEMENT_DESC* il,
+                       D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd)
+{
+    const u32* w = r->w;
+    u32 k = 9;
+    memset(pd, 0, sizeof *pd);
+    pd->pRootSignature = s_rootsig;
+    pd->VS.pShaderBytecode = CALL0(vs, GetBufferPointer); pd->VS.BytecodeLength = CALL0(vs, GetBufferSize);
+    pd->PS.pShaderBytecode = CALL0(ps, GetBufferPointer); pd->PS.BytecodeLength = CALL0(ps, GetBufferSize);
+    pd->InputLayout.NumElements = w[k++];
+    pd->InputLayout.pInputElementDescs = pd->InputLayout.NumElements ? il : NULL;
+    for (u32 i = 0; i < 16; i++, k += 3) {
+        memset(&il[i], 0, sizeof il[i]);
+        il[i].SemanticName = "ATTR"; il[i].SemanticIndex = w[k]; il[i].Format = (DXGI_FORMAT)w[k + 1];
+        il[i].AlignedByteOffset = w[k + 2]; il[i].InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
+    }
+    D3D12_BLEND_DESC* bd = &pd->BlendState;
+    bd->AlphaToCoverageEnable = (BOOL)w[k++]; bd->IndependentBlendEnable = (BOOL)w[k++];
+    for (int i = 0; i < 8; i++) {
+        D3D12_RENDER_TARGET_BLEND_DESC* t = &bd->RenderTarget[i];
+        t->BlendEnable = (BOOL)w[k++]; t->LogicOpEnable = (BOOL)w[k++];
+        t->SrcBlend = (D3D12_BLEND)w[k++]; t->DestBlend = (D3D12_BLEND)w[k++]; t->BlendOp = (D3D12_BLEND_OP)w[k++];
+        t->SrcBlendAlpha = (D3D12_BLEND)w[k++]; t->DestBlendAlpha = (D3D12_BLEND)w[k++];
+        t->BlendOpAlpha = (D3D12_BLEND_OP)w[k++]; t->LogicOp = (D3D12_LOGIC_OP)w[k++];
+        t->RenderTargetWriteMask = (UINT8)w[k++];
+    }
+    pd->SampleMask = w[k++];
+    D3D12_RASTERIZER_DESC* rd = &pd->RasterizerState;
+    rd->FillMode = (D3D12_FILL_MODE)w[k++]; rd->CullMode = (D3D12_CULL_MODE)w[k++];
+    rd->FrontCounterClockwise = (BOOL)w[k++]; rd->DepthBias = (INT)w[k++];
+    memcpy(&rd->DepthBiasClamp, &w[k++], 4); memcpy(&rd->SlopeScaledDepthBias, &w[k++], 4);
+    rd->DepthClipEnable = (BOOL)w[k++]; rd->MultisampleEnable = (BOOL)w[k++]; rd->AntialiasedLineEnable = (BOOL)w[k++];
+    rd->ForcedSampleCount = w[k++]; rd->ConservativeRaster = (D3D12_CONSERVATIVE_RASTERIZATION_MODE)w[k++];
+    D3D12_DEPTH_STENCIL_DESC* ds = &pd->DepthStencilState;
+    ds->DepthEnable = (BOOL)w[k++]; ds->DepthWriteMask = (D3D12_DEPTH_WRITE_MASK)w[k++];
+    ds->DepthFunc = (D3D12_COMPARISON_FUNC)w[k++]; ds->StencilEnable = (BOOL)w[k++];
+    ds->StencilReadMask = (UINT8)w[k++]; ds->StencilWriteMask = (UINT8)w[k++];
+    D3D12_DEPTH_STENCILOP_DESC* f[2] = { &ds->FrontFace, &ds->BackFace };
+    for (int i = 0; i < 2; i++) {
+        f[i]->StencilFailOp = (D3D12_STENCIL_OP)w[k++]; f[i]->StencilDepthFailOp = (D3D12_STENCIL_OP)w[k++];
+        f[i]->StencilPassOp = (D3D12_STENCIL_OP)w[k++]; f[i]->StencilFunc = (D3D12_COMPARISON_FUNC)w[k++];
+    }
+    pd->IBStripCutValue = (D3D12_INDEX_BUFFER_STRIP_CUT_VALUE)w[k++];
+    pd->PrimitiveTopologyType = (D3D12_PRIMITIVE_TOPOLOGY_TYPE)w[k++]; pd->NumRenderTargets = w[k++];
+    for (int i = 0; i < 8; i++) pd->RTVFormats[i] = (DXGI_FORMAT)w[k++];
+    pd->DSVFormat = (DXGI_FORMAT)w[k++]; pd->SampleDesc.Count = w[k++]; pd->SampleDesc.Quality = w[k++];
+    pd->NodeMask = w[k++]; pd->Flags = (D3D12_PIPELINE_STATE_FLAGS)w[k++];
+}
+
+/* w[0] is the record's flags, not its identity. */
+static u64 pso_hash(const EngPsoRec* r)
+{
+    return fnv1a64(r->w + 1, (u32)sizeof r->w - 4u, 1469598103934665603ull);
+}
+
+/* The slot holding r, or the empty one it would go in (NULL: the table is
+ * full). Under s_pso_lock. */
+static EngPsoSlot* pso_slot(const EngPsoRec* r, u64 h)
+{
+    for (u32 i = (u32)(h ^ (h >> 31)) & (PSO_TAB_SIZE - 1u), n = 0; n < PSO_TAB_SIZE; i = (i + 1u) & (PSO_TAB_SIZE - 1u), n++) {
+        EngPsoSlot* s = &s_pso_tab[i];
+        if (!s->rec) return s_pso_n + 1u < PSO_TAB_SIZE ? s : NULL;
+        if (s->hash == h && !memcmp(s->rec->w + 1, r->w + 1, sizeof r->w - 4u)) return s;
+    }
+    return NULL;
+}
+
+/* r into the table (a copy) unless it is there; its slot, or NULL. Under the lock. */
+static EngPsoSlot* pso_put(const EngPsoRec* r, int* added)
+{
+    const u64 h = pso_hash(r);
+    EngPsoSlot* s = pso_slot(r, h);
+    *added = 0;
+    if (!s || s->rec) return s;
+    EngPsoRec* c = (EngPsoRec*)malloc(sizeof *c);
+    if (!c) return NULL;
+    *c = *r;
+    s->hash = h; s->rec = c; s->pso = NULL;
+    s_pso_n++;
+    *added = 1;
+    return s;
+}
+
+static void pso_append(const EngPsoRec* r)
+{
+    if (!s_pso_file) return;
+    if (fwrite(r->w, sizeof r->w, 1, s_pso_file) == 1) fflush(s_pso_file);
+}
+
+/* CreateGraphicsPipelineState for a guest pipeline, through the list: a state
+ * built ahead is handed out (a reference of its own), and a new one is built
+ * and recorded. */
+static HRESULT eng_create_pso(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, ID3D12PipelineState** out)
+{
+    EngPsoRec r;
+    const int listed = s_pso_tab && pso_encode(pd, &r);
+    if (listed) {
+        AcquireSRWLockShared(&s_pso_lock);
+        EngPsoSlot* s = pso_slot(&r, pso_hash(&r));
+        ID3D12PipelineState* got = s && s->rec ? s->pso : NULL;
+        if (got) CALL0(got, AddRef);
+        ReleaseSRWLockShared(&s_pso_lock);
+        if (got) { *out = got; return S_OK; }
+    }
+    const HRESULT hr = CALL(s_dev, CreateGraphicsPipelineState, pd, &IID_ID3D12PipelineState, (void**)out);
+    if (!listed || FAILED(hr)) return hr;
+    /* The state as built, so that the same description is not built twice,
+     * then the canonical record: a multisampled build is listed as its
+     * single-sampled form with the flag, the sample count being the player's. */
+    AcquireSRWLockExclusive(&s_pso_lock);
+    int added;
+    EngPsoSlot* s = pso_put(&r, &added);
+    if (s && !s->pso) { s->pso = *out; CALL0(*out, AddRef); }
+    if (pd->SampleDesc.Count > 1) {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC one = *pd;
+        one.SampleDesc.Count = 1; one.SampleDesc.Quality = 0; one.RasterizerState.MultisampleEnable = FALSE;
+        if (pso_encode(&one, &r)) {
+            s = pso_put(&r, &added);
+            if (s && (added || !(s->rec->w[0] & PSO_REC_MSAA))) {
+                s->rec->w[0] |= PSO_REC_MSAA;
+                pso_append(s->rec);
+            }
+        }
+    } else if (added) {
+        pso_append(&r);
+    }
+    ReleaseSRWLockExclusive(&s_pso_lock);
+    return hr;
+}
+
+/* The programs the list names, by checksum: the bytecode cache's files (read
+ * on first use) and the engine's own snapshot-copy shader. */
+typedef struct { u32 id[4]; char* path; ID3DBlob* blob; } PsoProg;
+static PsoProg* s_pso_prog;
+static u32 s_pso_prog_n;
+static SRWLOCK s_pso_prog_lock = SRWLOCK_INIT;
+
+static ID3DBlob* pso_program(const u32* id)
+{
+    ID3DBlob* b = NULL;
+    AcquireSRWLockExclusive(&s_pso_prog_lock);
+    for (u32 i = 0; i < s_pso_prog_n; i++) {
+        PsoProg* p = &s_pso_prog[i];
+        if (memcmp(p->id, id, 16)) continue;
+        if (!p->blob && p->path) {
+            FILE* f = fopen(p->path, "rb");
+            if (f) {
+                fseek(f, 0, SEEK_END); const long n = ftell(f); fseek(f, 0, SEEK_SET);
+                if (n > 0 && SUCCEEDED(D3DCreateBlob((SIZE_T)n, &p->blob)) &&
+                    fread(CALL0(p->blob, GetBufferPointer), 1, (size_t)n, f) != (size_t)n)
+                    RELEASE(p->blob);
+                fclose(f);
+            }
+            free(p->path); p->path = NULL;
+        }
+        b = p->blob;
+        break;
+    }
+    ReleaseSRWLockExclusive(&s_pso_prog_lock);
+    return b;
+}
+
+static void pso_programs_scan(const char* dir)
+{
+    char pat[1024];
+    snprintf(pat, sizeof pat, "%s/*.dxbc", dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pat, &fd);
+    u32 cap = 0;
+    for (BOOL more = h != INVALID_HANDLE_VALUE; more; more = FindNextFileA(h, &fd)) {
+        char path[1024];
+        snprintf(path, sizeof path, "%s/%s", dir, fd.cFileName);
+        u8 head[20];
+        FILE* f = fopen(path, "rb");
+        if (!f) continue;
+        const size_t got = fread(head, 1, sizeof head, f);
+        fclose(f);
+        u32 id[4];
+        if (got != sizeof head || !pso_dxbc_id(head, sizeof head, id)) continue;
+        if (s_pso_prog_n == cap) {
+            cap = cap ? cap * 2 : 2048;
+            PsoProg* np = (PsoProg*)realloc(s_pso_prog, cap * sizeof *np);
+            if (!np) break;
+            s_pso_prog = np;
+        }
+        PsoProg* p = &s_pso_prog[s_pso_prog_n++];
+        memcpy(p->id, id, 16); p->path = _strdup(path); p->blob = NULL;
+    }
+    if (h != INVALID_HANDLE_VALUE) FindClose(h);
+    /* The engine's own program (eng_copy_pso_build's), compiled at start-up. */
+    u32 id[4];
+    if (!s_snap_copy_ps ||
+        !pso_dxbc_id(CALL0(s_snap_copy_ps, GetBufferPointer), CALL0(s_snap_copy_ps, GetBufferSize), id))
+        return;
+    PsoProg* np = (PsoProg*)realloc(s_pso_prog, (s_pso_prog_n + 1u) * sizeof *np);
+    if (!np) return;
+    s_pso_prog = np;
+    PsoProg* p = &s_pso_prog[s_pso_prog_n++];
+    memcpy(p->id, id, 16); p->path = NULL; p->blob = s_snap_copy_ps; CALL0(s_snap_copy_ps, AddRef);
+}
+
+/* Build one listed state (and its multisampled form when the player has
+ * MSAA on) unless something built it first. */
+static void pso_build(const EngPsoRec* rec)
+{
+    ID3DBlob* vs = pso_program(rec->w + 1);
+    ID3DBlob* ps = pso_program(rec->w + 5);
+    if (!vs || !ps) { InterlockedIncrement(&s_pso_missing); return; }
+    for (int ms = 0; ms < 2; ms++) {
+        D3D12_INPUT_ELEMENT_DESC il[16];
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
+        pso_decode(rec, vs, ps, il, &pd);
+        if (ms) {
+            /* The count asked for, not s_ms_n: the engine applies it at its
+             * first frame, after these builds have begun. */
+            const int m = rsx_aa_mode();
+            const u32 n = (m == 2 || m == 4 || m == 8) ? (u32)m : 1u;
+            if (!(rec->w[0] & PSO_REC_MSAA) || n <= 1) break;
+            pd.SampleDesc.Count = n; pd.SampleDesc.Quality = 0; pd.RasterizerState.MultisampleEnable = TRUE;
+        }
+        EngPsoRec r;
+        if (!pso_encode(&pd, &r)) continue;
+        AcquireSRWLockShared(&s_pso_lock);
+        EngPsoSlot* s = pso_slot(&r, pso_hash(&r));
+        const int have = s && s->rec && s->pso;
+        ReleaseSRWLockShared(&s_pso_lock);
+        if (have) { InterlockedIncrement(&s_pso_had); continue; }
+        ID3D12PipelineState* pso = NULL;
+        if (FAILED(CALL(s_dev, CreateGraphicsPipelineState, &pd, &IID_ID3D12PipelineState, (void**)&pso))) continue;
+        AcquireSRWLockExclusive(&s_pso_lock);
+        int added;
+        s = pso_put(&r, &added);
+        if (s && !s->pso) { s->pso = pso; pso = NULL; InterlockedIncrement(&s_pso_built); }
+        ReleaseSRWLockExclusive(&s_pso_lock);
+        RELEASE(pso);   /* another thread's build won */
+    }
+}
+
+static DWORD WINAPI pso_prewarm_worker(LPVOID arg)
+{
+    (void)arg;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+    for (;;) {
+        if (s_pso_quit) break;
+        const LONG i = InterlockedIncrement(&s_pso_next) - 1;
+        if (i >= (LONG)s_pso_list_n) break;
+        pso_build(s_pso_list[i]);
+        if (InterlockedIncrement(&s_pso_done) == (LONG)s_pso_list_n) {
+            LARGE_INTEGER t1, f; QueryPerformanceCounter(&t1); QueryPerformanceFrequency(&f);
+            fprintf(stderr, "[rsx engine/d3d12] pipeline list: %ld states built ahead in %.1f s (%ld were built already, "
+                            "%ld entries named a program the cache does not have)\n",
+                    (long)s_pso_built, (double)(t1.QuadPart - s_pso_t0.QuadPart) / (double)f.QuadPart,
+                    (long)s_pso_had, (long)s_pso_missing);
+        }
+    }
+    return 0;
+}
+
+/* The list read and its builds started; from eng_init_device, once the root
+ * signature and the snapshot-copy shader exist. */
+static void eng_pso_list_init(void)
+{
+    const char* on = getenv("PS3RECOMP_PSO_LIST");
+    const char* dir = getenv("PS3RECOMP_DXBC_CACHE");
+    const char* async = getenv("RSX_ASYNC_SHADERS");
+    if ((on && on[0] == '0') || !dir || !*dir || (async && async[0] == '0')) return;
+    s_pso_tab = (EngPsoSlot*)calloc(PSO_TAB_SIZE, sizeof *s_pso_tab);
+    if (!s_pso_tab) return;
+    _mkdir(dir);
+    char path[1024];
+    snprintf(path, sizeof path, "%s/pipelines.bin", dir);
+    FILE* f = fopen(path, "rb");
+    u32 cap = 0, bad = 0;
+    if (f) {
+        char head[16];
+        u32 words = 0;
+        if (fread(head, 1, sizeof head, f) == sizeof head && !memcmp(head, kPsoMagic, 8) &&
+            (memcpy(&words, head + 8, 4), words == PSO_REC_WORDS)) {
+            EngPsoRec r;
+            while (fread(r.w, sizeof r.w, 1, f) == 1) {
+                /* A second header in the middle: a list written by a build
+                 * that wrote one per session. Step over it and go on. */
+                if (!memcmp(r.w, kPsoMagic, 8)) {
+                    if (fseek(f, -(long)(sizeof r.w - 16u), SEEK_CUR) != 0) break;
+                    continue;
+                }
+                int added;
+                EngPsoSlot* s = pso_put(&r, &added);
+                if (!s) break;
+                if (!added) { s->rec->w[0] |= r.w[0]; continue; }   /* a later line adds a flag */
+                if (s_pso_list_n == cap) {
+                    cap = cap ? cap * 2 : 4096;
+                    EngPsoRec** nl = (EngPsoRec**)realloc(s_pso_list, cap * sizeof *nl);
+                    if (!nl) break;
+                    s_pso_list = nl;
+                }
+                s_pso_list[s_pso_list_n++] = s->rec;
+            }
+        } else {
+            bad = 1;   /* another layout: kept aside, a new list started */
+        }
+        fclose(f);
+    }
+    if (bad) {
+        char old[1100];
+        snprintf(old, sizeof old, "%s.old", path);
+        remove(old); rename(path, old);
+    }
+    s_pso_file = fopen(path, "ab");
+    /* Opened to append, the position is 0 until the first write: the size
+     * says whether the file is new. */
+    if (s_pso_file && fseek(s_pso_file, 0, SEEK_END) == 0 && ftell(s_pso_file) == 0) {
+        char head[16] = { 0 };
+        const u32 words = PSO_REC_WORDS;
+        memcpy(head, kPsoMagic, 8); memcpy(head + 8, &words, 4);
+        fwrite(head, 1, sizeof head, s_pso_file); fflush(s_pso_file);
+    }
+    const char* pw = getenv("PS3RECOMP_PSO_PREWARM");
+    if (!s_pso_list_n || (pw && pw[0] == '0')) return;
+    pso_programs_scan(dir);
+    SYSTEM_INFO si; GetSystemInfo(&si);
+    u32 n = si.dwNumberOfProcessors * 2u / 3u;
+    if (n < 1) n = 1;
+    if (n > 8) n = 8;
+    QueryPerformanceCounter(&s_pso_t0);
+    for (u32 t = 0; t < n; t++) {
+        HANDLE th = CreateThread(NULL, 1u << 20, pso_prewarm_worker, NULL, 0, NULL);
+        if (!th) break;
+        SetThreadDescription(th, L"rsx pipeline prewarm");
+        s_pso_threads[s_pso_nthreads++] = th;
+    }
+    fprintf(stderr, "[rsx engine/d3d12] pipeline list: %u states to build ahead on %u threads (%u programs in the cache)\n",
+            s_pso_list_n, s_pso_nthreads, s_pso_prog_n);
+}
+
+/* The builds stopped and the table's references dropped (eng_shutdown). */
+static void eng_pso_list_shutdown(void)
+{
+    InterlockedExchange(&s_pso_quit, 1);
+    for (u32 t = 0; t < s_pso_nthreads; t++) { WaitForSingleObject(s_pso_threads[t], INFINITE); CloseHandle(s_pso_threads[t]); }
+    s_pso_nthreads = 0;
+    if (s_pso_file) { fclose(s_pso_file); s_pso_file = NULL; }
+    for (u32 i = 0; s_pso_tab && i < PSO_TAB_SIZE; i++) { RELEASE(s_pso_tab[i].pso); free(s_pso_tab[i].rec); }
+    free(s_pso_tab); s_pso_tab = NULL; s_pso_n = 0;
+    free(s_pso_list); s_pso_list = NULL; s_pso_list_n = 0;
+    for (u32 i = 0; i < s_pso_prog_n; i++) { RELEASE(s_pso_prog[i].blob); free(s_pso_prog[i].path); }
+    free(s_pso_prog); s_pso_prog = NULL; s_pso_prog_n = 0;
+}
+
 static int eng_make_root_signatures(void)
 {
     /* The draw root signature, matching the decompilers' register plan:
@@ -1664,6 +2116,7 @@ static int eng_init_device(u32 width, u32 height)
         RELEASE(pd); RELEASE(pp);
         if (!s_blit_pso) return -1;
     }
+    eng_pso_list_init();
     if (s_headless) {
         s_offscreen = make_texture(DXGI_FORMAT_R8G8B8A8_UNORM, width, height, 1, 1,
                                    D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET, NULL);
@@ -1686,6 +2139,7 @@ static void eng_shutdown(void* user)
 {
     (void)user;
     if (s_queue && s_fence) fence_wait(fence_signal());
+    eng_pso_list_shutdown();
     for (u32 i = 0; i < s_obj_count; i++) { RELEASE(s_obj[i].res); memset(&s_obj[i], 0, sizeof s_obj[i]); }
     s_obj_count = s_obj_free_count = s_retired_count = 0;
     for (u32 i = 0; i < s_ntheap; i++) { RELEASE(s_theap[i].heap); free(s_theap[i].m.fr); memset(&s_theap[i], 0, sizeof s_theap[i]); }
@@ -2238,7 +2692,7 @@ static ID3D12PipelineState* eng_pso(u32 pipeline, int cls)
                              : cls == 1 ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE
                                         : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     ID3D12PipelineState* pso = NULL;
-    HRESULT hr = CALL(s_dev, CreateGraphicsPipelineState, &pd, &IID_ID3D12PipelineState, (void**)&pso);
+    HRESULT hr = eng_create_pso(&pd, &pso);
     AcquireSRWLockExclusive(&s_pipe_lock);
     if (p->pso[cls]) RELEASE(pso);
     else if (FAILED(hr)) {
@@ -2282,7 +2736,7 @@ static ID3D12PipelineState* eng_pso_for(u32 pipeline, int cls, int unscaled)
         pd.PrimitiveTopologyType = cls == 0 ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT
                                  : cls == 1 ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE
                                             : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-        hr = CALL(s_dev, CreateGraphicsPipelineState, &pd, &IID_ID3D12PipelineState, (void**)&pso);
+        hr = eng_create_pso(&pd, &pso);
     }
     AcquireSRWLockExclusive(&s_pipe_lock);
     if (!p->ps1 && ps1) { p->ps1 = ps1; CALL0(ps1, AddRef); }
@@ -3010,7 +3464,7 @@ static ID3D12PipelineState* eng_pso_ms(u32 pipeline, int cls)
     pd.SampleDesc.Count = n; pd.SampleDesc.Quality = 0;
     pd.RasterizerState.MultisampleEnable = TRUE;
     ID3D12PipelineState* pso = NULL;
-    const HRESULT hr = CALL(s_dev, CreateGraphicsPipelineState, &pd, &IID_ID3D12PipelineState, (void**)&pso);
+    const HRESULT hr = eng_create_pso(&pd, &pso);
     AcquireSRWLockExclusive(&s_pipe_lock);
     if (p->psoms[cls] || n != s_ms_n) RELEASE(pso);
     else if (FAILED(hr)) {
@@ -3283,7 +3737,10 @@ static ID3D12PipelineState* eng_copy_pso_build(u32 pipeline, int cls, DXGI_FORMA
         pd.PrimitiveTopologyType = cls == 0 ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT
                                  : cls == 1 ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE
                                             : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-        HRESULT hr = CALL(s_dev, CreateGraphicsPipelineState, &pd, &IID_ID3D12PipelineState, (void**)&pso);
+        /* The multisampled twin's copy shader is compiled for the sample
+         * count in use, so its states stay off the list. */
+        HRESULT hr = ms ? CALL(s_dev, CreateGraphicsPipelineState, &pd, &IID_ID3D12PipelineState, (void**)&pso)
+                        : eng_create_pso(&pd, &pso);
         AcquireSRWLockExclusive(&s_pipe_lock);
         if (*slot && *slot_fmt == fmt) { RELEASE(pso); pso = *slot; }
         else if (FAILED(hr)) {
