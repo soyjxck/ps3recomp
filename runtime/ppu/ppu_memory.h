@@ -322,9 +322,12 @@ static inline int ppu_stwcx(ppu_context* ctx, uint32_t addr, uint32_t val)
     int ok;
     if (spu_coh_is_reserved(addr)) {
         spu_lockline_lock();
-        ok = atomic_compare_exchange_strong_explicit(
-            atom, &expected, desired,
-            memory_order_acq_rel, memory_order_acquire);
+        /* Again under the lock: an SPU PUTLLC we waited behind may have broken
+         * the reservation (see resv_still_held in ppu_loader.cpp). */
+        ok = ctx->reserve_valid && ctx->reserve_addr == addr &&
+             atomic_compare_exchange_strong_explicit(
+                 atom, &expected, desired,
+                 memory_order_acq_rel, memory_order_acquire);
         if (ok) spu_coh_notify_write(addr);
         spu_lockline_unlock();
     } else {
@@ -371,9 +374,12 @@ static inline int ppu_stdcx(ppu_context* ctx, uint32_t addr, uint64_t val)
     int ok;
     if (spu_coh_is_reserved(addr)) {
         spu_lockline_lock();
-        ok = atomic_compare_exchange_strong_explicit(
-            atom, &expected, desired,
-            memory_order_acq_rel, memory_order_acquire);
+        /* Again under the lock: an SPU PUTLLC we waited behind may have broken
+         * the reservation (see resv_still_held in ppu_loader.cpp). */
+        ok = ctx->reserve_valid && ctx->reserve_addr == addr &&
+             atomic_compare_exchange_strong_explicit(
+                 atom, &expected, desired,
+                 memory_order_acq_rel, memory_order_acquire);
         if (ok) spu_coh_notify_write(addr);
         spu_lockline_unlock();
     } else {

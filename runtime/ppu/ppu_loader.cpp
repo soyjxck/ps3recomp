@@ -918,6 +918,19 @@ static inline void ppu_resv_break(uint64_t addr)   /* MUST hold g_resv_lock */
  * that thread's reservations are never broken by others (ABA slips through), and
  * the fix is to register it (not plain-store invalidation). One line per ctx. */
 static inline int resv_diag() { static int v = -1; if (v < 0) v = getenv("RESV_DIAG") ? 1 : 0; return v; }
+/* The reservation, looked at again once the lock-line lock is held. An SPU
+ * PUTLLC commits its line and breaks the PPU reservations on it
+ * (ppu_resv_break_line) inside that lock, so a store-conditional that found
+ * its reservation intact and then waited for the lock behind such a PUTLLC
+ * has lost it by the time it gets in: the SPU rewrote other words of the line,
+ * and the value-CAS only sees this one. Committing anyway is a lost update on
+ * the line. A queue kept in one line -- a SPURS LFQueue, pushed by the PPU and
+ * popped by an SPU task that parks when it is empty -- then reads "nobody is
+ * waiting" from before the task parked, and never signals it. */
+static inline int resv_still_held(ppu_context* self, uint64_t ea)
+{
+    return !self || self->reserve_addr == (uint32_t)ea;
+}
 static void resv_check_reg(ppu_context* self)
 {
     long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
@@ -986,7 +999,10 @@ extern "C" int ppu_stwcx32_ctx(ppu_context* self, uint64_t ea, uint32_t expected
             if ((++n % 100000) == 1)
                 fprintf(stderr, "[ppu-steals-resv] %llu: PPU CAS on reserved line 0x%08X\n",
                         n, (uint32_t)ea & ~127u); } }
-    if (coh) spu_lockline_lock();
+    if (coh) {
+        spu_lockline_lock();
+        if (!resv_still_held(self, ea)) { spu_lockline_unlock(); resv_unlock(L); return 0; }
+    }
     int ok = __atomic_compare_exchange_n((uint32_t*)(vm_base + ea), &exp_raw, new_raw,
                                          0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
     if (coh) {
@@ -1056,7 +1072,10 @@ extern "C" int ppu_stdcx64_ctx(ppu_context* self, uint64_t ea, uint64_t expected
     resv_lock(L);
     if (self && self->reserve_addr != (uint32_t)ea) { resv_unlock(L); return 0; }
     int coh = spu_coh_is_reserved((uint32_t)ea);
-    if (coh) spu_lockline_lock();
+    if (coh) {
+        spu_lockline_lock();
+        if (!resv_still_held(self, ea)) { spu_lockline_unlock(); resv_unlock(L); return 0; }
+    }
     int ok = __atomic_compare_exchange_n((uint64_t*)(vm_base + ea), &exp_raw, new_raw, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
     if (coh) {
         if (ok) spu_coh_notify_write((uint32_t)ea);
