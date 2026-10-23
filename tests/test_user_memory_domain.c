@@ -21,14 +21,21 @@ static void reset(void) { sys_memory_init(&table); }
 int main(void) {
  CHECK(vm_init()==CELL_OK);
  reset();
+ /* The fork keeps user memory at 0x40000000 (primary window 0x40000000-0x50000000,
+  * overflow from 0x70000000) and starts the mapper at 0x11000000. User addresses
+  * stay below the sign bit, which mapper addresses up to 0xC0000000 may carry. */
  CHECK(allocate(0x10000,0x200)==CELL_OK);uint32_t a=out();
- CHECK(a>=0x10000000u&&a<0x20000000u); CHECK((a&0xFFFFu)==0);
+ CHECK(a>=0x40000000u&&a<0x50000000u); CHECK((a&0xFFFFu)==0);
  CHECK(allocate(0x100000,0x400)==CELL_OK);uint32_t b=out();
- CHECK(b>=0x10000000u&&b<0x20000000u); CHECK((b&0xFFFFFu)==0);
- CHECK((a&0x40000000u)==0&&(b&0x40000000u)==0);
+ CHECK(b>=0x40000000u&&b<0x50000000u); CHECK((b&0xFFFFFu)==0);
+ CHECK((a&0x80000000u)==0&&(b&0x80000000u)==0);
  CHECK(a+0x10000u<=b||b+0x100000u<=a);
  CHECK(reserve(0x100000,0x100000)==CELL_OK);uint32_t m=out();
- CHECK(m>=0x40000000u&&m<0xC0000000u); CHECK(m!=a&&m!=b);
+ CHECK(m>=0x11000000u&&m<0xC0000000u); CHECK(m!=a&&m!=b);
+ CHECK(m+0x100000u<=0x40000000u||m>=0x50000000u);
+ /* 512 MB from the mapper's next 256 MB boundary would run into the user window:
+  * it goes past it, and past the heap, audio, sys_vm and the overflow window. */
+ CHECK(reserve(0x20000000,0x10000000)==CELL_OK); CHECK(out()==0x80000000u);
  memset(vm_base+a,0x55,0x10000);ppu_context c={0};c.gpr[3]=a;
  CHECK(sys_memory_free(&c)==CELL_OK);
  CHECK(allocate(0x10000,0x200)==CELL_OK&&out()==a);
@@ -38,20 +45,32 @@ int main(void) {
  CHECK(allocate(UINT64_MAX,0x400)!=(int64_t)CELL_OK);
  CHECK(allocate(0x100000000ull,0x400)!=(int64_t)CELL_OK);
  CHECK(allocate(0xFFFFFFFFull,0x400)!=(int64_t)CELL_OK);
+ CHECK(allocate(0x100100000ull,0x400)!=(int64_t)CELL_OK);  /* 1 MB if cut to 32 bits */
  CHECK(allocate(0,0x400)!=(int64_t)CELL_OK);
- CHECK(allocate(0x100000,0x400)==CELL_OK); CHECK(out()<0x20000000u);
+ CHECK(allocate(0x100000,0x400)==CELL_OK); CHECK(out()>=0x40000000u&&out()<0x50000000u);
  reset();
  CHECK(vm_commit(VM_PPU_TLS_BASE,0x100000u)==CELL_OK);
  vm_base[VM_PPU_TLS_BASE]=0xA5;
  CHECK(allocate(213u*1024u*1024u,0x200)==CELL_OK);
  CHECK(vm_base[VM_PPU_TLS_BASE]==0xA5);
- uint32_t before=out(); CHECK(allocate(0x10000,0x200)!=(int64_t)CELL_OK); CHECK(out()==before);
+ /* The fork has no 213 MB cap: the next allocation follows it, and once the
+  * primary window is used up they go on at 0x70000000, never in the HLE heap,
+  * audio or sys_vm between. One that fits nowhere fails without an output. */
+ uint32_t first=out(); CHECK(allocate(0x10000,0x200)==CELL_OK); CHECK(out()==first+213u*1024u*1024u);
+ CHECK(allocate(0x3000000,0x200)==CELL_OK); CHECK(out()==0x70000000u);
+ uint32_t before=out(); CHECK(allocate(0x10000000,0x200)!=(int64_t)CELL_OK); CHECK(out()==before);
  reset();
  ppu_hle_inject_base=0x10000000u;
  CHECK(allocate(0x10000,0x200)==CELL_OK);CHECK(out()>=0x11000000u);
+ /* The fork's mapper, from 0x11000000, steps over the window moved there. */
+ ppu_hle_inject_base=0x11000000u;
+ CHECK(reserve(0x100000,0x100000)==CELL_OK);CHECK(out()>=0x12000000u);
  ppu_hle_inject_base=0x20000000u;
  reset();
- CHECK(reserve(0x50000000ull,0x10000000)==CELL_OK); CHECK(out()==0x70000000u);
+ /* No 1 GB span below 0x80000000 is clear of the injected window, the fork's
+  * user windows (0x40000000 and 0x70000000), the heap, audio and sys_vm: the
+  * largest reservation lands at 0x80000000 and takes the mapper to its end. */
+ CHECK(reserve(0x40000000ull,0x10000000)==CELL_OK); CHECK(out()==0x80000000u);
  CHECK(reserve(0x10000000ull,0x10000000)!=(int64_t)CELL_OK);
  CHECK(reserve(UINT64_MAX,0x10000000)!=(int64_t)CELL_OK);
  reset(); CHECK(reserve(0x100000,3)!=(int64_t)CELL_OK);

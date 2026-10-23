@@ -47,7 +47,9 @@ static void reset(void) {
 }
 int main(void) {
     CHECK(vm_init()==CELL_OK);CHECK(vm_commit(YZ_HEAP_BASE,0x100000)==CELL_OK);reset();
-    CHECK(reserve(0x10000000,0x10000000)==CELL_OK);CHECK(out()==0x40000000);
+    /* The fork keeps user memory at 0x40000000 and starts the mapper at
+     * 0x11000000: 256 MB-aligned, the first reservation is at 0x20000000. */
+    CHECK(reserve(0x10000000,0x10000000)==CELL_OK);CHECK(out()==0x20000000u);
     uint32_t object=(uint32_t)(uintptr_t)sys_heap_malloc(1,1024);
     CHECK(object>=YZ_HEAP_BASE && object+1024<=YZ_HEAP_END);
     memset(vm_base+object,0x5A,1024);
@@ -65,13 +67,21 @@ int main(void) {
     CHECK((uint32_t)(uintptr_t)sys_heap_malloc(1,1024)==object);
     reset();CHECK(reserve(0x10000000,0x10000000)==CELL_OK);
     CHECK(direct(35u*1024u*1024u)==CELL_OK);CHECK(disjoint(out(),35u*1024u*1024u));
-    /* Alignment can move past the heap into a relocated injection window;
-     * both exclusions must be revisited before committing a reservation. */
-    reset();CHECK(reserve(0x18000000,0x10000000)==CELL_OK);
+    /* Alignment can move past a relocated injection window into the user
+     * window and the heap; every exclusion must be revisited before
+     * committing a reservation. The fork keeps user memory at 0x40000000, up
+     * to the heap, and starts the mapper at 0x11000000, so the window is
+     * relocated into the mapper's free space, at 0x30000000. */
+    reset();ppu_hle_inject_base=0x30000000u;CHECK(reserve(0x18000000,0x10000000)==CELL_OK);
     CHECK(out()==0x80000000u);CHECK(disjoint(out(),0x20000000u));
-    /* Ending exactly at the heap is legal; the next reservation skips it. */
+    /* Ending exactly at an exclusion is legal; the next reservation skips it.
+     * With the fork's mapper from 0x11000000 and its user memory at
+     * 0x40000000 (up to the heap), one reservation ends at the injected
+     * window, the next at the user window, and the one after that skips the
+     * user window, the heap and audio. */
     reset();ppu_hle_inject_base=0x20000000u;
-    CHECK(reserve(0x10000000,0x100000)==CELL_OK);CHECK(out()==YZ_HEAP_BASE-0x10000000u);
+    CHECK(reserve(0x0F000000,0x100000)==CELL_OK);CHECK(out()==VM_HLE_INJECT_BASE-0x0F000000u);
+    CHECK(reserve(0x1F000000,0x100000)==CELL_OK);CHECK(out()==VM_HLE_INJECT_BASE+VM_HLE_INJECT_SIZE);
     CHECK(reserve(0x100000,0x100000)==CELL_OK);CHECK(out()==VM_AUDIO_BASE+VM_AUDIO_SIZE);
     /* An actual sys_vm allocation and all manufactured audio-port spans
      * retain their contents after mapper ownership and memory writes. */
@@ -89,6 +99,6 @@ int main(void) {
     /* Failure must neither publish an output nor consume the safe gap. */
     reset();vm_write32(0x10000,0xAABBCCDDu);
     CHECK(reserve(0x80000000,0x10000000)!=(int64_t)CELL_OK);CHECK(out()==0xAABBCCDDu);
-    CHECK(reserve(0x100000,0x100000)==CELL_OK);CHECK(out()==0x40000000u);
+    CHECK(reserve(0x100000,0x100000)==CELL_OK);CHECK(out()==0x11000000u);  /* the fork's mapper base */
     vm_shutdown();printf("PASS %u mapper/HLE heap checks\n",checks);return 0;
 }

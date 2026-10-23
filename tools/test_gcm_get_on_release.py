@@ -18,7 +18,8 @@ with tempfile.TemporaryDirectory(prefix='gcm-get-on-release-') as tmp:
     subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG',
                     '-ffunction-sections', '-fdata-sections',
                     '-I' + str(root / 'include'), '-I' + str(root / 'libs/video'),
-                    str(root / 'libs/video/tests/test_gcm_get_on_release.c'), *linker,
+                    str(root / 'libs/video/tests/test_gcm_get_on_release.c'),
+                    str(root / 'runtime/platform/env_cache.c'), *linker,
                     '-o', str(binary)], check=True)
     base = {k: v for k, v in os.environ.items() if k != 'GCM_GET_EQ_PUT'}
     for args, extra in (([], {}), (['eq-put'], {'GCM_GET_EQ_PUT': '1'})):

@@ -9,8 +9,7 @@
  *   - a new process (simulated by rsx_hlsl_to_spirv_cache_reset) is served
  *     from the disk file, with the same words;
  *   - a damaged file is a miss, and is rewritten;
- *   - a failed translation is not cached;
- *   - a hit larger than the caller's buffer still fails as before.
+ *   - a failed translation is not cached.
  *
  * Built as a CMake target (test_shader_spirv) because it links glslang.
  * POSIX only (mkdtemp). Needs no GPU.
@@ -48,12 +47,17 @@ static const char* kBoth =
 #define MAX_WORDS 4096u
 static u32 g_a[MAX_WORDS], g_b[MAX_WORDS];
 
+/* The fork's rsx_hlsl_to_spirv returns the count and a malloc'd copy. */
 static int translate(const char* hlsl, int stage, u32* words, u32* n)
 {
     char log[512] = "";
-    int r = rsx_hlsl_to_spirv(hlsl, stage, words, MAX_WORDS, n, log, sizeof log);
-    if (r) printf("       (%s)\n", log);
-    return r;
+    u32* w = NULL;
+    *n = rsx_hlsl_to_spirv(hlsl, stage, &w, log, sizeof log);
+    if (!*n) { printf("       (%s)\n", log); return -1; }
+    if (*n > MAX_WORDS) { free(w); *n = 0; return -1; }
+    memcpy(words, w, *n * 4u);
+    free(w);
+    return 0;
 }
 
 static RsxSpirvCacheStats stats(void)
@@ -95,30 +99,24 @@ int main(void)
     rsx_hlsl_to_spirv_cache_reset();
 
     /* Memory. */
-    check("vertex program translates", translate(kVS, RSX_SHADER_STAGE_VERTEX, g_a, &na) == 0 && na > 5);
+    check("vertex program translates", translate(kVS, RSX_SPV_STAGE_VERTEX, g_a, &na) == 0 && na > 5);
     check("SPIR-V magic", g_a[0] == 0x07230203u);
-    check("same request again succeeds", translate(kVS, RSX_SHADER_STAGE_VERTEX, g_b, &nb) == 0);
+    check("same request again succeeds", translate(kVS, RSX_SPV_STAGE_VERTEX, g_b, &nb) == 0);
     check("... with the same words", na == nb && memcmp(g_a, g_b, na * 4u) == 0);
     s = stats();
     check("... served from memory, glslang ran once", s.translations == 1 && s.memory_hits == 1);
 
-    check("fragment program translates", translate(kPS, RSX_SHADER_STAGE_FRAGMENT, g_b, &nb) == 0);
+    check("fragment program translates", translate(kPS, RSX_SPV_STAGE_FRAGMENT, g_b, &nb) == 0);
     check("... with other words", na != nb || memcmp(g_a, g_b, na * 4u) != 0);
 
-    check("same text as a vertex program", translate(kBoth, RSX_SHADER_STAGE_VERTEX, g_a, &na) == 0);
-    check("same text as a fragment program", translate(kBoth, RSX_SHADER_STAGE_FRAGMENT, g_b, &nb) == 0);
+    check("same text as a vertex program", translate(kBoth, RSX_SPV_STAGE_VERTEX, g_a, &na) == 0);
+    check("same text as a fragment program", translate(kBoth, RSX_SPV_STAGE_FRAGMENT, g_b, &nb) == 0);
     s = stats();
     check("... two entries, not a hit", s.translations == 4 && s.memory_hits == 1);
     check("... with other words", na != nb || memcmp(g_a, g_b, na * 4u) != 0);
 
-    {
-        u32 small[4], n = 123;
-        int r = rsx_hlsl_to_spirv(kPS, RSX_SHADER_STAGE_FRAGMENT, small, 4, &n, NULL, 0);
-        check("a hit larger than the buffer fails", r == -1 && n == 0);
-    }
-
-    check("broken HLSL fails", translate("float4 main( {", RSX_SHADER_STAGE_FRAGMENT, g_a, &na) != 0);
-    check("... and again (not cached)", translate("float4 main( {", RSX_SHADER_STAGE_FRAGMENT, g_a, &na) != 0);
+    check("broken HLSL fails", translate("float4 main( {", RSX_SPV_STAGE_FRAGMENT, g_a, &na) != 0);
+    check("... and again (not cached)", translate("float4 main( {", RSX_SPV_STAGE_FRAGMENT, g_a, &na) != 0);
     s = stats();
     check("... counted as no translation", s.translations == 4);
 
@@ -128,7 +126,7 @@ int main(void)
     setenv("PS3RECOMP_SPIRV_CACHE", dir, 1);
     rsx_hlsl_to_spirv_cache_reset();
 
-    check("disk: first run translates", translate(kPS, RSX_SHADER_STAGE_FRAGMENT, g_a, &na) == 0);
+    check("disk: first run translates", translate(kPS, RSX_SPV_STAGE_FRAGMENT, g_a, &na) == 0);
     s = stats();
     check("... with glslang", s.translations == 1 && s.disk_hits == 0);
     char path[1024];
@@ -136,11 +134,11 @@ int main(void)
     check("... and writes one file", path[0] != 0);
 
     rsx_hlsl_to_spirv_cache_reset();
-    check("disk: next run succeeds", translate(kPS, RSX_SHADER_STAGE_FRAGMENT, g_b, &nb) == 0);
+    check("disk: next run succeeds", translate(kPS, RSX_SPV_STAGE_FRAGMENT, g_b, &nb) == 0);
     s = stats();
     check("... from the file, no glslang", s.disk_hits == 1 && s.translations == 0);
     check("... with the same words", na == nb && memcmp(g_a, g_b, na * 4u) == 0);
-    translate(kPS, RSX_SHADER_STAGE_FRAGMENT, g_b, &nb);
+    translate(kPS, RSX_SPV_STAGE_FRAGMENT, g_b, &nb);
     s = stats();
     check("... then from memory", s.memory_hits == 1 && s.disk_hits == 1);
 
@@ -150,19 +148,19 @@ int main(void)
         if (f) { fseek(f, 13 * 4 + 10, SEEK_SET); fputc('#', f); fclose(f); }
     }
     rsx_hlsl_to_spirv_cache_reset();
-    check("disk: damaged file still succeeds", translate(kPS, RSX_SHADER_STAGE_FRAGMENT, g_b, &nb) == 0);
+    check("disk: damaged file still succeeds", translate(kPS, RSX_SPV_STAGE_FRAGMENT, g_b, &nb) == 0);
     s = stats();
     check("... as a miss, with glslang", s.disk_hits == 0 && s.translations == 1);
     check("... with the same words", na == nb && memcmp(g_a, g_b, na * 4u) == 0);
     rsx_hlsl_to_spirv_cache_reset();
-    translate(kPS, RSX_SHADER_STAGE_FRAGMENT, g_b, &nb);
+    translate(kPS, RSX_SPV_STAGE_FRAGMENT, g_b, &nb);
     s = stats();
     check("... and the file was rewritten", s.disk_hits == 1 && s.translations == 0);
 
     /* A truncated file. */
     if (path[0] && truncate(path, 20) == 0) {
         rsx_hlsl_to_spirv_cache_reset();
-        check("disk: truncated file still succeeds", translate(kPS, RSX_SHADER_STAGE_FRAGMENT, g_b, &nb) == 0);
+        check("disk: truncated file still succeeds", translate(kPS, RSX_SPV_STAGE_FRAGMENT, g_b, &nb) == 0);
         s = stats();
         check("... as a miss", s.disk_hits == 0 && s.translations == 1);
     } else {

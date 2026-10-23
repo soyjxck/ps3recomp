@@ -22,7 +22,9 @@ def main():
                         str(ROOT / 'runtime/syscalls/sys_memory.c'),
                         str(ROOT / 'runtime/syscalls/sys_vm.c'), '-pthread',
                         '-o', str(executable)], check=True, timeout=30)
-        subprocess.run([str(executable)], check=True, timeout=15)
+        # The fork's SYS_MEM_OVERFLOW_END moves a window the mapper steps over.
+        subprocess.run([str(executable)], check=True, timeout=15,
+                       env={k: v for k, v in os.environ.items() if not k.startswith('SYS_MEM_')})
     return 0
 if __name__ == '__main__':
     raise SystemExit(main())

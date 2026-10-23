@@ -18,7 +18,8 @@ with tempfile.TemporaryDirectory(prefix='gcm-flip-stream-') as tmp:
     subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG',
                     '-ffunction-sections', '-fdata-sections',
                     '-I' + str(root / 'include'), '-I' + str(root / 'libs/video'),
-                    str(root / 'libs/video/tests/test_gcm_flip_stream.c'), *linker,
+                    str(root / 'libs/video/tests/test_gcm_flip_stream.c'),
+                    str(root / 'runtime/platform/env_cache.c'), *linker,
                     '-o', str(binary)], check=True)
     result = subprocess.run([str(binary)], timeout=30, capture_output=True, text=True)
     print(result.stdout.strip())

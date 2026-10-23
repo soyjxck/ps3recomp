@@ -4,10 +4,14 @@
  * never-joined thread per piece of work (flags 0) used to fill the table after 63 of them and then got EAGAIN. */
 #include "../runtime/syscalls/sys_ppu_thread.c"
 #include <assert.h>
+#include <sys/mman.h>
 #include <time.h>
 
+/* Guest memory up to the end of the stack region main() gives the threads: the fork's thread code clears a stack it
+ * hands out again (sys_ppu_thread.c, stack_take), so the stacks must be real memory. Only touched pages are backed. */
+#define GUEST_VM_SIZE 0xA0000000u
 uint8_t* vm_base;
-uint32_t ppu_vm_size = 0x10000;
+uint32_t ppu_vm_size = GUEST_VM_SIZE;
 /* The few runtime services the thread proc and create call; nothing here replaces the code under test. */
 void ppu_resv_register(ppu_context* c) { (void)c; }
 int ps3_intr_is_handler(unsigned long long tid) { (void)tid; return 0; }
@@ -41,13 +45,16 @@ static int used_slots(void)       /* slots other than main that are not FREE */
     table_unlock();
     return n;
 }
-/* Wait until every created thread has run to its end: nothing RUNNING any more. */
+/* Wait until every created thread has run to its end: nothing RUNNING any more. The fork's runtime marks a thread made
+ * without the joinable flag DETACHED from its create and frees the slot when it ends, so nothing DETACHED either. */
 static void settle(void)
 {
     for (int i = 0; i < 5000; i++) {
         int running = 0;
         table_lock();
-        for (int k = 1; k < PPU_THREAD_MAX; k++) if (g_ppu_threads[k].state == PPU_THREAD_STATE_RUNNING) running++;
+        for (int k = 1; k < PPU_THREAD_MAX; k++)
+            if (g_ppu_threads[k].state == PPU_THREAD_STATE_RUNNING || g_ppu_threads[k].state == PPU_THREAD_STATE_DETACHED)
+                running++;
         table_unlock();
         if (!running) return;
         struct timespec ts = { 0, 1000000 }; nanosleep(&ts, NULL);
@@ -56,9 +63,10 @@ static void settle(void)
 
 int main(void)
 {
-    vm_base = calloc(1, 0x10000); assert(vm_base);
+    vm_base = mmap(NULL, GUEST_VM_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+    assert(vm_base != MAP_FAILED);
     g_vm_stack_alloc.next_addr = 0x10000000u;   /* the guest stack region the threads bump-allocate from */
-    g_vm_stack_alloc.region_end = 0xA0000000u;
+    g_vm_stack_alloc.region_end = GUEST_VM_SIZE;
     g_ppu_thread_entry_trampoline = guest_entry;
     ppu_thread_register_main();
 
@@ -100,7 +108,7 @@ int main(void)
         EXPECT_EQ(create(1, NULL), 0);
     }
 
-    free(vm_base);
+    munmap(vm_base, GUEST_VM_SIZE);
     if (g_fails) { fprintf(stderr, "%d check(s) failed\n", g_fails); return 1; }
     puts("PASS: non-joinable PPU threads free their slot when they end; joinable ones keep it until joined");
     return 0;

@@ -10,6 +10,9 @@ extern "C" {
 uint8_t* vm_base;
 uint32_t ppu_hle_inject_base = 0x20000000u;
 uint32_t ppu_load_elf(const char*);
+/* the fork's runtime: the inline accessors' page table, no SPU reservation */
+unsigned char g_ppu_vm_page[65536];
+int g_spu_coh_armed;
 /* These subsystems are inactive in a loader-only fixture. */
 int spu_coh_is_reserved(uint32_t) { return 0; }
 void spu_coh_notify_write(uint32_t) { std::abort(); }
@@ -51,22 +54,24 @@ int main(int argc, char** argv)
     CHECK(!std::memcmp(vm_base + 0x10000000, "QRST", 4));
     CHECK(vm_base[0x1077FFFF] == 0);
     vm_base[0x1077FFFF] = 0xA5;  /* live object in the loaded segment's BSS */
-    vm_base[0x4020FFFF] = 0x5A;  /* BSS-only mapper-domain segment */
+    vm_base[0x1120FFFF] = 0x5A;  /* BSS-only mapper-domain segment */
     CHECK(allocate(0xA400000) == CELL_OK);
     ppu_context c{};
     c.gpr[3] = 0x10000; c.gpr[4] = 0x500000;
     CHECK(sys_mmapper_allocate_memory(&c) == CELL_OK);
     uint32_t mapped = output();
-    CHECK(mapped >= 0x40210000u);
+    /* The fork's mapper starts at 0x11000000, where the image's last two
+     * segments are (user memory keeps 0x40000000). */
+    CHECK(mapped >= 0x11210000u);
     std::memset(vm_base + mapped, 0xCC, 0x500000);
     CHECK(allocate(0x700000) == CELL_OK);
-    CHECK(output() >= 0x10780000u);
+    CHECK(output() >= 0x40000000u);  /* the fork keeps user memory at 0x40000000, above the image */
     std::memset(vm_base + output(), 0xDD, 0x700000);
     CHECK(!std::memcmp(vm_base + 0x10000000, "QRST", 4));
     CHECK(!std::memcmp(vm_base + 0x10080000, "ABCD", 4));
     CHECK(vm_base[0x1077FFFF] == 0xA5);
-    CHECK(!std::memcmp(vm_base + 0x40000000, "MAPS", 4));
-    CHECK(vm_base[0x4020FFFF] == 0x5A);
+    CHECK(!std::memcmp(vm_base + 0x11000000, "MAPS", 4));
+    CHECK(vm_base[0x1120FFFF] == 0x5A);
     /* Reservation search must also avoid the image, including an aligned
      * candidate that lands in the second, BSS-only PT_LOAD. */
     sys_memory_init(&table);
@@ -74,22 +79,23 @@ int main(int argc, char** argv)
     c.gpr[3] = 0x200000; c.gpr[5] = 0x100000; c.gpr[6] = 0x10000;
     CHECK(sys_mmapper_allocate_address(&c) == CELL_OK);
     uint32_t reservation = output();
-    CHECK(reservation == 0x40300000u);
+    CHECK(reservation == 0x11300000u);  /* the fork's mapper starts at 0x11000000 */
     uint32_t block = 0;
     CHECK(sys_mmapper_search_map_address(reservation, 0x100000, &block) == CELL_OK);
     CHECK(block == reservation);
     std::memset(vm_base + block, 0xEE, 0x100000);
-    CHECK(vm_base[0x4020FFFF] == 0x5A);
-    CHECK(!std::memcmp(vm_base + 0x40000000, "MAPS", 4));
-    /* Replacing the executable replaces the range list, without stale holes. */
+    CHECK(vm_base[0x1120FFFF] == 0x5A);
+    CHECK(!std::memcmp(vm_base + 0x11000000, "MAPS", 4));
+    /* Replacing the executable replaces the range list, without stale holes.
+     * The fork keeps user memory at 0x40000000 and the mapper from 0x11000000. */
     CHECK(ppu_load_elf(argv[2]) == 0x10000);
     sys_memory_init(&table);
     CHECK(allocate(0x100000) == CELL_OK);
-    CHECK(output() == 0x10000000u);
+    CHECK(output() == 0x40000000u);
     c = {};
     c.gpr[3] = 0x10000; c.gpr[4] = 0x100000;
     CHECK(sys_mmapper_allocate_memory(&c) == CELL_OK);
-    CHECK(output() == 0x40000000u);
+    CHECK(output() == 0x11000000u);
     munmap(vm_base, 0xE0000000ull);
     std::printf("PASS %u loaded-image allocation checks\n", checks);
 }

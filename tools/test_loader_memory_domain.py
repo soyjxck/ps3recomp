@@ -24,7 +24,7 @@ void actual_loader_cases(ppu_context* ctx){switch(ctx->gpr[11]){
  post='''default:std::abort();}}
 #define CHECK(x) do{if(!(x)){std::fprintf(stderr,"FAIL loader line%d: %s\\n",__LINE__,#x);return 1;}}while(0)
 int main(){CHECK(vm_init()==CELL_OK);lv2_syscall_table tbl{};sys_memory_init(&tbl);ppu_context c{};
-c.gpr[11]=330;c.gpr[3]=0x100000;c.gpr[5]=0x100000;c.gpr[6]=0x10000;actual_loader_cases(&c);CHECK(c.gpr[3]==0);uint32_t base=vm_read32(0x10000);CHECK(base>=0x40000000u);
+c.gpr[11]=330;c.gpr[3]=0x100000;c.gpr[5]=0x100000;c.gpr[6]=0x10000;actual_loader_cases(&c);CHECK(c.gpr[3]==0);uint32_t base=vm_read32(0x10000);CHECK(base>=0x11000000u);/* the fork's mapper starts at 0x11000000 (user memory keeps 0x40000000) */
 c={};c.gpr[11]=337;c.gpr[3]=0x10000000;c.gpr[4]=1;c.gpr[6]=0x10000;actual_loader_cases(&c);CHECK(c.gpr[3]!=0);
 c.gpr[3]=base;actual_loader_cases(&c);CHECK(c.gpr[3]==0&&vm_read32(0x10000)==base);
 c.gpr[3]=base;actual_loader_cases(&c);CHECK(c.gpr[3]!=0);

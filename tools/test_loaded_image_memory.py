@@ -31,11 +31,14 @@ def main():
         tmp = Path(tmp)
         (tmp / 'ppu_recomp.h').write_text(stub_header())
         elf = tmp / 'image.elf'
+        # The last two sit where mapper reservations begin: the fork starts the
+        # mapper at 0x11000000, past the TLS window, and keeps user memory at
+        # 0x40000000.
         elf.write_bytes(image([
             (0x10000000, b'QRST' * 64, 0x71000),
             (0x10080000, b'ABCD' * 64, 0x700000),
-            (0x40000000, b'MAPS' * 64, 0x180001),
-            (0x40200000, b'', 0x10000),
+            (0x11000000, b'MAPS' * 64, 0x180001),
+            (0x11200000, b'', 0x10000),
         ]))
         empty = tmp / 'empty.elf'
         empty.write_bytes(image([]))

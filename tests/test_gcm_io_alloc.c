@@ -18,6 +18,8 @@ void spu_coh_notify_write(uint32_t addr) { (void)addr; abort(); }
 void spu_lockline_lock(void) { abort(); }
 void spu_lockline_unlock(void) { abort(); }
 void (*g_spu_put_hook)(uint32_t ea, uint32_t size);   /* set by cellGcmInit */
+/* the fork's runtime: guest time is host time (never paused) */
+int64_t ps3_guest_ticks(int64_t host_ticks) { return host_ticks; }
 
 #define MB 0x100000u
 #define OUT ((u32*)(uintptr_t)0x100)

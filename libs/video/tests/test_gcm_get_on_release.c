@@ -57,6 +57,14 @@ void rsx_live_draw_note_resolve(u32 a, u32 b, u32 c, u32 d) { (void)a; (void)b; 
 int  rsx_live_draw_resolve_blit(u32 a, u32 b, u32 c, u32 d, u32 e, u32 f, u32 g, u32 h,
                                 u32 i, u32 j, u32 k, u32 l)
 { (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; (void)g; (void)h; (void)i; (void)j; (void)k; (void)l; return 0; }
+/* The fork's runtime: guest time is host time (never paused); no store or DMA
+ * watch for GCM_PARK_WATCH to arm, no page table to refresh; the draw engine
+ * (off) presents no flip and has no occlusion queries out. */
+int64_t ps3_guest_ticks(int64_t host_ticks) { return host_ticks; }
+uint32_t g_ww_dyn, g_spu_watchea_dyn;
+void ppu_vm_slow_any_update(void) {}
+int  rsx_draw_engine_fifo_flip(u32 buffer_id) { (void)buffer_id; return 0; }
+void rsx_draw_engine_sync_queries(void) {}
 
 #define SEMA_OFF  0x10u
 #define LABEL_EA  (GCM_LABEL_GUEST_BASE + SEMA_OFF)
