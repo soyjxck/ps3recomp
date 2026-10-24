@@ -2813,9 +2813,40 @@ static int eng_sampler_slot(const rsx_be_sampler_desc* d, int aniso_ok)
     return slot;
 }
 
+/* RSX_SUBMIT_EVERY=<n> (default 256, 0 off): hand the GPU what is recorded
+ * every n records, so it runs the frame while the walker records the rest.
+ * Submitted only at fences and the present, the frame reached the GPU at the
+ * fence after the occlusion queries, and the walker sat there for all of it:
+ * 2-3 ms a frame in the heaviest parts of Drakengard 3. In paired runs there,
+ * 256 made 95 -> 109 fps (91 -> 107 at 4K, 77 -> 89 in the heaviest part),
+ * 128 and 512 less; a part already at the 120 cap is unchanged. A list
+ * boundary costs the first snapshot of a target in the next list a whole
+ * copy (the copy-draw tracking is a list's), which the 4K run absorbs. The
+ * submit is made where a
+ * draw begins, before anything of it is staged: a submit closes the stage
+ * chain, and the constants a draw binds after its targets are offsets into
+ * it (the vertex constants' reuse sees the new submit and stages them again).
+ * A host may switch it in a run. RSX_SUBMIT_IDLE=1: only while the GPU has
+ * run everything submitted -- n is then the least a submit carries (as good
+ * there, at twice the submits). */
+int g_eng_submit_every = -1;
+static int s_submit_idle = -1;
+static void eng_submit_early(void)
+{
+    if (g_eng_submit_every < 0) {
+        const char* e = getenv("RSX_SUBMIT_EVERY");
+        g_eng_submit_every = e ? atoi(e) : 256;
+    }
+    if (s_submit_idle < 0) s_submit_idle = getenv("RSX_SUBMIT_IDLE") ? 1 : 0;
+    if (g_eng_submit_every <= 0 || s_rec_count < (u32)g_eng_submit_every) return;
+    if (s_submit_idle && ((s_rec_count & 7u) || !fence_done(s_fence_value))) return;
+    eng_submit(0, 0);
+}
+
 static void eng_bind_targets(void* user, const u32* surfaces, u32 count, u32 depth)
 {
     (void)user;
+    eng_submit_early();
     if (count > RSX_BE_MAX_COLOR_TARGETS) count = RSX_BE_MAX_COLOR_TARGETS;
     for (u32 i = 0; i < RSX_BE_MAX_COLOR_TARGETS; i++)
         s_pending.rt[i] = (i < count) ? surfaces[i] : 0;
@@ -4545,8 +4576,14 @@ static void eng_submit(u32 present_surface, int wait)
             }
         }
         if (hl > 0.0) QueryPerformanceCounter(&pq1);
-        /* Pace: at most ENG_INFLIGHT presents queued. */
-        if (f > ENG_INFLIGHT) fence_wait(f - ENG_INFLIGHT);
+        /* Pace: at most ENG_INFLIGHT presents queued -- counted in presents.
+         * A frame submits more than once (the query fence, RSX_SUBMIT_EVERY),
+         * and f - ENG_INFLIGHT, which was the last frame's present at two
+         * submits a frame, became a fence of this very frame. */
+        { static u64 prev[ENG_INFLIGHT - 1]; static u32 n;
+          const u64 old = prev[n % (ENG_INFLIGHT - 1)];
+          prev[n++ % (ENG_INFLIGHT - 1)] = f;
+          if (old) fence_wait(old); }
         if (hl > 0.0) {
             QueryPerformanceCounter(&pq2);
             const double pres = (double)(pq1.QuadPart - pq0.QuadPart) * 1000.0 / (double)pqf.QuadPart;
