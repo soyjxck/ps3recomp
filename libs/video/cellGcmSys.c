@@ -16,7 +16,9 @@
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 (translate + byte-swap, OOB-safe) */
 #include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
 int64_t ps3_guest_ticks(int64_t host_ticks);   /* sys_timer.c: still while paused */
-uint64_t host_monotonic_ns(void);                /* sys_timer.c */
+#ifdef __APPLE__
+#include <mach/mach_time.h>
+#endif
 #include "../../runtime/spu/spu_coherency.h" /* the blit row copy's reservation bookkeeping */
 #include "rsx_commands.h"                    /* rsx_state, rsx_process_command_buffer */
 #include "../../include/ps3emu/guest_call.h" /* g_ps3_guest_caller for direct handler dispatch */
@@ -73,9 +75,20 @@ static u64 get_timestamp_ns(void)
 #else
 static u64 get_timestamp_ns(void)
 {
-    /* host_monotonic_ns: the clock ps3_guest_ticks keeps its paused time in
-     * (mach time on macOS, CLOCK_MONOTONIC elsewhere) */
-    return (u64)ps3_guest_ticks((int64_t)host_monotonic_ns());   /* still while paused */
+    /* The clock ps3_guest_ticks keeps its paused time in, as
+     * host_monotonic_ns (sys_timer.c) reads it: mach time on macOS,
+     * CLOCK_MONOTONIC elsewhere -- read here, so the tests that build this
+     * file without sys_timer.c link. */
+#ifdef __APPLE__
+    static mach_timebase_info_data_t tb;
+    if (!tb.denom) mach_timebase_info(&tb);   /* benign race: same values either way */
+    const uint64_t t = mach_absolute_time();
+    return (u64)ps3_guest_ticks((int64_t)(t / tb.denom * tb.numer + t % tb.denom * tb.numer / tb.denom));
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (u64)ps3_guest_ticks((int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec);   /* still while paused */
+#endif
 }
 #endif
 
