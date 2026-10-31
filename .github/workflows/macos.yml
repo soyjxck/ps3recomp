@@ -150,7 +150,12 @@ jobs:
           # is compiled as C++98, so it is built on its own line.
           clang++ -std=c++17 -I include -I libs/video -c libs/video/rsx_shader_msl.cpp \
             -o /tmp/rsx_shader_msl.o
+          # The fork's backend reaches the draw engine and a few runtime
+          # hooks: those sources, and stand-ins for the rest
+          # (metal_test_standins.c).
           clang -fobjc-arc -I include -I libs/video libs/video/tests/test_metal_host_surface.m \
+            libs/video/rsx_draw_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c \
+            runtime/platform/env_cache.c libs/video/tests/metal_test_standins.c \
             libs/video/rsx_texture_layout.c libs/video/rsx_vertex_fetch.c libs/video/rsx_vp_decompiler.c \
             libs/video/rsx_fp_decompiler.c /tmp/rsx_shader_msl.o -lc++ -Wl,-dead_strip \
             -framework Metal -framework Cocoa -framework QuartzCore -framework IOSurface \
@@ -235,12 +240,14 @@ jobs:
           # backend that uploads level 0 and stops presents level 0's colour
           # and fails, so this cannot pass without the whole mip chain.
           PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --mip
-          # PS3_ANISO: the same two levels under a quad stretched along y.
+          # RSX_ANISO: the same two levels under a quad stretched along y.
           # Only anisotropic filtering reads level 0 there, so it must pass
-          # with PS3_ANISO and fail without it.
-          PS3_ANISO=16 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --mip-aniso
-          if PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --mip-aniso; then
-            echo "--mip-aniso passed without PS3_ANISO; the check is not checking"
+          # at 16x and fail at 1x (off). (Upstream's backend reads PS3_ANISO,
+          # off when unset; the fork's reads RSX_ANISO, as its D3D12 and
+          # Vulkan engines do, and is 16x when unset.)
+          RSX_ANISO=16 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --mip-aniso
+          if RSX_ANISO=1 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --mip-aniso; then
+            echo "--mip-aniso passed with RSX_ANISO=1; the check is not checking"
             exit 1
           fi
           # SET_TEXTURE_BORDER_COLOR: a quad sampling only outside [0,1]

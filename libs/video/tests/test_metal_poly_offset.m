@@ -100,6 +100,9 @@ static float draw_depth(u32 zfmt, int fill, float factor, float bias)
 
 int main(void)
 {
+    /* One draw per case: the fork's engine builds a new pipeline on a worker
+     * and skips the draws until it is ready, so build it in place. */
+    setenv("RSX_ASYNC_SHADERS", "0", 0);
     @autoreleasepool {
         s_dev = MTLCreateSystemDefaultDevice();
         if (!s_dev) { puts("no Metal device: skipped"); return 0; }

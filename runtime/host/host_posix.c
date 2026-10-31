@@ -399,7 +399,7 @@ static void upload_mip_texture(void)
 /* --mip-aniso: the same quad stretched to 0.8 of the target's height, so the
  * texture is minified ~2.5x across and magnified ~4.5x down. Isotropic
  * filtering takes the LOD from the longer axis and still lands on level 1;
- * anisotropic filtering (PS3_ANISO) takes several samples along it and its
+ * anisotropic filtering (RSX_ANISO) takes several samples along it and its
  * LOD from the shorter one, which is level 0. */
 static int s_mip_aniso;
 static void upload_mip_quad(void)
@@ -1591,7 +1591,7 @@ int main(int argc, char** argv)
          * so a backend that uploads only level 0 presents the wrong one. */
         else if (strcmp(argv[i], "--mip") == 0)    do_draw = 5;
         /* --mip-aniso: --mip with the quad stretched along y, which only
-         * anisotropic filtering samples from level 0. Passes with PS3_ANISO
+         * anisotropic filtering samples from level 0. Passes with RSX_ANISO
          * set and must fail without it. */
         else if (strcmp(argv[i], "--mip-aniso") == 0) { do_draw = 5; s_mip_aniso = 1; }
         /* --rtt: render into a colour surface of the guest's own and then

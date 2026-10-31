@@ -590,6 +590,8 @@ if(UNIX)
         if(APPLE)
             add_executable(test_metal_poly_offset
                 libs/video/tests/test_metal_poly_offset.m
+                libs/video/tests/metal_test_standins.c   # the fork's runtime hooks
+                runtime/platform/env_cache.c
                 libs/video/rsx_shader_msl.cpp
                 libs/video/rsx_dispatch.c
                 libs/video/rsx_vertex_compact.c
