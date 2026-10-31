@@ -2451,6 +2451,8 @@ static u32 s_eng_arch_unsaved, s_eng_arch_added, s_eng_arch_hits, s_eng_arch_fil
 static int s_eng_arch_broken;            /* adding failed: stop trying */
 static int s_eng_arch_fold;              /* the set is being rebuilt into one file */
 static int s_eng_arch_marked;            /* <dir>/launch written: no pipeline built yet */
+static int s_eng_warmup_running;         /* the warm-up saves the archive itself, when done */
+static int s_eng_arch_saving;            /* a tick's save is on its way (eng_archive_tick) */
 static char s_eng_arch_mark[1100];
 static FILE* s_eng_list;                 /* pipelines.list, append */
 static u64* s_eng_list_known; static u32 s_eng_list_known_n, s_eng_list_known_cap;
@@ -3603,31 +3605,38 @@ static id<MTLFunction> eng_wpos_function(const char* ps_hlsl, float scale)
 }
 /* ---- the compiled-pipeline archive and the pipeline list -----------------
  *
- * Metal keeps its own cache of compiled shaders, but keyed on the binary:
- * every new build of the game compiled every pipeline again, in play, with
- * the draw skipped until each was ready (characters and walls black for the
- * first minutes). Two files beside the MSL cache replace that:
+ * Metal keeps its own cache of compiled functions and pipelines. Before the
+ * list below, a new build of the game compiled each pipeline when a draw
+ * first needed it, the draw skipped until it was ready (characters and walls
+ * black for the first minutes). Beside the MSL cache:
  *
- *   <cache>/metal_pipelines/NNN.bin  MTLBinaryArchives of every pipeline
- *       this machine compiled, one file per launch that compiled something:
- *       all of them are loaded at start and asked before a pipeline is
- *       compiled (a hit is a load, not a compile, whatever binary asks), and
- *       the ones compiled this time go into a new file. An archive is
+ *   <cache>/pipelines.list        one line per pipeline (both programs' HLSL
+ *       hashes and the state the descriptor is built from). At launch
+ *       eng_warmup_start builds every listed pipeline on all cores from the
+ *       MSL cache, while the title boots, so a warm machine compiles nothing
+ *       in play and a cold one does its compiling up front.
+ *   PS3RECOMP_METAL_ARCHIVE=<dir>: <dir>/NNN.bin, MTLBinaryArchives of every
+ *       pipeline this machine compiled, one file per save: all of them are
+ *       loaded at start and asked before a pipeline is compiled, and the
+ *       ones compiled this time go into a new file. An archive is
  *       serialised ONCE and never added to again: re-serialising a growing
  *       archive, or adding to one read back from disk, leaves a file the
  *       archiver cannot pack ("expecting 'fragment' stage in pipeline no.
  *       N", macOS 27, M1 Pro), so saving within a launch rotates to a fresh
  *       archive object. Files an OS or GPU update cannot read are dropped;
  *       the set is folded into one file when it grows past 32.
- *   <cache>/pipelines.list        one line per pipeline (both programs' HLSL
- *       hashes and the state the descriptor is built from). At launch
- *       eng_warmup_start builds every listed pipeline on all cores from the
- *       MSL cache and the archive, while the title boots, so a warm machine
- *       compiles nothing in play and a cold one does its compiling up front.
+ *       Off unless asked for. Loading an archive costs far more than its
+ *       size (Drakengard 3, M1 Pro, macOS 27: 6.8 MB in 0.07 s, 24 MB in
+ *       0.9 s, 78 MB still loading after two minutes), every build waits for
+ *       the load, and the game is black with its sound playing meanwhile --
+ *       a player's report on macOS 26, and here a second launch after a
+ *       1,898-pipeline warm-up saved one file. Without the archives the same
+ *       launch's warm-up took 0.3 s from Metal's own cache. Off, the
+ *       <cache>/metal_pipelines an earlier build wrote is removed.
  *
  * <cache> is the MSL cache's parent (PS3RECOMP_MSL_CACHE=cache/msl ->
- * cache/); PS3RECOMP_METAL_ARCHIVE=<dir> and PS3RECOMP_PIPELINE_LIST=<file>
- * move them; PS3RECOMP_METAL_WARMUP=0 skips the warm-up. */
+ * cache/); PS3RECOMP_PIPELINE_LIST=<file> moves the list;
+ * PS3RECOMP_METAL_WARMUP=0 skips the warm-up. */
 
 static const char* eng_cache_parent(char* buf, size_t n)
 {
@@ -3653,9 +3662,23 @@ static void eng_archive_open_locked(void)
     if (@available(macOS 11.0, *)) {} else return;
     char parent[1024];
     const char* e = getenv("PS3RECOMP_METAL_ARCHIVE");
-    if (e && *e) snprintf(s_eng_arch_dir, sizeof s_eng_arch_dir, "%s", e);
-    else if (eng_cache_parent(parent, sizeof parent)) snprintf(s_eng_arch_dir, sizeof s_eng_arch_dir, "%s/metal_pipelines", parent);
-    else return;
+    if (!(e && *e)) {   /* off (above): what an earlier build left goes */
+        if (!eng_cache_parent(parent, sizeof parent)) return;
+        char dir[1100];
+        snprintf(dir, sizeof dir, "%s/metal_pipelines", parent);
+        u32 removed = 0;
+        for (NSString* n in [NSFileManager.defaultManager contentsOfDirectoryAtPath:[NSString stringWithUTF8String:dir] error:nil])
+            if ([n hasSuffix:@".bin"] || [n hasSuffix:@".tmp"] || [n isEqualToString:@"launch"] || [n isEqualToString:@"off"]) {
+                char path[1300]; snprintf(path, sizeof path, "%s/%s", dir, n.UTF8String);
+                if (unlink(path) == 0) removed++;
+            }
+        rmdir(dir);
+        if (removed)
+            fprintf(stderr, "[rsx engine/metal] pipeline archives are off (PS3RECOMP_METAL_ARCHIVE=<dir> turns them on): "
+                            "%u files an earlier build left removed\n", removed);
+        return;
+    }
+    snprintf(s_eng_arch_dir, sizeof s_eng_arch_dir, "%s", e);
     mkdir(s_eng_arch_dir, 0755);
     NSArray<NSString*>* names = [[NSFileManager.defaultManager contentsOfDirectoryAtPath:[NSString stringWithUTF8String:s_eng_arch_dir] error:nil]
                                  sortedArrayUsingSelector:@selector(compare:)];
@@ -3728,39 +3751,46 @@ static void eng_archive_open_locked(void)
 
 /* This launch's archive to a new file of the set, then a fresh archive for
  * whatever is compiled next (a serialised archive is never added to again).
- * The file just written joins the set for lookups. */
-static void eng_archive_save_locked(void)
-{
-    if (!s_eng_archive || !s_eng_arch_dir[0] || !s_eng_arch_unsaved) return;
-    if (@available(macOS 11.0, *)) {
-        char path[1200], tmp[1300];
-        snprintf(path, sizeof path, "%s/%03u.bin", s_eng_arch_dir, s_eng_arch_files + 1);
-        snprintf(tmp, sizeof tmp, "%s.tmp", path);
-        NSError* err = nil;
-        if ([s_eng_archive serializeToURL:[NSURL fileURLWithPath:[NSString stringWithUTF8String:tmp]] error:&err]) {
-            rename(tmp, path);
-            s_eng_arch_files++;
-            MTLBinaryArchiveDescriptor* d = [MTLBinaryArchiveDescriptor new];
-            d.url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path]];
-            id<MTLBinaryArchive> back = [s_dev newBinaryArchiveWithDescriptor:d error:&err];
-            if (back) [s_eng_arch_set addObject:back];
-            s_eng_archive = [s_dev newBinaryArchiveWithDescriptor:[MTLBinaryArchiveDescriptor new] error:&err];
-            s_eng_arch_unsaved = 0;
-        } else {
-            fprintf(stderr, "[rsx engine/metal] pipeline archive not saved: %s\n", [[err localizedDescription] UTF8String]);
-            unlink(tmp);
-            s_eng_arch_unsaved = 0;   /* not again with the same contents */
-        }
-    }
-}
+ * The file just written joins the set for lookups. The fresh archive is put
+ * in place under the lock and the full one serialised outside it: a first
+ * launch's warm-up saves ~1,900 pipelines at once, and every build (which
+ * takes the lock to add, and to read the set) waited that long. */
 static void eng_archive_save(void)
 {
+    if (@available(macOS 11.0, *)) {} else return;
     pthread_mutex_lock(&s_eng_arch_mu);
-    eng_archive_save_locked();
+    if (!s_eng_archive || !s_eng_arch_dir[0] || !s_eng_arch_unsaved) { pthread_mutex_unlock(&s_eng_arch_mu); return; }
+    id<MTLBinaryArchive> full = s_eng_archive;
+    NSError* err = nil;
+    s_eng_archive = [s_dev newBinaryArchiveWithDescriptor:[MTLBinaryArchiveDescriptor new] error:&err];
+    s_eng_arch_unsaved = 0;   /* a failed save is not tried again with the same contents */
+    const u32 num = ++s_eng_arch_files;
     pthread_mutex_unlock(&s_eng_arch_mu);
+    char path[1200], tmp[1300];
+    snprintf(path, sizeof path, "%s/%03u.bin", s_eng_arch_dir, num);
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    if ([full serializeToURL:[NSURL fileURLWithPath:[NSString stringWithUTF8String:tmp]] error:&err]) {
+        rename(tmp, path);
+        MTLBinaryArchiveDescriptor* d = [MTLBinaryArchiveDescriptor new];
+        d.url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path]];
+        id<MTLBinaryArchive> back = [s_dev newBinaryArchiveWithDescriptor:d error:&err];
+        if (back) {
+            pthread_mutex_lock(&s_eng_arch_mu);
+            [s_eng_arch_set addObject:back];
+            pthread_mutex_unlock(&s_eng_arch_mu);
+        }
+    } else {
+        fprintf(stderr, "[rsx engine/metal] pipeline archive not saved: %s\n", [[err localizedDescription] UTF8String]);
+        unlink(tmp);
+    }
 }
 /* From the present, once a second or so: pending additions older than 10 s
- * go to disk even when no more arrive. */
+ * go to disk even when no more arrive -- on a queue of their own, not the
+ * present's thread: serialising is ~2 s for the few hundred pipelines a
+ * first launch's warm-up adds in 10 s, and done here it froze the frame that
+ * long every 10 s (Drakengard 3's 1,898-pipeline list: 1.6-2.5 s stalls at
+ * the title). While the warm-up runs, nothing is saved here; it saves once
+ * when done. */
 static void eng_archive_tick(void)
 {
     static time_t last, first_unsaved;
@@ -3771,10 +3801,13 @@ static void eng_archive_tick(void)
     if (!pending) { first_unsaved = 0; return; }
     if (!first_unsaved) { first_unsaved = now; return; }
     if (now - first_unsaved < 10) return;
-    if (pthread_mutex_trylock(&s_eng_arch_mu) != 0) return;   /* a build is adding: next second */
-    eng_archive_save_locked();
+    if (__atomic_load_n(&s_eng_warmup_running, __ATOMIC_ACQUIRE)) return;
+    if (__atomic_exchange_n(&s_eng_arch_saving, 1, __ATOMIC_ACQ_REL)) return;
     first_unsaved = 0;
-    pthread_mutex_unlock(&s_eng_arch_mu);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        eng_archive_save();
+        __atomic_store_n(&s_eng_arch_saving, 0, __ATOMIC_RELEASE);
+    });
 }
 
 /* A pipeline just COMPILED from pd goes into the archive. One the archive
@@ -4062,7 +4095,11 @@ static void eng_warmup_start(void)
 {
     const char* e = getenv("PS3RECOMP_METAL_WARMUP");
     if ((e && *e == '0') || !s_guest_shaders || !eng_msl_cache_dir()) return;
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ eng_warmup_run(); });
+    __atomic_store_n(&s_eng_warmup_running, 1, __ATOMIC_RELEASE);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        eng_warmup_run();
+        __atomic_store_n(&s_eng_warmup_running, 0, __ATOMIC_RELEASE);
+    });
 }
 
 static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_hlsl,
