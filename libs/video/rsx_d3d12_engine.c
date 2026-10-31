@@ -67,6 +67,7 @@
 #define RELEASE(p)      do { if (p) { (p)->lpVtbl->Release(p); (p) = NULL; } } while (0)
 
 #define ENG_MAX_OBJECTS   4096
+#define ENG_HELPER_CONSTANTS 8   /* the helper passes' root constants (b0) */
 #define ENG_MAX_PIPES     4096
 #define ENG_MAX_RECORDS   8192
 #define ENG_MAX_VIEWS     256
@@ -359,6 +360,7 @@ static ID3D12PipelineState* s_depth_ms_pso, *s_depth_pack_ms_pso;   /* MSAA dept
 static ID3DBlob* s_helper_vs_blob; static ID3DBlob* s_helper_blit_blob; /* kept: MSAA refresh pipelines */
 static ID3D12PipelineState* s_zcopy_ms_pso;   /* MSAA depth twin -> its single-sampled target */
 static ID3D12PipelineState* s_present_pso, *s_fxaa_pso;   /* rsx_present_passes.h */
+static ID3D12PipelineState* s_present_hdr_pso;   /* kPresentHdrHLSL: into an scRGB back buffer (RSX_HDR) */
 int rsx_aa_mode(void);                                    /* rsx_draw_engine.c */
 static ID3D12Resource* s_null_tex;
 static SRWLOCK s_pipe_lock = SRWLOCK_INIT;
@@ -1821,12 +1823,16 @@ static int eng_make_root_signatures(void)
     if (FAILED(hr)) return -1;
 
     /* The helper passes: one texture; s0 point/clamp, s1 linear/clamp (the
-     * present passes, rsx_present_passes.h). */
+     * present passes, rsx_present_passes.h); ENG_HELPER_CONSTANTS 32-bit
+     * root constants at b0 (eng_helper_constants). */
     D3D12_DESCRIPTOR_RANGE hr_srv = {0};
     hr_srv.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; hr_srv.NumDescriptors = 1;
-    D3D12_ROOT_PARAMETER hp[1] = {0};
+    D3D12_ROOT_PARAMETER hp[2] = {0};
     hp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; hp[0].DescriptorTable.NumDescriptorRanges = 1;
     hp[0].DescriptorTable.pDescriptorRanges = &hr_srv; hp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    hp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    hp[1].Constants.ShaderRegister = 0; hp[1].Constants.Num32BitValues = ENG_HELPER_CONSTANTS;
+    hp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     D3D12_STATIC_SAMPLER_DESC ss = {0};
     ss.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
     ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
@@ -1834,7 +1840,7 @@ static int eng_make_root_signatures(void)
     D3D12_STATIC_SAMPLER_DESC hs[2] = { ss, ss };
     hs[1].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR; hs[1].ShaderRegister = 1;
     D3D12_ROOT_SIGNATURE_DESC hd = {0};
-    hd.NumParameters = 1; hd.pParameters = hp; hd.NumStaticSamplers = 2; hd.pStaticSamplers = hs;
+    hd.NumParameters = 2; hd.pParameters = hp; hd.NumStaticSamplers = 2; hd.pStaticSamplers = hs;
     if (FAILED(D3D12SerializeRootSignature(&hd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err))) { RELEASE(err); return -1; }
     hr = CALL(s_dev, CreateRootSignature, 0, CALL0(sig, GetBufferPointer), CALL0(sig, GetBufferSize),
               &IID_ID3D12RootSignature, (void**)&s_helper_rootsig);
@@ -1852,6 +1858,117 @@ static ID3D12DescriptorHeap* eng_make_heap(D3D12_DESCRIPTOR_HEAP_TYPE type, u32 
     return h;
 }
 
+/* ---- HDR output ------------------------------------------------------------
+ * RSX_HDR=1: where Windows has HDR on for the display the window is on, the
+ * swap chain is FP16 in scRGB (linear light, the sRGB primaries, 1.0 at 80
+ * nits) and the present pass (kPresentHdrHLSL) decodes the frame -- the
+ * title's SDR picture -- to linear light and scales it to the paper white:
+ * RSX_HDR_WHITE=<nits>, else Windows' own SDR white level for that display
+ * (Settings > Display > HDR, SDR content brightness). RSX_HDR_PEAK=<nits>
+ * (else the display's peak) caps it. The decode is a 2.2 power -- what an
+ * SDR display shows the frame with, so what the title was graded on;
+ * Windows composes an SDR window on an HDR desktop with the sRGB curve
+ * instead, which lifts its shadows -- or with RSX_HDR_GAMMA=srgb that curve.
+ * Without HDR on in Windows, or without RSX_HDR, the swap chain is the 8-bit
+ * one it always was. All of it is read again when the settings page changes
+ * it; Windows' HDR switch and the display under the window are checked as
+ * the game runs (eng_hdr_poll). */
+static int s_hdr_want;                          /* RSX_HDR */
+static int s_hdr_on;                            /* the swap chain is scRGB */
+static int s_hdr_force;                         /* the display's HDR changed: a new swap chain */
+static float s_hdr_white_set, s_hdr_peak_set;   /* nits; 0 = the display's */
+static int s_hdr_srgb;                          /* RSX_HDR_GAMMA=srgb */
+static float s_hdr_white = 200.0f, s_hdr_peak = 1000.0f;   /* in use, nits */
+static IDXGIFactory1* s_hdr_factory;            /* stale (IsCurrent) once the displays change */
+static HMONITOR s_hdr_monitor;
+typedef struct { int found, hdr; float peak, white; } EngHdrDisplay;
+
+static void eng_read_hdr(void)
+{
+    const char* e = getenv("RSX_HDR");
+    s_hdr_want = e && *e && e[0] != '0';
+    e = getenv("RSX_HDR_WHITE");
+    s_hdr_white_set = e && *e ? (float)atof(e) : 0.0f;
+    e = getenv("RSX_HDR_PEAK");
+    s_hdr_peak_set = e && *e ? (float)atof(e) : 0.0f;
+    e = getenv("RSX_HDR_GAMMA");
+    s_hdr_srgb = e && !_stricmp(e, "srgb");
+}
+
+/* Windows' SDR white level for the display gdi names (\\.\DISPLAYn), in nits;
+ * 0 when it cannot be read. */
+static float eng_sdr_white_nits(const wchar_t* gdi)
+{
+    UINT32 np = 0, nm = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &np, &nm) != ERROR_SUCCESS || !np) return 0.0f;
+    DISPLAYCONFIG_PATH_INFO* paths = (DISPLAYCONFIG_PATH_INFO*)calloc(np, sizeof *paths);
+    DISPLAYCONFIG_MODE_INFO* modes = (DISPLAYCONFIG_MODE_INFO*)calloc(nm ? nm : 1, sizeof *modes);
+    float nits = 0.0f;
+    if (paths && modes && QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &np, paths, &nm, modes, NULL) == ERROR_SUCCESS) {
+        for (UINT32 i = 0; i < np && nits == 0.0f; i++) {
+            DISPLAYCONFIG_SOURCE_DEVICE_NAME src;
+            memset(&src, 0, sizeof src);
+            src.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+            src.header.size = sizeof src;
+            src.header.adapterId = paths[i].sourceInfo.adapterId;
+            src.header.id = paths[i].sourceInfo.id;
+            if (DisplayConfigGetDeviceInfo(&src.header) != ERROR_SUCCESS || wcscmp(src.viewGdiDeviceName, gdi) != 0) continue;
+            DISPLAYCONFIG_SDR_WHITE_LEVEL wl;
+            memset(&wl, 0, sizeof wl);
+            wl.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
+            wl.header.size = sizeof wl;
+            wl.header.adapterId = paths[i].targetInfo.adapterId;
+            wl.header.id = paths[i].targetInfo.id;
+            if (DisplayConfigGetDeviceInfo(&wl.header) == ERROR_SUCCESS && wl.SDRWhiteLevel)
+                nits = (float)wl.SDRWhiteLevel / 1000.0f * 80.0f;   /* in thousandths of 80 nits */
+        }
+    }
+    free(paths); free(modes);
+    return nits;
+}
+
+/* The display the window is on: is HDR on for it in Windows, its peak, and
+ * its SDR white level. Keeps the factory it asked, for eng_hdr_poll. */
+static EngHdrDisplay eng_hdr_display(void)
+{
+    EngHdrDisplay d = { 0, 0, 0.0f, 0.0f };
+    if (!s_hwnd) return d;
+    HMONITOR mon = MonitorFromWindow(s_hwnd, MONITOR_DEFAULTTONEAREST);
+    RELEASE(s_hdr_factory);
+    if (!mon || FAILED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void**)&s_hdr_factory))) return d;
+    s_hdr_monitor = mon;
+    IDXGIAdapter1* ad = NULL;
+    for (UINT a = 0; !d.found && CALL(s_hdr_factory, EnumAdapters1, a, &ad) != DXGI_ERROR_NOT_FOUND; a++) {
+        IDXGIOutput* out = NULL;
+        for (UINT o = 0; !d.found && CALL(ad, EnumOutputs, o, &out) != DXGI_ERROR_NOT_FOUND; o++) {
+            DXGI_OUTPUT_DESC od;
+            IDXGIOutput6* o6 = NULL;
+            if (SUCCEEDED(CALL(out, GetDesc, &od)) && od.Monitor == mon &&
+                SUCCEEDED(CALL(out, QueryInterface, &IID_IDXGIOutput6, (void**)&o6))) {
+                DXGI_OUTPUT_DESC1 d1;
+                if (SUCCEEDED(CALL(o6, GetDesc1, &d1))) {
+                    d.found = 1;
+                    d.hdr = d1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+                    d.peak = d1.MaxLuminance;
+                    d.white = eng_sdr_white_nits(od.DeviceName);
+                }
+                RELEASE(o6);
+            }
+            RELEASE(out);
+        }
+        RELEASE(ad);
+    }
+    return d;
+}
+
+/* The paper white and the peak from the settings, else from the display. */
+static void eng_hdr_levels(const EngHdrDisplay* d)
+{
+    s_hdr_white = s_hdr_white_set > 0.0f ? s_hdr_white_set : d->white > 0.0f ? d->white : 200.0f;
+    s_hdr_peak = s_hdr_peak_set > 0.0f ? s_hdr_peak_set : d->peak > 0.0f ? d->peak : 1000.0f;
+    if (s_hdr_peak < s_hdr_white) s_hdr_peak = s_hdr_white;   /* a paper white above the peak is the peak's */
+}
+
 /* ---- device ---------------------------------------------------------------- */
 
 /* The swap chain over s_hwnd at s_win_w x s_win_h for s_display: flip
@@ -1861,8 +1978,21 @@ static ID3D12DescriptorHeap* eng_make_heap(D3D12_DESCRIPTOR_HEAP_TYPE type, u32 
 static int eng_swapchain_create(IDXGIFactory4* factory)
 {
     HRESULT hr;
+    /* RSX_HDR: scRGB FP16 on a display Windows has HDR on for. */
+    s_hdr_on = 0;
+    EngHdrDisplay hd = { 0, 0, 0.0f, 0.0f };
+    if (s_hdr_want && s_present_hdr_pso) {   /* (at start-up the pass is built after: eng_init_device asks again) */
+        hd = eng_hdr_display();
+        eng_hdr_levels(&hd);
+        s_hdr_on = hd.hdr;
+        if (!s_hdr_on)
+            fprintf(stderr, "[rsx engine/d3d12] HDR: %s; the picture stays SDR\n",
+                    hd.found ? "Windows has HDR off for this display (Settings > Display > Use HDR)"
+                             : "the display under the window was not found");
+    }
     DXGI_SWAP_CHAIN_DESC1 sd = {0};
-    sd.Width = s_win_w; sd.Height = s_win_h; sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.Width = s_win_w; sd.Height = s_win_h;
+    sd.Format = s_hdr_on ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
     sd.SampleDesc.Count = 1; sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     sd.BufferCount = 3; sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     s_tearing = 0;
@@ -1912,6 +2042,17 @@ static int eng_swapchain_create(IDXGIFactory4* factory)
     hr = CALL(sc1, QueryInterface, &IID_IDXGISwapChain3, (void**)&s_swap);
     RELEASE(sc1);
     if (FAILED(hr)) return -1;
+    if (s_hdr_on) {
+        UINT support = 0;
+        const DXGI_COLOR_SPACE_TYPE cs = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
+        if (FAILED(CALL(s_swap, CheckColorSpaceSupport, cs, &support)) ||
+            !(support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT) || FAILED(CALL(s_swap, SetColorSpace1, cs)))
+            fprintf(stderr, "[rsx engine/d3d12] HDR: the swap chain refused scRGB; left in FP16's default\n");
+        fprintf(stderr, "[rsx engine/d3d12] HDR: scRGB FP16, paper white %.0f nits (%s), peak %.0f nits (%s), %s decode\n",
+                s_hdr_white, s_hdr_white_set > 0.0f ? "RSX_HDR_WHITE" : hd.white > 0.0f ? "Windows' SDR white level" : "default",
+                s_hdr_peak, s_hdr_peak_set > 0.0f ? "RSX_HDR_PEAK" : hd.peak > 0.0f ? "the display's" : "default",
+                s_hdr_srgb ? "sRGB" : "2.2");
+    }
     if (!s_backbuf_rtv_heap) s_backbuf_rtv_heap = eng_make_heap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 3, 0);
     if (!s_backbuf_rtv_heap) return -1;
     s_rtv_step = CALL(s_dev, GetDescriptorHandleIncrementSize, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
@@ -2086,6 +2227,16 @@ static int eng_init_device(u32 width, u32 height)
           if (pvs && pa) s_present_pso = eng_helper_pso(pvs, pa, DXGI_FORMAT_R8G8B8A8_UNORM);
           if (pvs && pf) s_fxaa_pso = eng_helper_pso(pvs, pf, DXGI_FORMAT_R8G8B8A8_UNORM);
           RELEASE(pvs); RELEASE(pa); RELEASE(pf); }
+        { ID3DBlob* hvs = eng_compile(kPresentHdrHLSL, sizeof kPresentHdrHLSL - 1, "vs_main", "vs_5_0", "present hdr vs");
+          ID3DBlob* hps = eng_compile(kPresentHdrHLSL, sizeof kPresentHdrHLSL - 1, "ps_blit_area_hdr", "ps_5_0", "present hdr");
+          if (hvs && hps && !s_present_hdr_pso) s_present_hdr_pso = eng_helper_pso(hvs, hps, DXGI_FORMAT_R16G16B16A16_FLOAT);
+          RELEASE(hvs); RELEASE(hps);
+          /* RSX_HDR: the swap chain was made before this pass existed; the
+           * first message pump makes it again, scRGB where HDR is on. */
+          if (s_hdr_want && !s_headless) {
+              if (s_present_hdr_pso) { s_hdr_force = 1; g_rsx_display_reload = 1; }
+              else fprintf(stderr, "[rsx engine/d3d12] HDR: its present pass did not build; the picture stays SDR\n");
+          } }
         if (vs && pd) s_depth_pso = eng_helper_pso(vs, pd, DXGI_FORMAT_R32_FLOAT);
         if (vs && pp) s_depth_pack_pso = eng_helper_pso(vs, pp, DXGI_FORMAT_R8G8B8A8_UNORM);
         { ID3DBlob* pdm = eng_compile(kHelperHLSL, sizeof kHelperHLSL - 1, "ps_depth_ms", "ps_5_0", "helper depth ms");
@@ -3125,6 +3276,12 @@ static void eng_use_helper_rootsig(void)
     if (s_cur_helper_rs) return;
     CALL(s_list, SetGraphicsRootSignature, s_helper_rootsig);
     s_cur_helper_rs = 1; s_cur_pso = NULL; s_cur_targets_valid = 0;
+}
+/* The next helper pass's b0: n of ENG_HELPER_CONSTANTS floats. */
+static void eng_helper_constants(const float* v, u32 n)
+{
+    eng_use_helper_rootsig();
+    CALL(s_list, SetGraphicsRoot32BitConstants, 1, n, v, 0);
 }
 
 /* The list's descriptor rings ran dry mid-frame: submit what is encoded,
@@ -4297,7 +4454,7 @@ static int eng_read_vsync(void)
 }
 
 /* g_rsx_display_reload (rsx_draw_engine.c): the settings page changed
- * RSX_VSYNC / RSX_DISPLAY / RSX_WINDOW / RSX_SCALE. Picked up by the message pump, on
+ * RSX_VSYNC / RSX_DISPLAY / RSX_WINDOW / RSX_SCALE / RSX_HDR*. Picked up by the message pump, on
  * the thread that owns the window and presents. V-sync alone is the next
  * present's interval; a new mode or size drains the GPU, restyles the
  * window and makes a new swap chain (a frame or two of black). */
@@ -4309,19 +4466,28 @@ static void eng_display_reload(void)
     const u32 ow = s_win_w, oh = s_win_h;
     const int ov = s_vsync;
     const float os = s_scale;
+    const int ohdr = s_hdr_want;
     s_vsync = eng_read_vsync();
     eng_read_display();
     eng_read_scale();
+    eng_read_hdr();
     if (s_scale != os) eng_rescale();
+    /* HDR switched, or the display's changed (eng_hdr_poll): a new swap
+     * chain; only the levels: from the next present. */
+    const int hdr_new = s_hdr_want != ohdr || s_hdr_force;
+    s_hdr_force = 0;
+    if (!hdr_new && s_hdr_on) { const EngHdrDisplay d = eng_hdr_display(); eng_hdr_levels(&d); }
     if ((u32)eng_ms_want() != s_ms_n) eng_ms_apply(eng_ms_want());
     if (s_vsync != ov) fprintf(stderr, "[RSX d3d12] vsync %d\n", s_vsync);
-    if (s_display == od && s_win_w == ow && s_win_h == oh) return;
+    if (s_display == od && s_win_w == ow && s_win_h == oh && !hdr_new) return;
     fence_wait(fence_signal());
     const EngDisplayMode nd = s_display;
     s_display = od;
     eng_swapchain_release();
     s_display = nd;
-    if (s_display == DISP_WINDOWED) {
+    if (s_display == od && s_win_w == ow && s_win_h == oh) {
+        /* HDR alone: the window stays as it is */
+    } else if (s_display == DISP_WINDOWED) {
         RECT wr = {0, 0, (LONG)s_win_w, (LONG)s_win_h};
         AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
         const int w = wr.right - wr.left, h = wr.bottom - wr.top;
@@ -4517,7 +4683,13 @@ static void eng_submit(u32 present_surface, int wait)
                 const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
                 CALL(s_list, ClearRenderTargetView, rtv, black, 0, NULL);
             }
-            eng_fullscreen_pass_at(s_present_pso && !s_headless ? s_present_pso : s_blit_pso, rtv, s_win_w, s_win_h,
+            ID3D12PipelineState* ppso = s_present_pso && !s_headless ? s_present_pso : s_blit_pso;
+            if (!s_headless && s_hdr_on && s_present_hdr_pso) {
+                const float k[4] = { s_hdr_white / 80.0f, s_hdr_peak / 80.0f, s_hdr_srgb ? 1.0f : 0.0f, 0.0f };
+                eng_helper_constants(k, 4);
+                ppso = s_present_hdr_pso;
+            }
+            eng_fullscreen_pass_at(ppso, rtv, s_win_w, s_win_h,
                                    obj_srv(shown), s_headless ? NULL : lvp, s_headless ? NULL : lrect);
             if (windowed) res_transition(dst, &st, D3D12_RESOURCE_STATE_PRESENT);
             else s_offscreen_state = st;
@@ -4813,7 +4985,7 @@ static void eng_release_device(void)
     if (s_swap && s_display == DISP_FULLSCREEN) CALL(s_swap, SetFullscreenState, FALSE, NULL);
     RELEASE(s_zero_cb); RELEASE(s_readback); s_readback_cap = 0; RELEASE(s_aux_alloc);
     RELEASE(s_null_tex); RELEASE(s_blit_pso); RELEASE(s_depth_pso); RELEASE(s_depth_pack_pso);
-    RELEASE(s_present_pso); RELEASE(s_fxaa_pso);
+    RELEASE(s_present_pso); RELEASE(s_fxaa_pso); RELEASE(s_present_hdr_pso); RELEASE(s_hdr_factory);
     RELEASE(s_depth_ms_pso); RELEASE(s_depth_pack_ms_pso); RELEASE(s_zcopy_ms_pso);
     RELEASE(s_helper_vs_blob); RELEASE(s_helper_blit_blob);
     RELEASE(s_rootsig); RELEASE(s_helper_rootsig);
@@ -4838,6 +5010,7 @@ int rsx_d3d12_engine_init(u32 width, u32 height, const char* title)
     s_width = width ? width : 1280; s_height = height ? height : 720;
     s_vsync = eng_read_vsync();
     eng_read_scale();
+    eng_read_hdr();
     { const char* e = getenv("RSX_BUF_POOL"); if (e && *e == '0') g_eng_buf_pool = 0; }
     { const char* e = getenv("RSX_TEX_HEAPS"); if (e && *e == '0') g_eng_tex_heaps = 0; }
     { const char* e = getenv("RSX_VB_PAGES"); if (e && *e == '0') g_eng_vb_pages = 0; }
@@ -4898,9 +5071,31 @@ void rsx_d3d12_engine_shutdown(void)
 
 int rsx_d3d12_engine_active(void) { return s_active; }
 
+/* RSX_HDR: every 60th pump, whether the displays changed (the factory went
+ * stale: HDR switched in Windows, a display added or set up anew) or the
+ * window moved to another display; then whether HDR is on for the one it is
+ * on now, and a new swap chain if that is not what it has. */
+static void eng_hdr_poll(void)
+{
+    static u32 n;
+    if (!s_hdr_want || ++n % 60) return;
+    if (s_hdr_factory && CALL0(s_hdr_factory, IsCurrent) &&
+        MonitorFromWindow(s_hwnd, MONITOR_DEFAULTTONEAREST) == s_hdr_monitor)
+        return;
+    const EngHdrDisplay d = eng_hdr_display();
+    if ((d.hdr && s_present_hdr_pso) != s_hdr_on) {
+        fprintf(stderr, "[rsx engine/d3d12] HDR: the display %s HDR now; a new swap chain\n", d.hdr ? "has" : "has no");
+        s_hdr_force = 1;
+        g_rsx_display_reload = 1;
+    } else if (s_hdr_on) {
+        eng_hdr_levels(&d);
+    }
+}
+
 int rsx_d3d12_engine_pump_messages(void)
 {
     if (s_headless) return 0;
+    if (s_ready && s_swap) eng_hdr_poll();
     if (g_rsx_display_reload && s_ready && s_swap) eng_display_reload();
     MSG msg;
     while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {

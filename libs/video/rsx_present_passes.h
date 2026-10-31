@@ -14,6 +14,42 @@
  * pixel is on an edge; the edge's direction and its two ends along it are
  * searched for; the pixel is re-sampled across the edge by how far it sits
  * from the nearer end, and blended for sub-pixel aliasing. */
+/* The present blit for an HDR swap chain (rsx_d3d12_engine.c, RSX_HDR):
+ * scRGB, linear light with 1.0 at 80 nits. The frame is an SDR picture: each
+ * tap is decoded to linear light (a 2.2 power, what an SDR display shows it
+ * with; hdr.z = 1: the sRGB curve) before the area average, then scaled to
+ * the paper white (hdr.x = its nits / 80) and held under the peak (hdr.y). */
+static const char kPresentHdrHLSL[] =
+    "struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
+    "VSOut vs_main(uint vid : SV_VertexID) {\n"
+    "    float2 p = float2((vid << 1) & 2, vid & 2);\n"
+    "    VSOut o; o.pos = float4(p * 2.0 - 1.0, 0.0, 1.0); o.uv = float2(p.x, 1.0 - p.y); return o;\n"
+    "}\n"
+    "Texture2D<float4> src : register(t0);\n"
+    "SamplerState smp : register(s1);\n"
+    "cbuffer HdrConstants : register(b0) { float4 hdr; };\n"
+    "float3 decode(float3 c) {\n"
+    "    c = saturate(c);\n"
+    "    if (hdr.z > 0.5) return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);\n"
+    "    return pow(c, 2.2);\n"
+    "}\n"
+    "float4 ps_blit_area_hdr(VSOut i) : SV_Target {\n"
+    "    uint w, h; src.GetDimensions(w, h);\n"
+    "    float2 d = float2(ddx(i.uv.x), ddy(i.uv.y));\n"
+    "    float2 fp = abs(d) * float2(w, h);\n"
+    "    float3 lin;\n"
+    "    if (fp.x <= 1.25 && fp.y <= 1.25) lin = decode(src.SampleLevel(smp, i.uv, 0).rgb);\n"
+    "    else {\n"
+    "        int nx = clamp((int)ceil(fp.x - 0.01), 1, 4), ny = clamp((int)ceil(fp.y - 0.01), 1, 4);\n"
+    "        float3 acc = 0;\n"
+    "        for (int y = 0; y < ny; y++)\n"
+    "            for (int x = 0; x < nx; x++)\n"
+    "                acc += decode(src.SampleLevel(smp, i.uv + (float2(x + 0.5, y + 0.5) / float2(nx, ny) - 0.5) * d, 0).rgb);\n"
+    "        lin = acc / (float)(nx * ny);\n"
+    "    }\n"
+    "    return float4(min(lin * hdr.x, hdr.y), 1.0);\n"
+    "}\n";
+
 static const char kPresentHLSL[] =
     "struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
     "VSOut vs_main(uint vid : SV_VertexID) {\n"
