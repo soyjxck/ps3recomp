@@ -226,6 +226,17 @@ static void test_cache(void)
     s = cache_stats();
     check_true("cache: ... and was rewritten", s.disk_hits == 1 && s.translations == 0);
 
+    /* rsx_hlsl_to_msl_disk_cache(0) (the Metal backend keeps its own files):
+     * the directory is neither read nor written. */
+    if (path[0]) unlink(path);
+    rsx_hlsl_to_msl_disk_cache(0);
+    rsx_hlsl_to_msl_cache_reset();
+    rsx_hlsl_to_msl(kPS, RSX_SHADER_STAGE_FRAGMENT, g_msl2, sizeof g_msl2, g_log, sizeof g_log);
+    s = cache_stats();
+    only_msl_file(dir, path, sizeof path);
+    check_true("cache: disk layer off: translated, no file", s.translations == 1 && s.disk_hits == 0 && path[0] == 0);
+    rsx_hlsl_to_msl_disk_cache(1);
+
     if (path[0]) unlink(path);
     rmdir(dir);
     unsetenv("PS3RECOMP_MSL_CACHE");

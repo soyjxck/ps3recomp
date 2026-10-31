@@ -231,6 +231,7 @@ struct Cache {
     std::unordered_map<std::string, std::string> map;
     std::string dir;
     bool dir_read = false;
+    bool disk_off = false;   /* rsx_hlsl_to_msl_disk_cache(0) */
     RsxMslCacheStats stats = {};
 };
 
@@ -244,7 +245,7 @@ const std::string& cache_dir(Cache& c)
 {
     if (!c.dir_read) {
         const char* e = getenv("PS3RECOMP_MSL_CACHE");
-        c.dir = (e && *e) ? e : "";
+        c.dir = (e && *e && !c.disk_off) ? e : "";
         c.dir_read = true;
     }
     return c.dir;
@@ -411,6 +412,14 @@ extern "C" void rsx_hlsl_to_msl_cache_reset(void)
     c.stats = {};
 }
 
+extern "C" void rsx_hlsl_to_msl_disk_cache(int on)
+{
+    Cache& c = cache();
+    std::lock_guard<std::mutex> guard(c.lock);
+    c.disk_off = !on;
+    c.dir_read = false;
+}
+
 #else /* !PS3RECOMP_HAVE_MSL_TRANSLATION */
 
 extern "C" int rsx_hlsl_to_msl_available(void) { return 0; }
@@ -421,6 +430,8 @@ extern "C" void rsx_hlsl_to_msl_cache_stats(RsxMslCacheStats* out)
 }
 
 extern "C" void rsx_hlsl_to_msl_cache_reset(void) {}
+
+extern "C" void rsx_hlsl_to_msl_disk_cache(int on) { (void)on; }
 
 extern "C" int rsx_hlsl_to_msl(const char* hlsl, int stage,
                                char* out, u32 out_size,

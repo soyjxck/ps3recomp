@@ -66,6 +66,14 @@ void rsx_hlsl_to_msl_cache_stats(RsxMslCacheStats* out);
  * PS3RECOMP_MSL_CACHE again on the next request. Disk files stay. */
 void rsx_hlsl_to_msl_cache_reset(void);
 
+/* on = 0: no disk layer, whatever PS3RECOMP_MSL_CACHE says; the memory layer
+ * stays. For a caller that keeps translations on disk itself: the fork's
+ * Metal backend keys its own files on the HLSL hash in that same directory
+ * and a release ships them, and this layer's files would be a second copy of
+ * each, valid only for the build that wrote them (the header holds the
+ * translator's build time). */
+void rsx_hlsl_to_msl_disk_cache(int on);
+
 #ifdef __cplusplus
 }
 #endif

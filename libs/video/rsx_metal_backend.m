@@ -6548,6 +6548,10 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
          * tell a translation problem from a fetch or state one. */
         const char* ff = getenv("PS3RECOMP_METAL_FIXED_FUNCTION");
         s_guest_shaders = rsx_hlsl_to_msl_available() && !(ff && *ff && *ff != '0');
+        /* The translations on disk are this backend's (eng_msl_cache_path);
+         * the translator's own disk layer would write a second copy of each
+         * into the same folder. */
+        rsx_hlsl_to_msl_disk_cache(0);
         if (!s_headless) eng_warmup_start();
 
         s_inflight = dispatch_semaphore_create(MTL_MAX_INFLIGHT);
