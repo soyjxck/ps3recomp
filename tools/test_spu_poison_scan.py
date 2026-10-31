@@ -23,7 +23,8 @@ class PoisonScanTests(unittest.TestCase):
         cmd = [cc, '-std=gnu17', '-O2', '-pthread', '-I', str(ROOT / 'include'),
                '-I', str(ROOT / 'runtime/spu'), '-I', str(ROOT / 'runtime/platform'),
                str(ROOT / 'runtime/spu/tests/test_spu_poison_scan.c'),
-               str(ROOT / 'runtime/platform/win32_compat.c'), '-o', str(cls.exe)]
+               str(ROOT / 'runtime/platform/win32_compat.c'),
+               str(ROOT / 'runtime/spu/tests/fork_runtime_standins.c'), '-o', str(cls.exe)]
         subprocess.run(cmd, check=True, capture_output=True, text=True)
 
     def run_mode(self, mode, watch):

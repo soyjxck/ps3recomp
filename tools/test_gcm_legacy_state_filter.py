@@ -19,7 +19,8 @@ with tempfile.TemporaryDirectory(prefix='gcm-legacy-state-filter-') as tmp:
     subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG',
                     '-ffunction-sections', '-fdata-sections',
                     '-I' + str(root / 'include'), '-I' + str(root / 'libs/video'),
-                    str(root / 'libs/video/tests/test_gcm_legacy_state_filter.c'), *linker,
+                    str(root / 'libs/video/tests/test_gcm_legacy_state_filter.c'),
+                    str(root / 'runtime/platform/env_cache.c'), *linker,
                     '-o', str(binary)], check=True)
     for args in ([], ['trace']):
         result = subprocess.run([str(binary), *args], timeout=30, capture_output=True, text=True)

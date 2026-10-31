@@ -33,6 +33,10 @@ void spu_lockline_unlock(void) {}
 void spu_lockguard_check(spu_context* c, uint32_t ea, const uint8_t* p, uint32_t n, const char* what)
 { (void)c; (void)ea; (void)p; (void)n; (void)what; }
 void spu_ch_wake(spu_context* c) { (void)c; }
+/* The fork's SPU_DMA_RANGE report (spu_workload.c parses it): no window. */
+uint32_t g_spu_dma_rng_lo, g_spu_dma_rng_hi;
+long g_spu_dma_rng_cap;
+void spu_dma_range_init(void) {}
 
 static void check(int ok, const char* what)
 { if (!ok) { fprintf(stdout, "FAIL: %s\n", what); exit(2); } }

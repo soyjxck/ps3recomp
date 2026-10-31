@@ -40,6 +40,9 @@ int spurs_run_taskset_policy_probe(uint32_t a, uint32_t b, uint32_t c, uint64_t 
 { (void)a; (void)b; (void)c; (void)d; (void)e; (void)ls; (void)f; return -1; }
 void tsp_spu_func_00000A00(spu_context* c) { (void)c; }
 void ydkj_wake_all_event_flags(void) { }
+/* The fork's task threads: a task's start, and a dead stack's coherence entries. */
+void spu_task_begin(void) { }
+void spu_coh_forget_range(uintptr_t lo, uintptr_t hi) { (void)lo; (void)hi; }
 
 static void prog_a(spu_context* c) { (void)c; }
 static void prog_b(spu_context* c) { (void)c; }

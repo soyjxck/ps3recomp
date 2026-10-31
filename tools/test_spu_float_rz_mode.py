@@ -20,7 +20,9 @@ with tempfile.TemporaryDirectory(prefix='spu-float-rz-mode-') as tmp:
                     '-I'+str(root/'runtime/platform'),
                     str(spu/'tests/test_spu_float_rz_mode.c'),
                     *[str(spu / name) for name in sources],
-                    str(root/'runtime/platform/win32_compat.c'), '-pthread', '-lm',
+                    str(root/'runtime/platform/win32_compat.c'),
+                    str(root/'runtime/platform/env_cache.c'),
+                    str(root/'runtime/spu/tests/fork_runtime_standins.c'), '-pthread', '-lm',
                     '-o', str(binary)], check=True)
     for rz in ('0', '1'):
         env = {k: v for k, v in os.environ.items()

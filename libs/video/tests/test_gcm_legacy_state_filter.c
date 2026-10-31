@@ -11,6 +11,7 @@
  *   (gcc: -Wl,--gc-sections -pthread -lm)
  */
 #include "../cellGcmSys.c"
+#include "gcm_fork_standins.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

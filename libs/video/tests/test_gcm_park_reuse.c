@@ -20,6 +20,7 @@
  *   (clang on macOS: -Wl,-dead_strip)
  */
 #include "../cellGcmSys.c"
+#include "gcm_fork_standins.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>

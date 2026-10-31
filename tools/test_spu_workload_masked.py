@@ -15,5 +15,6 @@ with tempfile.TemporaryDirectory(prefix='spu-workload-masked-') as tmp:
                     '-I' + str(root / 'include'), '-I' + str(root / 'runtime'),
                     '-I' + str(root / 'runtime/spu'),
                     str(root / 'runtime/spu/tests/test_spu_workload_masked.c'),
+                    str(root / 'runtime/platform/env_cache.c'),
                     '-pthread', '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True, timeout=30, cwd=tmp)

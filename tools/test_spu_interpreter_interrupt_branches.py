@@ -27,5 +27,5 @@ with tempfile.TemporaryDirectory(prefix='spu-interrupt-branches-') as tmp:
  (tmp/'interrupt_branches_lifted.h').write_text('\n'.join(body)+'\n')
  for lifted in [False,True]:
   binary=tmp/('lifted' if lifted else 'interp')
-  subprocess.run([os.environ.get('CC','cc'),'-std=gnu17','-O1','-UNDEBUG',*(['-DBRANCH_LIFTED'] if lifted else []),'-I'+str(tmp),'-I'+str(root/'include'),'-I'+str(spu),'-I'+str(root/'runtime/platform'),str(spu/'tests/test_spu_interpreter_interrupt_branches.c'),*[str(spu/x) for x in sources],str(root/'runtime/platform/win32_compat.c'),'-pthread','-lm','-o',str(binary)],check=True)
+  subprocess.run([os.environ.get('CC','cc'),'-std=gnu17','-O1','-UNDEBUG',*(['-DBRANCH_LIFTED'] if lifted else []),'-I'+str(tmp),'-I'+str(root/'include'),'-I'+str(spu),'-I'+str(root/'runtime/platform'),str(spu/'tests/test_spu_interpreter_interrupt_branches.c'),*[str(spu/x) for x in sources],str(root/'runtime/platform/win32_compat.c'),str(root/'runtime/platform/env_cache.c'),str(root/'runtime/spu/tests/fork_runtime_standins.c'),'-pthread','-lm','-o',str(binary)],check=True)
   subprocess.run([str(binary)],check=True,timeout=5,env=env,cwd=tmp)

@@ -20,7 +20,8 @@ sources = ['runtime/spu/tests/test_spu_decrementer.c',
            'runtime/spu/spurs_policy.c', 'runtime/spu/spurs_job.c',
            'runtime/spu/spu_tsp_weak.c', 'runtime/spu/spu_vm_pagemap.c',
            'runtime/spu/spurs_policy_blob_weak.c', 'runtime/spu/spu_interp.c',
-           'runtime/platform/win32_compat.c']
+           'runtime/platform/win32_compat.c', 'runtime/platform/env_cache.c',
+           'runtime/spu/tests/fork_runtime_standins.c']
 with tempfile.TemporaryDirectory(prefix='spu-decrementer-') as tmp:
     binary = Path(tmp) / 'test'
     subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-w',

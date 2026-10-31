@@ -75,8 +75,11 @@ int main(void)
     setvbuf(stdout, NULL, _IONBF, 0);
     if (cache_existing_main()) return 1;
     cache_fixture_lock = &s_mfc_claim_lock;
+    /* The fork's cache is on unless SPU_MFC_LOOKUP_CACHE=0 or SPU_MFC_TLS=0
+     * (upstream's is off unless SPU_MFC_LOOKUP_CACHE=1). */
     const char* flag = getenv("SPU_MFC_LOOKUP_CACHE");
-    int enabled = flag && !strcmp(flag, "1");
+    const char* tls = getenv("SPU_MFC_TLS");
+    int enabled = !((flag && flag[0] == '0') || (tls && tls[0] == '0'));
     spu_context* ctx = calloc(1, sizeof(*ctx)); CHECK(ctx != NULL);
     mfc_engine* original = mfc_for(ctx); original->tag_completed = 0x12345678;
     atomic_store(&cache_fixture_reads, 0);

@@ -22,7 +22,9 @@ with tempfile.TemporaryDirectory(prefix='spu-dispatch-miss-') as tmp:
         '-I'+str(root/'include'),'-I'+str(root/'runtime/spu'),'-I'+str(root/'runtime/platform'),
         str(root/'tests/test_spu_dispatch_miss.c'),
         *[str(root/'runtime/spu'/f'{u}.c') for u in units],
-        str(root/'runtime/platform/win32_compat.c'),'-pthread','-lm','-o',str(out)],check=True)
+        str(root/'runtime/platform/win32_compat.c'),
+        str(root/'runtime/platform/env_cache.c'),
+        str(root/'runtime/spu/tests/fork_runtime_standins.c'),'-pthread','-lm','-o',str(out)],check=True)
 
     env={k:v for k,v in os.environ.items() if k not in ('SPU_MISS_FATAL','SPU_DUMP_MISS')}
     p=subprocess.run([str(out)],env=env,capture_output=True,text=True,timeout=15)

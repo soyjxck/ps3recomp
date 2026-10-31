@@ -18,7 +18,6 @@ parser.add_argument('--mutants', action='store_true')
 args = parser.parse_args()
 env = {k: v for k, v in os.environ.items()
        if not k.startswith(('SPU_', 'SPURS_', 'YDKJ_', 'LBP_', 'GH3_'))}
-source = (SPU / 'spu_drain.c').read_text()
 # CI has already configured its compiler matrix before discovering this suite.
 # Honor explicit overrides, then use that configured compiler rather than `cc`
 # (which would silently run GCC in both Linux matrix entries).
@@ -48,19 +47,34 @@ def depth_history(result):
 with tempfile.TemporaryDirectory(prefix='spu-drain-launch-') as td:
     tmp = Path(td)
 
-    def run(name, drain, *, sanitize=False, diagnostics=False, debug=False,
+    def run(name, mutation=None, *, sanitize=False, diagnostics=False, debug=False,
             lockstep=False, depth_only=False):
-        path = tmp / (name + '.c')
-        path.write_text(drain)
+        # A bug control edits one file of a copy of runtime/spu: the copies
+        # include each other first ("spu_context.h" next to the includer), and
+        # their ../ includes fall back to the real tree through -I SPU.
+        spu = SPU
+        if mutation:
+            spu = tmp / (name + '-src') / 'runtime/spu'
+            (spu / 'tests').mkdir(parents=True)
+            for f in SPU.iterdir():
+                if f.is_file():
+                    shutil.copyfile(f, spu / f.name)
+            shutil.copyfile(SPU / 'tests/test_spu_drain_launch.c', spu / 'tests/test_spu_drain_launch.c')
+            file, old, new = mutation
+            text = (spu / file).read_bytes()
+            assert text.count(old.encode()) == 1, (name, file, text.count(old.encode()))
+            (spu / file).write_bytes(text.replace(old.encode(), new.encode()))
         exe = tmp / (name + ('.exe' if os.name == 'nt' else ''))
         flags = ['-std=gnu17', '-O0' if debug else '-O2', '-UNDEBUG',
                  '-I' + str(ROOT / 'include'), '-I' + str(SPU),
                  '-I' + str(ROOT / 'runtime/platform')]
         if sanitize:
             flags += ['-fsanitize=undefined', '-fno-sanitize-recover=all']
-        command = [cc, *flags, str(SPU / 'tests/test_spu_drain_launch.c'), str(path),
-                   *[str(SPU / (unit + '.c')) for unit in UNITS],
+        command = [cc, *flags, str(spu / 'tests/test_spu_drain_launch.c'), str(spu / 'spu_drain.c'),
+                   *[str(spu / (unit + '.c')) for unit in UNITS],
                    str(ROOT / 'runtime/platform/win32_compat.c'),
+                   str(ROOT / 'runtime/platform/env_cache.c'),
+                   str(ROOT / 'runtime/spu/tests/fork_runtime_standins.c'),
                    *([] if os.name == 'nt' else ['-pthread', '-lm']), '-o', str(exe)]
         built = subprocess.run(command, capture_output=True, text=True, timeout=60)
         assert built.returncode == 0, built.stdout + built.stderr
@@ -98,32 +112,35 @@ with tempfile.TemporaryDirectory(prefix='spu-drain-launch-') as td:
     if os.name != 'nt':
         modes.append(('ubsan', {'sanitize': True}))
     for name, options in modes:
-        result = run(name, source, **options)
+        result = run(name, **options)
         assert result.returncode == 0, result.stdout + result.stderr
         if name == 'diagnostics':
             assert '[step]' in result.stderr and '[spu-exit]' in result.stderr, result.stderr
     if args.mutants:
-        history_line = next(line for line in source.splitlines()
-                            if ('.pc[' in line or '->pc[' in line)
-                            and 'SPU_LS_MASK' in line and '++' in line)
         # Each temporary edit removes a real side effect; expected values are
         # literal history/steps/register assertions in the compiled fixture.
+        # The fork's hop runs inline from spu_context.h (spu_hop) unless a
+        # debug switch sends it through spu_drain.c's full check, and the
+        # history is the context's own ring (dbg_recent).
         controls = {
-            'history': (history_line, ''),
-            'steps': ('ctx->steps++;', '/* missing hot step increment */'),
-            'reset': ('spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);', '(void)fn;'),
-            'irq': ('if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) {', 'if (0) {'),
-            'flow': ('g_pm_flow_buf[g_pm_flow_n++] = ctx->pc;', '(void)ctx;'),
-            'lockstep': ('yz_lockstep_tick(ctx);', '(void)ctx;'),
+            'history': ('spu_context.h',
+                        'ctx->dbg_recent[ctx->dbg_recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;', ''),
+            'steps': ('spu_context.h', 'if (ctx->steps++ && (ctx->pc & SPU_LS_MASK) == 0 &&',
+                      'if (ctx->steps && (ctx->pc & SPU_LS_MASK) == 0 &&'),
+            'reset': ('spu_context.h', 'spu_check_stack_reset(ctx, tf);', '(void)tf;'),
+            'irq': ('spu_drain.c', 'if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) {',
+                    'if (0) {'),
+            'flow': ('spu_context.h', 'g_pm_flow_buf[g_pm_flow_n++] = ctx->pc;', '(void)ctx;'),
+            'lockstep': ('spu_context.h',
+                         'if (__builtin_expect(g_yz_lockstep_on != 0, 0)) yz_lockstep_tick(ctx);',
+                         '(void)ctx;'),
         }
-        for name, (old, new) in controls.items():
-            assert source.count(old) == 1, (name, source.count(old))
-            result = run('mutant-' + name, source.replace(old, new))
+        for name, control in controls.items():
+            result = run('mutant-' + name, control)
             assert result.returncode != 0 and 'FAIL:' in result.stdout, result.stdout + result.stderr
             print('PASS rejected bug control:', name, flush=True)
-        old = 'if (ctx->host_depth < s_max / 2) return;'
-        assert source.count(old) == 1
-        result = run('mutant-half-ring', source.replace(old, 'if (ctx->host_depth < s_max) return;'),
+        result = run('mutant-half-ring', ('spu_drain.c', 'if (ctx->host_depth < s_max / 2) return;',
+                                          'if (ctx->host_depth < s_max) return;'),
                      depth_only=True)
         assert result.returncode != 0 or depth_history(result) != [0xA010, 0xA014, 0xA01C, 0xA020]
         print('PASS rejected bug control: half-ring', flush=True)

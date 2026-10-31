@@ -19,7 +19,8 @@ with tempfile.TemporaryDirectory(prefix='gcm-walker-prof-') as tmp:
     subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG',
                     '-ffunction-sections', '-fdata-sections',
                     '-I' + str(root / 'include'), '-I' + str(root / 'libs/video'),
-                    str(root / 'libs/video/tests/test_gcm_walker_prof.c'), *linker,
+                    str(root / 'libs/video/tests/test_gcm_walker_prof.c'),
+                    str(root / 'runtime/platform/env_cache.c'), *linker,
                     '-o', str(binary)], check=True)
     base = {k: v for k, v in os.environ.items() if not k.startswith('RSX_WALKER_PROF')}
     for mode, extra in (('off', {}),

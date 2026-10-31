@@ -22,7 +22,9 @@ with tempfile.TemporaryDirectory(prefix='spu-raw-runcntl-stop-') as tmp:
                     '-I'+str(root/'runtime/platform'),
                     str(spu/'tests/test_spu_raw_runcntl_stop.c'),
                     *[str(spu / name) for name in sources],
-                    str(root/'runtime/platform/win32_compat.c'), '-pthread', '-lm',
+                    str(root/'runtime/platform/win32_compat.c'),
+                    str(root/'runtime/platform/env_cache.c'),
+                    str(root/'runtime/spu/tests/fork_runtime_standins.c'), '-pthread', '-lm',
                     '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True, timeout=30, cwd=tmp, env=env,
                    stderr=subprocess.DEVNULL if os.environ.get('CI') else None)

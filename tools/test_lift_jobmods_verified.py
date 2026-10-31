@@ -245,7 +245,9 @@ int main(void)
                         "-I" + str(ROOT / "runtime/platform"),
                         str(driver), str(data), str(tmp / "out/jobmods_register.c"), *lifted,
                         *[str(spu / s) for s in sources],
-                        str(ROOT / "runtime/platform/win32_compat.c"), "-pthread", "-lm",
+                        str(ROOT / "runtime/platform/win32_compat.c"),
+                        str(ROOT / "runtime/platform/env_cache.c"),
+                        str(ROOT / "runtime/spu/tests/fork_runtime_standins.c"), "-pthread", "-lm",
                         "-o", str(binary)], check=True)
         r = subprocess.run([str(binary)], capture_output=True, text=True, timeout=10, cwd=tmp,
                            env={k: v for k, v in os.environ.items()

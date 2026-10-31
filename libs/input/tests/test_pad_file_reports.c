@@ -54,6 +54,23 @@ static u16 word(unsigned n){return vm_read16(0x104+n*2);}
 static u16 buttons(void)
 {return word(CELL_PAD_BTN_OFFSET_DIGITAL1)|(word(CELL_PAD_BTN_OFFSET_DIGITAL2)<<8);}
 static void next_report(void){fake_ms+=PAD_POLL_INTERVAL_MS;}
+/* The fork's cellPad.c opens PAD_FILE at most every PAD_FILE_CHECK_MS of host
+ * time (opening it on every read cost the game thread 2-3%), where upstream
+ * opens it on every read. publish_due writes the file between two reports 29 ms
+ * apart: the first looks at the file before the write, the second is too soon
+ * to look again and leaves the press in the file, and the read 1 ms on, inside
+ * that report, is the first to find the file due -- the read that follows the
+ * write upstream. Called with no press held. */
+#define PAD_FILE_CHECK_MS 30
+static void publish_due(const char* path,const char* text)
+{
+    const u16 mask=(u16)strtoul(text,NULL,0);
+    fake_ms+=PAD_FILE_CHECK_MS;assert(read_pad(0)>0);
+    publish(path,text);
+    fake_ms+=PAD_FILE_CHECK_MS-1;assert(read_pad(0)>0 && !(buttons()&mask));
+    assert(file_size(path)>0);
+    fake_ms+=1;
+}
 static void drains(unsigned count)
 {for(unsigned n=0;n<count;n++)assert(read_pad(0)==0);}
 static void held_reports(unsigned n,u16 held,u16 after)
@@ -77,14 +94,14 @@ int main(int argc,char** argv)
      * reads is allowed, but these are len0 and must not spend a hold. */
     assert(read_pad(0)>0);
     if(!strcmp(mode,"drains")){
-        publish(path,"0x4000 4\n");assert(read_pad(0)==0);
+        publish_due(path,"0x4000 4\n");assert(read_pad(0)==0);
         assert(!file_size(path)); /* admission ACK is not packet consumption */
         drains(200);held_reports(4,CELL_PAD_CTRL_CROSS,0);
     }else if(!strcmp(mode,"default")){
-        publish(path,"0x4000\n");assert(read_pad(0)==0);drains(100);
+        publish_due(path,"0x4000\n");assert(read_pad(0)==0);drains(100);
         held_reports(40,CELL_PAD_CTRL_CROSS,0);
     }else if(!strcmp(mode,"ports-clear")){
-        publish(path,"0x4000 2\n");
+        publish_due(path,"0x4000 2\n");
         assert(cellPadGetData(7,guest)==(s32)CELL_PAD_ERROR_INVALID_PARAMETER);
         assert(cellPadGetData(0,NULL)==(s32)CELL_PAD_ERROR_INVALID_PARAMETER);
         s_pad_initialized=0;assert(cellPadGetData(0,guest)==(s32)CELL_PAD_ERROR_NOT_OPENED);
@@ -99,13 +116,13 @@ int main(int argc,char** argv)
     }else if(!strcmp(mode,"physical")){
         s_sdl_controllers[0]=(SDL_GameController*)&device;attached=1;
         device_buttons=CELL_PAD_CTRL_CIRCLE;
-        publish(path,"0x4000 2\n");assert(read_pad(0)==0);
+        publish_due(path,"0x4000 2\n");assert(read_pad(0)==0);
         held_reports(2,CELL_PAD_CTRL_CROSS|CELL_PAD_CTRL_CIRCLE,CELL_PAD_CTRL_CIRCLE);
         device_buttons=0;next_report();assert(read_pad(0)>0 && !buttons());
         attached=0;next_report();assert(read_pad(0)>0 && !buttons());
     }else if(!strcmp(mode,"pressure-sensor")){
         s_port_setting[0]=CELL_PAD_SETTING_PRESS_ON|CELL_PAD_SETTING_SENSOR_ON;
-        publish(path,"0x4000 2\n");assert(read_pad(0)==0);drains(100);
+        publish_due(path,"0x4000 2\n");assert(read_pad(0)==0);drains(100);
         for(unsigned n=0;n<2;n++){
             next_report();assert(read_pad(0)==CELL_PAD_LEN_CHANGE_SENSOR_ON);
             assert(word(0)==0 && word(1)==0x7E);
@@ -117,7 +134,7 @@ int main(int argc,char** argv)
         next_report();assert(read_pad(0)==CELL_PAD_LEN_CHANGE_SENSOR_ON);
         assert(!buttons() && word(CELL_PAD_BTN_OFFSET_PRESS_CROSS)==0);
     }else if(!strcmp(mode,"always")){
-        publish(path,"0x4000 3\n");
+        publish_due(path,"0x4000 3\n");
         for(unsigned n=0;n<3;n++)assert(read_pad(0)>0 && buttons()==CELL_PAD_CTRL_CROSS);
         assert(read_pad(0)>0 && !buttons());
     }else if(!strcmp(mode,"other-inputs")){

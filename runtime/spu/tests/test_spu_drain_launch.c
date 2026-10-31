@@ -1,7 +1,10 @@
-/* Actual launch checkpoints: shared per-thread history, changing contexts,
+/* Actual launch checkpoints: per-context history, changing contexts,
  * dynamic IRQ delivery and iret unwinding, stack reset and LS0 completion.
  * A skipped checkpoint, cached context field, or stale trampoline must fail.
- * Neutral functions/ISA only; no guest files or substitute runtime hooks. */
+ * Neutral functions/ISA only; no guest files or substitute runtime hooks.
+ * The fork keeps the recent-hop history in each spu_context (dbg_recent),
+ * where upstream keeps one per host thread: each context's sequence is
+ * checked on that context. */
 #include "../spu_helpers.h"
 #include "../spu_coherency.h"
 #include "../spu_lockstep.h"
@@ -23,17 +26,17 @@ static void check(int ok, const char* what) {
     ++g_fail; printf("FAIL: %s\n", what);
 }
 #define CHECK(cond) check((cond), #cond)
-extern unsigned spu_recent_pcs(uint32_t*, unsigned);
+extern unsigned spu_recent_pcs(const spu_context*, uint32_t*, unsigned);
 extern uint32_t g_pm_flow_buf[8192];
 extern volatile unsigned g_pm_flow_n;
 extern void* volatile g_pm_flow_ctx;
 extern void spu_register_stack_reset_entry(uint32_t,int);
 extern void spu_drain_hop(spu_context*,void (*)(spu_context*));
 
-static void history(const uint32_t* want,unsigned n)
+static void history(const spu_context* c,const uint32_t* want,unsigned n)
 {
     uint32_t got[32]={0};
-    CHECK(spu_recent_pcs(got,n)==n);
+    CHECK(spu_recent_pcs(c,got,n)==n);
     CHECK(!memcmp(got,want,n*sizeof(*want)));
 }
 static spu_context* make_context(int image)
@@ -82,9 +85,11 @@ static void outer(spu_context* c)
     CHECK(c->drain_ret_pc==0x101c);   /* #510: the enclosing drain's return pc again */
     raw->pc=0x2004;raw->gpr[6]=spu_link(0x2010);
     g_spu_trampoline_fn=to_return;spu_drain_call(raw,0x2010);CHECK(raw->steps==2);
+    { const uint32_t want[]={0x2000,0x2004};history(raw,want,2); }
     free(ls);raw->ls=raw->ls_store;release_context(raw);
     spu_context* async=make_context(903);
     CHECK(spu_run_with_halt(async_entry,async)==1);CHECK(async->steps==1);
+    { const uint32_t want[]={0x3000};history(async,want,1); }
     release_context(async);
     g_pm_flow_n=0;g_pm_flow_ctx=c;
     g_yz_lockstep_on=1; /* Must be observed on the next hop, not cached off. */
@@ -95,8 +100,8 @@ static void context_history(void)
     g_yz_lockstep_on=0;
     spu_context* c=make_context(901);c->pc=0x1000;
     g_spu_trampoline_fn=outer;spu_drain_call(c,0x101c);
-    const uint32_t want[]={0x1000,0x2000,0x1004,0x1008,0x2004,0x3000,0x1014};
-    history(want,7);CHECK(c->steps==4 && !g_spu_trampoline_fn);
+    const uint32_t want[]={0x1000,0x1004,0x1008,0x1014};   /* raw's and async's are their own */
+    history(c,want,4);CHECK(c->steps==4 && !g_spu_trampoline_fn);
     release_context(c);
 }
 static void macro_target(spu_context* c)
@@ -113,7 +118,7 @@ static void checkpoint_paths(void)
     CHECK(c->steps==2 && c->lockstep_quantum_ctr==1);
     spu_drain_hop(c,macro_target);
     CHECK(c->steps==3 && c->lockstep_quantum_ctr==2);
-    const uint32_t want[]={0x9000,0x9004,0x9008};history(want,3);
+    const uint32_t want[]={0x9000,0x9004,0x9008};history(c,want,3);
     g_yz_lockstep_on=0;release_context(c);
 }
 static unsigned irq_count,stale_handler,irq_finished;
@@ -159,7 +164,7 @@ static void dynamic_irq(unsigned raises_event)
     irq_count=stale_handler=irq_finished=0;
     g_spu_trampoline_fn=irq_start;spu_drain_call(c,0x4110);
     CHECK(irq_count==1 && !stale_handler && irq_finished==1 && c->steps==5);
-    const uint32_t want[]={0x4100,0x4104,0x8004,0x4104,0x4104};history(want,5);
+    const uint32_t want[]={0x4100,0x4104,0x8004,0x4104,0x4104};history(c,want,5);
     CHECK(!c->irq_frame && !c->drain_ret_pc);
     release_context(c);
 }
@@ -189,7 +194,7 @@ static void stack_reset(void)
     spu_context* c=make_context(905);reset_count=stale_reset=0;
     CHECK(spu_run_with_halt(reset_outer,c)==1);
     CHECK(reset_count==1 && !stale_reset && c->steps==2 && c->pc==0x5004);
-    const uint32_t want[]={0x4ff0,0x5000,0x5004};history(want,3);release_context(c);
+    const uint32_t want[]={0x4ff0,0x5000,0x5004};history(c,want,3);release_context(c);
 }
 static unsigned zero_entries,zero_later;
 static void zero_again(spu_context* c) {++zero_later;spu_halt(c);}
@@ -205,15 +210,16 @@ static void ls0_completion(void)
 {
     spu_context* c=make_context(906);CHECK(spu_run_with_halt(zero_outer,c)==1);
     CHECK(zero_entries==1 && zero_later==0 && c->steps==2);
-    const uint32_t want[]={0,0};history(want,2);release_context(c);
+    const uint32_t want[]={0,0};history(c,want,2);release_context(c);
 }
 static DWORD WINAPI thread_history(LPVOID arg)
 {
     const uint32_t pc=(uint32_t)(uintptr_t)arg;
-    uint32_t got[32]={0};CHECK(spu_recent_pcs(got,32)==0);
-    spu_context* c=make_context(907);c->pc=pc;c->gpr[6]=spu_link(pc+4);
+    uint32_t got[32]={0};
+    spu_context* c=make_context(907);CHECK(spu_recent_pcs(c,got,32)==0);
+    c->pc=pc;c->gpr[6]=spu_link(pc+4);
     g_spu_trampoline_fn=to_return;spu_drain_call(c,pc+4);
-    CHECK(spu_recent_pcs(got,32)==1 && got[0]==pc && c->steps==1);
+    CHECK(spu_recent_pcs(c,got,32)==1 && got[0]==pc && c->steps==1);
     release_context(c);return 0;
 }
 static int armed_lockstep(void)
@@ -227,7 +233,7 @@ static int armed_lockstep(void)
          * real owning-drain hop must advance the enabled lockstep counter. */
         CHECK(c->lockstep_quantum_ctr==i+1 && c->steps==i+1);
     }
-    const uint32_t want[]={0x7100,0x7104};history(want,2);
+    const uint32_t want[]={0x7100,0x7104};history(c,want,2);
     release_context(c);
     printf("DRAIN_LAUNCH lockstep passed=%d failed=%d\n",g_pass,g_fail);
     return g_fail?1:0;
@@ -258,15 +264,20 @@ int main(int argc,char** argv)
     spu_register_function(0x4104,irq_resume);spu_begin_image(905);
     spu_register_function(0x5004,reset_target);spu_begin_image(0);
     context_history();checkpoint_paths();dynamic_irq(0);dynamic_irq(1);stack_reset();ls0_completion();
-    uint32_t before[32],after[32];unsigned n=spu_recent_pcs(before,32);
-    /* Separate fresh host threads must not inherit the caller's TLS history.
-     * Join each before checking so fixture accounting itself has no data race. */
+    /* Contexts on separate fresh host threads start with no history, and
+     * their hops leave a context of this thread's as it was. Join each before
+     * checking so fixture accounting itself has no data race. */
+    spu_context* keep=make_context(907);keep->pc=0x7800;keep->gpr[6]=spu_link(0x7804);
+    g_spu_trampoline_fn=to_return;spu_drain_call(keep,0x7804);
+    uint32_t before[32],after[32];unsigned n=spu_recent_pcs(keep,before,32);
+    CHECK(n==1 && before[0]==0x7800);
     for (unsigned i=0;i<2;++i) {
         HANDLE t=CreateThread(NULL,0,thread_history,(void*)(uintptr_t)(0x7000+4*i),0,NULL);
         CHECK(t!=NULL);
         if (t) { CHECK(WaitForSingleObject(t,10000)==WAIT_OBJECT_0); CHECK(CloseHandle(t)); }
     }
-    CHECK(spu_recent_pcs(after,32)==n && !memcmp(before,after,n*sizeof(*before)));
+    CHECK(spu_recent_pcs(keep,after,32)==n && !memcmp(before,after,n*sizeof(*before)));
+    release_context(keep);
     printf("DRAIN_LAUNCH passed=%d failed=%d\n",g_pass,g_fail);return g_fail?1:0;
 }
 

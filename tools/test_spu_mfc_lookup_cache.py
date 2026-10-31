@@ -13,9 +13,11 @@ with tempfile.TemporaryDirectory(prefix='spu-mfc-cache-') as tmp:
  if os.environ.get('SANITIZERS'):flags+=['-fsanitize='+os.environ['SANITIZERS'],'-fno-sanitize-recover=all','-g']
  cmd=[os.environ.get('CC','cc'),*flags,'-I'+str(root/'include'),'-I'+str(spu),'-I'+str(root/'runtime/platform'),str(spu/'tests/test_spu_mfc_lookup_cache.c'),*[str(spu/c) for c in common],str(root/'runtime/platform/win32_compat.c'),'-pthread','-lm','-o',str(exe)]
  subprocess.run(cmd,check=True)
- for mode in (None,'0','1'):
-  env=dict(os.environ);env.pop('SPU_MFC_LOOKUP_CACHE',None)
-  if mode is not None:env['SPU_MFC_LOOKUP_CACHE']=mode
+ # The fork's cache is on by default; SPU_MFC_LOOKUP_CACHE=0 or SPU_MFC_TLS=0 turns it off.
+ for mode in (None,'0','1','tls0'):
+  env=dict(os.environ);env.pop('SPU_MFC_LOOKUP_CACHE',None);env.pop('SPU_MFC_TLS',None)
+  if mode=='tls0':env['SPU_MFC_TLS']='0'
+  elif mode is not None:env['SPU_MFC_LOOKUP_CACHE']=mode
   try:p=subprocess.run([str(exe)],env=env,capture_output=True,text=True,timeout=60)
   except subprocess.TimeoutExpired as error:
    print('timeout mode',mode,'stdout',error.stdout,'stderr',error.stderr,flush=True)

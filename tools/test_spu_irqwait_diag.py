@@ -21,7 +21,9 @@ with tempfile.TemporaryDirectory(prefix='spu-irqwait-diag-') as tmp:
                     '-I' + str(root / 'include'), '-I' + str(spu), '-I' + str(root / 'runtime/platform'),
                     str(spu / 'tests/test_spu_irqwait_diag.c'),
                     *[str(spu / name) for name in sources],
-                    str(root / 'runtime/platform/win32_compat.c'), '-pthread', '-lm',
+                    str(root / 'runtime/platform/win32_compat.c'),
+                    str(root / 'runtime/platform/env_cache.c'),
+                    str(root / 'runtime/spu/tests/fork_runtime_standins.c'), '-pthread', '-lm',
                     '-o', str(binary)], check=True)
     subprocess.run([str(binary), 'off'], check=True, timeout=60, cwd=tmp, env=env)
     subprocess.run([str(binary), 'on', str(Path(tmp) / 'log')], check=True, timeout=60, cwd=tmp,
