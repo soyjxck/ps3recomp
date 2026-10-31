@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <vector>
+#include <atomic>
 #ifdef _WIN32
 #  include <windows.h>
 #else
@@ -34,11 +35,13 @@
 #include "ppu_tls.h"   /* PPU_THREAD_LOCAL, without a second ppu_context */
 #define PPU_NO_INLINE_LOADS   /* this file defines the out-of-line accessors */
 #include "ppu_recomp.h"
+#include "../spu/spu_coh_bitmap.h"   /* spu_coh_line_reserved, for the stores */
 #include "ps3emu/ps3_ftrace.h"   /* PS3_FTRACE timeline */
 #include "ps3emu/milestone.h"   /* ps3_ms / ps3_msf -- boot milestone log */     /* ppu_context, func decls, ppu_recomp_register */
 #include "../memory/vm.h"   /* vm_commit -- sys_mmapper_search_and_map maps for real */
 #include "../platform/win32_compat.h"      /* Win32 types, interlocked ops, Sleep/QPC on POSIX */
 #include "../platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
+#include "../platform/ps3_stdio.h"        /* ps3_stdio_init -- buffered stdout/stderr, timed flush */
 #ifndef _WIN32
 #include <sys/mman.h>   /* the guest-pointer trap reserves the low 4 GB */
 #include <signal.h>
@@ -620,6 +623,8 @@ static void samp_report(void)
  * guest histogram says nothing about where it loops. */
 static DWORD s_samp_boot_tid;
 static int   s_samp_main = -1;
+static int   s_samp_drain = -1;
+extern "C" volatile unsigned long g_gcm_drain_tid;
 
 static uint32_t samp_stack_guest(HANDLE h, const CONTEXT* c)
 {
@@ -632,6 +637,41 @@ static uint32_t samp_stack_guest(HANDLE h, const CONTEXT* c)
         if (g) return g;
     }
     return 0;
+}
+
+/* PS3_SAMPLE_RVAS=<file>: every sample's address as an RVA of the executable,
+ * one hex word per line, appended at each report. 0 marks a sample outside the
+ * executable (a wait in ntdll, a DLL). The extent map above credits any host
+ * code that sits between two lifted functions to the first of them; naming
+ * these RVAs from the linker map (scripts/gow1hd.py symbolize does the
+ * parsing) attributes guest and runtime code exactly. */
+static FILE*     s_samp_rva_file;
+static uint32_t* s_samp_rvas;
+static uint32_t  s_samp_rva_n, s_samp_rva_cap;
+static void samp_rva_record(uintptr_t rip)
+{
+    if (!s_samp_rva_file) return;
+    static uintptr_t base, end;
+    if (!base) {
+        base = (uintptr_t)GetModuleHandleA(NULL);
+        const IMAGE_NT_HEADERS* nt = (const IMAGE_NT_HEADERS*)(base + ((const IMAGE_DOS_HEADER*)base)->e_lfanew);
+        end = base + nt->OptionalHeader.SizeOfImage;
+    }
+    if (s_samp_rva_n == s_samp_rva_cap) {
+        uint32_t cap = s_samp_rva_cap ? s_samp_rva_cap * 2 : 65536;
+        uint32_t* n = (uint32_t*)realloc(s_samp_rvas, cap * sizeof *n);
+        if (!n) return;
+        s_samp_rvas = n; s_samp_rva_cap = cap;
+    }
+    s_samp_rvas[s_samp_rva_n++] = (rip >= base && rip < end) ? (uint32_t)(rip - base) : 0u;
+}
+static void samp_rva_flush(void)
+{
+    if (!s_samp_rva_file) return;
+    fprintf(s_samp_rva_file, "# %llu ms\n", (unsigned long long)GetTickCount64());  /* block end */
+    for (uint32_t i = 0; i < s_samp_rva_n; i++) fprintf(s_samp_rva_file, "%x\n", s_samp_rvas[i]);
+    fflush(s_samp_rva_file);
+    s_samp_rva_n = 0;
 }
 
 static DWORD WINAPI samp_thread(LPVOID p)
@@ -647,13 +687,58 @@ static DWORD WINAPI samp_thread(LPVOID p)
     unsigned ei = 0;
     unsigned long long next_report = t0 + early[0];
     samp_build_map();
+    if (const char* f = getenv("PS3_SAMPLE_RVAS")) s_samp_rva_file = fopen(f, "w");
+    /* PS3_SAMPLE_MAIN and PS3_SAMPLE_DRAIN sample one thread: open it once
+     * rather than walk a snapshot of every thread in the process each period,
+     * which held the rate to about 17 samples a second. The drain's thread is
+     * known once it has walked the FIFO, and reopened if that changes. */
+    HANDLE main_h = (s_samp_main > 0)
+        ? OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, s_samp_boot_tid) : NULL;
+    DWORD one_tid = s_samp_main > 0 ? s_samp_boot_tid : 0;
     for (;;) {
+        if (s_samp_drain > 0 && g_gcm_drain_tid && g_gcm_drain_tid != one_tid) {
+            if (main_h) CloseHandle(main_h);
+            one_tid = (DWORD)g_gcm_drain_tid;
+            main_h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, one_tid);
+        }
+        if (main_h) {
+            if (SuspendThread(main_h) != (DWORD)-1) {
+                CONTEXT c; c.ContextFlags = CONTEXT_CONTROL;
+                if (GetThreadContext(main_h, &c)) {
+                    s_samp_total++;
+                    samp_rva_record((uintptr_t)c.Rip);
+                    uint32_t g = samp_lookup((uintptr_t)c.Rip);
+                    if (!g && s_samp_main > 0) g = samp_stack_guest(main_h, &c);
+                    if (g) { s_samp_guest++; samp_hit(g); samp_tid_hit(one_tid);
+                             samp_tid2(one_tid, 1, 0); }
+                    else { int nt = samp_mod_hit((uintptr_t)c.Rip);
+                           if (!nt) samp_rva_hit((uintptr_t)c.Rip);
+                           samp_tid2(one_tid, 0, nt); }
+                }
+                ResumeThread(main_h);
+            }
+            Sleep(period);
+            if (GetTickCount64() >= next_report) {
+                fprintf(stderr, "[samp] --- report at t=%llums ---\n",
+                        (unsigned long long)(GetTickCount64() - t0));
+                samp_report();
+                samp_rva_flush();
+                if (ei + 1 < sizeof early / sizeof early[0]) { ei++; next_report = t0 + early[ei]; }
+                else next_report = GetTickCount64() + 10000;
+            }
+            continue;
+        }
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
         if (snap != INVALID_HANDLE_VALUE) {
             THREADENTRY32 te; te.dwSize = sizeof te;
             if (Thread32First(snap, &te)) do {
                 if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
                 if (s_samp_main > 0 && te.th32ThreadID != s_samp_boot_tid) continue;
+                /* PS3_SAMPLE_DRAIN=1: only the thread that last walked the
+                 * RSX FIFO (cellGcm_rsx_process_fifo records it), so the RVA
+                 * histogram is the drain's own cost, not the spin loops of
+                 * every SPU thread. */
+                if (s_samp_drain > 0 && te.th32ThreadID != g_gcm_drain_tid) continue;
                 HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT,
                                       FALSE, te.th32ThreadID);
                 if (!h) continue;
@@ -661,6 +746,7 @@ static DWORD WINAPI samp_thread(LPVOID p)
                     CONTEXT c; c.ContextFlags = CONTEXT_CONTROL;
                     if (GetThreadContext(h, &c)) {
                         s_samp_total++;
+                        samp_rva_record((uintptr_t)c.Rip);
                         uint32_t g = samp_lookup((uintptr_t)c.Rip);
                         if (!g && s_samp_main > 0) g = samp_stack_guest(h, &c);
                         if (g) { s_samp_guest++; samp_hit(g); samp_tid_hit(te.th32ThreadID);
@@ -680,6 +766,7 @@ static DWORD WINAPI samp_thread(LPVOID p)
             fprintf(stderr, "[samp] --- report at t=%llums ---\n",
                     (unsigned long long)(GetTickCount64() - t0));
             samp_report();
+            samp_rva_flush();
             if (ei + 1 < sizeof early / sizeof early[0]) { ei++; next_report = t0 + early[ei]; }
             else next_report = GetTickCount64() + 10000;
         }
@@ -737,6 +824,7 @@ void ps3_sampler_start(void)
     unsigned ms = (unsigned)atoi(e); if (!ms) ms = 5;
     s_samp_boot_tid = GetCurrentThreadId();
     s_samp_main = getenv("PS3_SAMPLE_MAIN") ? 1 : 0;
+    s_samp_drain = getenv("PS3_SAMPLE_DRAIN") ? 1 : 0;
     /* Self-check: does .pdata actually describe the lifted bodies? If not, the
      * exact attribution mode misses ALL guest code by construction and its "0
      * guest samples" means nothing. Print it rather than assume either way. */
@@ -767,8 +855,9 @@ extern "C" void ppu_log_host_chain(const char* tag);  /* fwd decl (defined below
  * to serialize through the SPU lock-line lock, or it can land inside a PUTLLC's
  * compare and be written straight back over; and it has to raise SPU_EVENT_LR,
  * which is how an SPURS idle service parked in `rdch SPU_RdEventStat` finds out
- * work was posted. spu_coh_is_reserved reads a global that stays zero until an
- * SPU reserves its first line, so an ordinary store pays one branch. */
+ * work was posted. The stores test the bitmap inline (spu_coh_line_reserved):
+ * a pointer that stays NULL until an SPU reserves its first line, so an
+ * ordinary store pays one branch. */
 extern "C" int  spu_coh_is_reserved(uint32_t addr);
 extern "C" int  g_spu_coh_armed;   /* 0 until an SPU reserves a line: skip the call */
 extern "C" void spu_lockline_lock(void);
@@ -1563,7 +1652,7 @@ extern "C" int* ps3_ppu_vcall_sp_slot(void) { return &g_vcall_sp; }
  * them, until SPU code runs) it is the plain memcpy it replaced. */
 #define VM_WRITE_COH(a, src, n)                                               \
     do {                                                                      \
-        if (g_spu_coh_armed && spu_coh_is_reserved((uint32_t)(a))) {         \
+        if (spu_coh_line_reserved((uint32_t)(a))) {                           \
             spu_lockline_lock();                                              \
             memcpy(vm_base + (uint32_t)(a), (src), (n));                      \
             spu_coh_notify_write((uint32_t)(a));                              \
@@ -1665,10 +1754,12 @@ static inline void ppu_null_read_report(uint32_t a, int width, void* ra)
 }
 
 /* ppu_recomp.h's inline loads (vm_read*_inl) skip the out-of-line accessors'
- * probes, so they run only while no read diagnostic is armed. (With
+ * probes, so they run only while no read diagnostic is armed; its inline
+ * stores (vm_write*_inl) likewise for the store diagnostics. (With
  * PPU_INLINE_VM the lifted code uses ppu_vm_fast.h instead, whose page table
- * stands down for the same diagnostics: g_ppu_vm_slow_reads.) */
+ * stands down for the same diagnostics: g_ppu_vm_slow_reads/_stores.) */
 extern "C" int vm_inline_ok = 0;
+extern "C" int vm_inline_st_ok = 0;
 static struct VmInlineInit {
     VmInlineInit() {
         static const char* const vars[] = {
@@ -1677,6 +1768,11 @@ static struct VmInlineInit {
         int d = 0;
         for (int i = 0; vars[i]; i++) if (getenv(vars[i])) d = 1;
         vm_inline_ok = !d;
+        static const char* const svars[] = { "PPU_WVAL", "PPU_WWATCH", "PT",
+            "PPU_WW_GUARD", "GCM_PARK_WRITE_LOG", "GCM_PARK_WATCH", "PPU_SLOW_STORES", 0 };
+        int sd = 0;
+        for (int i = 0; svars[i]; i++) if (getenv(svars[i])) sd = 1;
+        vm_inline_st_ok = !sd;
     }
 } s_vm_inline_init;
 
@@ -1899,13 +1995,14 @@ static void ww_arm_inline_window(uint32_t ww)
 /* The store-side diagnostics below are armed by environment variables that
  * stay unset in a normal run, yet every lifted store paid the whole function:
  * it was the top leaf of Drakengard 3's render thread. One flag test on the
- * hot path; g_ww_dyn is the one watch armed at run time (by the GCM walker),
- * so it is tested too. */
+ * hot path; g_ww_dyn (armed at run time by the GCM walker) and the sync-line
+ * probe (g_barrier_sync_watch) are tested too. */
 static void barrier_watch_hit_slow(uint32_t a, uint32_t v, int width, void* ra);
 static int g_ww_slow = -1;   /* -1 undecided, 0 nothing armed, 1 run the diagnostics */
 static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra)
 {
-    if (__builtin_expect(g_ww_slow == 0, 1) && __builtin_expect(g_ww_dyn == 0, 1)) return;
+    if (__builtin_expect(g_ww_slow == 0, 1) && __builtin_expect(g_ww_dyn == 0, 1) &&
+        __builtin_expect(g_barrier_sync_watch == 0, 1)) return;
     barrier_watch_hit_slow(a, v, width, ra);
 }
 
@@ -3992,6 +4089,75 @@ extern "C" void ppu_register_opd_fixup(uint32_t opd, uint32_t code, uint32_t toc
         s_opd_fixups[s_opd_fixup_n].code = code; s_opd_fixups[s_opd_fixup_n].toc = toc; s_opd_fixup_n++; }
 }
 
+/* The guest stack an HLE -> guest callback runs on.
+ *
+ * This used to be the fixed EA 0xCFFE0000 in every host thread (the variable
+ * was thread-local, its value was not). The movie player's cellAdec and cellVdec
+ * callbacks run synchronously on two different MoviePlayerStream threads, so
+ * they built their frames over each other: the adec callback's scoped mutex
+ * guard (func_005F0CA8, guard at 0xCFFDFE50) read back a NULL mutex pointer,
+ * unlocked NULL (the [null-write] at 0x005EF018 / [null-read] of 0x8 in the
+ * hung runs) and left the player mutex locked for good -- the next lock of it
+ * (func_005EEFE4) never returned. 0xCFFE0000 is also inside RSX local memory
+ * (0xC0000000 + 256 MB), so VRAM writes could land on it as well.
+ *
+ * lv2 runs these callbacks on a real PPU thread with a stack of its own (the
+ * decoder's thread, or the thread that asked for the callback). Give every
+ * host thread its own 256 KB slot in VM_CB_STACK_REGION, and start a nested
+ * callback below the live frame of the one it is nested in. */
+/* Slots in use, one bit each. A host thread takes the lowest free one on its
+ * first callback and gives it back when it exits (cb_slot_owner below), so a
+ * title that starts and ends threads all session -- a movie player starts
+ * several per movie -- never runs out: only more than 64 host threads making
+ * callbacks AT ONCE share a slot. */
+static std::atomic<uint64_t> s_cb_slots_used{0};
+struct cb_slot_owner {
+    int slot = -1;
+    ~cb_slot_owner()
+    {
+        if (slot >= 0) s_cb_slots_used.fetch_and(~(1ull << slot), std::memory_order_acq_rel);
+    }
+};
+static thread_local cb_slot_owner t_cb_slot;
+
+static uint32_t ppu_cb_stack_sp(const ppu_context* active)
+{
+    static PPU_THREAD_LOCAL uint32_t s_lo = 0, s_hi = 0;
+    if (!s_hi) {
+        const uint32_t slots = VM_CB_STACK_REGION / VM_CB_STACK_SIZE;
+        static_assert(VM_CB_STACK_REGION / VM_CB_STACK_SIZE <= 64, "one bit per slot");
+        uint32_t i = slots;
+        uint64_t used = s_cb_slots_used.load(std::memory_order_acquire);
+        while (~used & (slots >= 64 ? ~0ull : (1ull << slots) - 1u)) {
+            uint32_t k = 0;
+            while (used >> k & 1u) k++;
+            if (s_cb_slots_used.compare_exchange_weak(used, used | (1ull << k),
+                                                      std::memory_order_acq_rel)) {
+                i = k;
+                t_cb_slot.slot = (int)k;
+                break;
+            }
+        }
+        if (i < slots) {
+            s_lo = VM_CB_STACK_BASE + i * VM_CB_STACK_SIZE;
+            s_hi = s_lo + VM_CB_STACK_SIZE;
+        } else {
+            /* Out of slots: share the last one, and say so. */
+            s_lo = VM_CB_STACK_BASE + (slots - 1) * VM_CB_STACK_SIZE;
+            s_hi = s_lo + VM_CB_STACK_SIZE;
+            fprintf(stderr, "[ppu] guest_call: more than %u live host threads make guest "
+                            "callbacks; callback stack slot %u is SHARED\n", slots, slots - 1);
+        }
+    }
+    if (active) {
+        uint32_t sp = (uint32_t)active->gpr[1];
+        /* Nested: below the outer callback's frame and its 288-byte protected zone. */
+        if (sp > s_lo + 0x1000 && sp <= s_hi) return (sp - 0x400) & ~0xFu;
+    }
+    /* Room above the first frame for the callee's LR/CR save words (sp+8, sp+16). */
+    return (s_hi - 0x100) & ~0xFu;
+}
+
 extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
                                    uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                                    uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
@@ -4016,14 +4182,9 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
                 vm_read32(opd_addr + 8), vm_read32(opd_addr + 12));
         return 0; }
 
-    /* Private scratch stack high in the guest stack region, distinct from the
-     * main + ppu_thread stacks. One callback at a time per caller thread. */
-    static PPU_THREAD_LOCAL uint32_t s_cb_sp = 0;
-    if (!s_cb_sp) s_cb_sp = 0xCFFE0000u;
-
     ppu_context ctx;
     memset(&ctx, 0, sizeof(ctx));
-    ctx.gpr[1]  = s_cb_sp;
+    ctx.gpr[1]  = ppu_cb_stack_sp(g_active_ctx);   /* per host thread, see above */
     ctx.gpr[2]  = toc;
     ctx.gpr[3]  = a0; ctx.gpr[4] = a1; ctx.gpr[5] = a2; ctx.gpr[6] = a3;
     ctx.gpr[7]  = a4; ctx.gpr[8] = a5; ctx.gpr[9] = a6; ctx.gpr[10] = a7;
@@ -4063,12 +4224,9 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
     ppu_fn fn = ppu_lookup(code);
     if (!fn) { fprintf(stderr, "[ppu] guest_call_ct: code 0x%08X not registered\n", code); return 0; }
 
-    static PPU_THREAD_LOCAL uint32_t s_cb_sp = 0;
-    if (!s_cb_sp) s_cb_sp = 0xCFFE0000u;
-
     ppu_context ctx;
     memset(&ctx, 0, sizeof(ctx));
-    ctx.gpr[1]  = s_cb_sp;
+    ctx.gpr[1]  = ppu_cb_stack_sp(g_active_ctx);   /* per host thread, see above */
     ctx.gpr[2]  = toc;
     ctx.gpr[3]  = a0; ctx.gpr[4] = a1; ctx.gpr[5] = a2; ctx.gpr[6] = a3;
     ctx.gpr[7]  = a4; ctx.gpr[8] = a5; ctx.gpr[9] = a6; ctx.gpr[10] = a7;
@@ -4096,11 +4254,16 @@ extern "C" ppu_context* volatile g_ppu_main_ctx = nullptr;
 extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
 {
     ppu_hotread_init();
-    /* Line-buffer stdout: HLE logs mix printf (stdout) with probe fprintf
-     * (stderr); with a redirected block-buffered stdout, printf lines sat in
-     * the buffer for minutes and were LOST when the run was killed -- which
-     * made "the log line is absent" unusable as evidence. */
-    setvbuf(stdout, NULL, _IONBF, 0);
+    /* HLE logs mix printf (stdout) with probe fprintf (stderr); with a
+     * redirected block-buffered stdout and nothing flushing it, printf lines
+     * sat in the buffer for minutes and were LOST when the run was killed --
+     * which made "the log line is absent" unusable as evidence. This used to
+     * set stdout unbuffered, which with mingw-w64 costs one write() per
+     * character. ps3_stdio_init() buffers stdout and stderr and flushes them
+     * every PS3_STDIO_FLUSH_MS (50 ms), at exit, on abort and on a crash, so a
+     * killed run loses at most one interval (runtime/platform/ps3_stdio.h).
+     * PS3_STDIO_UNBUFFERED=1 restores the old unbuffered stdout. */
+    ps3_stdio_init();
 
     g_ppu_thread_entry_trampoline = ppu_thread_entry_trampoline;
     uint32_t code = 0, toc = 0;

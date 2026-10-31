@@ -199,53 +199,149 @@ static inline void vm_raw_st16(uint64_t ea, const void* src) {
     uint64_t lo, hi; memcpy(&lo, src, 8); memcpy(&hi, (const uint8_t*)src + 8, 8);
     VM_RAW_ST(uint64_t, ea, lo); VM_RAW_ST(uint64_t, ea + 8, hi); }
 extern int      vm_inline_ok;
+extern int      vm_inline_st_ok;
 extern uint32_t ppu_vm_size;
 extern uint32_t ppu_hle_inject_base;
+/* Inline guest-store fast paths, the store side of the loads below: every
+ * lifted store was an out-of-line call, about a fifth of God of War HD's main
+ * thread. A store the out-of-line path treats specially still goes there:
+ * anything outside the inline range, any armed store diagnostic (vm_inline_st_ok,
+ * the barrier watch, a null-page sweep), and a store to a line an SPU holds a
+ * reservation on, which has to take the lock-line lock and raise the
+ * lost-reservation event. */
+extern uint32_t             g_barrier_sync_watch;
+extern uint32_t             g_null_sweep_hi;
+extern const unsigned char* g_spu_coh_bits;   /* SPU-reserved lines, NULL until the first */
 #ifdef __cplusplus
 }
 #endif
-static inline int vm_inl_ok(uint32_t ea, uint32_t n)
+/* The memory-model globals that are set before any guest code runs, copied
+ * into a local. A guest store goes through a byte pointer the compiler cannot
+ * tell apart from these globals, so code that reads them directly reloads
+ * all of them after every store. Each lifted function takes one copy at entry
+ * (PPU_MM_SNAP, emitted by the lifter) and its loads and stores use that.
+ * What can change while a function runs -- the SPU reservation bitmap and the
+ * store watches -- is still read from the globals.
+ *
+ * The copy holds the inline range as one span from 0x10000: not the null
+ * page, not the raw SPU windows from 0xE0000000, nothing past the end of the
+ * mapping, and a span of 0 while a diagnostic is armed. An access then takes
+ * one compare. The range is the old checks' or narrower. The one address
+ * they also turned away, the gcm ref-poll word, is only special to vm_read32,
+ * so only the 32-bit load still tests it. */
+typedef struct ppu_mm { uint8_t* vb; int64_t ld_span, st_span; uint32_t poll; } ppu_mm;
+static inline ppu_mm ppu_mm_take(void)
 {
-    return __builtin_expect(vm_inline_ok, 1) && ea >= 0x10000u && ea < 0xE0000000u &&
-           ea != ppu_hle_inject_base + 0x2008u &&
-           (ppu_vm_size == 0 || (uint64_t)ea + n <= ppu_vm_size);
+    const uint32_t hi = (ppu_vm_size != 0 && ppu_vm_size < 0xE0000000u) ? ppu_vm_size : 0xE0000000u;
+    const int64_t span = hi > 0x10000u ? (int64_t)(hi - 0x10000u) : 0;
+    ppu_mm m;
+    m.vb = vm_base;
+    m.ld_span = vm_inline_ok ? span : 0;
+    m.st_span = (vm_inline_ok && vm_inline_st_ok) ? span : 0;
+    m.poll = ppu_hle_inject_base + 0x2008u;   /* the gcm ref-poll word: vm_read32 */
+    return m;
 }
-static inline uint8_t vm_read8_inl(uint64_t a)
+/* [ea, ea + n) inside [0x10000, 0x10000 + span). Below 0x10000 the 32-bit
+ * subtraction wraps past any span. Signed, so span - n is computed once per
+ * function and a span of 0 still turns everything away. */
+static inline int vm_mm_in(int64_t span, uint32_t ea, uint32_t n)
+{
+    return (int64_t)(uint32_t)(ea - 0x10000u) <= span - (int64_t)n;
+}
+static inline int vm_mm_ok(const ppu_mm* m, uint32_t ea, uint32_t n)
+{
+    return vm_mm_in(m->ld_span, ea, n);
+}
+static inline int vm_mm_st_ok(const ppu_mm* m, uint32_t ea, uint32_t n)
+{
+    if (!__builtin_expect(vm_mm_in(m->st_span, ea, n), 1) ||
+        __builtin_expect((g_barrier_sync_watch | g_null_sweep_hi) != 0, 0))
+        return 0;
+    const unsigned char* bits = g_spu_coh_bits;
+    if (bits) { const uint32_t line = ea >> 7; if ((bits[line >> 3] >> (line & 7)) & 1u) return 0; }
+    return 1;
+}
+static inline uint8_t vm_read8_mm(const ppu_mm* m, uint64_t a)
 {
     const uint32_t ea = (uint32_t)a;
-    if (vm_inl_ok(ea, 1)) return __atomic_load_n(vm_base + ea, __ATOMIC_RELAXED);
+    if (__builtin_expect(vm_mm_ok(m, ea, 1), 1)) return __atomic_load_n(m->vb + ea, __ATOMIC_RELAXED);
     return vm_read8(a);
 }
-static inline uint16_t vm_read16_inl(uint64_t a)
+static inline uint16_t vm_read16_mm(const ppu_mm* m, uint64_t a)
 {
     const uint32_t ea = (uint32_t)a;
-    if (vm_inl_ok(ea, 2)) {   /* aligned: single-copy atomic, as on Cell */
+    if (__builtin_expect(vm_mm_ok(m, ea, 2), 1)) {   /* aligned: single-copy atomic, as on Cell */
         uint16_t v;
-        if (!(ea & 1u)) v = __atomic_load_n((const uint16_t*)(vm_base + ea), __ATOMIC_RELAXED);
-        else memcpy(&v, vm_base + ea, 2);
+        if (!(ea & 1u)) v = __atomic_load_n((const uint16_t*)(m->vb + ea), __ATOMIC_RELAXED);
+        else memcpy(&v, m->vb + ea, 2);
         return __builtin_bswap16(v); }
     return vm_read16(a);
 }
-static inline uint32_t vm_read32_inl(uint64_t a)
+static inline uint32_t vm_read32_mm(const ppu_mm* m, uint64_t a)
 {
     const uint32_t ea = (uint32_t)a;
-    if (vm_inl_ok(ea, 4)) {   /* aligned: single-copy atomic, as on Cell */
+    if (__builtin_expect(vm_mm_ok(m, ea, 4), 1) && __builtin_expect(ea != m->poll, 1)) {   /* aligned: single-copy atomic, as on Cell */
         uint32_t v;
-        if (!(ea & 3u)) v = __atomic_load_n((const uint32_t*)(vm_base + ea), __ATOMIC_RELAXED);
-        else memcpy(&v, vm_base + ea, 4);
+        if (!(ea & 3u)) v = __atomic_load_n((const uint32_t*)(m->vb + ea), __ATOMIC_RELAXED);
+        else memcpy(&v, m->vb + ea, 4);
         return __builtin_bswap32(v); }
     return vm_read32(a);
 }
-static inline uint64_t vm_read64_inl(uint64_t a)
+static inline uint64_t vm_read64_mm(const ppu_mm* m, uint64_t a)
 {
     const uint32_t ea = (uint32_t)a;
-    if (vm_inl_ok(ea, 8)) {   /* aligned: single-copy atomic, as on Cell */
+    if (__builtin_expect(vm_mm_ok(m, ea, 8), 1)) {   /* aligned: single-copy atomic, as on Cell */
         uint64_t v;
-        if (!(ea & 7u)) v = __atomic_load_n((const uint64_t*)(vm_base + ea), __ATOMIC_RELAXED);
-        else memcpy(&v, vm_base + ea, 8);
+        if (!(ea & 7u)) v = __atomic_load_n((const uint64_t*)(m->vb + ea), __ATOMIC_RELAXED);
+        else memcpy(&v, m->vb + ea, 8);
         return __builtin_bswap64(v); }
     return vm_read64(a);
 }
+static inline void vm_write8_mm(const ppu_mm* m, uint64_t a, uint8_t v)
+{
+    const uint32_t ea = (uint32_t)a;
+    if (__builtin_expect(vm_mm_st_ok(m, ea, 1), 1)) { __atomic_store_n(m->vb + ea, v, __ATOMIC_RELAXED); return; }
+    vm_write8(a, v);
+}
+static inline void vm_write16_mm(const ppu_mm* m, uint64_t a, uint16_t v)
+{
+    const uint32_t ea = (uint32_t)a;
+    if (__builtin_expect(vm_mm_st_ok(m, ea, 2), 1)) {   /* aligned: single-copy atomic, as on Cell */
+        const uint16_t be = __builtin_bswap16(v);
+        if (!(ea & 1u)) __atomic_store_n((uint16_t*)(m->vb + ea), be, __ATOMIC_RELAXED);
+        else memcpy(m->vb + ea, &be, 2);
+        return; }
+    vm_write16(a, v);
+}
+static inline void vm_write32_mm(const ppu_mm* m, uint64_t a, uint32_t v)
+{
+    const uint32_t ea = (uint32_t)a;
+    if (__builtin_expect(vm_mm_st_ok(m, ea, 4), 1)) {
+        const uint32_t be = __builtin_bswap32(v);
+        if (!(ea & 3u)) __atomic_store_n((uint32_t*)(m->vb + ea), be, __ATOMIC_RELAXED);
+        else memcpy(m->vb + ea, &be, 4);
+        return; }
+    vm_write32(a, v);
+}
+static inline void vm_write64_mm(const ppu_mm* m, uint64_t a, uint64_t v)
+{
+    const uint32_t ea = (uint32_t)a;
+    if (__builtin_expect(vm_mm_st_ok(m, ea, 8), 1)) {
+        const uint64_t be = __builtin_bswap64(v);
+        if (!(ea & 7u)) __atomic_store_n((uint64_t*)(m->vb + ea), be, __ATOMIC_RELAXED);
+        else memcpy(m->vb + ea, &be, 8);
+        return; }
+    vm_write64(a, v);
+}
+/* Outside a lifted function: a fresh copy per access. */
+static inline uint8_t  vm_read8_inl (uint64_t a) { const ppu_mm m = ppu_mm_take(); return vm_read8_mm(&m, a); }
+static inline uint16_t vm_read16_inl(uint64_t a) { const ppu_mm m = ppu_mm_take(); return vm_read16_mm(&m, a); }
+static inline uint32_t vm_read32_inl(uint64_t a) { const ppu_mm m = ppu_mm_take(); return vm_read32_mm(&m, a); }
+static inline uint64_t vm_read64_inl(uint64_t a) { const ppu_mm m = ppu_mm_take(); return vm_read64_mm(&m, a); }
+static inline void vm_write8_inl (uint64_t a, uint8_t  v) { const ppu_mm m = ppu_mm_take(); vm_write8_mm(&m, a, v); }
+static inline void vm_write16_inl(uint64_t a, uint16_t v) { const ppu_mm m = ppu_mm_take(); vm_write16_mm(&m, a, v); }
+static inline void vm_write32_inl(uint64_t a, uint32_t v) { const ppu_mm m = ppu_mm_take(); vm_write32_mm(&m, a, v); }
+static inline void vm_write64_inl(uint64_t a, uint64_t v) { const ppu_mm m = ppu_mm_take(); vm_write64_mm(&m, a, v); }
 /* PPU_INLINE_VM has its own inline accessors (ppu_vm_fast.h, above), loads
  * and stores, so these stand aside there. */
 #if !defined(PPU_NO_INLINE_LOADS) && !defined(PPU_INLINE_VM)
@@ -253,6 +349,12 @@ static inline uint64_t vm_read64_inl(uint64_t a)
 #define vm_read16(a) vm_read16_inl(a)
 #define vm_read32(a) vm_read32_inl(a)
 #define vm_read64(a) vm_read64_inl(a)
+#endif
+#if !defined(PPU_NO_INLINE_LOADS) && !defined(PPU_NO_INLINE_STORES) && !defined(PPU_INLINE_VM)
+#define vm_write8(a, v)  vm_write8_inl(a, v)
+#define vm_write16(a, v) vm_write16_inl(a, v)
+#define vm_write32(a, v) vm_write32_inl(a, v)
+#define vm_write64(a, v) vm_write64_inl(a, v)
 #endif
 
 /* Syscall handler */
@@ -353,7 +455,18 @@ static inline double ppu_fp_default_qnan(void)
  * FRB's, else the default QNaN rather than x86's negative one). Bit-identical
  * to testing the inputs first; the hot float code ran three compares per op.
  * The rules are a function of their own, and stay one (PPU_COLD_FN): inlined
- * at every operation they were a quarter of a float-heavy function's code. */
+ * at every operation they were a quarter of a float-heavy function's code.
+ *
+ * PPU_FAST_FP drops that test and takes the host's NaN instead: the same
+ * value when one operand is a NaN, but the host picks which of two NaN
+ * operands propagates, the negating fmadd forms flip a NaN's sign, and a new
+ * NaN (inf - inf, 0 * inf) has its sign bit set. Only for a title whose
+ * output does not depend on NaN bits. */
+#ifndef PPU_FAST_FP
+#define PPU_FP_NAN_RESULT(r) PPU_UNLIKELY((r) != (r))
+#else
+#define PPU_FP_NAN_RESULT(r) 0
+#endif
 PPU_COLD_FN static double ppu_fp_bin_nan(double a, double b)
 {
     if (a != a) return ppu_fp_quiet(a);
@@ -362,7 +475,7 @@ PPU_COLD_FN static double ppu_fp_bin_nan(double a, double b)
 }
 static inline double ppu_fp_bin(double a, double b, double r)
 {
-    if (PPU_UNLIKELY(r != r)) return ppu_fp_bin_nan(a, b);
+    if (PPU_FP_NAN_RESULT(r)) return ppu_fp_bin_nan(a, b);
     return r;
 }
 static inline double ppu_fadd(double a, double b) { return ppu_fp_bin(a, b, a + b); }
@@ -381,7 +494,7 @@ PPU_COLD_FN static double ppu_fmadd_nan(double a, double c, double b)
 static inline double ppu_fmadd_core(double a, double c, double b, int neg_b, int neg_res)
 {
     const double r = fma(a, c, neg_b ? -b : b);
-    if (PPU_UNLIKELY(r != r)) return ppu_fmadd_nan(a, c, b);   /* any NaN input lands here */
+    if (PPU_FP_NAN_RESULT(r)) return ppu_fmadd_nan(a, c, b);   /* any NaN input lands here */
     return neg_res ? -r : r;
 }
 /* Round to single: the result must be representable in single format, NaNs
@@ -394,14 +507,14 @@ static inline double ppu_fp_single(double r)
  * to single, where ppu_fp_single(ppu_fadd(..)) tested twice. Identical
  * results: a NaN result takes the same priority rules and is then rounded
  * like any other (its payload truncated to the single fraction). */
-static inline double ppu_fadds(double a, double b) { const double r = a + b; if (PPU_UNLIKELY(r != r)) return ppu_fp_single(ppu_fp_bin_nan(a, b)); return (double)(float)r; }
-static inline double ppu_fsubs(double a, double b) { const double r = a - b; if (PPU_UNLIKELY(r != r)) return ppu_fp_single(ppu_fp_bin_nan(a, b)); return (double)(float)r; }
-static inline double ppu_fmuls(double a, double b) { const double r = a * b; if (PPU_UNLIKELY(r != r)) return ppu_fp_single(ppu_fp_bin_nan(a, b)); return (double)(float)r; }
-static inline double ppu_fdivs(double a, double b) { const double r = a / b; if (PPU_UNLIKELY(r != r)) return ppu_fp_single(ppu_fp_bin_nan(a, b)); return (double)(float)r; }
+static inline double ppu_fadds(double a, double b) { const double r = a + b; if (PPU_FP_NAN_RESULT(r)) return ppu_fp_single(ppu_fp_bin_nan(a, b)); return (double)(float)r; }
+static inline double ppu_fsubs(double a, double b) { const double r = a - b; if (PPU_FP_NAN_RESULT(r)) return ppu_fp_single(ppu_fp_bin_nan(a, b)); return (double)(float)r; }
+static inline double ppu_fmuls(double a, double b) { const double r = a * b; if (PPU_FP_NAN_RESULT(r)) return ppu_fp_single(ppu_fp_bin_nan(a, b)); return (double)(float)r; }
+static inline double ppu_fdivs(double a, double b) { const double r = a / b; if (PPU_FP_NAN_RESULT(r)) return ppu_fp_single(ppu_fp_bin_nan(a, b)); return (double)(float)r; }
 static inline double ppu_fmadds_core(double a, double c, double b, int neg_b, int neg_res)
 {
     const double r = fma(a, c, neg_b ? -b : b);
-    if (PPU_UNLIKELY(r != r)) return ppu_fp_single(ppu_fmadd_nan(a, c, b));
+    if (PPU_FP_NAN_RESULT(r)) return ppu_fp_single(ppu_fmadd_nan(a, c, b));
     return (double)(float)(neg_res ? -r : r);
 }
 /* frsp of a NaN (Book I 4.6.6): FRB[0:34] quieted, then 29 zero bits -- the
@@ -875,6 +988,36 @@ extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*);
     } \\
 } while(0)
 
+/* Each lifted function opens with PPU_MM_SNAP; its loads and stores use that
+ * copy of the memory model (ppu_mm in ppu_recomp.h). PPU_INLINE_VM's
+ * accessors (ppu_vm_fast.h) use the function's vm_base local instead, and
+ * keep their own mapping of the names: there it is nothing. */
+#ifdef PPU_INLINE_VM
+#define PPU_MM_SNAP
+#else
+#define PPU_MM_SNAP const ppu_mm _mm = ppu_mm_take(); (void)_mm;
+#ifndef PPU_NO_INLINE_LOADS
+#undef vm_read8
+#undef vm_read16
+#undef vm_read32
+#undef vm_read64
+#define vm_read8(a)  vm_read8_mm(&_mm, a)
+#define vm_read16(a) vm_read16_mm(&_mm, a)
+#define vm_read32(a) vm_read32_mm(&_mm, a)
+#define vm_read64(a) vm_read64_mm(&_mm, a)
+#endif
+#if !defined(PPU_NO_INLINE_LOADS) && !defined(PPU_NO_INLINE_STORES)
+#undef vm_write8
+#undef vm_write16
+#undef vm_write32
+#undef vm_write64
+#define vm_write8(a, v)  vm_write8_mm(&_mm, a, v)
+#define vm_write16(a, v) vm_write16_mm(&_mm, a, v)
+#define vm_write32(a, v) vm_write32_mm(&_mm, a, v)
+#define vm_write64(a, v) vm_write64_mm(&_mm, a, v)
+#endif
+#endif
+
 """
 
 # ---------------------------------------------------------------------------
@@ -1045,6 +1188,31 @@ _CRSET_RE = re.compile(
     r"ctx->cr = \(ctx->cr & ~\(0xFu << (?P<shift>\d+)\)\) \| \(cr_val << (?P<shift2>\d+)\); \}$")
 _CRBR_RE = re.compile(
     r"^(?P<ind>\s*)if \((?P<neg>!)?\(+ctx->cr >> (?P<shift>\d+)\) & (?P<mask>0x[0-9A-Fa-f]+|\d+)\)+\) (?P<rest>.*)$")
+# A line PPULifter._patched_translate wrote; group 1 is its guard symbol.
+_INSN_PATCH_RE = re.compile(r"^if \(([A-Za-z_]\w*)\) \{ .* /\* insn patch 0x[0-9A-F]{8}: ")
+
+
+def load_insn_patches(path: str) -> dict[int, tuple[int, int, str]]:
+    """Read an --insn-patches file:
+
+        {"patches": [{"addr": "0x001E6F68", "orig": "0x419DFFDC",
+                      "new": "0x60000000", "guard": "g_port_unlock_fps",
+                      "note": "..."}, ...]}
+
+    -> {addr: (orig, new, guard)}."""
+    with open(path) as f:
+        spec = json.load(f)
+    out: dict[int, tuple[int, int, str]] = {}
+    for e in spec.get("patches", []):
+        addr = int(str(e["addr"]), 0)
+        guard = str(e["guard"])
+        if not re.fullmatch(r"[A-Za-z_]\w*", guard):
+            sys.exit(f"[ppu_lifter] {path}: guard {guard!r} is not a C identifier")
+        if addr & 3 or addr in out:
+            sys.exit(f"[ppu_lifter] {path}: bad or duplicate address 0x{addr:08X}")
+        out[addr] = (int(str(e["orig"]), 0) & 0xFFFFFFFF,
+                     int(str(e["new"]), 0) & 0xFFFFFFFF, guard)
+    return out
 
 
 def _crval_to_c(val: str, mask: int, decl_a: str, a_expr: str, b_expr: str) -> str:
@@ -1270,6 +1438,10 @@ class PPULifter:
         # Module primary TOC (r2). Set by main() only when the ELF yields exactly
         # one TOC candidate; enables the `ld r2, N(r1)` restore lowering below.
         self.toc_base: int = 0
+        # Runtime-switchable instruction patches (--insn-patches):
+        # {addr -> (original word, replacement word, guard symbol)}. See
+        # _patched_translate.
+        self.insn_patches: dict[int, tuple[int, int, str]] = {}
         # addr(int) -> recovered name label (from Ghidra analysis). Emitted as a
         # comment above func_ADDR so dispatch stays address-based.
         self.name_map: dict[int, str] = {}
@@ -1383,7 +1555,11 @@ class PPULifter:
                 func.body_lines.append(f"loc_{insn.addr:08X}:")
                 emitted_labels.add(insn.addr)
 
-            c_line = self._translate(insn, func)
+            patch = self.insn_patches.get(insn.addr)
+            if patch is not None:
+                c_line = self._patched_translate(insn, func, patch)
+            else:
+                c_line = self._translate(insn, func)
             if c_line:
                 func.body_lines.append(f"    {c_line}")
 
@@ -1929,6 +2105,39 @@ class PPULifter:
         alt = Instruction(insn.addr, raw, base, insn.operands, insn.comment)
         code2 = self._translate_op(alt, func)
         return code if code2.startswith("/* TODO") else code2
+
+    def _patched_translate(self, insn: Instruction, func: LiftedFunction,
+                           patch: tuple[int, int, str]) -> str:
+        """Both forms of a patched instruction, chosen at run time.
+
+        A static recompilation never executes the guest's code words, so a
+        patch that rewrites an instruction word in .text at run time does
+        nothing to the lifted title. This lifts the original
+        word and the replacement and emits
+
+            if (<guard>) { <replacement> } else { <original> }
+
+        so one build serves both, switched by an int the port defines and sets
+        before the guest starts. The original word must match what the spec
+        expects: a patch for one build of a title must never land on another.
+        The replacement may not branch -- it would need labels and call targets
+        this function was not lifted with; a nop, an immediate or a compare is
+        the shape these patches have."""
+        # Raised, not sys.exit: this runs in pool workers, where a SystemExit
+        # kills the worker and leaves the parent waiting for its result.
+        orig, new, guard = patch
+        if insn.raw != orig:
+            raise ValueError(f"insn patch at 0x{insn.addr:08X}: the input has "
+                             f"0x{(insn.raw or 0):08X}, the patch expects 0x{orig:08X} "
+                             f"(wrong binary for this patch set?)")
+        if (new >> 26) in (16, 17, 18, 19):
+            raise ValueError(f"insn patch at 0x{insn.addr:08X}: the replacement "
+                             f"0x{new:08X} is a branch/sc/CR op; not supported")
+        alt = disassemble_bytes(new.to_bytes(4, "big"), insn.addr, True)[0]
+        alt_c = self._translate(alt, func) or "/* nop */;"
+        orig_c = self._translate(insn, func) or ";"
+        return (f"if ({guard}) {{ {alt_c} }} else {{ {orig_c} }}"
+                f"  /* insn patch 0x{insn.addr:08X}: {orig:08X} -> {new:08X} */")
 
     def _translate(self, insn: Instruction, func: LiftedFunction) -> str:
         code = self._oe_wrap(insn, self._translate_xo_base(insn, func))
@@ -4648,11 +4857,18 @@ class PPULifter:
             lines.append(f"/* {label} */")
         hooked = "_lifted" if func.start_addr in self.hooks else ""
         weak = "__attribute__((weak)) " if getattr(self, "weak_emit", False) else ""
+        # The guard of each --insn-patches line in this body: the port defines it.
+        guards = sorted({m.group(1) for bl in func.body_lines
+                         for m in [_INSN_PATCH_RE.match(bl.strip())] if m})
+        for g in guards:
+            lines += ["#ifdef __cplusplus", f'extern "C" int {g};', "#else",
+                      f"extern int {g};", "#endif"]
         lines.append(f"void {weak}{func.name}{hooked}(ppu_context* ctx) {{")
         # The base of guest memory in a local (see the prelude). PPU_VM_BASE_LOCAL=0: not.
         if os.environ.get("PPU_VM_BASE_LOCAL", "1") != "0" and any(
                 "vm_" in l or "PPU_F" in l or "PPU_R" in l for l in func.body_lines):
             lines.append("        uint8_t* const vm_base = ppu_vm_base_now();")
+        lines.append("    PPU_MM_SNAP")
         drainless = self._drainless()
         elide = self._drain_elide
         nv = self._nv_needs()
@@ -5145,13 +5361,46 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
             # Widening is safe for the cases that already worked: the walk stops
             # at the NEAREST definition of `cand`, so when one exists inside the
             # window the result is unchanged.
-            for w in reversed(win_cand):
+            # Only definitions BEFORE the table load: `add r11, r0, r11` after
+            # `lwzx r0, r9, r11` reuses the base register for the case address,
+            # and is not the base's definition.
+            for w in reversed([x for x in win_cand if x.addr < lwzx.addr]):
                 a = [x.strip() for x in w.operands.split(',')]
                 if not a or a[0] != cand or w.mnemonic.startswith(('st', 'lf')):
                     continue                    # not a GPR def: a store READS it; ppu_disasm names lfs/lfd's FPR target rN
                 if w.mnemonic in ('lwz', 'ld') and len(a) == 2 and '(r2)' in a[1]:
                     disp = mem_disp(a[1]); r_base = cand
                     base_is_ld = (w.mnemonic == 'ld')
+                elif w.mnemonic in ('lwz', 'ld') and len(a) == 2 and '(r1)' in a[1]:
+                    # SPILLED base: the table address was TOC-loaded earlier,
+                    # stored to a stack slot, and reloaded at the dispatch
+                    # (`lwz r10,d(r2); std r10,s(r1)` ... `ld r11,s(r1);
+                    # lwzx; add; mtctr; bctr`). A loop around the dispatch in a
+                    # function with high register pressure does this; the reload
+                    # read as a non-TOC definition, the dispatcher was dropped
+                    # and its bctr lifted to an unresolved indirect call, so no
+                    # case of the switch ever ran. Follow the slot to the
+                    # nearest preceding store of it, and that register to its
+                    # TOC load.
+                    _slot, _at = mem_disp(a[1]), w.addr
+                    _src = None
+                    for w2 in reversed([x for x in win_cand if x.addr < _at]):
+                        b = [x.strip() for x in w2.operands.split(',')]
+                        if w2.mnemonic in ('std', 'stw') and len(b) == 2 and '(r1)' in b[1] \
+                                and mem_disp(b[1]) == _slot:
+                            _src = (b[0], w2.addr)
+                            break
+                        if b and b[0] == 'r1' and w2.mnemonic not in ('std', 'stw'):
+                            break               # the frame moved: another slot
+                    if _src is not None:
+                        for w2 in reversed([x for x in win_cand if x.addr < _src[1]]):
+                            b = [x.strip() for x in w2.operands.split(',')]
+                            if not b or b[0] != _src[0] or w2.mnemonic.startswith(('st', 'lf')):
+                                continue
+                            if w2.mnemonic in ('lwz', 'ld') and len(b) == 2 and '(r2)' in b[1]:
+                                disp = mem_disp(b[1]); r_base = cand
+                                base_is_ld = (w2.mnemonic == 'ld')
+                            break               # nearest definition wins, TOC load or not
                 elif w.mnemonic in ('lwz', 'ld') and len(a) == 2 and '(' in a[1]:
                     # TWO-LEVEL base: `lwz r30, d1(r2); lwz r11, d2(r30)`. The
                     # table address is not in the TOC itself but in a global the
@@ -5418,7 +5667,8 @@ def _mtvscr_absent(segs, big_endian, lo, hi):
 
 def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
                  function_entries=None, code_lo=0, code_hi=None, jump_tables=None,
-                 toc_base=0, nonvolatile_locals=False, so_zero=False, vscr_const=False):
+                 toc_base=0, nonvolatile_locals=False, so_zero=False, vscr_const=False,
+                 insn_patches=None):
     _WORKER_STATE["nonvolatile_locals"] = nonvolatile_locals
     _WORKER_STATE["so_zero"] = so_zero
     _WORKER_STATE["vscr_const"] = vscr_const
@@ -5436,6 +5686,7 @@ def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
     _WORKER_STATE["code_lo"] = code_lo
     _WORKER_STATE["code_hi"] = code_hi
     _WORKER_STATE["jump_tables"] = jump_tables or {}
+    _WORKER_STATE["insn_patches"] = insn_patches or {}
 
 
 def _worker_lift(task):
@@ -5454,6 +5705,7 @@ def _worker_lift(task):
     lifter.nonvolatile_locals = _WORKER_STATE.get("nonvolatile_locals", False)
     lifter.so_zero = _WORKER_STATE.get("so_zero", False)
     lifter.vscr_const = _WORKER_STATE.get("vscr_const", False)
+    lifter.insn_patches = _WORKER_STATE.get("insn_patches", {})
     results = []
     for start, end in bounds:
         blob = b""
@@ -5491,7 +5743,8 @@ def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
                              getattr(lifter, "toc_base", 0),
                              getattr(lifter, "nonvolatile_locals", False),
                              getattr(lifter, "so_zero", False),
-                             getattr(lifter, "vscr_const", False)))
+                             getattr(lifter, "vscr_const", False),
+                             lifter.insn_patches))
     try:
         for idx0, results, ct, bt, nvst in pool.imap_unordered(_worker_lift, tasks):
             _nv_stats_add(nvst)
@@ -5585,6 +5838,12 @@ def main() -> None:
                              "instead of its literal .lib.stub trampoline, and "
                              "split out as its own 0x20-byte function so direct "
                              "calls to it dispatch to the HLE handler.")
+    parser.add_argument("--insn-patches", metavar="FILE", default=None,
+                        help="JSON list of instruction patches to lift as "
+                             "run-time switches: each {addr, orig, new, guard} "
+                             "is emitted as `if (guard) {new} else {orig}`, guard "
+                             "being an int the port defines. The input must hold "
+                             "`orig` at `addr` or the lift stops.")
     args = parser.parse_args()
 
     # Load firmware-import stubs (addr -> NID) up front; applied to func_bounds
@@ -6061,6 +6320,9 @@ def main() -> None:
         if lifter.vscr_const:
             print("  VSCR: no mtvscr in the code, so NJ stays 0: the VMX float helpers "
                   "are handed it as a constant (PPU_VSCR_EXACT=1 reads it)")
+    if args.insn_patches:
+        lifter.insn_patches = load_insn_patches(args.insn_patches)
+        print(f"  insn-patches: {len(lifter.insn_patches)} from {args.insn_patches}")
 
     # Optional: load a recovered-name map (from Ghidra analysis) to annotate
     # generated functions with meaningful names as comments.
@@ -6107,6 +6369,16 @@ def main() -> None:
         print(f"  Mid-function pass {pass_num}: generated {n} tail-entry wrappers ({total_mid} total)")
     if total_mid:
         print(f"  Generated {total_mid} mid-function tail-entry wrappers total")
+
+    # Every patch must have landed in a lifted function: one at an address no
+    # function covers would otherwise vanish without a word.
+    if lifter.insn_patches:
+        landed = {int(m.group(1), 16) for f in lifter.functions for bl in f.body_lines
+                  for m in [re.search(r"/\* insn patch 0x([0-9A-F]{8}): ", bl)] if m}
+        missing = sorted(set(lifter.insn_patches) - landed)
+        if missing:
+            sys.exit("[ppu_lifter] insn patches at no lifted instruction: " +
+                     ", ".join(f"0x{a:08X}" for a in missing))
 
     os.makedirs(args.output, exist_ok=True)
 

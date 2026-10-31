@@ -21,6 +21,7 @@
 #include <stdint.h>
 #include <math.h>
 #include "ps3emu/log_first.h"
+#include "ps3emu/thread_name.h"
 
 /* Event-queue push/lookup (runtime/syscalls/sys_event.c). Forward-declared
  * rather than including sys_event.h to avoid pulling PPU context/syscall
@@ -304,8 +305,12 @@ static int audio_backend_init(void)
      * mixer below keeps it nearly full, so this is how long a scheduling
      * hiccup -- the mixer or the guest's audio thread held off the CPU --
      * can last before the device runs dry. 20 ms stuttered on Drakengard 3
-     * under load; the PS3's own output path is several 5.33 ms blocks deep. */
+     * under load, and Bink cutscenes on a six-core machine with every core
+     * busy; the PS3's own output path is several 5.33 ms blocks deep.
+     * PS3_AUDIO_BUF_MS=<10..500> sets it as well (AUDIO_BUF_MS wins). */
     long buf_ms = 40;
+    { const char* e = getenv("PS3_AUDIO_BUF_MS"); const long ms = e ? atol(e) : 0;
+      if (ms >= 10 && ms <= 500) buf_ms = ms; }
     { const char* e = getenv("AUDIO_BUF_MS"); if (e && atol(e) > 0) buf_ms = atol(e); }
     REFERENCE_TIME buf_duration = (REFERENCE_TIME)buf_ms * 10000; /* 100 ns units */
     s_wasapi_event = CreateEventW(NULL, FALSE, FALSE, NULL);
@@ -663,6 +668,7 @@ static void audio_notify_event_queues(void)
 }
 
 #ifdef _WIN32
+static unsigned long long g_audio_underruns;
 static unsigned __stdcall audio_mix_thread_func(void* arg)
 {
     (void)arg;
@@ -719,6 +725,12 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
          * drop the backlog instead of mixing it in a burst. */
         if (now.QuadPart - due > qf.QuadPart / 20) q0.QuadPart = now.QuadPart - (long long)blocks * period;
         const int room = audio_backend_room();
+#if AUDIO_BACKEND_WASAPI
+        /* Device queue under half a block: it is about to play silence (an
+         * audible click/stutter). AUDIO_RATE reports how often. */
+        if (room >= 0 && blocks > 64 &&
+            (UINT32)room + CELL_AUDIO_BLOCK_SAMPLES / 2 >= s_wasapi_buf_frames) g_audio_underruns++;
+#endif
         if (room >= 0 && room < CELL_AUDIO_BLOCK_SAMPLES) { q0.QuadPart += period; continue; }   /* DAC slower: slip */
         if (room >= 0 && (UINT32)room >= s_wasapi_buf_frames - CELL_AUDIO_BLOCK_SAMPLES && blocks > 8)
             q0.QuadPart -= period;                                                                /* DAC faster: gain */
@@ -747,7 +759,7 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
         /* AUDIO_RATE=1: blocks mixed vs real time, and frames dropped. */
         { static int on = -1; if (on < 0) on = getenv("AUDIO_RATE") ? 1 : 0;
-          if (on) { static ULONGLONG t0; static unsigned n, z; static unsigned long long d0;
+          if (on) { static ULONGLONG t0; static unsigned n, z; static unsigned long long d0, u0;
             ULONGLONG now = GetTickCount64(); if (!t0) t0 = now; n++;
             { int nz = 0; for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) if (s_mix_buffer[i] != 0.0f) { nz = 1; break; }
               if (!nz) z++; }
@@ -756,14 +768,15 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
                 fprintf(stderr, "[audio-rate] gaps %llu (%llu blocks, %.1f%% of the window); ",
                         g_audio_gaps - g0, g_audio_gap_blocks - gb0, n ? 100.0 * (g_audio_gap_blocks - gb0) / n : 0.0);
                 g0 = g_audio_gaps; gb0 = g_audio_gap_blocks;
-                fprintf(stderr, "%.1f blocks/s (real time 187.5), silent %.1f%%, dropped %.0f frames/s, device buf %u%c",
+                fprintf(stderr, "%.1f blocks/s (real time 187.5), silent %.1f%%, dropped %.0f frames/s, underruns %llu, device buf %u%c",
                         n * 1000.0 / (now - t0), n ? 100.0 * z / n : 0.0, (g_audio_dropped - d0) * 1000.0 / (now - t0),
+                        g_audio_underruns - u0,
                 #if AUDIO_BACKEND_WASAPI
                         (unsigned)s_wasapi_buf_frames, 10);
 #else
                         0u, 10);
 #endif
-                n = z = 0; d0 = g_audio_dropped; t0 = now; } } }
+                n = z = 0; d0 = g_audio_dropped; u0 = g_audio_underruns; t0 = now; } } }
 
         /* Notify event queues */
         audio_notify_event_queues();

@@ -18,6 +18,7 @@ void spu_lockline_unlock(void) {}
 int  g_spu_coh_armed = 0;
 void vm_watch_touch(uint32_t ea, uint32_t len) { (void)ea; (void)len; }
 void np_psnr_pump(void) {}
+void ps3_np_eula_tick(void) {}
 
 static unsigned calls;
 static int waiting;

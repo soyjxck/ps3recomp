@@ -16,6 +16,7 @@
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 (translate + byte-swap, OOB-safe) */
 #include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
 int64_t ps3_guest_ticks(int64_t host_ticks);   /* sys_timer.c: still while paused */
+uint64_t host_monotonic_ns(void);                /* sys_timer.c */
 #include "../../runtime/spu/spu_coherency.h" /* the blit row copy's reservation bookkeeping */
 #include "rsx_commands.h"                    /* rsx_state, rsx_process_command_buffer */
 #include "../../include/ps3emu/guest_call.h" /* g_ps3_guest_caller for direct handler dispatch */
@@ -72,9 +73,9 @@ static u64 get_timestamp_ns(void)
 #else
 static u64 get_timestamp_ns(void)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (u64)ps3_guest_ticks((int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec);   /* still while paused */
+    /* host_monotonic_ns: the clock ps3_guest_ticks keeps its paused time in
+     * (mach time on macOS, CLOCK_MONOTONIC elsewhere) */
+    return (u64)ps3_guest_ticks((int64_t)host_monotonic_ns());   /* still while paused */
 }
 #endif
 
@@ -178,6 +179,22 @@ int cellGcm_take_flip_pending(void)
 }
 
 
+/* The RSX puts its 3D state back to the reset values at a flip, and a title
+ * may count on that: one sets ZSTENCIL_CLEAR_VALUE to 0 for a single clear
+ * and never writes it again, so its later depth clears are to the far plane
+ * only because every flip restored 0xFFFFFF00 (RPCS3's flip_command resets
+ * the whole register file, rsx_state::reset). Here it reaches every consumer
+ * of the method stream, at the flip's place in it.
+ * TODO: the rest of the reset image; this is the one register a title has
+ * been seen to depend on. */
+static void gcm_fifo_flip_resets_state(rsx_state* state)
+{
+    const u32 m = NV4097_SET_ZSTENCIL_CLEAR_VALUE, v = RSX_DSP_ZSTENCIL_CLEAR_RESET;
+    rsx_process_method(state, m, v);
+    if (rsx_live_draw_enabled())   rsx_live_draw_method(m, v);
+    if (rsx_draw_engine_enabled()) rsx_draw_engine_method(m, v);
+}
+
 /* Configuration */
 static CellGcmConfig s_config;
 /* Offset pages (1MB) known to be LOCAL-memory-derived (set by
@@ -224,6 +241,13 @@ typedef struct IoMapping {
 
 static IoMapping s_io_mappings[CELL_GCM_MAX_IO_MAPPINGS];
 static int s_io_mapping_count = 0;
+/* One past the highest slot ever handed out since the table was last cleared:
+ * every active slot is below it. Slots are taken first-free, so it stays at
+ * the peak number of simultaneous mappings. Lets gcm_ea2io_range(), which runs
+ * on every SPU PUT, skip the never-used tail of the table. It only grows
+ * between resets, so a reader racing a map or unmap elsewhere in the table
+ * still reaches every mapping that stays active. */
+static int s_io_mapping_hw = 0;
 
 /* Callback handlers — these are GUEST OPD addresses passed by the
  * recompiled game, not host function pointers. Stored as uint32_t and
@@ -264,7 +288,8 @@ extern u32 vm_read32(unsigned int);
 static u32 s_flip_handler_code    = 0;
 static u32 s_vblank_handler_code  = 0;
 static void ydkj_restore_handler_opd(u32 opd, u32 code) {
-    if (!getenv("YDKJ_HANDLERFIX") || !opd || !code) return;
+    static int fix = -1; if (fix < 0) fix = getenv("YDKJ_HANDLERFIX") ? 1 : 0;
+    if (!fix || !opd || !code) return;
     extern u8* vm_base; if (!vm_base) return;
     if (vm_read32(opd) == 0) {
         u8* p = vm_base + opd; p[0]=(u8)(code>>24); p[1]=(u8)(code>>16); p[2]=(u8)(code>>8); p[3]=(u8)code;
@@ -514,8 +539,13 @@ static IoMapping* find_mapping_by_io(u32 io)
 static IoMapping* find_free_mapping(void)
 {
     for (int i = 0; i < CELL_GCM_MAX_IO_MAPPINGS; i++) {
-        if (!s_io_mappings[i].active)
+        if (!s_io_mappings[i].active) {
+            /* Raised before the caller activates the slot; a caller that then
+             * fails leaves it one slot high, which only costs a visit. */
+            if (i >= __atomic_load_n(&s_io_mapping_hw, __ATOMIC_RELAXED))
+                __atomic_store_n(&s_io_mapping_hw, i + 1, __ATOMIC_RELAXED);
             return &s_io_mappings[i];
+        }
     }
     return NULL;
 }
@@ -550,6 +580,7 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
     memset(&s_config, 0, sizeof(s_config));
     memset(&s_control, 0, sizeof(s_control));
     memset(s_io_mappings, 0, sizeof(s_io_mappings));
+    __atomic_store_n(&s_io_mapping_hw, 0, __ATOMIC_RELAXED);
     memset(s_tiles, 0, sizeof(s_tiles));
     memset(s_zcull, 0, sizeof(s_zcull));
     memset(s_report_data, 0, sizeof(s_report_data));
@@ -602,6 +633,7 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
         s_io_mappings[0].ea     = ioAddress;
         s_io_mappings[0].io     = 0;
         s_io_mappings[0].size   = ioSize;
+        __atomic_store_n(&s_io_mapping_hw, 1, __ATOMIC_RELAXED);
         s_io_mappings[0].active = 1;
         s_io_mapping_count = 1;
     }
@@ -748,7 +780,8 @@ void cellGcmSetWaitFlipUnsafe(void) { cellGcmSetWaitFlip(); }
 void cellGcmResetFlipStatus(void)
 {
     { static int n = 0;
-      if (getenv("FLIP_DBG") && PS3_LOG_FIRST(n, 12))
+      static int fd = -1; if (fd < 0) fd = getenv("FLIP_DBG") ? 1 : 0;
+      if (fd && PS3_LOG_FIRST(n, 12))
           fprintf(stderr, "[FLIP] ResetFlipStatus%c", 10); }
     FLIP_LOCK();
     s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
@@ -767,7 +800,8 @@ u32 cellGcmGetFlipStatus(void)
      * every wait-for-flip loop exit on its first poll, so titles ran
      * completely unpaced (wave: 95 fps with a fixed-dt simulation). */
     { static int n = 0;
-      if (getenv("FLIP_DBG") && PS3_LOG_FIRST(n, 24))
+      static int fd = -1; if (fd < 0) fd = getenv("FLIP_DBG") ? 1 : 0;
+      if (fd && PS3_LOG_FIRST(n, 24))
           fprintf(stderr, "[FLIP] GetFlipStatus -> %u (0=DONE 1=WAITING)%c",
                   s_flip_status, 10); }
     return s_flip_status;
@@ -788,7 +822,11 @@ u32 cellGcmGetFlipStatus(void)
 #ifdef _WIN32
 #include <windows.h>
 static volatile LONG s_gcm_pending = 0;    /* bit0 = vblank, bit1 = flip */
-#define GCM_PENDING_SET(bits)  InterlockedOr(&s_gcm_pending, (bits))
+/* Wakes one guest thread blocked in a semaphore wait, which then pumps (see
+ * ppu_gcm_wait_pump). Auto-reset; NULL until the first such wait. */
+static HANDLE s_gcm_pump_ev = NULL;
+static void gcm_pump_wake(void) { if (s_gcm_pump_ev) SetEvent(s_gcm_pump_ev); }
+#define GCM_PENDING_SET(bits)  (InterlockedOr(&s_gcm_pending, (bits)), gcm_pump_wake())
 #define GCM_PENDING_TAKE()     InterlockedExchange(&s_gcm_pending, 0)
 #define GCM_PENDING_PEEK()     (s_gcm_pending != 0)
 static volatile LONG s_gcm_pumping = 0;
@@ -852,6 +890,29 @@ void cellGcm_request_tick(void)
  * A nonblocking guard also prevents nested callbacks from reentering. Leave
  * pending notifications untouched when another pump is active. */
 extern void (*g_gcm_trace_hook)(u32 type, u32 a, u32 b);   /* defined with the ring recycle */
+#ifdef _WIN32
+/* For sys_semaphore_wait. A guest thread blocked there also waits on this
+ * event and, when it fires, runs *pump (ppu_gcm_pump) to deliver what is
+ * pending, as a timer sleep or an HLE call does. Without it a flip handler
+ * waits for some guest thread to reach one of those: about 1 ms a frame in
+ * God of War HD, whose main thread sits in a semaphore wait until its flip
+ * handler posts that semaphore. */
+void ppu_gcm_pump(void);
+void* ppu_gcm_wait_pump(void (**pump)(void))
+{
+    if (!s_gcm_pump_ev) {
+        HANDLE e = CreateEventA(NULL, FALSE, FALSE, NULL);
+        if (e && InterlockedCompareExchangePointer((PVOID volatile*)&s_gcm_pump_ev, e, NULL) != NULL)
+            CloseHandle(e);
+        if (s_gcm_pending ||
+            *(volatile u32*)&s_user_qhead != *(volatile u32*)&s_user_qtail)
+            gcm_pump_wake();
+    }
+    *pump = ppu_gcm_pump;
+    return (void*)s_gcm_pump_ev;
+}
+#endif
+
 void ppu_gcm_pump(void)
 {
     /* Nothing pending -- the case at nearly every HLE call, from the game
@@ -993,13 +1054,28 @@ void (*g_gcm_label_write_hook)(void) = 0;
 void (*g_gcm_fifo_kick_hook)(void) = 0;
 static int s_sema_blocked_pass = 0;   /* this drain stopped on a semaphore acquire */
 static int s_park_pass = 0;           /* this drain stopped on a self-JUMP park */
+/* The park the walker is waiting on (0 = none), the `put` it saw there, and
+ * since when it has stood with that put: the jump-park grace in the walker. */
+static u32 park_off, park_put;
+static unsigned long long park_since;
 /* Backlog past which the drain stops honouring one-flip-per-tick and
  * catches up instead. Sized well above a frame's command list so a
  * title that keeps up never sees this path. */
 #define GCM_FIFO_CATCHUP_BYTES 0x10000u
 /* How long a self-JUMP park may stand with `put` somewhere else before the
- * drain gives up on it being patched and follows `put` instead. */
+ * drain gives up on it being patched and follows `put` instead.
+ * GCM_PARK_GRACE_MS=<ms> sets it. A title that appends after the park, moves
+ * `put` there and patches the park last needs it longer: God of War HD,
+ * loading its menu, has taken more than 50 ms between the two stores, and
+ * following `put` dropped the commands in between, a fence with them, so
+ * the boot stopped. The RSX itself would just wait. */
 #define GCM_PARK_GRACE_MS 50ull
+static unsigned long long gcm_park_grace_ms(void)
+{
+    static long long ms = -1;
+    if (ms < 0) { const char* e = getenv("GCM_PARK_GRACE_MS"); ms = e ? atoll(e) : (long long)GCM_PARK_GRACE_MS; }
+    return (unsigned long long)ms;
+}
 /* How close `current` must get to `end` before the runtime will recycle a ring
  * on the title's behalf. One gcmReserve is 8 bytes; a page of slack keeps a
  * title that is merely near the end from being touched. */
@@ -1682,7 +1758,11 @@ static int s_spu_blk_w = 0;
 /* EA -> IO through the mapping list (range lookup; the by-ea helper is exact). */
 static u32 gcm_ea2io_range(u32 ea, u32* room)
 {
-    for (int i = 0; i < CELL_GCM_MAX_IO_MAPPINGS; i++) {
+    /* Called for every SPU PUT. The table has CELL_GCM_MAX_IO_MAPPINGS slots
+     * and a title uses a handful, all below the high-water mark; the first
+     * match in slot order is the one a full scan returns. */
+    const int n = __atomic_load_n(&s_io_mapping_hw, __ATOMIC_RELAXED);
+    for (int i = 0; i < n; i++) {
         IoMapping* m = &s_io_mappings[i];
         if (!m->active || !m->size) continue;
         if (ea >= m->ea && ea < m->ea + m->size) {
@@ -1786,9 +1866,54 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
             gcm_ref_push_at(vm_read32(dea), io);
             rescued++;
         }
-        if (rescued) { static int m = 0; if (PS3_LOG_FIRST(m, 8))
-            fprintf(stderr, "[cellGcmSys] resync rescued %u fence(s) from"
-                    " 0x%08X..0x%08X\n", rescued, from, land); }
+        /* Fences are not the only sync writes a title waits on. Walk the
+         * skipped range as a command stream (each header and its data; NOPs,
+         * flip markers and self-JUMP parks stepped over, forward JUMPs inside the range
+         * followed; stopping at anything else that is not a method header) and
+         * replay the label releases in it as well: NV406E SEMAPHORE_RELEASE
+         * (0x6C, at the offset 0x64 set) and the NV4097 back-end and
+         * texture-read releases (0x1D70/0x1D74 at the 0x1D6C offset, in the
+         * 0x01A4 context), the latter through rsx_process_method so they land
+         * exactly where the walker would have written them. inFAMOUS 2 waits
+         * on a 0x1D74 release from an SPU-filled command block; a resync that
+         * skipped it left the title waiting for the rest of the run. Draws in
+         * the range are still lost. */
+        static rsx_state s_resync_state;   /* the sync methods do not touch it */
+        unsigned labels = 0;
+        for (u32 io = from; io + 4 <= land; ) {
+            const u32 ea = gcm_io2ea(io); if (!ea) break;
+            const u32 w = vm_read32(ea), type = w >> 29;
+            if (w == 0 || (w & 0xFFFFFF00u) == GCM_FLIP_MARKER) { io += 4; continue; }   /* NOP, flip (counted above) */
+            if ((w & 0xE0000003u) == 0x20000000u || (w & 3u) == 1u) {   /* JUMP */
+                const u32 tgt = ((w & 3u) == 1u) ? (w & ~3u) : (w & 0x1FFFFFFCu);
+                if (tgt == io) { io += 4; continue; }   /* a park */
+                if (tgt > io && tgt < land) { io = tgt; continue; }
+                break;
+            }
+            if (type != 0 && type != 2) break;          /* CALL, RETURN, or not a header */
+            const u32 count = (w >> 18) & 0x7FFu, method = w & 0x1FFCu, subch = (w >> 13) & 7u;
+            if (!count || io + 4 + count * 4 > land) break;
+            for (u32 i = 0; i < count; i++) {
+                const u32 dea = gcm_io2ea(io + 4 + i * 4); if (!dea) break;
+                const u32 m = (type == 0) ? method + i * 4 : method, v = vm_read32(dea);
+                if (subch != 0) continue;
+                if (m == 0x64u) s_sema_offset = v;
+                else if (m == 0x6Cu) {
+                    atomic_thread_fence(memory_order_release);
+                    vm_write32(GCM_LABEL_GUEST_BASE + (s_sema_offset & 0xFFFFu), v);
+                    labels++;
+                } else if (m == 0x01A4u || m == 0x1D6Cu || m == 0x1D70u || m == 0x1D74u) {
+                    rsx_process_method(&s_resync_state, m, v);
+                    labels += (m == 0x1D70u || m == 0x1D74u);
+                }
+            }
+            io += 4 + count * 4;
+        }
+        /* As after the walker's own label writes. */
+        if (labels && g_gcm_label_write_hook) g_gcm_label_write_hook();
+        if (rescued || labels) { static int m = 0; if (PS3_LOG_FIRST(m, 8))
+            fprintf(stderr, "[cellGcmSys] resync rescued %u fence(s) and %u label"
+                    " write(s) from 0x%08X..0x%08X\n", rescued, labels, from, land); }
     }
     if (land < *getoff) s_fifo_back_jumps++;   /* a ring recycle waiting on the tail: it is gone */
     *getoff = land;
@@ -1941,8 +2066,131 @@ void cellGcm_ref_on_poll(void)
 
 static uint64_t s_ft_sema_t0;          /* PS3_FTRACE: when the walker began waiting on the current acquire */
 
+/* RSX_WALKER_PROF=<file>: an in-process sampling profile of the FIFO walker
+ * thread, for hosts where an external sampler cannot attach. Once
+ * RSX_WALKER_PROF_TRIGGER=<file> exists (immediately when unset), a sampler
+ * thread signals the walker every millisecond for RSX_WALKER_PROF_SECONDS
+ * (default 10); the handler records the interrupted pc and the frame-pointer
+ * chain. The file gets one sample per line, innermost first: addresses in
+ * the main image relative to it, for symbolizing offline; addresses in other
+ * images as @symbol. The profiled thread is the first one to drain the FIFO.
+ * Diagnostic only, off unless RSX_WALKER_PROF is set; macOS arm64. While it
+ * samples, the walker takes a SIGPROF every millisecond (SA_RESTART). */
+#if defined(__APPLE__) && defined(__aarch64__)
+#include <signal.h>
+#include <pthread.h>
+#include <sys/ucontext.h>
+#include <mach-o/dyld.h>
+#include <dlfcn.h>
+enum { WPROF_MAX = 120000, WPROF_DEPTH = 32 };
+static uintptr_t (*s_wprof_buf)[WPROF_DEPTH];
+static unsigned char* s_wprof_len;
+static atomic_int s_wprof_n;
+static pthread_t s_wprof_target;
+static atomic_int s_wprof_state;     /* 0 unset, 1 armed, 2 done */
+static uintptr_t s_wprof_lo, s_wprof_hi;
+static void wprof_handler(int sig, siginfo_t* si, void* ctx)
+{
+    (void)sig; (void)si;
+    const int i = atomic_load_explicit(&s_wprof_n, memory_order_relaxed);
+    if (i >= WPROF_MAX || !s_wprof_buf) return;
+    const ucontext_t* uc = (const ucontext_t*)ctx;
+    uintptr_t* o = s_wprof_buf[i];
+    unsigned d = 0;
+    o[d++] = (uintptr_t)__darwin_arm_thread_state64_get_pc(uc->uc_mcontext->__ss);
+    uintptr_t fp = (uintptr_t)__darwin_arm_thread_state64_get_fp(uc->uc_mcontext->__ss);
+    while (d < WPROF_DEPTH && fp >= s_wprof_lo && fp + 16 <= s_wprof_hi && !(fp & 7u)) {
+        const uintptr_t next = ((const uintptr_t*)fp)[0], ret = ((const uintptr_t*)fp)[1];
+        if (!ret) break;
+        o[d++] = ret;
+        if (next <= fp) break;
+        fp = next;
+    }
+    s_wprof_len[i] = (unsigned char)d;
+    /* Release: the writer reads this sample's frames after it sees the count. */
+    atomic_store_explicit(&s_wprof_n, i + 1, memory_order_release);
+}
+static void* wprof_thread(void* arg)
+{
+    (void)arg;
+    const char* out = getenv("RSX_WALKER_PROF");
+    const char* trig = getenv("RSX_WALKER_PROF_TRIGGER");
+    const char* secs_e = getenv("RSX_WALKER_PROF_SECONDS");
+    const int secs = secs_e && atoi(secs_e) > 0 ? atoi(secs_e) : 10;
+    struct timespec poll = {0, 100000000}, tick = {0, 1000000};
+    while (trig && *trig && access(trig, F_OK) != 0) nanosleep(&poll, NULL);
+    void* top = pthread_get_stackaddr_np(s_wprof_target);
+    const size_t size = pthread_get_stacksize_np(s_wprof_target);
+    s_wprof_hi = (uintptr_t)top; s_wprof_lo = (uintptr_t)top - size;
+    struct sigaction sa; memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = wprof_handler; sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGPROF, &sa, NULL);
+    fprintf(stderr, "[walker prof] sampling for %d s\n", secs);
+    for (int k = 0; k < secs * 1000 && atomic_load(&s_wprof_n) < WPROF_MAX; k++) {
+        pthread_kill(s_wprof_target, SIGPROF);
+        nanosleep(&tick, NULL);
+    }
+    nanosleep(&poll, NULL);
+    const int n = atomic_load_explicit(&s_wprof_n, memory_order_acquire);
+    FILE* f = fopen(out, "w");
+    if (f) {
+        const intptr_t slide = _dyld_get_image_vmaddr_slide(0);
+        fprintf(f, "# walker samples %d slide 0x%llx image %s\n", n, (unsigned long long)slide,
+                _dyld_get_image_name(0));
+        /* Addresses outside the main image (system frameworks) are named
+         * here with dladdr, since only this process knows where they are. */
+        const struct mach_header* mh = _dyld_get_image_header(0);
+        Dl_info self_info; uintptr_t self_lo = 0;
+        if (dladdr(mh, &self_info)) self_lo = (uintptr_t)self_info.dli_fbase;
+        for (int i = 0; i < n; i++) {
+            for (unsigned d = 0; d < s_wprof_len[i]; d++) {
+                const uintptr_t pc = s_wprof_buf[i][d];
+                Dl_info info;
+                if (dladdr((const void*)pc, &info) && (uintptr_t)info.dli_fbase != self_lo && info.dli_sname)
+                    fprintf(f, "%s@%s", d ? " " : "", info.dli_sname);
+                else
+                    fprintf(f, "%s%llx", d ? " " : "", (unsigned long long)(pc - (uintptr_t)slide));
+            }
+            fputc('\n', f);
+        }
+        fclose(f);
+    }
+    fprintf(stderr, "[walker prof] %d samples -> %s\n", n, out ? out : "(none)");
+    atomic_store(&s_wprof_state, 2);
+    return NULL;
+}
+static void wprof_note_walker(void)
+{
+    if (atomic_load_explicit(&s_wprof_state, memory_order_relaxed) != 0) return;
+    /* One caller arms it; that thread is the one sampled. */
+    int unset = 0;
+    if (!atomic_compare_exchange_strong(&s_wprof_state, &unset, 1)) return;
+    const char* out = getenv("RSX_WALKER_PROF");
+    if (!out || !*out) { atomic_store(&s_wprof_state, 2); return; }
+    s_wprof_buf = calloc(WPROF_MAX, sizeof *s_wprof_buf);
+    s_wprof_len = calloc(WPROF_MAX, 1);
+    if (!s_wprof_buf || !s_wprof_len) { atomic_store(&s_wprof_state, 2); return; }
+    s_wprof_target = pthread_self();
+    pthread_t t;
+    if (pthread_create(&t, NULL, wprof_thread, NULL) != 0) {
+        fprintf(stderr, "[walker prof] sampler thread not started\n");
+        atomic_store(&s_wprof_state, 2);
+        return;
+    }
+    pthread_detach(t);
+}
+#else
+static void wprof_note_walker(void) {}
+#endif
+
+/* Host thread that last walked the FIFO, for PS3_SAMPLE_DRAIN. */
+volatile unsigned long g_gcm_drain_tid;
+
 void cellGcm_rsx_process_fifo(void)
 {
+    wprof_note_walker();
+    g_gcm_drain_tid = GetCurrentThreadId();
     const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
     AcquireSRWLockExclusive(&s_gcm_fifo_lock);
     gcm_rsx_process_fifo_unlocked();
@@ -1951,6 +2199,21 @@ void cellGcm_rsx_process_fifo(void)
         const uint64_t t1 = ps3_ft_now();
         if (t1 - ft_t0 >= ps3_ft_min_ns())
             ps3_ft_span(PS3_FT_DRAIN, 0, s_ft_sema_t0 ? 1u : 0u, 0, ft_t0, t1);
+    }
+}
+
+/* The methods rsx_process_method acts on beyond its own rsx_state: the notify
+ * and semaphore DMA contexts, the notify write, the back-end label offset and
+ * label writes, and SET_REFERENCE (g_rsx_last_reference). Everything else only
+ * updates state for a vtable backend. */
+static int gcm_legacy_method_has_effect(u32 m)
+{
+    switch (m) {
+    case 0x0050u: case 0x0104u: case 0x0180u: case 0x01A4u:
+    case 0x1D6Cu: case 0x1D70u: case 0x1D74u:
+        return 1;
+    default:
+        return 0;
     }
 }
 
@@ -1999,10 +2262,11 @@ static int gcm_pos_flip_set(u32 ctx, u32 bufferId, int prepare)
     if (g_gcm_trace_hook) g_gcm_trace_hook(9, io, bufferId | (prepare ? 0x100u : 0u));
     return 1;
 }
-static void gcm_fire_pos_flip(void)
+static void gcm_fire_pos_flip(rsx_state* st)
 {
     const u32 id = s_pos_flip_id;
     s_pos_flip_io = GCM_NO_POS_FLIP;
+    gcm_fifo_flip_resets_state(st);                 /* as at a flip marker */
     if (g_gcm_trace_hook) g_gcm_trace_hook(10, s_fifo_getoff, id);
     s_current_display_buffer_id = id & 7u;
     s_flip_pending = 1;
@@ -2028,6 +2292,143 @@ static void gcm_fire_pos_flip(void)
  * processor too, as before the walker's fast paths. */
 int g_gcm_fifo_fast = 1;
 
+/* Any per-word FIFO switch set, or a mirrored draw engine on. Read once per
+ * drain: the walker hands every data word through these checks, a million a
+ * second in God of War HD gameplay, and it used to test each switch on its
+ * own for every word. */
+static int gcm_word_diag(void)
+{
+    static int env = -1;
+    if (env < 0)
+        env = (getenv("GCM_SUBCH7") || getenv("GCM_OBJDBG") || getenv("GCM_SUBCH_GATE") || getenv("GCM_WORD_STATS") ||
+               getenv("GCM_VAL_WATCH") || getenv("GCM_METHOD_HIST") || getenv("RSX_LIVE_FEED_DBG") ||
+               getenv("GCM_SUBCH_HIST")) ? 1 : 0;
+    /* The engines are asked each drain: the draw engine says it is off until
+     * a backend has registered, and a drain can run before that. */
+    return env || rsx_live_draw_enabled() || rsx_draw_engine_enabled();
+}
+
+/* One data word for the 3D engine (subchannel 0, or 1 unless GCM_SUBCH1_2D),
+ * plus the methods whose answer the walker writes itself. */
+static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
+{
+    extern u32 g_rsx_last_reference;
+    if (m == 0x1D70u || m == 0x1D74u) gcm_report_copies_flush();
+    /* rsx_state feeds only the legacy vtable backend (#466). With the draw
+     * engine drawing and no vtable registered, the state it builds is never
+     * read: of what the old processor does, only the labels and the reference
+     * are still needed, and what decides where a label or a notify lands --
+     * SET_CONTEXT_DMA_SEMAPHORE (0x1A4, a main-memory semaphore DMA object)
+     * and SET_CONTEXT_DMA_NOTIFIES / NOTIFY (0x180 / 0x104). The callers pass
+     * legacy_state_live set while anything else wants every method (a vtable
+     * backend, no draw engine, RSX_TRACE, the word-by-word walk). The gate
+     * lives here rather than at the call sites because every 3D method comes
+     * through this function (#554): the run fast path and the word loop. */
+    if (legacy_state_live || gcm_legacy_method_has_effect(m))
+        rsx_process_method(st, m, v);
+    if ((m == 0x1D70u || m == 0x1D74u) && g_gcm_label_write_hook) g_gcm_label_write_hook();
+    /* NV406E_SET_REFERENCE: queue the fence value for PACED
+     * publication (gcm_ref_publish below) instead of letting a
+     * later fence in the same batch overwrite it. */
+    if (m == 0x50) gcm_ref_push_at(g_rsx_last_reference, s_fifo_getoff);
+    /* NV4097_GET_REPORT: (type << 24) | offset into the report
+     * area. Sample counts are not measured, so a ZPASS query
+     * reports "visible" -- the conservative answer; reading 0
+     * tells the title every queried object is occluded. */
+    /* NV4097_CLEAR_REPORT_VALUE(ZPASS): the draw engine counts
+     * the samples of the draws up to the next GET_REPORT. */
+    if (m == 0x17C8 && v == 1u) s_zpass_query_open = 1;
+    if (m == 0x1A8) s_report_dma = v;
+    if (m == 0x1800) {
+        const u32 off = v & 0xFFFFFFu, idx = off / 16u;
+        /* GCM_REPORT_LOG=1: every report command, uncapped (how
+         * many queries a frame issues, and of which type). */
+        { static int rn = 0, all = -1; if (all < 0) all = getenv("GCM_REPORT_LOG") ? 1 : 0;
+          if (all || PS3_LOG_FIRST(rn, 6)) printf("[GET_REPORT] type=%u off=0x%X dma=0x%08X%c", v >> 24, off, s_report_dma, 10); }
+        /* A report DMA object in main memory: the report lands at
+         * that IO offset (CellGcmReportData, big-endian: u64
+         * timer, u32 value, u32 padding). */
+        if (s_report_dma == 0xFEED0001u || s_report_dma == 0xBAD68000u) {
+            s_zpass_query_open = 0;
+            const u64 ts = gcm_report_timestamp();
+            const u32 val = (v >> 24) == 1u ? 0xFFFFu : 0u;
+            const u32 rea = gcm_io2ea(off);
+            if (rea) {
+                vm_write32(rea, (u32)(ts >> 32));
+                vm_write32(rea + 4u, (u32)ts);
+                vm_write32(rea + 8u, val);
+                vm_write32(rea + 12u, 0u);
+            } else { static int un = 0; if (PS3_LOG_FIRST(un, 4)) printf("[GET_REPORT] main-memory offset 0x%X is not IO-mapped%c", off, 10); }
+        } else {
+            static int no_queries = -1;
+            if (no_queries < 0) no_queries = getenv("RSX_NO_QUERIES") ? 1 : 0;
+            const int measured_query = (v >> 24) == 1u && s_zpass_query_open &&
+                                       rsx_draw_engine_enabled() && !no_queries;
+            s_zpass_query_open = 0;
+            if (idx < CELL_GCM_MAX_REPORT_COUNT && !(measured_query && s_report_measured[idx])) {
+                s_report_data[idx].timestamp = get_timestamp_ns();
+                /* GCM_ZPASS_VALUE=<n>: the sample count a ZPASS
+                 * report carries when it is not measured (default
+                 * 0xFFFF, "visible"). */
+                { static long zp = -2; if (zp == -2) { const char* e = getenv("GCM_ZPASS_VALUE"); zp = e ? strtol(e, 0, 0) : 0xFFFF; }
+                  s_report_data[idx].value = (v >> 24) == 1u ? (u32)zp : 0u; }
+            }
+            /* The report lands in GUEST memory as well: the SDK's
+             * cellGcmGetReportDataAddress and friends are inline
+             * helpers that compute localAddress + 0x0E000000 +
+             * index * 16 and read the CellGcmReportData there
+             * ({timestamp, value, zero}, big-endian). Only the host
+             * array above was ever written, so a title that polls the
+             * area -- Drakengard 3's UE3 renderer, for every occlusion
+             * query it issues -- read value 0: "no pixels passed",
+             * every queried object occluded, hidden until the next
+             * re-test. Characters, props and distant buildings
+             * flickered in for a frame and vanished again. */
+            {
+                const u64 ts = get_timestamp_ns();
+                const u32 val = (v >> 24) == 1u ? 0xFFFFu : 0u;
+                /* The local report area follows the 256 labels in the
+                 * same window (notify, labels, reports: the layout the
+                 * real system exposes through cellGcmGetLabelAddress,
+                 * and the one a title's inline report readers derive
+                 * from it). The HLE window has 0x1000 bytes between the
+                 * labels and the control block, room for 256 reports;
+                 * a title that uses more is reported once. */
+                if (off + 16u <= 0x1000u) {
+                    const u32 rea = GCM_LABEL_GUEST_BASE + 0x1000u + off;
+                    vm_write32(rea + 0, (u32)(ts >> 32));
+                    vm_write32(rea + 4, (u32)ts);
+                    vm_write32(rea + 8, val);
+                    vm_write32(rea + 12, 0u);
+                } else { static int _n = 0; if (PS3_LOG_FIRST(_n, 4))
+                    printf("[GET_REPORT] index %u beyond the 256 the label window holds\n", idx); }
+                /* GCM_REPORT_LOCAL_MIRROR=1 also writes the report at
+                 * local offset 0x0E000000 + offset. Off by default:
+                 * that range is the title's own VRAM -- the real local
+                 * report area is in the driver's reserved block (RPCS3
+                 * keeps it with the labels) -- and Drakengard 3 keeps
+                 * vertex streams there. Reports 0x7FC-0x7FF landed
+                 * in the middle of a mesh's per-vertex float stream
+                 * outside the village, and the timestamps read as
+                 * 1e18 lit the object up as a blinding white box. */
+                static int local_mirror = -1;
+                if (local_mirror < 0) { const char* e = getenv("GCM_REPORT_LOCAL_MIRROR"); local_mirror = e ? atoi(e) : 0; }
+                if (local_mirror && s_config.localAddress && off + 16u <= s_config.localSize) {
+                    const u32 rea = s_config.localAddress + 0x0E000000u + off;
+                    vm_write32(rea + 0, (u32)(ts >> 32));
+                    vm_write32(rea + 4, (u32)ts);
+                    vm_write32(rea + 8, val);
+                    vm_write32(rea + 12, 0u);
+                }
+            }
+        }
+    }
+}
+
+
+/* The diagnostic switches below are tested on every drain pass, and GCM_RECDBG
+ * on every semaphore method. getenv walks the whole environment and showed in
+ * RSX-thread profiles, so each is read once and cached, like the other knobs. */
 static void gcm_rsx_process_fifo_unlocked(void)
 {
     { static unsigned _n = 0; static unsigned long long _t0 = 0;
@@ -2055,6 +2456,16 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * by s_gcm_ctx_out_ea, which stays 0 on that path. */
     if (!s_gcm_context_ea && !s_gcm_syscall_mode) return;
     if (!s_inited) { rsx_state_init(&s_state); s_inited = 1; }
+    const int wdiag = gcm_word_diag();
+    /* rsx_state feeds only the legacy vtable backend. With the draw engine
+     * up and no vtable registered, the state it builds is never read, and the
+     * only methods worth handing it are the ones with effects outside it
+     * (gcm_legacy_method_has_effect). RSX_TRACE still sees every method. */
+    static int s_rsx_trace = -1;
+    if (s_rsx_trace < 0) s_rsx_trace = getenv("RSX_TRACE") ? 1 : 0;
+    const int legacy_state_live = rsx_get_backend() != NULL || !rsx_draw_engine_enabled() ||
+                                  s_rsx_trace;
+
 
     /* Walk the FIFO exactly like the RSX: chase the guest-written `put` (an IO
      * offset in the control register), decoding method headers and following
@@ -2112,8 +2523,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * present in 0..put. "The title waits for a fence we never published" has
      * two very different causes -- we missed the command, or it was never
      * submitted -- and only a direct scan of the ring separates them. */
-    { static int scanned = 0;
-      if (!scanned && getenv("GCM_SCANREF") && put >= 0x19F0) { scanned = 1;
+    { static int scanned = 0, scanref = -1;
+      if (scanref < 0) scanref = getenv("GCM_SCANREF") ? 1 : 0;
+      if (!scanned && scanref && put >= 0x19F0) { scanned = 1;
         unsigned found = 0;
         for (u32 io = 0; io + 8 <= put; io += 4) {
             u32 ea = gcm_io2ea(io); if (!ea) continue;
@@ -2179,10 +2591,10 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * (Drakengard 3 sets it). */
     static int sub1_2d = -1;
     if (sub1_2d < 0) { const char* e = getenv("GCM_SUBCH1_2D"); sub1_2d = e ? atoi(e) : 0; }
-    if (s_fifo_getoff == s_pos_flip_io) gcm_fire_pos_flip();
+    if (s_fifo_getoff == s_pos_flip_io) gcm_fire_pos_flip(&s_state);
     while (s_fifo_getoff != put && budget-- > 0) {
         if (s_fifo_getoff == s_pos_flip_io) {
-            gcm_fire_pos_flip();
+            gcm_fire_pos_flip(&s_state);
             if (gcm_fifo_backlog(put, s_fifo_getoff) < GCM_FIFO_CATCHUP_BYTES)   /* as at a flip marker */
                 { why = "flip"; break; }
         }
@@ -2254,7 +2666,39 @@ static void gcm_rsx_process_fifo_unlocked(void)
                   fprintf(stderr, "\n");
                   nop = hdr = jmp = cal = ret = 0; t0 = now;
               } } }
+        /* A run of NOP words. God of War HD builds command blocks on SPUs into
+         * fixed-size reservations and leaves the rest of each one zero: in
+         * gameplay about 4.6 million NOPs a second against 1.2 million command
+         * headers, and each NOP went through the whole decode below. The RSX
+         * does nothing for them, so the run is passed over at once, up to
+         * `put` or the end of this 1 MB IO page (the next word may map
+         * elsewhere). Each NOP still spends a word of this tick's budget: the
+         * skip is a faster decode, not a bigger tick, and VF5 depends on the
+         * walker yielding at the cap (it lost 7 milestones when a whole run
+         * cost one word). Nor does it pass a positioned flip (gcm_pos_flip_set):
+         * that fires when `get` lands on its offset. */
+        if (!w && !wdiag) {
+            const u32 page_end = (s_fifo_getoff | 0xFFFFFu) + 1u;
+            u32 lim = (put > s_fifo_getoff && put < page_end) ? put : page_end;
+            if (s_pos_flip_io > s_fifo_getoff && s_pos_flip_io < lim) lim = s_pos_flip_io;
+            u32 off = s_fifo_getoff + 4u, nea = ea + 4u;
+            while (off < lim && budget > 0 && !vm_read32(nea)) { off += 4u; nea += 4u; budget--; }
+            if (s_fifo_getoff < put) s_last_ring_off = off;
+            s_fifo_getoff = off;
+            continue;
+        }
         u32 type = w >> 29;
+        /* The walker is reading something other than the park it waited on:
+         * it has left it, by the patched word (a JUMP elsewhere, or commands
+         * written over the park) or by a resync. Forget the park here. Kept,
+         * its start time survived until the walker next stopped at the same
+         * address with the same put -- a title that reuses its command blocks
+         * does that -- and that park then inherited a grace that had already
+         * run out, so the jump-park resync fired at once and dropped the
+         * commands the title was about to link in. */
+        if (park_off && (s_fifo_getoff != park_off ||
+                         (w & 0xE0000003u) != 0x20000000u || (w & 0x1FFFFFFCu) != park_off))
+            park_off = 0;
 
         if ((w & 0xFFFF0000u) == 0xFEAD0000u) {
             /* lv1 driver flip: statically-linked libgcm cellGcmSetFlip writes
@@ -2265,6 +2709,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
              * frame split across 4 presents, layout flashing/zooming). */
             extern s32 cellGcmSetFlipCommand(u32 bufferId);
             s_fifo_getoff += 4;
+            gcm_fifo_flip_resets_state(&s_state);
             /* Count the flip WORDS the title actually writes into the FIFO,
              * separately from the presents that result. When a title stops
              * appearing on screen the first question is which side stopped:
@@ -2395,12 +2840,17 @@ static void gcm_rsx_process_fifo_unlocked(void)
                    * takes between the two stores. */
                   if (put != s_fifo_getoff) {
                       extern unsigned long long ps3_ms_now(void);
-                      static u32 park_off, park_put;
-                      static unsigned long long park_since;
                       const unsigned long long now = ps3_ms_now();
                       if (park_off != s_fifo_getoff || park_put != put) {
                           park_off = s_fifo_getoff; park_put = put; park_since = now;
-                      } else if (now - park_since >= GCM_PARK_GRACE_MS) {
+                      } else if (now - park_since >= gcm_park_grace_ms() &&
+                                 /* Read the park again before giving up on it.
+                                  * An SPU job that fills a command-buffer hole
+                                  * (Edge geometry reserves them as self-JUMPs)
+                                  * can land between this pass's read and the
+                                  * resync, which would then jump over the
+                                  * commands it just wrote. */
+                                 vm_read32(gcm_io2ea(s_fifo_getoff)) == w) {
                           park_off = 0;
                           gcm_fifo_dump_around(s_fifo_getoff);
                           gcm_fifo_resync_why("jump-park", &s_fifo_getoff, put);
@@ -2485,7 +2935,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     u32 m = (type == 0) ? method + i * 4 : method;
                     u32 v = vm_read32(dea);
                     u32 la = GCM_LABEL_GUEST_BASE + (s_sema_offset & 0xFFFFu);
-                    { static int sn = 0; if (getenv("GCM_RECDBG") && PS3_LOG_FIRST(sn, 12))
+                    { static int sn = 0, recdbg = -1; if (recdbg < 0) recdbg = getenv("GCM_RECDBG") ? 1 : 0;
+                      if (recdbg && PS3_LOG_FIRST(sn, 12))
                         fprintf(stderr, "[SEMA] m=0x%02X v=0x%08X off=0x%X\n", m, v, s_sema_offset); }
                     /* PS3_FTRACE: an acquire this walker sat on is satisfied now. */
                     if (m == 0x68u && s_ft_sema_t0 && vm_read32(la) == v) {
@@ -2559,6 +3010,29 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     continue;
                 }
             }
+            static int s1_2d = -1;
+            if (s1_2d < 0) { const char* e = getenv("GCM_SUBCH1_2D"); s1_2d = e ? atoi(e) : 0; }
+            /* A run of 3D methods inside one 1 MB IO page, with no per-word
+             * diagnostic on: its words are contiguous in guest memory, so the
+             * offset is translated once and the per-word checks below, none of
+             * which can match, are skipped. Most of a frame's words come this
+             * way (God of War HD: about five million vertex-program microcode and
+             * constant words a second). */
+            if (!wdiag && count && (subch == 0 || (subch == 1 && !s1_2d)) &&
+                ((s_fifo_getoff + 4) >> 20) == ((s_fifo_getoff + count * 4) >> 20)) {
+                const u32 dea = gcm_io2ea(s_fifo_getoff + 4);
+                if (dea) {
+                    if (type == 0 && rsx_process_vp_run(&s_state, method, vm_base + dea, count)) {
+                        s_fifo_getoff += 4 + count * 4;
+                        continue;
+                    }
+                    for (u32 i = 0; i < count; i++)
+                        gcm_3d_method(&s_state, type == 0 ? method + i * 4 : method,
+                                      vm_read32(dea + i * 4), legacy_state_live || !fifo_fast);
+                    s_fifo_getoff += 4 + count * 4;
+                    continue;
+                }
+            }
             for (u32 i = 0; i < count; i++) {
                 u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
                 if (!dea) break;
@@ -2569,7 +3043,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * is not a 2D method at all: it tells the RSX to raise a
                  * USER_CMD interrupt, which is what ps1_netemu's flip path
                  * blocks on. */
-                { static int sd = -1; static unsigned long s7 = 0;
+                if (wdiag) { static int sd = -1; static unsigned long s7 = 0;
                   if (sd < 0) sd = getenv("GCM_SUBCH7") ? 1 : 0;
                   if (sd && subch == 7 && (PS3_LOG_FIRST(s7, 16)))
                       fprintf(stderr, "[subch7] method=0x%04X data=0x%08X\n",
@@ -2602,7 +3076,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * title binds to a subchannel is what says which engine that
                  * subchannel drives; comparing subchannel 1 against subchannel 0
                  * turns the routing below from a guess into a reading. */
-                { static int od = -1;
+                if (wdiag) { static int od = -1;
                   if (od < 0) { const char* e = getenv("GCM_OBJDBG"); od = e ? 1 : 0; }
                   if (od && m == 0) {
                       static unsigned seen[8]; static int have[8];
@@ -2626,11 +3100,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * for every draw in the game. Treat the subchannels the 2D path
                  * does not claim as 3D. GCM_SUBCH1_2D=1 restores the old split.
                  */
-                static int s1_2d = -1;
-                if (s1_2d < 0) { const char* e = getenv("GCM_SUBCH1_2D"); s1_2d = e ? atoi(e) : 0; }
                 /* GCM_SUBCH_GATE=<file>: while <file> exists, log every method on a
                  * non-zero subchannel -- what each binding slot actually carries. */
-                { static const char* sg = (const char*)-1; static unsigned poll; static int open_g;
+                if (wdiag) { static const char* sg = (const char*)-1; static unsigned poll; static int open_g;
                   if (sg == (const char*)-1) sg = getenv("GCM_SUBCH_GATE");
                   const u32 cm3 = m & 0x1FFCu;
                   /* GCM_VAL_WATCH=<hex>: every FIFO word carrying that value, any method. */
@@ -2654,13 +3126,13 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * engine (caner / canersaka). Inert unless RSX_LIVE_DRAW is set.
                  * It wants the raw method with its subchannel bits -- it
                  * canonicalises with & 0x1FFC itself. */
-                { static int live = -1;
+                if (wdiag) { static int live = -1;
                   if (live < 0) live = rsx_live_draw_enabled();
                   if (live) rsx_live_draw_method((subch << 13) | m, vm_read32(dea)); }
                 /* GCM_METHOD_HIST=<secs>: every <secs>, the most frequent
                  * (subchannel, method) pairs dispatched since the last report --
                  * what a frame is actually made of when nothing draws. */
-                { static int hs = -1; static u32 cnt[8][0x800]; static unsigned long long t0;
+                if (wdiag) { static int hs = -1; static u32 cnt[8][0x800]; static unsigned long long t0;
                   if (hs < 0) { const char* e = getenv("GCM_METHOD_HIST"); hs = e ? atoi(e) : 0; }
                   if (hs > 0) {
                       cnt[subch & 7][(m & 0x1FFCu) >> 2]++;
@@ -2704,7 +3176,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 /* GCM_SUBCH_HIST=<n>: every n drained words, the methods each
                  * non-zero subchannel carried since the last report (top 16
                  * by count) -- which engine is really bound where. */
-                { static long hist_every = -2; static unsigned long hist_n = 0;
+                if (wdiag) { static long hist_every = -2; static unsigned long hist_n = 0;
                   static unsigned cnt[8][0x800];
                   if (hist_every == -2) { const char* e = getenv("GCM_SUBCH_HIST"); hist_every = e ? atol(e) : -1; }
                   if (hist_every > 0) {
@@ -2733,7 +3205,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 /* RSX_LIVE_FEED_DBG=1: what the FIFO actually carries. Counted
                  * for any run, live engine or not, so the method stream and the
                  * backend's draw callbacks can be compared in one measurement. */
-                { static int fdbg = -1;
+                if (wdiag) { static int fdbg = -1;
                   if (fdbg < 0) fdbg = getenv("RSX_LIVE_FEED_DBG") ? 1 : 0;
                   if (fdbg) {
                       static long long n_be = 0, n_va = 0, n_ia = 0, tick = 0;
@@ -2756,113 +3228,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 } else if (mfull == 0xE920u || mfull == 0xE924u) {
                     cellGcmSetFlipCommand(vm_read32(dea) & 7u);
                 } else if (subch == 0 || (subch == 1 && !s1_2d)) {
-                    if (m == 0x1D70u || m == 0x1D74u) gcm_report_copies_flush();
-                    /* With the draw engine drawing, the old processor has no
-                     * backend: of what it does, only the labels and the
-                     * reference are still read -- and what decides where a
-                     * label or a notify lands: SET_CONTEXT_DMA_SEMAPHORE
-                     * (0x1A4, a main-memory semaphore DMA object), and
-                     * SET_CONTEXT_DMA_NOTIFIES / NOTIFY (0x180 / 0x104). */
-                    if (!fifo_fast || m == 0x50u || m == 0x1D6Cu || m == 0x1D70u || m == 0x1D74u ||
-                        m == 0x1A4u || m == 0x180u || m == 0x104u)
-                        rsx_process_method(&s_state, m, vm_read32(dea));
-                    if ((m == 0x1D70u || m == 0x1D74u) && g_gcm_label_write_hook) g_gcm_label_write_hook();
-                    /* NV406E_SET_REFERENCE: queue the fence value for PACED
-                     * publication (gcm_ref_publish below) instead of letting a
-                     * later fence in the same batch overwrite it. */
-                    if (m == 0x50) gcm_ref_push_at(g_rsx_last_reference, s_fifo_getoff);
-                    /* NV4097_GET_REPORT: (type << 24) | offset into the report
-                     * area. Sample counts are not measured, so a ZPASS query
-                     * reports "visible" -- the conservative answer; reading 0
-                     * tells the title every queried object is occluded. */
-                    /* NV4097_CLEAR_REPORT_VALUE(ZPASS): the draw engine counts
-                     * the samples of the draws up to the next GET_REPORT. */
-                    if (m == 0x17C8 && vm_read32(dea) == 1u) s_zpass_query_open = 1;
-                    if (m == 0x1A8) s_report_dma = vm_read32(dea);
-                    if (m == 0x1800) {
-                        const u32 v = vm_read32(dea), off = v & 0xFFFFFFu, idx = off / 16u;
-                        /* GCM_REPORT_LOG=1: every report command, uncapped (how
-                         * many queries a frame issues, and of which type). */
-                        { static int rn = 0, all = -1; if (all < 0) all = getenv("GCM_REPORT_LOG") ? 1 : 0;
-                          if (all || PS3_LOG_FIRST(rn, 6)) printf("[GET_REPORT] type=%u off=0x%X dma=0x%08X%c", v >> 24, off, s_report_dma, 10); }
-                        /* A report DMA object in main memory: the report lands at
-                         * that IO offset (CellGcmReportData, big-endian: u64
-                         * timer, u32 value, u32 padding). */
-                        if (s_report_dma == 0xFEED0001u || s_report_dma == 0xBAD68000u) {
-                            s_zpass_query_open = 0;
-                            const u64 ts = gcm_report_timestamp();
-                            const u32 val = (v >> 24) == 1u ? 0xFFFFu : 0u;
-                            const u32 rea = gcm_io2ea(off);
-                            if (rea) {
-                                vm_write32(rea, (u32)(ts >> 32));
-                                vm_write32(rea + 4u, (u32)ts);
-                                vm_write32(rea + 8u, val);
-                                vm_write32(rea + 12u, 0u);
-                            } else { static int un = 0; if (PS3_LOG_FIRST(un, 4)) printf("[GET_REPORT] main-memory offset 0x%X is not IO-mapped%c", off, 10); }
-                        } else {
-                            static int no_queries = -1;
-                            if (no_queries < 0) no_queries = getenv("RSX_NO_QUERIES") ? 1 : 0;
-                            const int measured_query = (v >> 24) == 1u && s_zpass_query_open &&
-                                                       rsx_draw_engine_enabled() && !no_queries;
-                            s_zpass_query_open = 0;
-                            if (idx < CELL_GCM_MAX_REPORT_COUNT && !(measured_query && s_report_measured[idx])) {
-                                s_report_data[idx].timestamp = get_timestamp_ns();
-                                /* GCM_ZPASS_VALUE=<n>: the sample count a ZPASS
-                                 * report carries when it is not measured (default
-                                 * 0xFFFF, "visible"). */
-                                { static long zp = -2; if (zp == -2) { const char* e = getenv("GCM_ZPASS_VALUE"); zp = e ? strtol(e, 0, 0) : 0xFFFF; }
-                                  s_report_data[idx].value = (v >> 24) == 1u ? (u32)zp : 0u; }
-                            }
-                            /* The report lands in GUEST memory as well: the SDK's
-                             * cellGcmGetReportDataAddress and friends are inline
-                             * helpers that compute localAddress + 0x0E000000 +
-                             * index * 16 and read the CellGcmReportData there
-                             * ({timestamp, value, zero}, big-endian). Only the host
-                             * array above was ever written, so a title that polls the
-                             * area -- Drakengard 3's UE3 renderer, for every occlusion
-                             * query it issues -- read value 0: "no pixels passed",
-                             * every queried object occluded, hidden until the next
-                             * re-test. Characters, props and distant buildings
-                             * flickered in for a frame and vanished again. */
-                            {
-                                const u64 ts = get_timestamp_ns();
-                                const u32 val = (v >> 24) == 1u ? 0xFFFFu : 0u;
-                                /* The local report area follows the 256 labels in the
-                                 * same window (notify, labels, reports: the layout the
-                                 * real system exposes through cellGcmGetLabelAddress,
-                                 * and the one a title's inline report readers derive
-                                 * from it). The HLE window has 0x1000 bytes between the
-                                 * labels and the control block, room for 256 reports;
-                                 * a title that uses more is reported once. */
-                                if (off + 16u <= 0x1000u) {
-                                    const u32 rea = GCM_LABEL_GUEST_BASE + 0x1000u + off;
-                                    vm_write32(rea + 0, (u32)(ts >> 32));
-                                    vm_write32(rea + 4, (u32)ts);
-                                    vm_write32(rea + 8, val);
-                                    vm_write32(rea + 12, 0u);
-                                } else { static int _n = 0; if (PS3_LOG_FIRST(_n, 4))
-                                    printf("[GET_REPORT] index %u beyond the 256 the label window holds\n", idx); }
-                                /* GCM_REPORT_LOCAL_MIRROR=1 also writes the report at
-                                 * local offset 0x0E000000 + offset. Off by default:
-                                 * that range is the title's own VRAM -- the real local
-                                 * report area is in the driver's reserved block (RPCS3
-                                 * keeps it with the labels) -- and Drakengard 3 keeps
-                                 * vertex streams there. Reports 0x7FC-0x7FF landed
-                                 * in the middle of a mesh's per-vertex float stream
-                                 * outside the village, and the timestamps read as
-                                 * 1e18 lit the object up as a blinding white box. */
-                                static int local_mirror = -1;
-                                if (local_mirror < 0) { const char* e = getenv("GCM_REPORT_LOCAL_MIRROR"); local_mirror = e ? atoi(e) : 0; }
-                                if (local_mirror && s_config.localAddress && off + 16u <= s_config.localSize) {
-                                    const u32 rea = s_config.localAddress + 0x0E000000u + off;
-                                    vm_write32(rea + 0, (u32)(ts >> 32));
-                                    vm_write32(rea + 4, (u32)ts);
-                                    vm_write32(rea + 8, val);
-                                    vm_write32(rea + 12, 0u);
-                                }
-                            }
-                        }
-                    }
+                    gcm_3d_method(&s_state, m, vm_read32(dea), legacy_state_live || !fifo_fast);
                 } else
                     gcm_2d_method(subch, m, vm_read32(dea));
                 }
@@ -3047,6 +3413,14 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_begin);  /* put */
                 s_fifo_getoff = io_begin;                          /* get */
                 put = io_begin;
+                /* Count it as the walker taking the JUMP to begin. The title's
+                 * own callback can be recycling at the same moment: it writes
+                 * its JUMP and `put`, and only then marks itself waiting, so a
+                 * pass that read the mark clear can still land here. It then
+                 * waits for a backward JUMP that never comes, because `get` is
+                 * already at begin == put. God of War HD stopped for 2-4 s at
+                 * random points in gameplay this way. */
+                s_fifo_back_jumps++;
                 static int n = 0;
                 if (PS3_LOG_FIRST(n, 8))
                     fprintf(stderr, "[cellGcmSys] recycled the title's own ring "
@@ -3329,7 +3703,8 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
           }
       } }
 
-    { static int _n=0; if (getenv("FLIP_DBG") && PS3_LOG_FIRST(_n, 20))
+    { static int _n=0, _fd=-1; if (_fd < 0) _fd = getenv("FLIP_DBG") ? 1 : 0;
+      if (_fd && PS3_LOG_FIRST(_n, 20))
         fprintf(stderr, "[FLIP] SetFlipCommand(buf=%u) set=%d\n",
                 bufferId, bufferId < CELL_GCM_MAX_DISPLAY_BUFFER_NUM ? s_display_buffer_set[bufferId] : -1); }
     if (bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM)
@@ -4346,6 +4721,7 @@ void cellGcmTerminate(void)
     memset(&s_config, 0, sizeof(s_config));
     memset(&s_control, 0, sizeof(s_control));
     memset(s_io_mappings, 0, sizeof(s_io_mappings));
+    __atomic_store_n(&s_io_mapping_hw, 0, __ATOMIC_RELAXED);
     memset(s_tiles, 0, sizeof(s_tiles));
     memset(s_zcull, 0, sizeof(s_zcull));
     memset(s_report_data, 0, sizeof(s_report_data));
@@ -4576,6 +4952,9 @@ void cellGcmQueueUserCommand(u32 cmd)
 {
     GCM_USER_STORE(cmd);
     GCM_USER_PENDING_STORE((1ULL << 32) | cmd);
+#ifdef _WIN32
+    gcm_pump_wake();
+#endif
 }
 
 /* Invalidate a tile region (unbind + clear) */

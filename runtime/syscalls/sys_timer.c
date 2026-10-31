@@ -6,6 +6,7 @@
 #define _DEFAULT_SOURCE /* tm_gmtoff on glibc */
 #endif
 #include "sys_timer.h"
+#include "sys_ppu_thread.h"   /* ppu_thread_note_block */
 #include <time.h>
 #include "sys_event.h"
 #include "../memory/vm.h"
@@ -20,6 +21,10 @@
 #include "ps3emu/env_cache.h"
 #define getenv(name) ps3_env(name)
 #include "ps3emu/log_first.h"
+#ifdef __APPLE__
+#include <mach/mach_time.h>
+#endif
+#include "ps3emu/thread_name.h"
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -79,13 +84,32 @@ uint64_t ppu_timebase_now(void)
     uint64_t q = (uint64_t)s_qpc_freq.QuadPart;
     return (d / q) * PS3_TIMEBASE_FREQ + (d % q) * PS3_TIMEBASE_FREQ / q;
 #else
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    const uint64_t ns = (uint64_t)ps3_guest_ticks((int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec);
+    const uint64_t ns = (uint64_t)ps3_guest_ticks((int64_t)host_monotonic_ns());
     return (ns / 1000000000ull) * PS3_TIMEBASE_FREQ +
            (ns % 1000000000ull) * PS3_TIMEBASE_FREQ / 1000000000ull;
 #endif
 }
+
+#ifndef _WIN32
+uint64_t host_monotonic_ns(void)
+{
+#ifdef __APPLE__
+    static uint32_t numer, denom;
+    if (!denom) {                       /* benign race: same values either way */
+        mach_timebase_info_data_t tb;
+        mach_timebase_info(&tb);
+        numer = tb.numer; denom = tb.denom;
+    }
+    const uint64_t t = mach_absolute_time();
+    /* Split so t * numer cannot overflow (numer is 125 on Apple silicon). */
+    return (t / denom) * numer + (t % denom) * numer / denom;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+#endif
+}
+#endif
 
 /* Guest time = host time - the time spent paused, held at s_guest_hold while
  * paused. Readers load the hold before the paused total and the resume
@@ -109,9 +133,7 @@ void ps3_guest_clock_pause(int paused)
     QueryPerformanceCounter(&c);
     const int64_t now = c.QuadPart, ms = s_qpc_freq.QuadPart / 1000;
 #else
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    const int64_t now = (int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec, ms = 1000000;
+    const int64_t now = (int64_t)host_monotonic_ns(), ms = 1000000;
 #endif
     const int64_t hold = __atomic_load_n(&s_guest_hold, __ATOMIC_ACQUIRE);
     if (paused && hold == INT64_MAX) {
@@ -176,6 +198,7 @@ int g_usleep_spin_below = 500;
 int64_t sys_timer_usleep(ppu_context* ctx)
 {
     uint64_t usec = LV2_ARG_U64(ctx, 0);
+    ppu_thread_note_block(ctx->thread_id);   /* PS3_PRIO_START */
     if (g_lv2_usleep_pre) g_lv2_usleep_pre(ctx, &usec);
     if (g_lv2_usleep_hook && g_lv2_usleep_hook((uint32_t)ctx->lr, usec)) return CELL_OK;
     /* A single sleep longer than a second is almost always a computed delay
@@ -404,6 +427,7 @@ int64_t sys_timer_usleep(ppu_context* ctx)
 int64_t sys_timer_sleep(ppu_context* ctx)
 {
     uint32_t sec = LV2_ARG_U32(ctx, 0);
+    ppu_thread_note_block(ctx->thread_id);   /* PS3_PRIO_START */
 
 #ifdef _WIN32
     Sleep(sec * 1000);
@@ -574,8 +598,7 @@ static uint64_t timer_now_us(void)
     return (uint64_t)(n.QuadPart / f.QuadPart) * 1000000ull +
            (uint64_t)(n.QuadPart % f.QuadPart) * 1000000ull / (uint64_t)f.QuadPart;
 #else
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+    return host_monotonic_ns() / 1000ull;
 #endif
 }
 
@@ -583,6 +606,7 @@ static uint64_t timer_now_us(void)
 static DWORD WINAPI timer_thread_proc(LPVOID param)
 {
     sys_timer_info* t = (sys_timer_info*)param;
+    ps3_thread_name("lv2 timer");
 
     while (t->running) {
         DWORD ms = (DWORD)(t->period_usec / 1000);

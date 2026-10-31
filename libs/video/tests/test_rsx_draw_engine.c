@@ -17,6 +17,7 @@
 #include "ps3emu/env_cache.h"
 #include "ps3emu/vm_watch.h"
 #include "rsx_primitives.h"   /* RSX_PRIMITIVE_* */
+#include "rsx_test_programs.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -95,6 +96,7 @@ typedef struct {
     int n_texture_create, n_texture_release, n_texture_upload;
     int n_color_create, n_color_release, n_color_seeded;
     int n_depth_create, n_depth_snapshot;
+    u32 snapshot_w, snapshot_h;        /* the last depth snapshot request */
     int n_pipeline_create;
     rsx_be_render_state pipeline_rs;   /* the last pipeline's render state */
     int n_draw, n_clear_color, n_clear_ds, n_present;
@@ -109,11 +111,14 @@ typedef struct {
     u32 bound_surface, bound_depth, bound_pipeline;
     u32 draw_vertices, draw_indices, draw_stride;
     float draw_first_vertex[4];   /* ATTR0 of the first vertex handed over */
+    float captured_vertices[16][64];
+    u32 captured_indices[24];
     rsx_topology draw_topology;
     u32 scissor[4];
     u32 stencil_ref;
     u32 last_created_texture, last_created_color;
     u32 last_released;
+    float last_clear_depth;
 } StubState;
 
 static StubState stub;
@@ -178,7 +183,7 @@ static u32 stub_depth_create(void* u, u32 w, u32 h)
 { (void)u; (void)w; (void)h; stub.n_depth_create++; return stub_handle(); }
 
 static u32 stub_depth_snapshot(void* u, u32 d, u32 w, u32 h)
-{ (void)u; (void)d; (void)w; (void)h; stub.n_depth_snapshot++; return stub_handle(); }
+{ (void)u; (void)d; stub.snapshot_w = w; stub.snapshot_h = h; stub.n_depth_snapshot++; return stub_handle(); }
 
 static u32 stub_pipeline_create(void* u, const char* vs, const char* ps,
                                 const rsx_be_render_state* rs,
@@ -241,6 +246,14 @@ static void stub_draw(void* u, rsx_topology topology, const void* verts,
     memset(stub.draw_first_vertex, 0, sizeof stub.draw_first_vertex);
     if (verts && stride >= sizeof stub.draw_first_vertex)
         memcpy(stub.draw_first_vertex, verts, sizeof stub.draw_first_vertex);
+    memset(stub.captured_vertices, 0, sizeof stub.captured_vertices);
+    memset(stub.captured_indices, 0, sizeof stub.captured_indices);
+    if (verts && stride <= sizeof stub.captured_vertices[0])
+        for (u32 i = 0; i < count && i < 16; i++)
+            memcpy(stub.captured_vertices[i], (const u8*)verts + i * stride, stride);
+    if (indices)
+        memcpy(stub.captured_indices, indices,
+               (index_count < 24 ? index_count : 24) * sizeof(u32));
     stub.draw_topology = topology;
     stub.draw_vertices = count;
     stub.draw_stride = stride;
@@ -256,7 +269,7 @@ static void stub_clear_color(void* u, u32 s, const float rgba[4])
 }
 
 static void stub_clear_ds(void* u, u32 d, u32 f, float z, u8 s)
-{ (void)u; (void)d; (void)f; (void)z; (void)s; stub.n_clear_ds++; }
+{ (void)u; (void)d; (void)f; (void)s; stub.n_clear_ds++; stub.last_clear_depth = z; }
 
 static u32 presented_surface;
 static void stub_present(void* u, u32 s) { (void)u; presented_surface = s; stub.n_present++; }
@@ -328,6 +341,12 @@ static const rsx_draw_backend g_stub_backend = {
 #define M_INLINE_ARRAY        0x1818
 #define M_TEX_UNIT            0x1A00   /* + unit * 0x20 */
 #define M_STENCIL_FUNC_REF    0x0334
+#define M_CONTEXT_DMA_ZETA    0x0198
+#define M_ZSTENCIL_CLEAR      0x1D8C
+#define M_ZETA_PITCH          0x022C
+#define M_COLOR_MASK          0x0324
+#define M_DEPTH_WRITE         0x0A70
+#define M_DEPTH_TEST          0x0A74
 #define M_CLEAR_BUFFERS       0x1D94
 #define M_VP_UPLOAD_CONST_ID  0x1EFC
 #define M_VP_UPLOAD_CONST     0x1F00
@@ -340,10 +359,10 @@ static const rsx_draw_backend g_stub_backend = {
 
 static void m(u32 method, u32 arg) { rsx_draw_engine_method(method, arg); }
 
-static void engine_up(void)
+static void engine_up_with(const rsx_draw_backend* be)
 {
     memset(&stub, 0, sizeof stub);
-    rsx_draw_engine_set_backend(&g_stub_backend);
+    rsx_draw_engine_set_backend(be);
     if (rsx_draw_engine_init(1280, 720) != 0) {
         printf("[FAIL] engine init\n");
         exit(1);
@@ -357,6 +376,8 @@ static void engine_up(void)
     m(M_VTXFMT, 2u | (4u << 4) | (16u << 8));
     m(M_VTXBUF_OFFSET, 0x80000000u | VTX_OFFSET);
 }
+
+static void engine_up(void) { engine_up_with(&g_stub_backend); }
 
 static void engine_down(void)
 {
@@ -945,6 +966,73 @@ static void test_queued_flip_buffer(void)
     engine_down();
 }
 
+/* ---- indexed draws: big-endian index runs, restart sentinels ------------ */
+
+#define IDX_OFFSET 0x00030000u
+static void put_be(u8* p, u32 v, u32 bytes)
+{
+    for (u32 i = 0; i < bytes; i++) p[i] = (u8)(v >> (8u * (bytes - 1u - i)));
+}
+/* The x of the draw's k-th vertex, through its index list when it has one
+ * (a list of distinct vertices is drawn without). */
+static float drawn_x(u32 k)
+{
+    float x;
+    memcpy(&x, stub.captured_vertices[stub.draw_indices ? stub.captured_indices[k] : k], 4);
+    return x;
+}
+static int triangles_are(const u32* want, u32 n)
+{
+    if ((stub.draw_indices ? stub.draw_indices : stub.draw_vertices) != n) return 0;
+    for (u32 k = 0; k < n; k++) if (drawn_x(k) != (float)want[k]) return 0;
+    return 1;
+}
+static void indexed_case(const u32* idx, u32 n, int u32_indices, int restart, u32 sentinel,
+                         u32 prim, const u32* want, u32 nwant, const char* what)
+{
+    engine_up();
+    u8 saved[8 * 16]; memcpy(saved, vm_base + VTX_OFFSET, sizeof saved);
+    for (u32 i = 0; i < 8; i++) {
+        const float f[4] = { (float)i, 0.0f, 0.0f, 1.0f };
+        for (u32 c = 0; c < 4; c++) { u32 w; memcpy(&w, &f[c], 4); put_be(vm_base + VTX_OFFSET + i * 16 + c * 4, w, 4); }
+    }
+    const u32 esz = u32_indices ? 4u : 2u;
+    for (u32 i = 0; i < n; i++) put_be(vm_base + IDX_OFFSET + 8 + i * esz, idx[i], esz);
+    m(0x181C, IDX_OFFSET);                                 /* index array offset */
+    m(0x1820, 1u | ((u32_indices ? 0u : 1u) << 4));       /* main memory, type */
+    m(0x1DAC, restart ? 1u : 0u);
+    m(0x1DB0, sentinel);
+    m(M_BEGIN_END, prim);
+    m(0x1824, (8u / esz) | ((n - 1u) << 24));             /* first index past 8 bytes */
+    m(M_BEGIN_END, 0u);
+    CHECK(stub.n_draw == 1 && triangles_are(want, nwant), "%s (%u indices, %u vertices drawn)", what, stub.draw_indices, stub.draw_vertices);
+    memcpy(vm_base + VTX_OFFSET, saved, sizeof saved);
+    memset(vm_base + IDX_OFFSET, 0, 64);
+    m(0x1DAC, 0u);
+    engine_down();
+}
+static void test_indexed_runs(void)
+{
+    printf("-- indexed runs\n");
+    static const u32 strip[] = { 0, 1, 2, 3, 0xFFFF, 4, 5, 6, 7 };
+    static const u32 strip_tris[] = { 0, 1, 2, 2, 1, 3, 4, 5, 6, 6, 5, 7 };
+    indexed_case(strip, 9, 0, 1, 0xFFFF, RSX_PRIMITIVE_TRIANGLE_STRIP, strip_tris, 12,
+                 "16-bit strip cut by its restart sentinel");
+    static const u32 strip32[] = { 0, 1, 2, 3, 0xFFFFFFFFu, 4, 5, 6, 7 };
+    indexed_case(strip32, 9, 1, 1, 0xFFFFFFFFu, RSX_PRIMITIVE_TRIANGLE_STRIP, strip_tris, 12,
+                 "32-bit strip cut by its restart sentinel");
+    static const u32 tris[] = { 3, 1, 2, 7, 0, 5 };
+    indexed_case(tris, 6, 0, 0, 0xFFFF, RSX_PRIMITIVE_TRIANGLES, tris, 6,
+                 "16-bit triangle list in index order");
+    static const u32 tris32[] = { 0x0003, 0x0001, 0x0002, 0x0007, 0x0000, 0x0005 };
+    indexed_case(tris32, 6, 1, 0, 0xFFFFFFFFu, RSX_PRIMITIVE_TRIANGLES, tris, 6,
+                 "32-bit triangle list in index order");
+    /* A 16-bit buffer ignores a sentinel that does not fit in 16 bits. */
+    static const u32 big_sentinel_tris[] = { 3, 1, 2 };
+    indexed_case(big_sentinel_tris, 3, 0, 1, 0x10002u, RSX_PRIMITIVE_TRIANGLES, big_sentinel_tris, 3,
+                 "16-bit restart off when the sentinel is wider than 16 bits");
+}
+
 static unsigned custom_reads;
 static const u8* custom_guest_read(void* user, u32 location, u32 offset, u32 bytes)
 {
@@ -966,6 +1054,89 @@ static void test_custom_guest_mapping(void)
     rsx_draw_engine_set_guest_memory(NULL, NULL);
     draw_triangle();
     CHECK(custom_reads == calls, "clearing resolver restores default mapping");
+    engine_down();
+}
+
+/* ---- polygon offset ------------------------------------------------------ */
+
+#define M_POLY_OFFSET_POINT  0x0A60
+#define M_POLY_OFFSET_LINE   0x0A64
+#define M_POLY_OFFSET_FILL   0x0A68
+#define M_POLY_OFFSET_FACTOR 0x0A78
+#define M_POLY_OFFSET_BIAS   0x0A7C
+
+static u32 po_bits(float f) { u32 u; memcpy(&u, &f, 4); return u; }
+
+/* What the backend was told before the last draw. */
+static float po_slope = -99.0f, po_units = -99.0f;
+static u32 po_depth_bits, po_calls;
+static void stub_set_depth_bias(void* u, float slope, float units, u32 bits)
+{ (void)u; po_slope = slope; po_units = units; po_depth_bits = bits; po_calls++; }
+
+/* SET_POLY_OFFSET_FILL_ENABLE with SCALE_FACTOR and BIAS reaches the backend
+ * as set_depth_bias(slope, units, depth bits) before each draw, Z16 or Z24
+ * by the zeta format, and 0/0 while the offset is off. A title draws its
+ * shadow casters, decals and projected shadows with an offset so they do
+ * not fight the depth they sit on; the engine used to drop it. */
+static void test_polygon_offset(void)
+{
+    printf("-- polygon offset\n");
+    engine_up();
+    static rsx_draw_backend be;
+    be = g_stub_backend;
+    be.set_depth_bias = stub_set_depth_bias;
+    rsx_draw_engine_set_backend(&be);
+    po_calls = 0;
+
+    draw_triangle();
+    CHECK(stub.n_draw == 1, "the draw executed");
+    CHECK(po_calls == 1 && po_slope == 0.0f && po_units == 0.0f,
+          "no offset: the backend is told 0/0 (%u calls, slope %g units %g)",
+          po_calls, po_slope, po_units);
+
+    m(M_POLY_OFFSET_FACTOR, po_bits(-1.0f));
+    m(M_POLY_OFFSET_BIAS, po_bits(-256.0f));
+    draw_triangle();
+    CHECK(po_slope == 0.0f && po_units == 0.0f,
+          "factor and bias alone change nothing while FILL is off");
+
+    m(M_POLY_OFFSET_FILL, 1u);
+    draw_triangle();
+    CHECK(po_slope == -1.0f && po_units == -256.0f && po_depth_bits == 24u,
+          "FILL on: -1/-256 against a Z24S8 zeta (slope %g units %g bits %u)",
+          po_slope, po_units, po_depth_bits);
+
+    m(M_SURFACE_FORMAT, 8u | (1u << 5));          /* A8R8G8B8, Z16 */
+    m(M_POLY_OFFSET_FACTOR, po_bits(0.25f));
+    m(M_POLY_OFFSET_BIAS, po_bits(200.0f));
+    draw_triangle();
+    CHECK(po_slope == 0.25f && po_units == 200.0f && po_depth_bits == 16u,
+          "a Z16 zeta says 16 bits (slope %g units %g bits %u)",
+          po_slope, po_units, po_depth_bits);
+    m(M_SURFACE_FORMAT, 8u | (2u << 5));          /* back to Z24S8 */
+
+    /* The enable for what the primitive rasterises as: LINE for lines. */
+    m(M_POLY_OFFSET_FILL, 0u);
+    m(M_POLY_OFFSET_LINE, 1u);
+    draw_triangle();
+    CHECK(po_slope == 0.0f && po_units == 0.0f,
+          "LINE alone does not offset a triangle (slope %g units %g)", po_slope, po_units);
+    m(M_BEGIN_END, RSX_PRIMITIVE_LINES);
+    m(M_DRAW_ARRAYS, 0u | ((2u - 1u) << 24));
+    m(M_BEGIN_END, 0u);
+    CHECK(po_slope == 0.25f && po_units == 200.0f,
+          "LINE offsets a line list (slope %g units %g)", po_slope, po_units);
+    m(M_POLY_OFFSET_LINE, 0u);
+
+    /* A NaN factor is no offset, not a NaN bias. */
+    m(M_POLY_OFFSET_FILL, 1u);
+    m(M_POLY_OFFSET_FACTOR, 0x7FC00000u);
+    draw_triangle();
+    CHECK(po_slope == 0.0f && po_units == 200.0f, "a NaN factor reads 0 (slope %g)", po_slope);
+
+    m(M_POLY_OFFSET_FILL, 0u);
+    draw_triangle();
+    CHECK(po_slope == 0.0f && po_units == 0.0f, "FILL off again: 0/0");
     engine_down();
 }
 
@@ -1011,6 +1182,238 @@ static void test_inline_array(void)
     engine_down();
 }
 
+/* ---- the depth clear value ---------------------------------------------- */
+
+#define ZETA_OFFSET  0x00100000u        /* local memory */
+
+/* ZSTENCIL_CLEAR_VALUE in the zeta's own layout, and 0 as the near plane. */
+static void test_depth_clear_value(void)
+{
+    printf("-- depth clear value\n");
+    engine_up();
+    m(M_CONTEXT_DMA_ZETA, DMA_LOCAL);
+    m(M_ZETA_OFFSET, ZETA_OFFSET);
+
+    /* Z16 (depth field 1): the clear value is a bare depth16, and 0xFFFF its
+     * far plane. Read as Z24S8 it would clear to 255/16777215. */
+    m(M_SURFACE_FORMAT, 8u | (1u << 5));
+    m(M_ZSTENCIL_CLEAR, 0xFFFFu);
+    m(M_CLEAR_BUFFERS, 0x01u);
+    CHECK(stub.n_clear_ds == 1 && stub.last_clear_depth == 1.0f,
+          "a Z16 zeta cleared with 0xFFFF clears to 1.0 (%g)", stub.last_clear_depth);
+
+    /* Z24S8 (depth field 2): depth24 << 8 | stencil8. */
+    m(M_SURFACE_FORMAT, 8u | (2u << 5));
+    m(M_ZSTENCIL_CLEAR, 0xFFFFFF00u);
+    m(M_CLEAR_BUFFERS, 0x01u);
+    CHECK(stub.last_clear_depth == 1.0f,
+          "a Z24S8 zeta cleared with 0xFFFFFF00 clears to 1.0 (%g)", stub.last_clear_depth);
+
+    /* 0 is the near plane. It used to read as 1.0, standing in for the
+     * reset a flip does (the FIFO walker's job now). */
+    m(M_ZSTENCIL_CLEAR, 0u);
+    m(M_CLEAR_BUFFERS, 0x01u);
+    CHECK(stub.last_clear_depth == 0.0f,
+          "a zeta cleared with 0 clears to 0.0 (%g)", stub.last_clear_depth);
+    engine_down();
+}
+
+/* ---- full surface and zeta tables ----------------------------------------- */
+
+/* A depth-writing draw through a 256x256 Z24S8 zeta at `offset`; returns the
+ * depth target it was given, or 0. */
+static u32 depth_draw_at(u32 offset)
+{
+    m(M_CONTEXT_DMA_ZETA, DMA_LOCAL);
+    m(M_SURFACE_FORMAT, 8u | (2u << 5));
+    m(M_ZETA_OFFSET, offset);
+    m(M_ZETA_PITCH, 256u * 4u);
+    m(M_COLOR_MASK, 0u);
+    m(M_DEPTH_TEST, 1u);
+    m(M_DEPTH_WRITE, 1u);
+    m(M_TEX_UNIT + 0x0C, 0u);
+    stub.bound_depth = 0;
+    draw_triangle();
+    return stub.bound_depth;
+}
+
+/* The zeta and surface tables used to keep every target forever: once 64
+ * addresses had been rendered to, a new one got no slot, and a level loaded
+ * after enough cutscenes rendered its shadow maps nowhere. A full table now
+ * gives up the entry used longest ago, but never one used this frame or the
+ * last, and a texture read counts as a use. */
+static void test_full_tables_evict_the_oldest(void)
+{
+    printf("-- full surface and zeta tables evict the least recently used\n");
+    engine_up();
+#define ZETA_AT(k) (0x00100000u + (u32)(k) * 0x1000u)
+    u32 h[64];
+    for (u32 k = 0; k < 64; k++) h[k] = depth_draw_at(ZETA_AT(k));
+    CHECK(h[0] && h[63], "64 zetas got depth targets");
+    rsx_draw_engine_present();
+    rsx_draw_engine_present();
+
+    /* Zeta 1 is read as a texture this frame, through zeta 63. */
+    m(M_COLOR_MASK, 0x01010101u);
+    m(M_DEPTH_TEST, 0u);
+    m(M_DEPTH_WRITE, 0u);
+    bind_texture_unit(RSX_LOCATION_LOCAL, ZETA_AT(1));
+    m(0x1840 /* control3: pitch */, 256u * 4u);
+    draw_triangle();
+
+    int creates = stub.n_depth_create;
+    const u32 n64 = depth_draw_at(ZETA_AT(64));
+    CHECK(n64 && stub.n_depth_create == creates + 1 && !stub.alive[h[0]],
+          "a 65th zeta takes the oldest one's slot (%d creates, zeta 0 %s)",
+          stub.n_depth_create - creates, stub.alive[h[0]] ? "alive" : "released");
+    const u32 n65 = depth_draw_at(ZETA_AT(65));
+    CHECK(n65 && stub.alive[h[1]] && !stub.alive[h[2]] && stub.alive[h[63]],
+          "the next skips the zeta read this frame and the one bound (1 %d, 2 %d, 63 %d)",
+          stub.alive[h[1]], stub.alive[h[2]], stub.alive[h[63]]);
+
+    /* Zetas 3..62 are the only old ones left; after them nothing is evicted. */
+    u32 made = 0;
+    for (u32 k = 66; k < 66 + 61; k++) {
+        creates = stub.n_depth_create;
+        depth_draw_at(ZETA_AT(k));
+        if (stub.n_depth_create == creates + 1) made++;
+    }
+    CHECK(made == 60 && stub.alive[h[1]] && stub.alive[h[63]] && stub.alive[n64],
+          "60 more evict zetas 3..62, then a full table of this frame's zetas refuses (%u)", made);
+#undef ZETA_AT
+
+    /* Colour surfaces: the same rule, and the presented one stays. */
+    const u32 base_color = stub.bound_rt[0];
+    m(M_DEPTH_TEST, 0u);
+    m(M_DEPTH_WRITE, 0u);
+    m(M_COLOR_MASK, 0x01010101u);
+    m(M_CONTEXT_DMA_ZETA, 0u);
+    u32 c[64];
+    for (u32 k = 0; k < 63; k++) {
+        m(M_COLOR_A_OFFSET, 0x00200000u + k * 0x10000u);
+        draw_triangle();
+        c[k] = stub.bound_rt[0];
+    }
+    rsx_draw_engine_present();
+    rsx_draw_engine_present();
+    creates = stub.n_color_create;
+    m(M_COLOR_A_OFFSET, 0x00200000u + 63u * 0x10000u);
+    draw_triangle();
+    CHECK(stub.n_color_create == creates + 1 && !stub.alive[base_color] &&
+          stub.alive[c[62]] && stub.alive[c[0]],
+          "a 65th surface takes the oldest one's slot, not the presented one's (%d creates)",
+          stub.n_color_create - creates);
+    engine_down();
+}
+
+/* ---- clears limited to the scissor ---------------------------------------- */
+
+/* What the rectangle hooks were asked for. */
+static struct {
+    int n_color, n_depth;
+    u32 color_surface, depth;
+    u32 color_rect[4], depth_rect[4];
+    u32 depth_flags;
+} g_rect;
+
+static void stub_clear_color_rect(void* u, u32 s, const float rgba[4],
+                                  u32 x, u32 y, u32 w, u32 h)
+{
+    (void)u; (void)rgba;
+    g_rect.n_color++;
+    g_rect.color_surface = s;
+    g_rect.color_rect[0] = x; g_rect.color_rect[1] = y;
+    g_rect.color_rect[2] = w; g_rect.color_rect[3] = h;
+}
+
+static void stub_clear_ds_rect(void* u, u32 d, u32 f, float z, u8 st,
+                               u32 x, u32 y, u32 w, u32 h)
+{
+    (void)u; (void)z; (void)st;
+    g_rect.n_depth++;
+    g_rect.depth = d;
+    g_rect.depth_flags = f;
+    g_rect.depth_rect[0] = x; g_rect.depth_rect[1] = y;
+    g_rect.depth_rect[2] = w; g_rect.depth_rect[3] = h;
+}
+
+#define RECT_IS(r, x, y, w, h) ((r)[0] == (x) && (r)[1] == (y) && (r)[2] == (w) && (r)[3] == (h))
+
+/* CLEAR_SURFACE writes only what the scissor lets through, when the backend
+ * can clear part of a target: a split-screen title clears each view under a
+ * scissor on its half of one target. */
+static void test_clear_rect(void)
+{
+    printf("-- clears limited to the scissor\n");
+    static rsx_draw_backend be;
+    be = g_stub_backend;
+    be.clear_color_rect = stub_clear_color_rect;
+    be.clear_depth_stencil_rect = stub_clear_ds_rect;
+
+    /* The scissor on the right half of a 256x256 surface: a split-screen
+     * view's clear leaves the other view alone. */
+    engine_up_with(&be);
+    memset(&g_rect, 0, sizeof g_rect);
+    m(M_SCISSOR_H, (128u << 16) | 128u);
+    m(M_SCISSOR_V, 256u << 16);
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    CHECK(g_rect.n_color == 1 && stub.n_clear_color == 0 &&
+          RECT_IS(g_rect.color_rect, 128u, 0u, 128u, 256u) &&
+          g_rect.color_surface == stub.last_created_color,
+          "a colour clear under a right-half scissor clears 128,0 128x256 only"
+          " (%d rect, %d whole; %u,%u %ux%u)", g_rect.n_color, stub.n_clear_color,
+          g_rect.color_rect[0], g_rect.color_rect[1], g_rect.color_rect[2],
+          g_rect.color_rect[3]);
+
+    /* A scissor covering the surface, or none, is a whole clear the backend
+     * can fold into the next pass. */
+    m(M_SCISSOR_H, 4096u << 16);
+    m(M_SCISSOR_V, 4096u << 16);
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    CHECK(g_rect.n_color == 1 && stub.n_clear_color == 1,
+          "a scissor covering the surface clears it whole (%d rect, %d whole)",
+          g_rect.n_color, stub.n_clear_color);
+
+    /* A scissor entirely outside the surface clears nothing. */
+    m(M_SCISSOR_H, (64u << 16) | 300u);
+    m(M_SCISSOR_V, 64u << 16);
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    CHECK(g_rect.n_color == 1 && stub.n_clear_color == 1,
+          "a scissor outside the surface clears nothing (%d rect, %d whole)",
+          g_rect.n_color, stub.n_clear_color);
+
+    /* Depth under the same right-half scissor: that part of the zeta, and a
+     * zeta nothing initialised yet is cleared whole first, as its first bind
+     * would have. */
+    m(M_CONTEXT_DMA_ZETA, DMA_LOCAL);
+    m(M_ZETA_OFFSET, ZETA_OFFSET);
+    m(M_SCISSOR_H, (128u << 16) | 128u);
+    m(M_SCISSOR_V, 256u << 16);
+    const int ds_before = stub.n_clear_ds;
+    m(M_CLEAR_BUFFERS, 0x03u);
+    CHECK(g_rect.n_depth == 1 && stub.n_clear_ds == ds_before + 1 &&
+          RECT_IS(g_rect.depth_rect, 128u, 0u, 128u, 256u),
+          "a depth clear under a right-half scissor clears 128,0 128x256 of a fresh zeta"
+          " after one whole clear (%d rect, %d whole; %u,%u %ux%u)", g_rect.n_depth,
+          stub.n_clear_ds - ds_before, g_rect.depth_rect[0], g_rect.depth_rect[1],
+          g_rect.depth_rect[2], g_rect.depth_rect[3]);
+    m(M_CLEAR_BUFFERS, 0x03u);
+    CHECK(g_rect.n_depth == 2 && stub.n_clear_ds == ds_before + 1,
+          "the next one is the rectangle alone (%d rect, %d whole)",
+          g_rect.n_depth, stub.n_clear_ds - ds_before);
+    engine_down();
+
+    /* A backend without the rectangle hooks keeps the whole-target clear. */
+    engine_up();
+    m(M_SCISSOR_H, (128u << 16) | 128u);
+    m(M_SCISSOR_V, 256u << 16);
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    CHECK(stub.n_clear_color == 1,
+          "without clear_color_rect a scissored clear falls back to a whole one (%d)",
+          stub.n_clear_color);
+    engine_down();
+}
+
 int main(void)
 {
     vm_base = (u8*)calloc(1, GUEST_BYTES);
@@ -1029,12 +1432,17 @@ int main(void)
     test_texture_cache();
     test_pipeline_key();
     test_restart_expansion();
+    test_indexed_runs();
     test_indexed_draws();
     test_scissor();
     test_readback();
     test_custom_guest_mapping();
+    test_polygon_offset();
     test_queued_flip_buffer();
     test_inline_array();
+    test_depth_clear_value();
+    test_full_tables_evict_the_oldest();
+    test_clear_rect();
 
     free(vm_base);
     printf(g_failures ? "\n%d check(s) FAILED\n" : "\nall checks passed\n",

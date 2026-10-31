@@ -402,7 +402,7 @@ static const char* input_expr(u32 input_src)
         "input.tc0", "input.tc1", "input.tc2", "input.tc3",
         "input.tc4", "input.tc5", "input.tc6", "input.tc7" };
     switch (input_src) {
-    case 0x0: return "input.position"; /* WPOS */
+    case 0x0: return "_rsx_wpos(input.position)"; /* WPOS (window origin applied below) */
     case 0x1: return "input.col0";     /* COL0 */
     case 0x2: return "input.col1";     /* COL1 */
     case 0x3: return "input.fog";      /* FOGC */
@@ -512,17 +512,19 @@ static u8  s_shadow_func[16];
 /* Unnormalised (texel-addressed) units for the next decompile; see
  * rsx_fp_set_unnorm_units in the header. */
 static u32   s_unnorm_mask;
-static float s_unnorm_scale[16][2];
+static float s_unnorm_scale[16][3];   /* 1/width, 1/height, 1/depth (0: no depth given) */
 
-void rsx_fp_set_unnorm_units(u32 mask, const u32 dim[][2])
+void rsx_fp_set_unnorm_units(u32 mask, const u32 dim[][3])
 {
     s_unnorm_mask = 0;
     for (u32 u = 0; u < 16; u++) {
         s_unnorm_scale[u][0] = s_unnorm_scale[u][1] = 1.0f;
+        s_unnorm_scale[u][2] = 0.0f;
         if (!((mask >> u) & 1u) || !dim || !dim[u][0] || !dim[u][1]) continue;
         s_unnorm_mask |= 1u << u;
         s_unnorm_scale[u][0] = 1.0f / (float)dim[u][0];
         s_unnorm_scale[u][1] = 1.0f / (float)dim[u][1];
+        if (dim[u][2]) s_unnorm_scale[u][2] = 1.0f / (float)dim[u][2];
     }
 }
 
@@ -535,6 +537,21 @@ static void fp_coord2(u32 u, const char* xy, char* out, u32 out_size)
                  (double)s_unnorm_scale[u][0], (double)s_unnorm_scale[u][1]);
     else
         snprintf(out, out_size, "%s", xy);
+}
+
+/* The same for the three coordinates of a volume unit (Texture3D): all in
+ * texels on an unnormalised unit, so divided by width, height and depth
+ * (RPCS3's texture cache scales a 3D texture's r by 1/depth the same way).
+ * Without a depth, or on a unit that is not unnormalised, `xyz` as written,
+ * as before. */
+static void fp_coord3(u32 u, const char* xyz, char* out, u32 out_size)
+{
+    if (((s_unnorm_mask >> u) & 1u) && s_unnorm_scale[u][2] != 0.0f)
+        snprintf(out, out_size, "((%s) * float3(%.9g, %.9g, %.9g))", xyz,
+                 (double)s_unnorm_scale[u][0], (double)s_unnorm_scale[u][1],
+                 (double)s_unnorm_scale[u][2]);
+    else
+        snprintf(out, out_size, "%s", xyz);
 }
 
 /* Saturate the first colour export's alpha in the next decompile; see
@@ -902,11 +919,15 @@ static int rsx_fp_decompile_internal(
             fp_coord2(tex_unit, xy, c2, sizeof c2);
             if ((s_shadow_mask >> tex_unit) & 1u)
                 snprintf(rhs, sizeof(rhs), "rsx_shadow%u(float3(%s, (%s).z))", tex_unit, c2, a);
-            else if ((tex_sep_mask >> tex_unit) & 1u)
+            else if ((tex_sep_mask >> tex_unit) & 1u) {
                 /* Cubemap or volume: sample with all three coordinates. */
+                char xyz[224], c3[320];
+                snprintf(xyz, sizeof xyz, "(%s).xyz", a);
+                if ((s_vol_mask >> tex_unit) & 1u) fp_coord3(tex_unit, xyz, c3, sizeof c3);
+                else snprintf(c3, sizeof c3, "%s", xyz);
                 snprintf(rhs, sizeof(rhs),
-                         "rsx_tex%u.Sample(rsx_samp[%u], (%s).xyz)", tex_unit, tex_unit, a);
-            else if (tex_sep_mask)
+                         "rsx_tex%u.Sample(rsx_samp[%u], %s)", tex_unit, tex_unit, c3);
+            } else if (tex_sep_mask)
                 snprintf(rhs, sizeof(rhs),
                          "rsx_tex%u.Sample(rsx_samp[%u], %s)", tex_unit, tex_unit, c2);
             else
@@ -925,11 +946,13 @@ static int rsx_fp_decompile_internal(
                  * the direction directly. */
                 snprintf(rhs, sizeof(rhs),
                          "rsx_tex%u.Sample(rsx_samp[%u], (%s).xyz)", tex_unit, tex_unit, a);
-            else if ((s_vol_mask >> tex_unit) & 1u)
+            else if ((s_vol_mask >> tex_unit) & 1u) {
+                char xyz[424], c3[512];
+                snprintf(xyz, sizeof xyz, "(%s).xyz / (%s).w", a, a);
+                fp_coord3(tex_unit, xyz, c3, sizeof c3);
                 snprintf(rhs, sizeof(rhs),
-                         "rsx_tex%u.Sample(rsx_samp[%u], (%s).xyz / (%s).w)",
-                         tex_unit, tex_unit, a, a);
-            else if (tex_sep_mask)
+                         "rsx_tex%u.Sample(rsx_samp[%u], %s)", tex_unit, tex_unit, c3);
+            } else if (tex_sep_mask)
                 snprintf(rhs, sizeof(rhs),
                          "rsx_tex%u.Sample(rsx_samp[%u], %s)", tex_unit, tex_unit, c2);
             else
@@ -959,11 +982,13 @@ static int rsx_fp_decompile_internal(
              * TEXTURE_SAMPLE2D_BIAS / _LOD). GH3's fret buttons and fret lines
              * are TXB: unhandled, they sampled nothing and output alpha 0. */
             const int cube = (tex_sep_mask >> tex_unit) & 1u;   /* cube or volume: xyz */
-            char tn[32];
+            char tn[32], crd[224], c3[320];
             snprintf(tn, sizeof(tn), tex_sep_mask ? "rsx_tex%u" : "rsx_tex[%u]", tex_unit);
-            snprintf(rhs, sizeof(rhs), "%s.%s(rsx_samp[%u], (%s).%s, (%s).x)", tn,
-                     opcode == OP_TXB ? "SampleBias" : "SampleLevel", tex_unit, a,
-                     cube ? "xyz" : "xy", b);
+            snprintf(crd, sizeof crd, "(%s).%s", a, cube ? "xyz" : "xy");
+            if ((s_vol_mask >> tex_unit) & 1u) fp_coord3(tex_unit, crd, c3, sizeof c3);
+            else snprintf(c3, sizeof c3, "%s", crd);
+            snprintf(rhs, sizeof(rhs), "%s.%s(rsx_samp[%u], %s, (%s).x)", tn,
+                     opcode == OP_TXB ? "SampleBias" : "SampleLevel", tex_unit, c3, b);
             break;
         }
         case OP_KIL:
@@ -1251,6 +1276,18 @@ static int rsx_fp_decompile_internal(
             "#else\n"
             "#define _rsx_inv_w(i) (1.0 / (i).position.w)\n"
             "#endif\n");
+    /* WPOS in the RSX window convention. The host position has its origin at the
+     * top left; with SET_SHADER_WINDOW origin BOTTOM the RSX counts y up from the
+     * bottom edge. A full-screen pass that builds its UV from it, e.g.
+     * uv = wpos * (1/W, -1/H) + (0, 1), mirrored its source when it read the host y.
+     * The draw engine passes the window height in fp_alpha.y when the origin is
+     * BOTTOM (0 otherwise) and a pixel-center bias in fp_alpha.z (-0.5 for INTEGER
+     * centers, 0 for HALF). A backend that leaves both 0 gets the host position. */
+    if (strstr(o.p, "_rsx_wpos("))
+        out_puts(&p, buffered
+            ? "#define _rsx_wpos(p) float4((p).x + fp_alpha.z, "
+              "(fp_alpha.y != 0.0 ? fp_alpha.y - (p).y : (p).y) + fp_alpha.z, (p).z, (p).w)\n"
+            : "#define _rsx_wpos(p) (p)\n");
     /* Texture bank. With no cube units (the default) emit the exact legacy
      * array declaration so 2D-only programs are byte-identical. When any unit
      * is a cubemap, declare each unit individually at its t-register so the
@@ -1681,10 +1718,12 @@ u32 rsx_fp_code_hash(const u8* ucode, u32 max_bytes)
  * works this way, and leaves every non-UNNORM program byte-identical.
  *
  * Cube units are skipped: their coordinate is a float3 direction, and
- * RSX_TEX_FMT_UNNORM has no meaning for one.
+ * RSX_TEX_FMT_UNNORM has no meaning for one. A volume unit (Texture3D) is
+ * sampled with three coordinates, all in texels, so it is divided by its depth
+ * too (RPCS3's texture cache scales a 3D texture's r by 1/depth the same way).
  */
 int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
-                              const u32 dim[][2], u32 cube_mask)
+                              const u32 dim[][3], u32 cube_mask, u32 volume_mask)
 {
     if (!hlsl || !unnorm_mask) return 0;
     int patched = 0;
@@ -1692,8 +1731,9 @@ int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
     for (u32 u = 0; u < 16; u++) {
         if (!((unnorm_mask >> u) & 1u)) continue;
         if ((cube_mask >> u) & 1u) continue;
-        const u32 w = dim[u][0], h = dim[u][1];
-        if (!w || !h) continue;
+        const u32 w = dim[u][0], h = dim[u][1], d = dim[u][2];
+        const int volume = (volume_mask >> u) & 1u;
+        if (!w || !h || (volume && !d)) continue;
 
         /* Both spellings the emitter produces for a 2D unit. */
         char needles[2][40];
@@ -1719,8 +1759,12 @@ int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
                 if (*p != ')') break;
 
                 char scale[80];
-                snprintf(scale, sizeof scale, " * float2(%.9g, %.9g)",
-                         1.0 / (double)w, 1.0 / (double)h);
+                if (volume)
+                    snprintf(scale, sizeof scale, " * float3(%.9g, %.9g, %.9g)",
+                             1.0 / (double)w, 1.0 / (double)h, 1.0 / (double)d);
+                else
+                    snprintf(scale, sizeof scale, " * float2(%.9g, %.9g)",
+                             1.0 / (double)w, 1.0 / (double)h);
                 const u32 slen = (u32)strlen(scale);
                 const u32 used = (u32)strlen(hlsl);
                 if (used + slen + 1 > hlsl_size) return -1;
@@ -1740,4 +1784,50 @@ int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
             memcpy(q, "rsx_tex", 7);
     }
     return patched;
+}
+
+/*
+ * WPOS on an antialiased surface (see the header).
+ *
+ * A backend that keeps a DIAGONAL_CENTERED_2 or SQUARE_*_4 target at its sample
+ * resolution maps the viewport over the sample grid, so a pixel program runs
+ * once per sample and SV_POSITION.x of a 960-pixel 2x1 target runs to 1920. A
+ * program that addresses a screen-sized texture by WPOS then reads it at twice
+ * the position: Resistance 3's material pass fetches its light and SSAO
+ * buffers that way and drew its lighting shifted on the left half of the frame
+ * and clamped to one edge column, full-width streaks, on the right half.
+ *
+ * Every sample of a pixel gets that pixel's centre, floor(pos / grid) + 0.5,
+ * the half-pixel centre SV_POSITION already gives on a 1x1 grid. The line goes
+ * first in main, before any read; z and w (the _rsx_inv_w source) are kept.
+ * WPOS reaches the body only as the emitter's "_rsx_wpos(input.position)"
+ * source (#589's window convention wraps it; _rsx_inv_w also reads
+ * input.position, so match the wrapper), so a program without it stays
+ * byte-identical. The grid applies first, then _rsx_wpos flips y in pixels.
+ */
+int rsx_fp_apply_wpos_grid(char* hlsl, u32 capacity, u32 sx, u32 sy)
+{
+    static const char wpos_read[] = "_rsx_wpos(input.position)";
+    static const char* const entries[] = { "main(PSInput input) : SV_TARGET {\n",
+                                           "main(PSInput input) {\n" };
+    if (!hlsl || !capacity || !sx || !sy) return -1;
+    if (sx == 1 && sy == 1) return 0;
+    size_t len = 0;
+    while (len < capacity && hlsl[len]) ++len;
+    if (len == capacity) return -1;
+    if (!strstr(hlsl, wpos_read)) return 0;
+    if (strstr(hlsl, "input.position.xy = floor(")) return -1;
+    char* body = NULL;
+    for (size_t i = 0; i < sizeof entries / sizeof entries[0] && !body; ++i) {
+        char* at = strstr(hlsl, entries[i]);
+        if (at) body = at + strlen(entries[i]);
+    }
+    if (!body) return -1;
+    char line[128];
+    const int n = snprintf(line, sizeof line,
+        "    input.position.xy = floor(input.position.xy / float2(%u, %u)) + 0.5;\n", sx, sy);
+    if (n < 0 || (size_t)n >= sizeof line || len + (size_t)n + 1 > capacity) return -1;
+    memmove(body + n, body, len - (size_t)(body - hlsl) + 1);
+    memcpy(body, line, (size_t)n);
+    return 1;
 }

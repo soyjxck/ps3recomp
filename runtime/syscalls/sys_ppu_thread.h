@@ -55,6 +55,7 @@ typedef struct ppu_thread_info {
     void*        prof_ra;      /* ...as the host return address, named when read */
     int          proc_out;     /* the host thread is past its last use of this slot
                                 * (set by the thread procedure, under the table lock) */
+    int          blocked;      /* reached a blocking call (ppu_thread_note_block); atomic access only */
 
 #ifdef _WIN32
     HANDLE       host_thread;
@@ -84,6 +85,12 @@ extern vm_stack_alloc g_vm_stack_alloc;
 /* Callback to invoke recompiled code - must be set by the runtime */
 extern ppu_thread_entry_fn g_ppu_thread_entry_trampoline;
 
+/* The main thread's stack as sys_ppu_thread_get_stack_information reports it,
+ * set by a host before ppu_run. Size 0 (the default) reports VM_STACK_BASE +
+ * VM_PPU_STACK_SIZE. */
+extern uint32_t g_ppu_main_stack_addr;
+extern uint32_t g_ppu_main_stack_size;
+
 /* ---------------------------------------------------------------------------
  * Syscall handlers
  * -----------------------------------------------------------------------*/
@@ -93,6 +100,11 @@ int64_t sys_ppu_thread_create(ppu_context* ctx);
  * Call before the first sys_ppu_thread_create so no created thread aliases
  * main (thread_id 0 broke every owner-tracking sync primitive). */
 uint64_t ppu_thread_register_main(void);
+
+/* The blocking syscalls call this on entry: thread `tid` is about to wait, where lv2 would schedule another thread.
+ * With PS3_PRIO_START=1, sys_ppu_thread_create waits for it on a thread it has just made at a higher priority than
+ * the creator's, as lv2's scheduler would run that thread first. */
+void ppu_thread_note_block(uint64_t tid);
 int64_t sys_ppu_thread_exit(ppu_context* ctx);
 int64_t sys_ppu_thread_join(ppu_context* ctx);
 int64_t sys_ppu_thread_detach(ppu_context* ctx);

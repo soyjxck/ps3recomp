@@ -34,6 +34,10 @@
 #include <errno.h>
 #include "../platform/win32_compat.h"   /* LONG, InterlockedExchange, Sleep */
 #endif
+#include "ps3emu/thread_name.h"
+
+static void spu_workload_report_miss(const char* path, uint64_t fp, uint32_t size,
+                                     uint32_t owner_ea);   /* below */
 
 /* Set by the MFC DMA engine (spu_dma.h) when the cri task (image 22) issues a
  * real video-payload GET (>256B from a non-context EA) = it actually decoded,
@@ -174,6 +178,9 @@ typedef struct {
     spu_lifted_entry_fn fn;
     int                 image_id;
     const char*         name;
+    /* Masked registrations only (var_len != 0): the image is `size` bytes and
+     * its fingerprint takes [var_off, var_off + var_len) as zero. */
+    uint32_t            size, var_off, var_len;
 } spu_workload_entry;
 
 static spu_workload_entry s_registry[SPU_WORKLOAD_MAX];
@@ -224,6 +231,51 @@ spu_lifted_entry_fn spu_workload_find_img(uint64_t fingerprint, int* image_id_ou
             if (image_id_out) *image_id_out = s_registry[i].image_id;
             return s_registry[i].fn;
         }
+    if (image_id_out) *image_id_out = 0;
+    return NULL;
+}
+
+void spu_workload_register_img_masked(uint64_t fingerprint, spu_lifted_entry_fn fn,
+                                      int image_id, const char* name,
+                                      uint32_t size, uint32_t var_off,
+                                      uint32_t var_len)
+{
+    if (!fn || !size || !var_len || var_off > size || var_len > size - var_off) {
+        fprintf(stderr, "[spu_workload] bad masked registration '%s' "
+                        "(size 0x%X, area 0x%X+0x%X)\n",
+                name ? name : "?", size, var_off, var_len);
+        return;
+    }
+    spu_workload_register_img(fingerprint, fn, image_id, name);
+    for (unsigned i = 0; i < s_registry_count; i++)
+        if (s_registry[i].fp == fingerprint) {
+            s_registry[i].size    = size;
+            s_registry[i].var_off = var_off;
+            s_registry[i].var_len = var_len;
+            return;
+        }
+}
+
+spu_lifted_entry_fn spu_workload_find_img_masked(const void* data, size_t n,
+                                                 uint64_t* fp_out,
+                                                 int* image_id_out)
+{
+    const uint8_t* p = (const uint8_t*)data;
+    for (unsigned i = 0; i < s_registry_count; i++) {
+        const spu_workload_entry* e = &s_registry[i];
+        if (!e->var_len || e->size != n) continue;
+        /* spu_workload_fingerprint() with the variable area read as zero. */
+        uint64_t h = 1469598103934665603ULL;
+        for (size_t k = 0; k < n; k++) {
+            const uint8_t b = (k - e->var_off < e->var_len) ? 0 : p[k];
+            h ^= b;
+            h *= 1099511628211ULL;
+        }
+        if (h != e->fp) continue;
+        if (fp_out) *fp_out = h;
+        if (image_id_out) *image_id_out = e->image_id;
+        return e->fn;
+    }
     if (image_id_out) *image_id_out = 0;
     return NULL;
 }
@@ -319,12 +371,15 @@ size_t spu_elf_image_size(const uint8_t* image, size_t max_avail)
 
 /* ---- dispatch ---------------------------------------------------------- */
 
+/* Every dispatch below fingerprints through spu_workload_fingerprint_cached
+ * (above): the whole image hashed byte by byte was about a millisecond per
+ * task start, and a job chain dispatches one binary over and over. */
 int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
                           uint32_t args_ea)
 {
     if (!image || image_size == 0) return 0;
 
-    uint64_t fp = spu_workload_fingerprint(image, image_size);
+    uint64_t fp = spu_workload_fingerprint_cached(image, image_size);
     spu_lifted_entry_fn fn = NULL;
     int image_id = 0;
     for (unsigned i = 0; i < s_registry_count; i++)
@@ -334,6 +389,7 @@ int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
             "[spu_workload] dispatch MISS fp=0x%016llX size=%u "
             "(no lifted SPU binary registered for this image)\n",
             (unsigned long long)fp, image_size);
+        spu_workload_report_miss("sync", fp, image_size, args_ea);
         return 0;
     }
 
@@ -358,6 +414,35 @@ int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
 
     free(ls);
     return 1;
+}
+
+/* A dispatch MISS drops the program: the task, workload or job never runs,
+ * and whatever waits on it (a taskset barrier, an atomic another task spins
+ * on) waits forever with nothing pointing back here. Say so once per
+ * program as an error naming what was dropped; SPU_MISS_FATAL=1 stops the
+ * process instead, for runs that must not continue past unsupported work. */
+static void spu_workload_report_miss(const char* path, uint64_t fp, uint32_t size,
+                                     uint32_t owner_ea)
+{
+    static uint64_t seen[64];
+    static unsigned nseen;
+    static volatile LONG lock;
+    int first = 1;
+    while (InterlockedExchange(&lock, 1)) Sleep(0);
+    for (unsigned k = 0; k < nseen; k++) if (seen[k] == fp) { first = 0; break; }
+    if (first && nseen < 64) seen[nseen++] = fp;
+    InterlockedExchange(&lock, 0);
+    const char* fatal = getenv("SPU_MISS_FATAL");
+    const int abort_on_miss = fatal && *fatal == '1';
+    if (!first && !abort_on_miss) return;
+    fprintf(stderr,
+        "[spu_workload] ERROR: %s dispatch of an SPU program with no lifted image "
+        "(fp=0x%016llX size=%u owner=0x%08X) -- the program is DROPPED and will "
+        "never run; anything waiting on it stalls. Lift and register this image "
+        "(build_spu_workloads --input). Reported once per program; SPU_MISS_FATAL=1 aborts.\n",
+        path, (unsigned long long)fp, size, owner_ea);
+    fflush(stderr);
+    if (abort_on_miss) abort();
 }
 
 /* Async dispatch: run the SPU job on its OWN host thread so the PPU caller is
@@ -1275,6 +1360,7 @@ static void spu_async_run(spu_async_job* j)
 
 #ifdef _WIN32
 static DWORD WINAPI spu_async_thread(LPVOID p) {
+    ps3_thread_name("spu job");
     /* Reserve handler headroom so a stack overflow in lifted SPU code (e.g. a
      * runaway brsl recursion) can actually reach the STACKOVERFLOW reporter
      * instead of killing the process silently with 0x80000001. */
@@ -1574,6 +1660,7 @@ int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
           if (++miss_n <= 32 || miss_n % 100000 == 0)
             fprintf(stderr, "[spurs-job] dispatch MISS fp=0x%016llX size=%u job=0x%08X (#%llu)\n",
                     (unsigned long long)fp, image_size, job_ea, miss_n); }
+        spu_workload_report_miss("SPURS job", fp, image_size, job_ea);
         /* SPU_DUMP_MISS=<dir>: write the unrecognised image out so it can be
          * lifted and registered. SPURS job binaries are raw code+data blobs
          * the title loads from its own data files -- unlike sys_spu_image
@@ -1669,6 +1756,7 @@ int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
  * The bitset is guest state (SPU-visible); the host lock/condvar exist only
  * to block and wake the task's host thread. */
 #include "../../libs/spurs/spurs_taskset.h"
+#include "spu_coherency.h"
 
 #ifdef _WIN32
 static SRWLOCK            s_sig_lock = SRWLOCK_INIT;
@@ -1697,19 +1785,44 @@ void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId);  /* defined 
 #define SPU_PARKED_MAX 64
 static volatile uint64_t s_parked[SPU_PARKED_MAX];   /* (taskset<<32)|(taskId+1), 0 = free */
 static volatile uint32_t s_parked_obj[SPU_PARKED_MAX];  /* LS[0x2FD0] wait object, 0 = unknown */
+/* Bounds for spu_taskset_line_committed, which runs after every successful
+ * PUTLLC/PUTLLUC on every SPU. Both are hints in the same racy sense as the
+ * table, but err only towards visiting more:
+ *  - s_parked_count: entries published and not yet removed. Raised after the
+ *    key is stored and lowered only by the remove that clears that key, so a
+ *    task that is parked is always counted. (Two adds racing for one free slot
+ *    lose a key and leave the count one high for good; that costs scans, not
+ *    wakes.)
+ *  - s_parked_hw: one past the highest slot ever used. Raised before the key
+ *    is stored and never lowered, so every parked task is below it whatever
+ *    else is being parked or unparked at the same time. Slots are taken
+ *    first-free, so it stays at the peak number of tasks parked at once. */
+static volatile int s_parked_count;
+static volatile int s_parked_hw;
 
 void spu_taskset_parked_add(uint32_t taskset_ea, uint32_t taskId, uint32_t wait_obj)
 {
     uint64_t key = ((uint64_t)taskset_ea << 32) | (uint64_t)(taskId + 1);
     for (int i = 0; i < SPU_PARKED_MAX; i++)
-        if (s_parked[i] == 0) { s_parked_obj[i] = wait_obj; s_parked[i] = key; return; }
+        if (s_parked[i] == 0) {
+            int hw = __atomic_load_n(&s_parked_hw, __ATOMIC_RELAXED);
+            while (hw <= i && !__atomic_compare_exchange_n(&s_parked_hw, &hw, i + 1, 1,
+                                                           __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+            s_parked_obj[i] = wait_obj; s_parked[i] = key;
+            __atomic_fetch_add(&s_parked_count, 1, __ATOMIC_RELAXED);
+            return;
+        }
 }
 
 void spu_taskset_parked_del(uint32_t taskset_ea, uint32_t taskId)
 {
     uint64_t key = ((uint64_t)taskset_ea << 32) | (uint64_t)(taskId + 1);
     for (int i = 0; i < SPU_PARKED_MAX; i++)
-        if (s_parked[i] == key) { s_parked[i] = 0; return; }
+        if (s_parked[i] == key) {
+            s_parked[i] = 0;
+            __atomic_fetch_sub(&s_parked_count, 1, __ATOMIC_RELAXED);
+            return;
+        }
 }
 
 /* Event bits owed to a task, keyed by the OBJECT it waits on (flag - 0x80).
@@ -1821,21 +1934,31 @@ static void spu_signalled_update(uint32_t taskset_ea, uint32_t taskId, int set)
     spu_lockline_unlock();
 }
 
-/* Deliver a signal to a task (callable from any PPU/host thread). */
-void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
+/* Wake WAIT_SIGNAL sleepers when the signalled line is written, including by
+ * guest SPU/PPU atomics that bypass spu_taskset_signal_task. Coherence calls
+ * this with lock-line held; the guest bit remains the only predicate. */
+static void spu_taskset_wake_written(void* opaque)
 {
-    if (!taskset_ea || taskId >= 128) return;
+    (void)opaque;
 #ifdef _WIN32
     AcquireSRWLockExclusive(&s_sig_lock);
-    spu_signalled_update(taskset_ea, taskId, 1);
     WakeAllConditionVariable(&s_sig_cv);
     ReleaseSRWLockExclusive(&s_sig_lock);
 #else
     pthread_mutex_lock(&s_sig_lock);
-    spu_signalled_update(taskset_ea, taskId, 1);
     pthread_cond_broadcast(&s_sig_cv);
     pthread_mutex_unlock(&s_sig_lock);
 #endif
+}
+
+/* Deliver a signal to a task (callable from any PPU/host thread). */
+void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
+{
+    if (!taskset_ea || taskId >= 128) return;
+    /* Update before taking s_sig_lock: watched-line notifications run under
+     * lock-line and take s_sig_lock, so lock-line must never nest inside it. */
+    spu_signalled_update(taskset_ea, taskId, 1);
+    spu_taskset_wake_written(NULL);
     { static int _n = 0; if (PS3_LOG_FIRST(_n, 24))
         fprintf(stderr, "[spu_workload] signal task %u (taskset 0x%08X)\n",
                 taskId, taskset_ea); fflush(stderr); }
@@ -1876,7 +1999,13 @@ void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
  * re-checks. */
 void spu_taskset_line_committed(uint32_t line)
 {
-    for (int i = 0; i < SPU_PARKED_MAX; i++) {
+    /* Nothing parked -- the whole run, for a title that never parks a taskset
+     * task -- costs one load instead of a 64-slot scan; otherwise only the
+     * slots below the high-water mark can hold a parked task. Slot order, and
+     * so the first match, is that of the full scan. */
+    if (!__atomic_load_n(&s_parked_count, __ATOMIC_RELAXED)) return;
+    const int n = __atomic_load_n(&s_parked_hw, __ATOMIC_RELAXED);
+    for (int i = 0; i < n; i++) {
         const uint64_t k = s_parked[i];
         if (!k || (((uint32_t)(k >> 32) + CSTS_SIGNALLED) & ~127u) != line) continue;
 #ifdef _WIN32
@@ -1955,6 +2084,10 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
     /* Release the global SPU-serial lock while parked so another SPU task can
      * run (and possibly signal us); re-acquired before returning to resume. */
     spu_serial_release();
+    spu_coh_watch watch;
+    spu_lockline_lock();
+    spu_coh_watch_add(&watch, taskset_ea + CSTS_SIGNALLED, spu_taskset_wake_written, NULL);
+    spu_lockline_unlock();
 #ifdef _WIN32
     AcquireSRWLockExclusive(&s_sig_lock);
     while (!spurs_bitset_test(taskset_ea + CSTS_SIGNALLED, taskId)) {
@@ -1966,7 +2099,6 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
             if (drain && secs >= drain) { drained = 1; break; }
         }
     }
-    if (!drained) spu_signalled_update(taskset_ea, taskId, 0);
     ReleaseSRWLockExclusive(&s_sig_lock);
 #else
     pthread_mutex_lock(&s_sig_lock);
@@ -1980,9 +2112,13 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
             if (drain && secs >= drain) { drained = 1; break; }
         }
     }
-    if (!drained) spu_signalled_update(taskset_ea, taskId, 0);
     pthread_mutex_unlock(&s_sig_lock);
 #endif
+    spu_lockline_lock();
+    spu_coh_watch_remove(&watch);
+    spu_lockline_unlock();
+    /* Signals coalesce in the bit, so consuming it outside s_sig_lock loses none. */
+    if (!drained) spu_signalled_update(taskset_ea, taskId, 0);
     if (drained) { static int _d = 0; if (PS3_LOG_FIRST(_d, 24))
         fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) WS_DRAIN resume "
                 "after %us (no signal)\n", taskId, taskset_ea, secs); fflush(stderr); }
@@ -2037,6 +2173,7 @@ int spu_workload_dispatch_task(const uint8_t* image, uint32_t image_size,
           } }
         fprintf(stderr, "[spu_workload] async dispatch MISS fp=0x%016llX size=%u\n",
                 (unsigned long long)fp, image_size);
+        spu_workload_report_miss("async task", fp, image_size, args_ea);
         return 0;
     }
 
