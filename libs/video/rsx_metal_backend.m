@@ -3445,7 +3445,10 @@ static id<MTLFunction> eng_function_insert(u64 hash, id<MTLFunction> fn)
 }
 /* The translated-MSL cache (PS3RECOMP_MSL_CACHE), and the file a program's
  * translation lives in. The key is the HLSL hash and the stage; bump the
- * tag when the translator's output changes. */
+ * tag when the translator's output changes. v2: rsx_shader_msl.cpp's
+ * precise:: min/max/clamp and the RSX_FRAGCOORD_W_IS_RCP preamble (the
+ * v0.17 merge) -- a v1 file holds the fast:: spelling of the same HLSL.
+ * PS3RECOMP_MSL_FAST=1 translations are kept apart from those. */
 static const char* eng_msl_cache_dir(void)
 {
     static const char* cache_dir = (const char*)1;
@@ -3457,7 +3460,9 @@ static const char* eng_msl_cache_dir(void)
 }
 static void eng_msl_cache_path(char* out, size_t n, const char* what, u64 hash, int stage)
 {
-    const u64 key = fnv1a64("msl-v1", 6, hash ^ (u64)(stage + 1) * 0x9E3779B97F4A7C15ull);
+    static const char* tag = NULL;
+    if (!tag) tag = getenv("PS3RECOMP_MSL_FAST") ? "msl-f2" : "msl-v2";
+    const u64 key = fnv1a64(tag, 6, hash ^ (u64)(stage + 1) * 0x9E3779B97F4A7C15ull);
     snprintf(out, n, "%s/%s_%016llx.msl", eng_msl_cache_dir(), what, (unsigned long long)key);
 }
 /* A program's function from its cached translation alone (the warm-up has
