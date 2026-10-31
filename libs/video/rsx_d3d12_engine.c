@@ -4616,16 +4616,16 @@ static ID3D12Resource* s_readback; static u32 s_readback_cap;
 
 /* Diagnostics only (present log, trace triggers, surface dumps, frame grabs):
  * wait for the GPU so the bytes are the frame just submitted. */
-static void eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h, void* out, u32 out_pitch)
+/* host: the rectangle is in the texture's own pixels, read as they are. */
+static void eng_readback_at(u32 surface, u32 x, u32 y, u32 w, u32 h, void* out, u32 out_pitch, int host)
 {
-    (void)user;
     EngObj* o = eng_owner(surface);
     if (!o || !out || !out_pitch || !w || !h || !s_ready) return;
     /* The caller's rectangle is in guest pixels; the texture may be larger.
      * Read the matching host rectangle and resample it (nearest) on the way
      * out, so the caller sees the surface at the size it asked for. */
     const u32 gw = w, gh = h;
-    const int scaled = o->gw && o->gh && (o->gw != o->w || o->gh != o->h);
+    const int scaled = !host && o->gw && o->gh && (o->gw != o->w || o->gh != o->h);
     if (scaled) {
         if (x + w > o->gw || y + h > o->gh) return;
         const u32 x0 = (u32)((u64)x * o->w / o->gw), x1 = (u32)((u64)(x + w) * o->w / o->gw);
@@ -4679,11 +4679,17 @@ static void eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h, vo
         D3D12_RANGE wr = {0, 0}; CALL(s_readback, Unmap, 0, &wr);
     }
 }
+static void eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h, void* out, u32 out_pitch)
+{
+    (void)user;
+    eng_readback_at(surface, x, y, w, h, out, out_pitch, 0);
+}
 
 /* Opt-in readback of the presented surface to a PPM, as the Metal backend:
  * RSX_REPLAY_DUMP_PATH (tools/rsx_replay names each file), PS3RECOMP_FRAME_GRAB
  * (<prefix>.req asks for one <prefix>.ppm; tools/autoplay.sh's HUD check) and
- * PS3RECOMP_FRAME_DUMP every PS3RECOMP_FRAME_EVERY presents. The METAL-named
+ * PS3RECOMP_FRAME_DUMP every PS3RECOMP_FRAME_EVERY presents, at the guest's
+ * size, or the internal resolution's with PS3RECOMP_FRAME_HOST=1. The METAL-named
  * variables are honoured too, so the Mac tools run unchanged. */
 static const char* env2(const char* a, const char* b)
 {
@@ -4720,12 +4726,15 @@ static void eng_dump_frame(u32 surface)
         path = dump;
         if (seq) { snprintf(seqpath, sizeof seqpath, "%s.%06u.ppm", dump, frame); path = seqpath; }
     }
-    const u32 w = o->gw ? o->gw : o->w, h = o->gh ? o->gh : o->h;
+    /* PS3RECOMP_FRAME_HOST=1: at the internal resolution, not the guest's. */
+    static int host = -1;
+    if (host < 0) host = env2("PS3RECOMP_FRAME_HOST", "PS3RECOMP_METAL_FRAME_HOST") ? 1 : 0;
+    const u32 w = (o->gw && !host) ? o->gw : o->w, h = (o->gh && !host) ? o->gh : o->h;
     if (!w || !h || w > 16384 || h > 16384) return;
     u8* rgba = (u8*)malloc((size_t)w * h * 4);
     u8* rgb = (u8*)malloc((size_t)w * h * 3);
     if (!rgba || !rgb) { free(rgba); free(rgb); return; }
-    eng_readback(NULL, surface, 0, 0, w, h, rgba, w * 4);
+    eng_readback_at(surface, 0, 0, w, h, rgba, w * 4, host);
     for (size_t p = 0; p < (size_t)w * h; p++) { rgb[p*3] = rgba[p*4]; rgb[p*3+1] = rgba[p*4+1]; rgb[p*3+2] = rgba[p*4+2]; }
     FILE* f = fopen(path, "wb");
     if (f) {

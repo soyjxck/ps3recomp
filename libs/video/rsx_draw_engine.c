@@ -1640,6 +1640,44 @@ static int eng_fp_sat_alpha(const u8* fp_uc, u32 fp_size)
     return 0;
 }
 
+/* RSX_FP_OVERRIDE_DIR=<dir>: a fragment program with a file <dir>/<fp-struct>.hlsl
+ * (its structural id, 16 lower-case hex digits) gets that text in place of
+ * its translation -- a title's own version of one of its shaders, written
+ * against the translation's bindings (the PSInput, rsx_tex/rsx_samp and
+ * PSConstants of rsx_fp_decompiler.c's output, which the file starts from).
+ * Read at pipeline creation; 1 when *hlsl now holds the file's text. */
+static int eng_fp_override(const u8* fp_uc, u32 fp_size, char* hlsl, size_t cap)
+{
+    static const char* dir = (const char*)1;
+    if (dir == (const char*)1) { dir = getenv("RSX_FP_OVERRIDE_DIR"); if (dir && !*dir) dir = NULL; }
+    if (!dir || !fp_uc) return 0;
+    const u64 id = eng_fp_struct_id(fp_uc, fp_size);
+    char path[1100];
+    snprintf(path, sizeof path, "%s/%016llx.hlsl", dir, (unsigned long long)id);
+    FILE* f = fopen(path, "rb");
+    if (!f) return 0;
+    char* text = (char*)malloc(cap);
+    size_t n = text ? fread(text, 1, cap, f) : 0;
+    fclose(f);
+    if (!text || !n || n >= cap) {
+        fprintf(stderr, "[rsx engine] fp-struct=%016llx: %s unreadable or too long, the translation kept\n",
+                (unsigned long long)id, path);
+        free(text);
+        return 0;
+    }
+    memcpy(hlsl, text, n);
+    hlsl[n] = 0;
+    free(text);
+    static u64 said[32]; static u32 nsaid;
+    int seen = 0;
+    for (u32 i = 0; i < nsaid; i++) seen |= said[i] == id;
+    if (!seen && nsaid < 32) {
+        said[nsaid++] = id;
+        fprintf(stderr, "[rsx engine] fp-struct=%016llx: %s in place of its translation\n", (unsigned long long)id, path);
+    }
+    return 1;
+}
+
 /* ---- pipelines ----------------------------------------------------------- */
 
 static u32 eng_vtex_mask(void)
@@ -2370,6 +2408,7 @@ static int gl_translate(const u8* vp, u32 vp_instrs, const u8* fp, u32 fp_size, 
     rsx_fp_set_saturate_alpha(eng_fp_sat_alpha(fp, fp_size));
     rsx_fp_set_volume_units(vol_mask);
     int fi = rsx_fp_decompile_buffered_ex(fp, fp_size, fp_ctrl, cube_mask, s_ps_hlsl, sizeof s_ps_hlsl, &nconst);
+    if (fi > 0) eng_fp_override(fp, fp_size, s_ps_hlsl, sizeof s_ps_hlsl);
     rsx_fp_set_shadow_units(0, NULL);
     rsx_fp_set_unnorm_units(0, NULL);
     rsx_fp_set_texel_ops(NULL);
@@ -2747,6 +2786,7 @@ key_done:;
         rsx_fp_set_volume_units(vol_mask);
         fi = rsx_fp_decompile_buffered_ex(fp_uc, fp_size, fp_ctrl, cube_mask,
                                           s_ps_hlsl, sizeof s_ps_hlsl, &nconst);
+        if (fi > 0) eng_fp_override(fp_uc, fp_size, s_ps_hlsl, sizeof s_ps_hlsl);
         rsx_fp_set_shadow_units(0, NULL);
         rsx_fp_set_unnorm_units(0, NULL);
         rsx_fp_set_texel_ops(NULL);
