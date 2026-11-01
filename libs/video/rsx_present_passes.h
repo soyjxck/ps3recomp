@@ -16,20 +16,26 @@
  * from the nearer end, and blended for sub-pixel aliasing. */
 /* The present blit for an HDR swap chain (rsx_d3d12_engine.c, RSX_HDR):
  * scRGB, linear light with 1.0 at 80 nits. The frame is an SDR picture: each
- * tap is decoded to linear light (a 2.2 power, what an SDR display shows it
- * with; hdr.z = 1: the sRGB curve) before the area average, then scaled to
- * the paper white (hdr.x = its nits / 80). With hdr.w = 1, t1 is the
- * highlight plane (the title's own composite wrote it: rgb what it wrote to
- * the frame, a how many times brighter, in linear light, the pixel was
- * before its clip): a tap whose frame pixel is still what the plane says --
- * nothing drawn over it since, as the HUD is -- is that many times brighter.
- * Above a knee (half the peak, at least the paper white) the light rolls
- * off smoothly toward the peak (hdr.y = its nits / 80) instead of clipping.
- * hdr.w = 2 (RSX_HDR_DEBUG): the plane shown instead, within SDR's range --
- * the frame dimmed, red as far as a pixel is brightened (4 stops: full),
- * blue where something was drawn over the plane's picture. hdr2.x = 1: the
- * output is HDR10 instead -- the BT.2020 primaries and the PQ curve (ST
- * 2084), for a swap chain that has no scRGB (rsx_vulkan_engine.c). */
+ * of its pixels is decoded to linear light (a 2.2 power, what an SDR display
+ * shows it with; hdr.z = 1: the sRGB curve) and scaled to the paper white
+ * (hdr.x = its nits / 80). With hdr.w = 1, t1 is the HDR plane the title's
+ * own composite wrote (packed: x its HDR colour as RGB9E5, linear light with
+ * 1 at SDR white; y the 8-bit colour it wrote to the frame, bit 24 set): a
+ * pixel whose frame colour is still that -- nothing drawn over it since, as
+ * the HUD is -- is the plane's colour instead. hdr2.y is how much of the
+ * plane's own hue is kept: 1 all of it, 0 the frame pixel's colour at the
+ * plane's luminance (the SDR picture's whitening of bright colours). Pixels
+ * are resolved one by one before they are filtered: scaling down, an
+ * average over each window pixel's footprint (as ps_blit_area); at the same
+ * size, the pixel itself; scaling up, the four around the tap blended. Above
+ * a shoulder (a third of the peak, at least the paper white) the brightest
+ * channel rolls off toward the peak (hdr.y = its nits / 80) on the PQ curve,
+ * the hue kept, instead of clipping. hdr.w = 2 (RSX_HDR_DEBUG): bands
+ * instead -- grey where the plane has nothing, purple where something was
+ * drawn over it, blue, green, yellow and orange above 1, 2, 4 and 8 times the
+ * paper white, red near the peak. hdr2.x = 1: the output is HDR10 instead --
+ * the BT.2020 primaries and the PQ curve (ST 2084), for a swap chain that has
+ * no scRGB (rsx_vulkan_engine.c). */
 static const char kPresentHdrHLSL[] =
     "struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
     "VSOut vs_main(uint vid : SV_VertexID) {\n"
@@ -38,29 +44,54 @@ static const char kPresentHdrHLSL[] =
     "}\n"
     "Texture2D<float4> src : register(t0);\n"
     "SamplerState smp : register(s1);\n"
-    "Texture2D<float4> plane : register(t1);\n"
+    "Texture2D<uint2> plane : register(t1);\n"
     "cbuffer HdrConstants : register(b0) { float4 hdr; float4 hdr2; };\n"
     "float3 decode(float3 c) {\n"
     "    c = saturate(c);\n"
     "    if (hdr.z > 0.5) return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);\n"
     "    return pow(c, 2.2);\n"
     "}\n"
-    "float3 tap(float2 uv) {\n"
-    "    float3 s = src.SampleLevel(smp, uv, 0).rgb;\n"
-    "    float3 lin = decode(s);\n"
-    "    if (hdr.w > 0.5) {\n"
-    "        float4 p = plane.SampleLevel(smp, uv, 0);\n"
-    "        float3 dd = abs(saturate(s) - p.rgb);\n"
-    "        const bool same = max(max(dd.x, dd.y), dd.z) < 3.0 / 255.0;\n"
-    "        if (hdr.w > 1.5) {\n"
-    "            const float st = saturate(log2(clamp(p.a, 1.0, 64.0)) / 4.0);\n"
-    "            return (lin * 0.25 + (same ? float3(st, 0.0, 0.0) : float3(0.0, 0.0, 0.15))) / max(hdr.x, 1e-3);\n"
-    "        }\n"
-    "        if (same) lin *= clamp(p.a, 1.0, 64.0);\n"
-    "    }\n"
-    "    return lin;\n"
+    "float3 rgb9e5(uint p) {\n"
+    "    return float3(p & 511u, (p >> 9) & 511u, (p >> 18) & 511u) * exp2((float)(p >> 27) - 24.0);\n"
     "}\n"
-    "float3 pq(float3 o) {\n"
+    "float luma(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }\n"
+    "float3 texel(int2 t) {\n"
+    "    const float3 s = saturate(src.Load(int3(t, 0)).rgb);\n"
+    "    const float3 lin = decode(s);\n"
+    "    if (hdr.w < 0.5) return lin;\n"
+    "    const uint2 p = plane.Load(int3(t, 0));\n"
+    "    const float3 q = float3(p.y & 255u, (p.y >> 8) & 255u, (p.y >> 16) & 255u);\n"
+    "    const float3 dd = abs(s * 255.0 - q);\n"
+    "    const bool written = (p.y >> 24) != 0u;\n"
+    "    if (!written || max(max(dd.x, dd.y), dd.z) > 3.5) {\n"
+    "        if (hdr.w > 1.5) return written ? float3(0.3, 0.0, 0.3) : lin * 0.3;\n"
+    "        return lin;\n"
+    "    }\n"
+    "    float3 h = rgb9e5(p.x) + (lin - pow(s, 2.2));\n"
+    "    const float yl = luma(lin);\n"
+    "    const float3 native = yl > 1e-5 ? lin * (luma(h) / yl) : h;\n"
+    "    h = max(lerp(native, h, hdr2.y), 0.0);\n"
+    "    if (hdr.w > 1.5) {\n"
+    "        const float r = max(max(h.r, h.g), h.b);\n"
+    "        float3 c = lin * 0.3;\n"
+    "        if (r > 1.02) c = float3(0.0, 0.0, 1.0);\n"
+    "        if (r > 2.0) c = float3(0.0, 1.0, 0.0);\n"
+    "        if (r > 4.0) c = float3(1.0, 1.0, 0.0);\n"
+    "        if (r > 8.0) c = float3(1.0, 0.5, 0.0);\n"
+    "        if (r * hdr.x > 0.9 * hdr.y) c = float3(1.0, 0.0, 0.0);\n"
+    "        return c;\n"
+    "    }\n"
+    "    return h;\n"
+    "}\n"
+    "float pq(float x) {\n"
+    "    const float p = pow(saturate(x), 0.1593017578125);\n"
+    "    return pow((0.8359375 + 18.8515625 * p) / (1.0 + 18.6875 * p), 78.84375);\n"
+    "}\n"
+    "float pq_inv(float e) {\n"
+    "    const float p = pow(saturate(e), 1.0 / 78.84375);\n"
+    "    return pow(max(p - 0.8359375, 0.0) / (18.8515625 - 18.6875 * p), 1.0 / 0.1593017578125);\n"
+    "}\n"
+    "float3 hdr10(float3 o) {\n"
     "    const float3x3 m = float3x3(0.6274040, 0.3292820, 0.0433136,\n"
     "                                0.0690970, 0.9195400, 0.0113612,\n"
     "                                0.0163916, 0.0880132, 0.8955950);\n"
@@ -69,25 +100,41 @@ static const char kPresentHdrHLSL[] =
     "}\n"
     "float4 ps_blit_area_hdr(VSOut i) : SV_Target {\n"
     "    uint w, h; src.GetDimensions(w, h);\n"
-    "    float2 d = float2(ddx(i.uv.x), ddy(i.uv.y));\n"
-    "    float2 fp = abs(d) * float2(w, h);\n"
+    "    const float2 size = float2(w, h);\n"
+    "    const int2 last = int2(w, h) - 1;\n"
+    "    const float2 d = float2(ddx(i.uv.x), ddy(i.uv.y));\n"
+    "    const float2 fp = abs(d) * size;\n"
     "    float3 lin;\n"
-    "    if (fp.x <= 1.25 && fp.y <= 1.25) lin = tap(i.uv);\n"
-    "    else {\n"
-    "        int nx = clamp((int)ceil(fp.x - 0.01), 1, 4), ny = clamp((int)ceil(fp.y - 0.01), 1, 4);\n"
+    "    if (fp.x <= 1.25 && fp.y <= 1.25) {\n"
+    "        const float2 p = i.uv * size - 0.5;\n"
+    "        const float2 c = round(p);\n"
+    "        if (abs(p.x - c.x) < 0.002 && abs(p.y - c.y) < 0.002) lin = texel(clamp((int2)c, 0, last));\n"
+    "        else {\n"
+    "            const int2 t = (int2)floor(p);\n"
+    "            const float2 f = p - floor(p);\n"
+    "            const float3 a = texel(clamp(t, 0, last)), b = texel(clamp(t + int2(1, 0), 0, last));\n"
+    "            const float3 e = texel(clamp(t + int2(0, 1), 0, last)), g = texel(clamp(t + int2(1, 1), 0, last));\n"
+    "            lin = lerp(lerp(a, b, f.x), lerp(e, g, f.x), f.y);\n"
+    "        }\n"
+    "    } else {\n"
+    "        const int nx = clamp((int)ceil(fp.x - 0.01), 1, 4), ny = clamp((int)ceil(fp.y - 0.01), 1, 4);\n"
     "        float3 acc = 0;\n"
     "        for (int y = 0; y < ny; y++)\n"
     "            for (int x = 0; x < nx; x++)\n"
-    "                acc += tap(i.uv + (float2(x + 0.5, y + 0.5) / float2(nx, ny) - 0.5) * d);\n"
+    "                acc += texel(clamp((int2)floor((i.uv + (float2(x + 0.5, y + 0.5) / float2(nx, ny) - 0.5) * d) * size), 0, last));\n"
     "        lin = acc / (float)(nx * ny);\n"
     "    }\n"
     "    float3 o = lin * hdr.x;\n"
     "    if (hdr.w < 1.5) {\n"
-    "        const float knee = max(hdr.x, 0.5 * hdr.y), room = max(hdr.y - knee, 1e-3);\n"
     "        const float m = max(max(o.r, o.g), o.b);\n"
-    "        if (m > knee) o *= (knee + room * (1.0 - exp(-(m - knee) / room))) / m;\n"
+    "        const float sh = min(max(hdr.y / 3.0, hdr.x), hdr.y * 0.9);\n"
+    "        if (m > sh) {\n"
+    "            const float s = pq(sh * 0.008), top = pq(hdr.y * 0.008), l = pq(m * 0.008);\n"
+    "            const float room = max(top - s, 1e-4);\n"
+    "            o *= pq_inv(s + room * (1.0 - exp(-(l - s) / room))) * 125.0 / m;\n"
+    "        }\n"
     "    }\n"
-    "    return float4(hdr2.x > 0.5 ? pq(o) : o, 1.0);\n"
+    "    return float4(hdr2.x > 0.5 ? hdr10(o) : o, 1.0);\n"
     "}\n";
 
 /* The host overlay (rsx_overlay_set: a port's pop-ups) over an HDR back buffer

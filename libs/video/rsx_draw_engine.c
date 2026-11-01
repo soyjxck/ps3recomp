@@ -1664,8 +1664,8 @@ static int eng_fp_sat_alpha(const u8* fp_uc, u32 fp_size)
  * against the translation's bindings (the PSInput, rsx_tex/rsx_samp and
  * PSConstants of rsx_fp_decompiler.c's output, which the file starts from).
  * Read at pipeline creation; 1 when *hlsl now holds the file's text. A file
- * that names rsx_hdr_plane writes the D3D12 engine's HDR highlight plane at
- * its second target (rsx_d3d12_engine.c). */
+ * that names rsx_hdr_plane writes the backend's HDR plane at its second
+ * target (rsx_d3d12_engine.c, rsx_vulkan_encode.inc, rsx_metal_backend.m). */
 static int eng_fp_override(const u8* fp_uc, u32 fp_size, char* hlsl, size_t cap)
 {
     static const char* dir = (const char*)1;
@@ -1685,9 +1685,17 @@ static int eng_fp_override(const u8* fp_uc, u32 fp_size, char* hlsl, size_t cap)
         free(text);
         return 0;
     }
+    text[n] = 0;
     /* RSX_FP_OVERRIDE_DEFINES=<NAME>[,<NAME>...]: "#define NAME 1" above the
-     * file's text, for a file that has more than one version of itself. */
+     * file's text, for a file that has more than one version of itself; and
+     * RSX_HDR_PLANE_PACKED above one that writes the HDR plane, where the
+     * backend's plane is the packed one (rsx_draw_backend.hdr_plane_packed). */
     size_t at = 0;
+    if (g.be && g.be->hdr_plane_packed && strstr(text, "rsx_hdr_plane")) {
+        static const char kPacked[] = "#define RSX_HDR_PLANE_PACKED 1\n";
+        memcpy(hlsl, kPacked, sizeof kPacked - 1);
+        at = sizeof kPacked - 1;
+    }
     const char* defs = getenv("RSX_FP_OVERRIDE_DEFINES");
     while (defs && *defs) {
         const char* end = defs + strcspn(defs, ", ");

@@ -270,26 +270,34 @@ Things a port can turn on that the console never had. All three backends
   and `PSConstants`), so it is best made by editing a dump of the
   translation. `RSX_FP_OVERRIDE_DEFINES=NAME[,NAME]` prepends `#define NAME
   1`, for one file with several versions.
-- **HDR output** (`RSX_HDR=1`; `RSX_HDR_WHITE=<nits>`, `RSX_HDR_PEAK=<nits>`,
-  `RSX_HDR_GAMMA=srgb`, `RSX_HDR_HIGHLIGHTS=0`, `RSX_HDR_DEBUG=1`): where
+- **HDR output** (`RSX_HDR=1`; `RSX_HDR_WHITE=<nits>|windows`, `RSX_HDR_PEAK=<nits>`,
+  `RSX_HDR_HUE=0..1`, `RSX_HDR_GAMMA=srgb`, `RSX_HDR_HIGHLIGHTS=0`, `RSX_HDR_DEBUG=1`): where
   the display has HDR on (`rsx_hdr_display.c` asks DXGI on Windows; Vulkan
   elsewhere decides from the surface's formats; Metal from the screen's EDR
   headroom), the swap chain is scRGB FP16 (Vulkan: HDR10 where scRGB is not
   offered; Metal: extended linear sRGB) and the present pass
   (`rsx_present_passes.h`, `kPresentHdrHLSL`) decodes the SDR frame (a 2.2
   power, or the sRGB curve) and scales it to the paper white (1.0 = 80 nits
-  in scRGB). The settings are read again on `g_rsx_display_reload`, and the
-  display is polled as the title runs.
-- **The highlight plane**: a fragment program whose text names
-  `rsx_hdr_plane` (an override, above) may write a second output,
-  `SV_TARGET1`: rgb what it wrote to the frame, a how many times brighter
-  (linear light) the pixel was before the title clipped it. While HDR is on,
-  a pass of such a pipeline into one target (no MSAA) gets a build with a
-  host-only FP16 target there, the frame's size; the guest never sees it.
-  The HDR present multiplies a pixel by it where the frame still matches the
-  plane's rgb (within 3/255; something drawn over it later, such as a HUD,
-  does not), and rolls off above a knee (max(white, peak / 2)) toward the
-  peak. Without HDR the second output is simply dropped.
+  in scRGB; D3D12 and Vulkan: 203 nits unless set, `windows` for the
+  system's SDR white level). The settings are read again on
+  `g_rsx_display_reload`, and the display is polled as the title runs.
+- **The HDR plane**: a fragment program whose text names `rsx_hdr_plane`
+  (an override, above) may write a second output, `SV_TARGET1`. While HDR
+  is on, a pass of such a pipeline into one target (no MSAA) gets a build
+  with a host-only target there, the frame's size; the guest never sees it.
+  On D3D12 and Vulkan (`rsx_draw_backend.hdr_plane_packed`) the engine puts
+  `#define RSX_HDR_PLANE_PACKED 1` above the program's text and the plane is
+  R32G32 uint: x the pixel's HDR colour as RGB9E5 (linear light, 1 at SDR
+  white), y the 8-bit colour it wrote to the frame with bit 24 set. The HDR
+  present shows the HDR colour where the frame still shows that colour
+  (within 3/255 a channel; something drawn over it later, such as a HUD,
+  does not), mixed with the frame pixel's own colour at the HDR luminance by
+  `RSX_HDR_HUE` (0.5 unless set), pixel by pixel before any scaling, and
+  rolls the brightest channel off on the PQ curve above a shoulder (a third
+  of the peak, at least the paper white) toward the peak. Metal's plane is
+  RGBA16F: rgb what went to the frame, a how many times brighter the pixel's
+  HDR version is, and its present multiplies by it. Without HDR the second
+  output is simply dropped.
 - **A host overlay** (`rsx_overlay_set(fn, user)`, `rsx_draw_engine.h`): the
   port's callback records into the frame's command list after the frame is
   in the window and before the present, with the window's target bound (a

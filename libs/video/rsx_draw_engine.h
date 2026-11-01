@@ -305,6 +305,13 @@ typedef struct rsx_draw_backend {
      * and other formats read guest memory. Kept for the backends that have
      * it. */
     u32  (*depth_as_color)(void* user, u32 depth, u32 w, u32 h, u32 rsx_fmt);
+    /* Nonzero when the backend's HDR plane (a title's own composite that
+     * names rsx_hdr_plane, at its second target) is the packed one: R32G32
+     * uint, x the HDR colour as RGB9E5, y the 8-bit colour that went to the
+     * frame (bit 24: written). The engine puts "#define RSX_HDR_PLANE_PACKED 1"
+     * above such a shader's text; zero leaves the RGBA16F plane (rgb what
+     * went to the frame, a how many times brighter it was). */
+    int hdr_plane_packed;
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */

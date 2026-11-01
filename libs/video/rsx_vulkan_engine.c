@@ -350,22 +350,26 @@ int rsx_aa_mode(void);                      /* rsx_draw_engine.c */
  * sRGB primaries, 1.0 at 80 nits) -- or, where the driver offers no scRGB,
  * HDR10 (10 bits, the PQ curve, the BT.2020 primaries) -- and the present
  * pass (kPresentHdrHLSL) decodes the frame to linear light, scales it to the
- * paper white (RSX_HDR_WHITE=<nits>, else Windows' SDR white level for that
- * display) and lets the highlights the title's composite left in the plane
- * (eng_hdr_plane_*) go above it, rolled off toward the peak (RSX_HDR_PEAK=
- * <nits>, else the display's). RSX_HDR_GAMMA=srgb: the sRGB curve instead of
- * a 2.2 power; RSX_HDR_HIGHLIGHTS=0: no plane; RSX_HDR_DEBUG=1: the plane
- * shown. Read again when the settings page changes it (eng_display_reload);
+ * paper white (RSX_HDR_WHITE=<nits>, else 203; RSX_HDR_WHITE=windows:
+ * Windows' SDR white level for that display) and shows the HDR colour the
+ * title's composite left in the plane (eng_hdr_plane_*) where the frame
+ * still shows that pixel, rolled off toward the peak (RSX_HDR_PEAK=<nits>,
+ * else the display's). RSX_HDR_HUE (0 to 1, default 0.5): how much of the
+ * plane's own hue bright colours keep. RSX_HDR_GAMMA=srgb: the sRGB curve
+ * instead of a 2.2 power; RSX_HDR_HIGHLIGHTS=0: no plane; RSX_HDR_DEBUG=1:
+ * the plane shown. Read again when the settings page changes it (eng_display_reload);
  * Windows' HDR switch and the display under the window are checked as the
  * game runs (eng_hdr_poll). */
 static int s_hdr_want;                          /* RSX_HDR */
 static int s_hdr_on;                            /* the swap chain is HDR */
 static int s_hdr_pq;                            /* ... HDR10 (else scRGB) */
 static int s_hdr_force;                         /* the display's HDR changed: a new swap chain */
-static float s_hdr_white_set, s_hdr_peak_set;   /* nits; 0 = the display's */
+static float s_hdr_white_set, s_hdr_peak_set;   /* nits; 0 = the default (white) / the display's (peak);
+                                                   white -1 = Windows' SDR white level */
 static int s_hdr_srgb;                          /* RSX_HDR_GAMMA=srgb */
-static int s_hdr_highlights = 1;                /* RSX_HDR_HIGHLIGHTS=0: no highlight plane */
-static float s_hdr_white = 200.0f, s_hdr_peak = 1000.0f;   /* in use, nits */
+static int s_hdr_highlights = 1;                /* RSX_HDR_HIGHLIGHTS=0: no HDR plane */
+static float s_hdr_hue = 0.5f;                  /* RSX_HDR_HUE */
+static float s_hdr_white = 203.0f, s_hdr_peak = 1000.0f;   /* in use, nits */
 static VkShaderModule s_present_hdr_ps;         /* kPresentHdrHLSL */
 static VkPipeline s_present_hdr_pso;            /* ... into the swap chain's format (eng_hdr_pso) */
 static u32 s_hdr_obj;                           /* its target: window-sized, in that format */
@@ -376,19 +380,24 @@ static void eng_read_hdr(void)
     const char* e = getenv("RSX_HDR");
     s_hdr_want = e && *e && e[0] != '0';
     e = getenv("RSX_HDR_WHITE");
-    s_hdr_white_set = e && *e ? (float)atof(e) : 0.0f;
+    s_hdr_white_set = e && !_stricmp(e, "windows") ? -1.0f : e && *e ? (float)atof(e) : 0.0f;
     e = getenv("RSX_HDR_PEAK");
     s_hdr_peak_set = e && *e ? (float)atof(e) : 0.0f;
     e = getenv("RSX_HDR_GAMMA");
     s_hdr_srgb = e && !_stricmp(e, "srgb");
     e = getenv("RSX_HDR_HIGHLIGHTS");
     s_hdr_highlights = !(e && e[0] == '0');
+    e = getenv("RSX_HDR_HUE");
+    s_hdr_hue = e && *e ? (float)atof(e) : 0.5f;
+    s_hdr_hue = s_hdr_hue < 0.0f ? 0.0f : s_hdr_hue > 1.0f ? 1.0f : s_hdr_hue;
 }
 
-/* The paper white and the peak from the settings, else from the display. */
+/* The paper white and the peak from the settings, else the defaults and the
+ * display's. */
 static void eng_hdr_levels(const rsx_hdr_display* d)
 {
-    s_hdr_white = s_hdr_white_set > 0.0f ? s_hdr_white_set : d->white > 0.0f ? d->white : 200.0f;
+    s_hdr_white = s_hdr_white_set > 0.0f ? s_hdr_white_set
+                : s_hdr_white_set < 0.0f && d->white > 0.0f ? d->white : 203.0f;
     s_hdr_peak = s_hdr_peak_set > 0.0f ? s_hdr_peak_set : d->peak > 0.0f ? d->peak : 1000.0f;
     if (s_hdr_peak < s_hdr_white) s_hdr_peak = s_hdr_white;   /* a paper white above the peak is the peak's */
 }
@@ -1379,7 +1388,7 @@ static VkPipeline eng_build_pso(EngPipeline* p, int cls, VkShaderModule fs)
         memset(&bas[natt], 0, sizeof bas[natt]);
         bas[natt].colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                                    VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-        fmts[natt++] = VK_FORMAT_R16G16B16A16_SFLOAT;
+        fmts[natt++] = VK_FORMAT_R32G32_UINT;   /* packed (rsx_draw_backend.hdr_plane_packed) */
     }
     VkPipelineColorBlendStateCreateInfo cb = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
     cb.attachmentCount = natt; cb.pAttachments = bas;

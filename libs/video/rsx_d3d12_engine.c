@@ -1896,9 +1896,12 @@ static ID3D12DescriptorHeap* eng_make_heap(D3D12_DESCRIPTOR_HEAP_TYPE type, u32 
  * swap chain is FP16 in scRGB (linear light, the sRGB primaries, 1.0 at 80
  * nits) and the present pass (kPresentHdrHLSL) decodes the frame -- the
  * title's SDR picture -- to linear light and scales it to the paper white:
- * RSX_HDR_WHITE=<nits>, else Windows' own SDR white level for that display
- * (Settings > Display > HDR, SDR content brightness). RSX_HDR_PEAK=<nits>
- * (else the display's peak) caps it. The decode is a 2.2 power -- what an
+ * RSX_HDR_WHITE=<nits>, else 203 (BT.2408's reference white, where HDR games
+ * put it), or with RSX_HDR_WHITE=windows Windows' own SDR white level for
+ * that display (Settings > Display > HDR, SDR content brightness).
+ * RSX_HDR_PEAK=<nits> (else the display's peak) caps it; RSX_HDR_HUE (0 to
+ * 1, default 0.5) is how much of the HDR plane's own hue bright colours keep
+ * (kPresentHdrHLSL). The decode is a 2.2 power -- what an
  * SDR display shows the frame with, so what the title was graded on;
  * Windows composes an SDR window on an HDR desktop with the sRGB curve
  * instead, which lifts its shadows -- or with RSX_HDR_GAMMA=srgb that curve.
@@ -1909,10 +1912,12 @@ static ID3D12DescriptorHeap* eng_make_heap(D3D12_DESCRIPTOR_HEAP_TYPE type, u32 
 static int s_hdr_want;                          /* RSX_HDR */
 static int s_hdr_on;                            /* the swap chain is scRGB */
 static int s_hdr_force;                         /* the display's HDR changed: a new swap chain */
-static float s_hdr_white_set, s_hdr_peak_set;   /* nits; 0 = the display's */
+static float s_hdr_white_set, s_hdr_peak_set;   /* nits; 0 = the default (white) / the display's (peak);
+                                                   white -1 = Windows' SDR white level */
 static int s_hdr_srgb;                          /* RSX_HDR_GAMMA=srgb */
-static int s_hdr_highlights = 1;                /* RSX_HDR_HIGHLIGHTS=0: no highlight plane */
-static float s_hdr_white = 200.0f, s_hdr_peak = 1000.0f;   /* in use, nits */
+static int s_hdr_highlights = 1;                /* RSX_HDR_HIGHLIGHTS=0: no HDR plane */
+static float s_hdr_hue = 0.5f;                  /* RSX_HDR_HUE */
+static float s_hdr_white = 203.0f, s_hdr_peak = 1000.0f;   /* in use, nits */
 typedef rsx_hdr_display EngHdrDisplay;          /* rsx_hdr_display.h */
 
 static void eng_read_hdr(void)
@@ -1920,23 +1925,28 @@ static void eng_read_hdr(void)
     const char* e = getenv("RSX_HDR");
     s_hdr_want = e && *e && e[0] != '0';
     e = getenv("RSX_HDR_WHITE");
-    s_hdr_white_set = e && *e ? (float)atof(e) : 0.0f;
+    s_hdr_white_set = e && !_stricmp(e, "windows") ? -1.0f : e && *e ? (float)atof(e) : 0.0f;
     e = getenv("RSX_HDR_PEAK");
     s_hdr_peak_set = e && *e ? (float)atof(e) : 0.0f;
     e = getenv("RSX_HDR_GAMMA");
     s_hdr_srgb = e && !_stricmp(e, "srgb");
     e = getenv("RSX_HDR_HIGHLIGHTS");
     s_hdr_highlights = !(e && e[0] == '0');
+    e = getenv("RSX_HDR_HUE");
+    s_hdr_hue = e && *e ? (float)atof(e) : 0.5f;
+    s_hdr_hue = s_hdr_hue < 0.0f ? 0.0f : s_hdr_hue > 1.0f ? 1.0f : s_hdr_hue;
 }
 
 /* The display the window is on: is HDR on for it in Windows, its peak, and
  * its SDR white level (rsx_hdr_display.c). */
 static EngHdrDisplay eng_hdr_display(void) { return rsx_hdr_display_query(s_hwnd); }
 
-/* The paper white and the peak from the settings, else from the display. */
+/* The paper white and the peak from the settings, else the defaults and the
+ * display's. */
 static void eng_hdr_levels(const EngHdrDisplay* d)
 {
-    s_hdr_white = s_hdr_white_set > 0.0f ? s_hdr_white_set : d->white > 0.0f ? d->white : 200.0f;
+    s_hdr_white = s_hdr_white_set > 0.0f ? s_hdr_white_set
+                : s_hdr_white_set < 0.0f && d->white > 0.0f ? d->white : 203.0f;
     s_hdr_peak = s_hdr_peak_set > 0.0f ? s_hdr_peak_set : d->peak > 0.0f ? d->peak : 1000.0f;
     if (s_hdr_peak < s_hdr_white) s_hdr_peak = s_hdr_white;   /* a paper white above the peak is the peak's */
 }
@@ -2020,10 +2030,11 @@ static int eng_swapchain_create(IDXGIFactory4* factory)
         if (FAILED(CALL(s_swap, CheckColorSpaceSupport, cs, &support)) ||
             !(support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT) || FAILED(CALL(s_swap, SetColorSpace1, cs)))
             fprintf(stderr, "[rsx engine/d3d12] HDR: the swap chain refused scRGB; left in FP16's default\n");
-        fprintf(stderr, "[rsx engine/d3d12] HDR: scRGB FP16, paper white %.0f nits (%s), peak %.0f nits (%s), %s decode\n",
-                s_hdr_white, s_hdr_white_set > 0.0f ? "RSX_HDR_WHITE" : hd.white > 0.0f ? "Windows' SDR white level" : "default",
+        fprintf(stderr, "[rsx engine/d3d12] HDR: scRGB FP16, paper white %.0f nits (%s), peak %.0f nits (%s), %s decode, highlight hue %.2f\n",
+                s_hdr_white, s_hdr_white_set > 0.0f ? "RSX_HDR_WHITE"
+                           : s_hdr_white_set < 0.0f && hd.white > 0.0f ? "Windows' SDR white level" : "default",
                 s_hdr_peak, s_hdr_peak_set > 0.0f ? "RSX_HDR_PEAK" : hd.peak > 0.0f ? "the display's" : "default",
-                s_hdr_srgb ? "sRGB" : "2.2");
+                s_hdr_srgb ? "sRGB" : "2.2", s_hdr_hue);
     }
     if (!s_backbuf_rtv_heap) s_backbuf_rtv_heap = eng_make_heap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 3, 0);
     if (!s_backbuf_rtv_heap) return -1;
@@ -3618,14 +3629,15 @@ static void eng_ms_depth_sync(u32 h)
     s_cur_pso = NULL; s_cur_targets_valid = 0;
 }
 
-/* ---- the HDR highlight plane (RSX_HDR) ---------------------------------------
- * A host-only FP16 target the size of the frame a highlight-plane pipeline
+/* ---- the HDR plane (RSX_HDR) -------------------------------------------------
+ * A host-only target the size of the frame a highlight-plane pipeline
  * (EngPipeline.hdr_plane: a title's own composite, through
  * RSX_FP_OVERRIDE_DIR) draws into, at its second target, while HDR is on:
- * per pixel, what it wrote to the frame and how much brighter the pixel was
- * before the title clipped it. The HDR present pass reads it for the frame
- * it was drawn beside (s_plane_surface) and brightens the pixels that still
- * show what the plane says. RSX_HDR_HIGHLIGHTS=0 leaves it out. */
+ * per pixel, packed in R32G32 uint (rsx_draw_backend.hdr_plane_packed), the
+ * pixel's HDR colour (RGB9E5) and the 8-bit colour it wrote to the frame.
+ * The HDR present pass reads it for the frame it was drawn beside
+ * (s_plane_surface) and shows the HDR colour of the pixels that still show
+ * what the plane says. RSX_HDR_HIGHLIGHTS=0 leaves it out. */
 static ID3D12Resource* s_plane; static D3D12_RESOURCE_STATES s_plane_state;
 static u32 s_plane_w, s_plane_h, s_plane_surface;
 static ID3D12DescriptorHeap* s_plane_rtv; static ID3D12DescriptorHeap* s_plane_srv;
@@ -3641,18 +3653,18 @@ static int eng_hdr_plane_ready(u32 surface, u32 w, u32 h)
         static ID3D12Resource* dead; static u64 dead_fence;
         if (dead) { fence_wait(dead_fence); RELEASE(dead); }
         if (s_plane) { dead = s_plane; dead_fence = eng_retire_fence(); s_plane = NULL; }
-        D3D12_CLEAR_VALUE cv = {0}; cv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-        s_plane = make_texture(DXGI_FORMAT_R16G16B16A16_FLOAT, w, h, 1, 1, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+        D3D12_CLEAR_VALUE cv = {0}; cv.Format = DXGI_FORMAT_R32G32_UINT;
+        s_plane = make_texture(DXGI_FORMAT_R32G32_UINT, w, h, 1, 1, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
                                D3D12_RESOURCE_STATE_RENDER_TARGET, &cv);
         if (!s_plane) return 0;
         s_plane_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
         s_plane_w = w; s_plane_h = h;
         CALL(s_dev, CreateRenderTargetView, s_plane, NULL, cpu_handle(s_plane_rtv, s_rtv_step, 0));
         D3D12_SHADER_RESOURCE_VIEW_DESC sd = {0};
-        sd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sd.Format = DXGI_FORMAT_R32G32_UINT; sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; sd.Texture2D.MipLevels = 1;
         CALL(s_dev, CreateShaderResourceView, s_plane, &sd, cpu_handle(s_plane_srv, s_srv_step, 0));
-        fprintf(stderr, "[rsx engine/d3d12] HDR: highlight plane %ux%u\n", w, h);
+        fprintf(stderr, "[rsx engine/d3d12] HDR: plane %ux%u\n", w, h);
     }
     s_plane_surface = surface;
     return 1;
@@ -3671,7 +3683,7 @@ static ID3D12PipelineState* eng_pso_plane(u32 pipeline, int cls)
                                         : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     if (pd.NumRenderTargets != 1) return NULL;
     pd.NumRenderTargets = 2;
-    pd.RTVFormats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    pd.RTVFormats[1] = DXGI_FORMAT_R32G32_UINT;
     pd.BlendState.RenderTarget[1] = pd.BlendState.RenderTarget[0];
     pd.BlendState.RenderTarget[1].BlendEnable = FALSE;
     pd.BlendState.RenderTarget[1].LogicOpEnable = FALSE;
@@ -4845,7 +4857,7 @@ static void eng_submit(u32 present_surface, int wait)
                 static int dbg = -1;   /* RSX_HDR_DEBUG=1: the plane shown (kPresentHdrHLSL) */
                 if (dbg < 0) { const char* e = getenv("RSX_HDR_DEBUG"); dbg = e && *e && *e != '0'; }
                 const float k[8] = { s_hdr_white / 80.0f, s_hdr_peak / 80.0f, s_hdr_srgb ? 1.0f : 0.0f,
-                                     hl ? (dbg ? 2.0f : 1.0f) : 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+                                     hl ? (dbg ? 2.0f : 1.0f) : 0.0f, 0.0f, s_hdr_hue, 0.0f, 0.0f };
                 eng_helper_constants(k, 8);
                 if (hl) {
                     res_transition(s_plane, &s_plane_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -5141,6 +5153,7 @@ static const rsx_draw_backend s_engine_backend = {
     .clear_depth_stencil_rect = eng_clear_depth_stencil_rect,
     .present              = eng_present,
     .readback             = eng_readback,
+    .hdr_plane_packed     = 1,
 };
 
 /* ---- public API -------------------------------------------------------------- */

@@ -329,14 +329,15 @@ static void eng_ms_apply(int want)
     fprintf(stderr, "[RSX vulkan] MSAA %s\n", s_ms_n > 1 ? (s_ms_n == 2 ? "x2" : s_ms_n == 4 ? "x4" : "x8") : "off");
 }
 
-/* ---- the HDR highlight plane (RSX_HDR) -------------------------------------------
- * As the D3D12 engine's: a host-only FP16 target the size of the frame a
+/* ---- the HDR plane (RSX_HDR) -----------------------------------------------------
+ * As the D3D12 engine's: a host-only target the size of the frame a
  * highlight-plane pipeline (EngPipeline.hdr_plane: a title's own composite,
  * through RSX_FP_OVERRIDE_DIR) draws into, at its second output, while HDR is
- * on -- per pixel, what it wrote to the frame and how much brighter the pixel
- * was before the title clipped it. The HDR present reads it for the frame it
- * was drawn beside (s_plane_surface) and brightens the pixels that still show
- * what the plane says. RSX_HDR_HIGHLIGHTS=0 leaves it out. */
+ * on -- per pixel, packed in R32G32 uint (rsx_draw_backend.hdr_plane_packed),
+ * its HDR colour (RGB9E5) and the 8-bit colour it wrote to the frame. The HDR
+ * present reads it for the frame it was drawn beside (s_plane_surface) and
+ * shows the HDR colour of the pixels that still show what the plane says.
+ * RSX_HDR_HIGHLIGHTS=0 leaves it out. */
 static u32 s_plane_obj, s_plane_surface;
 /* The plane at w x h (made or made again), for the frame `surface`; 0 if it cannot be. */
 static int eng_hdr_plane_ready(u32 surface, u32 w, u32 h)
@@ -344,14 +345,14 @@ static int eng_hdr_plane_ready(u32 surface, u32 w, u32 h)
     EngObj* o = eng_obj(s_plane_obj);
     if (!o || o->w != w || o->h != h) {
         if (o) eng_obj_release(NULL, s_plane_obj);   /* freed once the submits that name it have run */
-        s_plane_obj = eng_image(OBJ_COLOR, VK_FORMAT_R16G16B16A16_SFLOAT, w, h, 1, 1,
+        s_plane_obj = eng_image(OBJ_COLOR, VK_FORMAT_R32G32_UINT, w, h, 1, 1,
                                 VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
         o = eng_obj(s_plane_obj);
         if (!o) { s_plane_obj = 0; return 0; }
         o->gw = o->gh = 0;   /* no guest size: eng_rescale leaves it alone */
         o->view = make_view(o->img, o->fmt, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, k_identity);
         o->att = make_view(o->img, o->fmt, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, k_identity);
-        fprintf(stderr, "[rsx engine/vulkan] HDR: highlight plane %ux%u\n", w, h);
+        fprintf(stderr, "[rsx engine/vulkan] HDR: plane %ux%u\n", w, h);
     }
     s_plane_surface = surface;
     return 1;
@@ -867,7 +868,7 @@ static void eng_submit(u32 present_surface, int wait)
                         static int dbg = -1;   /* RSX_HDR_DEBUG=1: the plane shown (kPresentHdrHLSL) */
                         if (dbg < 0) { const char* e = getenv("RSX_HDR_DEBUG"); dbg = e && *e && *e != '0'; }
                         const float k[8] = { s_hdr_white / 80.0f, s_hdr_peak / 80.0f, s_hdr_srgb ? 1.0f : 0.0f,
-                                             hl ? (dbg ? 2.0f : 1.0f) : 0.0f, s_hdr_pq ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f };
+                                             hl ? (dbg ? 2.0f : 1.0f) : 0.0f, s_hdr_pq ? 1.0f : 0.0f, s_hdr_hue, 0.0f, 0.0f };
                         eng_helper_constants(k, 8);
                         if (hl) eng_helper_t1(s_plane_obj);
                         eng_present_pass(s_present_hdr_pso, shown, ho);
@@ -1154,6 +1155,7 @@ static const rsx_draw_backend s_engine_backend = {
     .clear_depth_stencil_rect = eng_clear_depth_stencil_rect,
     .present              = eng_present,
     .readback             = eng_readback,
+    .hdr_plane_packed     = 1,
 };
 
 /* ---- device ---------------------------------------------------------------------------- */
@@ -1258,11 +1260,12 @@ static int eng_swapchain_create(void)
             sf = fmts[pick];
             s_hdr_on = 1;
             s_hdr_pq = sf.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT;
-            fprintf(stderr, "[rsx engine/vulkan] HDR: %s, paper white %.0f nits (%s), peak %.0f nits (%s), %s decode\n",
+            fprintf(stderr, "[rsx engine/vulkan] HDR: %s, paper white %.0f nits (%s), peak %.0f nits (%s), %s decode, highlight hue %.2f\n",
                     s_hdr_pq ? "HDR10 (10-bit PQ)" : "scRGB FP16",
-                    s_hdr_white, s_hdr_white_set > 0.0f ? "RSX_HDR_WHITE" : hd.white > 0.0f ? "Windows' SDR white level" : "default",
+                    s_hdr_white, s_hdr_white_set > 0.0f ? "RSX_HDR_WHITE"
+                               : s_hdr_white_set < 0.0f && hd.white > 0.0f ? "Windows' SDR white level" : "default",
                     s_hdr_peak, s_hdr_peak_set > 0.0f ? "RSX_HDR_PEAK" : hd.peak > 0.0f ? "the display's" : "default",
-                    s_hdr_srgb ? "sRGB" : "2.2");
+                    s_hdr_srgb ? "sRGB" : "2.2", s_hdr_hue);
         } else {
             fprintf(stderr, "[rsx engine/vulkan] HDR: %s; the picture stays SDR\n",
                     hd.found && !hd.hdr ? "Windows has HDR off for this display (Settings > Display > Use HDR)"
