@@ -368,6 +368,30 @@ void rsx_canvas_remap_set(u32 mark, float k, float x, float y);
  * the first. Any thread. */
 float rsx_present_window_aspect(void);
 
+/* A host overlay over each frame presented to the window: the port's own UI
+ * (a trophy pop-up, a menu) drawn by the port with the backend's own objects,
+ * after the frame is in the window and before it is presented. The callback
+ * runs on the thread that presents, records into the frame's command list
+ * with the window's target bound, and may change any of the list's state (it
+ * is the frame's last work; the backend sets its own again). A headless
+ * present has none. RSX_OVERLAY=0 leaves it out. Any thread sets it; NULL
+ * removes it. Backends: Direct3D 12 (more to come). */
+enum { RSX_OVERLAY_D3D12 = 1, RSX_OVERLAY_VULKAN = 2, RSX_OVERLAY_METAL = 3 };
+typedef struct rsx_overlay_frame {
+    int  api;                /* RSX_OVERLAY_* */
+    u32  width, height;      /* the target: the whole window, in pixels */
+    u32  frames_in_flight;   /* frames the GPU may still be reading */
+    void* device;            /* D3D12: ID3D12Device* */
+    void* queue;             /* D3D12: ID3D12CommandQueue* */
+    void* list;              /* D3D12: ID3D12GraphicsCommandList*, recording */
+    u32  format;             /* D3D12: the target's DXGI_FORMAT */
+    u64  target;             /* D3D12: the target's RTV (D3D12_CPU_DESCRIPTOR_HANDLE.ptr) */
+} rsx_overlay_frame;
+typedef void (*rsx_overlay_fn)(const rsx_overlay_frame* f, void* user);
+void rsx_overlay_set(rsx_overlay_fn fn, void* user);
+/* The overlay, or NULL (also when RSX_OVERLAY=0). For the backends. */
+rsx_overlay_fn rsx_overlay_get(void** user);
+
 /* For a backend's present of a fw x fh frame into a ww x wh window: vp, the
  * rectangle (x, y, w, h, window pixels) the whole frame is drawn to -- taller
  * than the window when the bars are cut away -- and rect, the part of the

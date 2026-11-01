@@ -90,6 +90,29 @@ static const char kPresentHdrHLSL[] =
     "    return float4(hdr2.x > 0.5 ? pq(o) : o, 1.0);\n"
     "}\n";
 
+/* The host overlay (rsx_overlay_set: a port's pop-ups) over an HDR back buffer
+ * (rsx_d3d12_engine.c): the overlay draws as it would into an SDR target --
+ * an RGBA8 one cleared to nothing, so its colour is premultiplied by its
+ * cover -- and this pass lays it over the scRGB frame: each pixel
+ * un-premultiplied, decoded as the frame is (hdr.z: the sRGB curve, else a
+ * 2.2 power), at the paper white (hdr.x = its nits / 80), and drawn with
+ * premultiplied alpha (ONE, INV_SRC_ALPHA). */
+static const char kOverlayHdrHLSL[] =
+    "struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
+    "VSOut vs_main(uint vid : SV_VertexID) {\n"
+    "    float2 p = float2((vid << 1) & 2, vid & 2);\n"
+    "    VSOut o; o.pos = float4(p * 2.0 - 1.0, 0.0, 1.0); o.uv = float2(p.x, 1.0 - p.y); return o;\n"
+    "}\n"
+    "Texture2D<float4> src : register(t0);\n"
+    "cbuffer HdrConstants : register(b0) { float4 hdr; float4 hdr2; };\n"
+    "float4 ps_overlay_hdr(VSOut i) : SV_Target {\n"
+    "    const float4 c = src.Load(int3(i.pos.xy, 0));\n"
+    "    if (c.a <= 0.0) return float4(0.0, 0.0, 0.0, 0.0);\n"
+    "    const float3 e = saturate(c.rgb / c.a);\n"
+    "    const float3 lin = hdr.z > 0.5 ? (e <= 0.04045 ? e / 12.92 : pow((e + 0.055) / 1.055, 2.4)) : pow(e, 2.2);\n"
+    "    return float4(lin * hdr.x * c.a, c.a);\n"
+    "}\n";
+
 static const char kPresentHLSL[] =
     "struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
     "VSOut vs_main(uint vid : SV_VertexID) {\n"

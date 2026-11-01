@@ -698,12 +698,11 @@ All sceNp modules simulate an offline PSN environment. Multiplayer features repo
 **File:** `libs/network/sceNpTrophy.c`
 **Purpose:** Trophy/achievement system
 
-- **Persistent JSON storage** — trophies are saved to a JSON file on the host
-- Unlock with timestamps
-- Progress tracking (percentage-based trophies)
-- Trophy configuration from TROPCONF.SFM
-- Trophy types: Bronze, Silver, Gold, Platinum
-- `sceNpTrophyUnlockTrophy(ctx, handle, id, &platinum)` — unlock and check for platinum
+- **The title's own trophy pack** — `PS3_GAME/TROPDIR/<comm id>/TROPHY.TRP` (`trophy_pack.h`): names and details in the console language (`TROP_xx.SFM`), grades, hidden flags, groups (DLC), icons
+- **Persistent JSON storage** — unlocks with their times in `gamedata/trophies/<comm id>.json` (or under `$PS3_GAMEDATA_ROOT`)
+- Firmware behaviour as RPCS3 documents it: the firmware's error codes, a hidden trophy's details withheld until earned, the platinum earned with the last trophy linked to it (`platinumId`), times as CellRtcTick, game and trophy icons
+- **For the port** (`trophy_host.h`): a listener for each unlock (the port's own pop-up) and a snapshot of the list; `PS3_TROPHY_PREVIEW=<id>` fires it at registration for testing
+- A title without a pack still registers: 128 nameless bronze slots
 
 ### sceNpTus
 

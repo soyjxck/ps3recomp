@@ -413,6 +413,10 @@ static s32 sysutil_language(void)
     return lang;
 }
 
+/* The console language (CELL_SYSUTIL_LANG_*), for the host side: the
+ * trophy names a port shows are the ones the game would get. */
+s32 ps3_sysutil_language(void) { return sysutil_language(); }
+
 s32 cellSysutilGetSystemParamInt(s32 id, u32 value_ea)
 {
     if (!value_ea)

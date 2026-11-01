@@ -368,6 +368,7 @@ static ID3DBlob* s_helper_vs_blob; static ID3DBlob* s_helper_blit_blob; /* kept:
 static ID3D12PipelineState* s_zcopy_ms_pso;   /* MSAA depth twin -> its single-sampled target */
 static ID3D12PipelineState* s_present_pso, *s_fxaa_pso;   /* rsx_present_passes.h */
 static ID3D12PipelineState* s_present_hdr_pso;   /* kPresentHdrHLSL: into an scRGB back buffer (RSX_HDR) */
+static ID3D12PipelineState* s_overlay_hdr_pso;   /* kOverlayHdrHLSL: the host overlay over it (eng_overlay_draw) */
 int rsx_aa_mode(void);                                    /* rsx_draw_engine.c */
 static ID3D12Resource* s_null_tex;
 static SRWLOCK s_pipe_lock = SRWLOCK_INIT;
@@ -1346,6 +1347,31 @@ static ID3D12PipelineState* eng_helper_pso(ID3DBlob* vs, ID3DBlob* ps, DXGI_FORM
     if (FAILED(hr)) fprintf(stderr, "[rsx engine/d3d12] helper pipeline failed: 0x%08lX\n", (long)hr);
     return pso;
 }
+/* As eng_helper_pso, laid over the target with premultiplied alpha (ONE,
+ * INV_SRC_ALPHA). */
+static ID3D12PipelineState* eng_helper_pso_over(ID3DBlob* vs, ID3DBlob* ps, DXGI_FORMAT rt)
+{
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
+    pd.pRootSignature = s_helper_rootsig;
+    pd.VS.pShaderBytecode = CALL0(vs, GetBufferPointer); pd.VS.BytecodeLength = CALL0(vs, GetBufferSize);
+    pd.PS.pShaderBytecode = CALL0(ps, GetBufferPointer); pd.PS.BytecodeLength = CALL0(ps, GetBufferSize);
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    D3D12_RENDER_TARGET_BLEND_DESC* b = &pd.BlendState.RenderTarget[0];
+    b->BlendEnable = TRUE;
+    b->SrcBlend = D3D12_BLEND_ONE; b->DestBlend = D3D12_BLEND_INV_SRC_ALPHA; b->BlendOp = D3D12_BLEND_OP_ADD;
+    b->SrcBlendAlpha = D3D12_BLEND_ONE; b->DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA; b->BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    b->LogicOp = D3D12_LOGIC_OP_NOOP;
+    b->RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = UINT_MAX;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1; pd.RTVFormats[0] = rt;
+    pd.SampleDesc.Count = 1;
+    ID3D12PipelineState* pso = NULL;
+    HRESULT hr = CALL(s_dev, CreateGraphicsPipelineState, &pd, &IID_ID3D12PipelineState, (void**)&pso);
+    if (FAILED(hr)) fprintf(stderr, "[rsx engine/d3d12] helper pipeline (over) failed: 0x%08lX\n", (long)hr);
+    return pso;
+}
 
 /* ---- the pipeline-state list ------------------------------------------------
  *
@@ -2183,6 +2209,10 @@ static int eng_init_device(u32 width, u32 height)
               if (s_present_hdr_pso) { s_hdr_force = 1; g_rsx_display_reload = 1; }
               else fprintf(stderr, "[rsx engine/d3d12] HDR: its present pass did not build; the picture stays SDR\n");
           } }
+        { ID3DBlob* ovs = eng_compile(kOverlayHdrHLSL, sizeof kOverlayHdrHLSL - 1, "vs_main", "vs_5_0", "overlay hdr vs");
+          ID3DBlob* ops = eng_compile(kOverlayHdrHLSL, sizeof kOverlayHdrHLSL - 1, "ps_overlay_hdr", "ps_5_0", "overlay hdr");
+          if (ovs && ops && !s_overlay_hdr_pso) s_overlay_hdr_pso = eng_helper_pso_over(ovs, ops, DXGI_FORMAT_R16G16B16A16_FLOAT);
+          RELEASE(ovs); RELEASE(ops); }
         if (vs && pd) s_depth_pso = eng_helper_pso(vs, pd, DXGI_FORMAT_R32_FLOAT);
         if (vs && pp) s_depth_pack_pso = eng_helper_pso(vs, pp, DXGI_FORMAT_R8G8B8A8_UNORM);
         { ID3DBlob* pdm = eng_compile(kHelperHLSL, sizeof kHelperHLSL - 1, "ps_depth_ms", "ps_5_0", "helper depth ms");
@@ -4674,6 +4704,86 @@ static u32 eng_aa_target(u32 w, u32 h)
 }
 
 /* s_walker_tid (above eng_pso): the thread that encodes -- PSO time there is walker time. */
+/* The overlay's RGBA8 target while the back buffer is HDR (eng_overlay_draw),
+ * the window's size: made or made again; 0 if it cannot be. */
+static ID3D12Resource* s_ovl; static D3D12_RESOURCE_STATES s_ovl_state;
+static u32 s_ovl_w, s_ovl_h;
+static ID3D12DescriptorHeap* s_ovl_rtv; static ID3D12DescriptorHeap* s_ovl_srv;
+static int eng_overlay_target_ready(u32 w, u32 h)
+{
+    if (!s_ovl_rtv) s_ovl_rtv = eng_make_heap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, 0);
+    if (!s_ovl_srv) s_ovl_srv = eng_make_heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, 0);
+    if (!s_ovl_rtv || !s_ovl_srv) return 0;
+    if (!s_ovl || s_ovl_w != w || s_ovl_h != h) {
+        /* the old one may still be named by a list in flight: released once
+         * the submit after it has run */
+        static ID3D12Resource* dead; static u64 dead_fence;
+        if (dead) { fence_wait(dead_fence); RELEASE(dead); }
+        if (s_ovl) { dead = s_ovl; dead_fence = eng_retire_fence(); s_ovl = NULL; }
+        D3D12_CLEAR_VALUE cv = {0}; cv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        s_ovl = make_texture(DXGI_FORMAT_R8G8B8A8_UNORM, w, h, 1, 1, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                             D3D12_RESOURCE_STATE_RENDER_TARGET, &cv);
+        if (!s_ovl) return 0;
+        s_ovl_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        s_ovl_w = w; s_ovl_h = h;
+        CALL(s_dev, CreateRenderTargetView, s_ovl, NULL, cpu_handle(s_ovl_rtv, s_rtv_step, 0));
+        D3D12_SHADER_RESOURCE_VIEW_DESC sv = {0};
+        sv.Format = DXGI_FORMAT_R8G8B8A8_UNORM; sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; sv.Texture2D.MipLevels = 1;
+        CALL(s_dev, CreateShaderResourceView, s_ovl, &sv, cpu_handle(s_ovl_srv, s_srv_step, 0));
+    }
+    return 1;
+}
+
+/* The host's overlay (rsx_overlay_set) over the window's target, bound at
+ * rtv, after the present blit; then the engine's own heaps and root signature
+ * again, and nothing assumed bound. With an HDR back buffer the overlay draws
+ * into an RGBA8 target of its own, cleared to nothing, which kOverlayHdrHLSL
+ * then lays over the frame at the paper white: the overlay sees the same
+ * format either way. */
+static void eng_overlay_draw(D3D12_CPU_DESCRIPTOR_HANDLE rtv)
+{
+    void* user = NULL;
+    rsx_overlay_fn fn = rsx_overlay_get(&user);
+    if (!fn || !s_swap) return;
+    DXGI_SWAP_CHAIN_DESC1 sd;
+    memset(&sd, 0, sizeof sd);
+    if (FAILED(CALL(s_swap, GetDesc1, &sd))) return;
+    const int hdr = s_hdr_on && s_overlay_hdr_pso && eng_overlay_target_ready(s_win_w, s_win_h);
+    const D3D12_CPU_DESCRIPTOR_HANDLE back = rtv;
+    if (hdr) {
+        res_transition(s_ovl, &s_ovl_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        bar_flush();
+        rtv = cpu_handle(s_ovl_rtv, s_rtv_step, 0);
+        const float none[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        CALL(s_list, ClearRenderTargetView, rtv, none, 0, NULL);
+        sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    }
+    CALL(s_list, OMSetRenderTargets, 1, &rtv, FALSE, NULL);
+    rsx_overlay_frame f;
+    memset(&f, 0, sizeof f);
+    f.api = RSX_OVERLAY_D3D12;
+    f.width = s_win_w; f.height = s_win_h;
+    f.frames_in_flight = ENG_FRAMES;
+    f.device = s_dev; f.queue = s_queue; f.list = s_list;
+    f.format = (u32)sd.Format;
+    f.target = (u64)rtv.ptr;
+    fn(&f, user);
+    ID3D12DescriptorHeap* heaps[2] = { s_srv_gpu, s_smp_gpu[s_slot] };
+    CALL(s_list, SetDescriptorHeaps, 2, heaps);
+    CALL(s_list, SetGraphicsRootSignature, s_cur_helper_rs ? s_helper_rootsig : s_rootsig);
+    s_cur_pso = NULL; s_cur_targets_valid = 0; s_srv_last_valid = 0;
+    s_cur_topo = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    if (hdr) {
+        res_transition(s_ovl, &s_ovl_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        bar_flush();
+        const float k[8] = { s_hdr_white / 80.0f, s_hdr_peak / 80.0f, s_hdr_srgb ? 1.0f : 0.0f, 0.0f,
+                             0.0f, 0.0f, 0.0f, 0.0f };
+        eng_helper_constants(k, 8);
+        eng_fullscreen_pass(s_overlay_hdr_pso, back, s_win_w, s_win_h, cpu_handle(s_ovl_srv, s_srv_step, 0));
+    }
+}
+
 static void eng_submit(u32 present_surface, int wait)
 {
     if (!s_walker_tid) s_walker_tid = GetCurrentThreadId();
@@ -4746,6 +4856,7 @@ static void eng_submit(u32 present_surface, int wait)
             }
             eng_fullscreen_pass_at(ppso, rtv, s_win_w, s_win_h,
                                    obj_srv(shown), s_headless ? NULL : lvp, s_headless ? NULL : lrect);
+            if (windowed) eng_overlay_draw(rtv);
             if (windowed) res_transition(dst, &st, D3D12_RESOURCE_STATE_PRESENT);
             else s_offscreen_state = st;
             bar_flush();
@@ -5042,6 +5153,7 @@ static void eng_release_device(void)
     RELEASE(s_null_tex); RELEASE(s_blit_pso); RELEASE(s_depth_pso); RELEASE(s_depth_pack_pso);
     RELEASE(s_present_pso); RELEASE(s_fxaa_pso); RELEASE(s_present_hdr_pso); rsx_hdr_display_release();
     RELEASE(s_plane); RELEASE(s_plane_rtv); RELEASE(s_plane_srv); s_plane_w = s_plane_h = s_plane_surface = 0;
+    RELEASE(s_overlay_hdr_pso); RELEASE(s_ovl); RELEASE(s_ovl_rtv); RELEASE(s_ovl_srv); s_ovl_w = s_ovl_h = 0;
     RELEASE(s_depth_ms_pso); RELEASE(s_depth_pack_ms_pso); RELEASE(s_zcopy_ms_pso);
     RELEASE(s_helper_vs_blob); RELEASE(s_helper_blit_blob);
     RELEASE(s_rootsig); RELEASE(s_helper_rootsig);

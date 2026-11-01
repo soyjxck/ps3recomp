@@ -112,7 +112,7 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 | sceNpMatching2 | NP Matching | **Complete** | Rooms, signaling and callbacks over a [psnr](ONLINE.md) server with `PS3_NET_ONLINE`; offline, operations return SERVER_NOT_AVAILABLE |
 | sceNpSignaling | NP Signaling | **Complete** | Context management, connection ops return NOT_CONNECTED, local net info |
 | sceNpSns | NP SNS | **Complete** | Facebook/Twitter stubs, operations return NOT_CONNECTED |
-| sceNpTrophy | NP Trophies | **Complete** | Persistent JSON storage, unlock with timestamps, progress tracking |
+| sceNpTrophy | NP Trophies | **Complete** | The title's TROPHY.TRP (names, grades, hidden, icons), platinum, JSON storage, an unlock listener for the port |
 | sceNpUtil | NP Utility | **Complete** | Bandwidth test (fake 100Mbps), NP environment, online ID validation, parental control |
 
 ## System Utilities (cellSysutil sub-modules)

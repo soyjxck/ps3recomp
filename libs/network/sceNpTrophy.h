@@ -16,24 +16,37 @@ extern "C" {
 #endif
 
 /* ---------------------------------------------------------------------------
- * Error codes
+ * Error codes (the firmware's: RPCS3's sceNpTrophy.h lists the same)
  * -----------------------------------------------------------------------*/
-#define SCE_NP_TROPHY_ERROR_NOT_INITIALIZED         0x80551601
-#define SCE_NP_TROPHY_ERROR_ALREADY_INITIALIZED     0x80551602
-#define SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT        0x80551603
-#define SCE_NP_TROPHY_ERROR_OUT_OF_MEMORY           0x80551604
-#define SCE_NP_TROPHY_ERROR_INVALID_CONTEXT         0x80551605
-#define SCE_NP_TROPHY_ERROR_INVALID_HANDLE          0x80551606
-#define SCE_NP_TROPHY_ERROR_CONTEXT_NOT_REGISTERED  0x80551607
-#define SCE_NP_TROPHY_ERROR_ALREADY_EXISTS          0x80551608
-#define SCE_NP_TROPHY_ERROR_NOT_FOUND               0x80551609
-#define SCE_NP_TROPHY_ERROR_ALREADY_UNLOCKED        0x8055160A
-#define SCE_NP_TROPHY_ERROR_PLATINUM_CANNOT_UNLOCK  0x8055160B
-#define SCE_NP_TROPHY_ERROR_CONTEXT_ALREADY_REG     0x8055160C
-#define SCE_NP_TROPHY_ERROR_INSUFFICIENT_SPACE      0x8055160D
-#define SCE_NP_TROPHY_ERROR_PROCESSING              0x8055160E
-#define SCE_NP_TROPHY_ERROR_ABORT                   0x8055160F
-#define SCE_NP_TROPHY_ERROR_UNKNOWN                 0x805516FF
+#define SCE_NP_TROPHY_ERROR_ALREADY_INITIALIZED     0x80022901
+#define SCE_NP_TROPHY_ERROR_NOT_INITIALIZED         0x80022902
+#define SCE_NP_TROPHY_ERROR_NOT_SUPPORTED           0x80022903
+#define SCE_NP_TROPHY_ERROR_CONTEXT_NOT_REGISTERED  0x80022904
+#define SCE_NP_TROPHY_ERROR_OUT_OF_MEMORY           0x80022905
+#define SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT        0x80022906
+#define SCE_NP_TROPHY_ERROR_EXCEEDS_MAX             0x80022907
+#define SCE_NP_TROPHY_ERROR_INSUFFICIENT            0x80022909
+#define SCE_NP_TROPHY_ERROR_UNKNOWN_CONTEXT         0x8002290A
+#define SCE_NP_TROPHY_ERROR_INVALID_FORMAT          0x8002290B
+#define SCE_NP_TROPHY_ERROR_INVALID_CONTEXT         0x8002290E
+#define SCE_NP_TROPHY_ERROR_PROCESSING_ABORTED      0x8002290F
+#define SCE_NP_TROPHY_ERROR_ABORT                   0x80022910
+#define SCE_NP_TROPHY_ERROR_UNKNOWN_HANDLE          0x80022911
+#define SCE_NP_TROPHY_ERROR_LOCKED                  0x80022912
+#define SCE_NP_TROPHY_ERROR_HIDDEN                  0x80022913
+#define SCE_NP_TROPHY_ERROR_CANNOT_UNLOCK_PLATINUM  0x80022914
+#define SCE_NP_TROPHY_ERROR_ALREADY_UNLOCKED        0x80022915
+#define SCE_NP_TROPHY_ERROR_INVALID_HANDLE          0x80022917
+#define SCE_NP_TROPHY_ERROR_INVALID_NP_COMM_ID      0x80022918
+#define SCE_NP_TROPHY_ERROR_CONF_DOES_NOT_EXIST     0x8002291B
+#define SCE_NP_TROPHY_ERROR_INVALID_TROPHY_ID       0x80022920
+#define SCE_NP_TROPHY_ERROR_UNKNOWN_TROPHY_ID       0x80022921
+#define SCE_NP_TROPHY_ERROR_UNKNOWN_FILE            0x80022923
+#define SCE_NP_TROPHY_ERROR_UNKNOWN                 0x800229FF
+
+/* the names this file used before it had the firmware's */
+#define SCE_NP_TROPHY_ERROR_CONTEXT_ALREADY_REG     SCE_NP_TROPHY_ERROR_INVALID_CONTEXT
+#define SCE_NP_TROPHY_ERROR_PLATINUM_CANNOT_UNLOCK  SCE_NP_TROPHY_ERROR_CANNOT_UNLOCK_PLATINUM
 
 /* ---------------------------------------------------------------------------
  * Constants
@@ -44,7 +57,7 @@ extern "C" {
 
 #define SCE_NP_TROPHY_MAX_NUM_TROPHIES      128
 #define SCE_NP_TROPHY_NAME_MAX_SIZE         128
-#define SCE_NP_TROPHY_DESC_MAX_SIZE         256
+#define SCE_NP_TROPHY_DESC_MAX_SIZE         1024
 #define SCE_NP_TROPHY_GAME_TITLE_MAX_SIZE   128
 #define SCE_NP_TROPHY_GAME_DESC_MAX_SIZE    1024
 
@@ -65,6 +78,7 @@ typedef s32 SceNpTrophyContext;
 typedef s32 SceNpTrophyHandle;
 typedef s32 SceNpTrophyId;
 
+/* The guest's layouts (every integer big-endian). */
 typedef struct SceNpTrophyDetails {
     u32  trophyId;
     u32  trophyGrade;
@@ -72,14 +86,14 @@ typedef struct SceNpTrophyDetails {
     char description[SCE_NP_TROPHY_DESC_MAX_SIZE];
     u8   hidden;
     u8   padding[3];
-} SceNpTrophyDetails;
+} SceNpTrophyDetails;   /* 1164 bytes */
 
 typedef struct SceNpTrophyData {
-    u64  timestamp;     /* UNIX timestamp when unlocked, 0 if locked */
+    u64  timestamp;     /* CellRtcTick: microseconds since 0001-01-01; 0 if locked */
     u32  trophyId;
     u8   unlocked;
     u8   padding[3];
-} SceNpTrophyData;
+} SceNpTrophyData;      /* 16 bytes */
 
 typedef struct SceNpTrophyGameDetails {
     u32  numTrophies;
@@ -89,7 +103,8 @@ typedef struct SceNpTrophyGameDetails {
     u32  numBronze;
     char title[SCE_NP_TROPHY_GAME_TITLE_MAX_SIZE];
     char description[SCE_NP_TROPHY_GAME_DESC_MAX_SIZE];
-} SceNpTrophyGameDetails;
+    u8   reserved[4];
+} SceNpTrophyGameDetails;   /* 1176 bytes */
 
 typedef struct SceNpTrophyGameData {
     u32  unlockedTrophies;
@@ -165,6 +180,14 @@ s32 sceNpTrophyGetTrophyUnlockState(SceNpTrophyContext context,
 s32 sceNpTrophyGetGameProgress(SceNpTrophyContext context,
                                SceNpTrophyHandle handle,
                                s32* percentage);
+
+s32 sceNpTrophyGetGameIcon(SceNpTrophyContext context, SceNpTrophyHandle handle,
+                           void* buffer, u32* size);
+s32 sceNpTrophyGetTrophyIcon(SceNpTrophyContext context, SceNpTrophyHandle handle,
+                             SceNpTrophyId trophyId, void* buffer, u32* size);
+s32 sceNpTrophySetSoundLevel(SceNpTrophyContext context, SceNpTrophyHandle handle,
+                             u32 level, u64 options);
+s32 sceNpTrophyAbortHandle(SceNpTrophyHandle handle);
 
 /* Set the trophy storage directory (defaults to "gamedata/trophies") */
 void sceNpTrophySetStoragePath(const char* path);

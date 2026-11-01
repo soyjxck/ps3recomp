@@ -1,5 +1,6 @@
 /* clang -std=gnu17 -I include libs/network/tests/test_trophy_start.c
- *   -Wl,-dead_strip -o /tmp/test_trophy_start && /tmp/test_trophy_start
+ *   libs/network/trophy_pack.c libs/system/cellSysutil.c
+ *   -pthread -o /tmp/test_trophy_start && /tmp/test_trophy_start
  */
 #include "../sceNpTrophy.c"
 #include <assert.h>
@@ -7,6 +8,7 @@ uint8_t* vm_base;
 uint32_t ppu_vm_size;
 int g_resv_store_active;
 uint32_t g_ww_lo, g_ww_hi;
+const char* ppu_vfs_root = ".";
 void ppu_resv_break_store(uint64_t ea) { (void)ea; }
 void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
 int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }

@@ -1089,6 +1089,24 @@ void rsx_present_set_content_aspect(float aspect) { s_content_aspect = aspect; }
 void rsx_present_set_screen_aspect(float aspect) { s_screen_aspect = aspect; }
 float rsx_present_window_aspect(void) { return s_window_aspect; }
 
+/* the host's overlay (rsx_draw_engine.h) */
+static rsx_overlay_fn volatile s_overlay_fn;
+static void* volatile s_overlay_user;
+void rsx_overlay_set(rsx_overlay_fn fn, void* user)
+{
+    s_overlay_fn = NULL;   /* never the old function with the new user */
+    s_overlay_user = user;
+    s_overlay_fn = fn;
+}
+rsx_overlay_fn rsx_overlay_get(void** user)
+{
+    static int off = -1;
+    if (off < 0) { const char* e = getenv("RSX_OVERLAY"); off = e && e[0] == '0'; }
+    rsx_overlay_fn fn = off ? NULL : s_overlay_fn;
+    if (user) *user = s_overlay_user;
+    return fn;
+}
+
 /* The largest a-shaped rectangle in (x, y, w, h), in its middle. */
 static void present_fit(float a, float x, float y, float w, float h, float r[4])
 {
