@@ -52,6 +52,7 @@
 #include <os/lock.h>
 #include <pthread.h>
 #import <QuartzCore/CAMetalLayer.h>
+#import <QuartzCore/CATransaction.h>
 #if !TARGET_OS_IPHONE
 #  import <AppKit/AppKit.h>
 #endif
@@ -728,6 +729,70 @@ static void host_detach(void) {}
 void rsx_metal_backend_note_guest_frame(void) {}
 #endif
 
+/* RSX_HDR=1: the picture in HDR, on a display with EDR headroom (an XDR
+ * panel; an external display with HDR on). The layer becomes RGBA16Float in
+ * extended linear sRGB, where 1.0 is the system's SDR white and the screen's
+ * maximumExtendedDynamicRangeColorComponentValue -- which follows the
+ * brightness -- the most it shows; the present decodes the frame to linear
+ * light and scales it to the paper white (eng_present_hdr_fs). The settings
+ * are the D3D12 engine's. EDR has no absolute scale, so a value in nits is
+ * taken with 100 nits as 1.0, which it is in the display's reference modes:
+ *   RSX_HDR_WHITE=<nits>  paper white; unset = the system's SDR white.
+ *   RSX_HDR_PEAK=<nits>   the brightest highlight; unset = the screen's
+ *                         headroom now, which also caps a value set.
+ *   RSX_HDR_GAMMA=srgb    decode with the sRGB curve, not a 2.2 power.
+ *   RSX_HDR_HIGHLIGHTS=0  no highlight plane.
+ *   RSX_HDR_DEBUG=1       the plane shown: red brightened (full red at 4
+ *                         stops), blue drawn over.
+ * Read with the display options, so again on g_rsx_display_reload. Only the
+ * draw engine's present, in a window of this process's own, does HDR. */
+static volatile int   s_hdr_want;
+static volatile float s_hdr_white_set, s_hdr_peak_set;   /* EDR units; 0 = auto */
+static volatile int   s_hdr_srgb, s_hdr_highlights = 1, s_hdr_debug;
+static volatile float s_edr_now = 1.0f;   /* the window's screen's headroom now (main thread) */
+static volatile int   s_hdr_layer_want;   /* the layer should be in EDR (main thread) */
+static int            s_hdr_layer;        /* and is (the render thread's, next to drawableSize) */
+static volatile int   s_hdr_check = 1;    /* main thread: look at the screen at the next pump */
+
+static float hdr_nits(const char* name)
+{
+    const char* e = getenv(name);
+    const double v = e && *e ? strtod(e, NULL) : 0.0;
+    return v >= 10.0 && v <= 10000.0 ? (float)(v / 100.0) : 0.0f;
+}
+
+static void read_hdr_options(void)
+{
+    const char* e = getenv("RSX_HDR");
+    s_hdr_want = e && (atoi(e) > 0 || !strcasecmp(e, "on") || !strcasecmp(e, "true"));
+    s_hdr_white_set = hdr_nits("RSX_HDR_WHITE");
+    s_hdr_peak_set  = hdr_nits("RSX_HDR_PEAK");
+    e = getenv("RSX_HDR_GAMMA");
+    s_hdr_srgb = e && !strcasecmp(e, "srgb");
+    e = getenv("RSX_HDR_HIGHLIGHTS");
+    s_hdr_highlights = !(e && *e == '0');
+    e = getenv("RSX_HDR_DEBUG");
+    s_hdr_debug = e && *e && *e != '0';
+    s_hdr_check = 1;
+}
+
+/* Render thread, before a drawable is taken: the layer into EDR -- RGBA16Float
+ * in extended linear sRGB -- or back, as hdr_layer_update wants. */
+static void hdr_layer_apply(void)
+{
+    const int on = s_hdr_layer_want;
+    if (on == s_hdr_layer || !s_layer) return;
+    s_hdr_layer = on;
+    CGColorSpaceRef cs = on ? CGColorSpaceCreateWithName(kCGColorSpaceExtendedLinearSRGB) : NULL;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    s_layer.wantsExtendedDynamicRangeContent = on ? YES : NO;
+    s_layer.pixelFormat = on ? MTLPixelFormatRGBA16Float : MTLPixelFormatBGRA8Unorm;
+    s_layer.colorspace  = cs;
+    [CATransaction commit];
+    if (cs) CGColorSpaceRelease(cs);
+}
+
 #if !TARGET_OS_IPHONE
 /* A borderless window is not key by default, and key events only reach the
  * key window -- the keyboard pad would go dead in RSX_DISPLAY=borderless. */
@@ -779,6 +844,7 @@ static void note_view_size(void)
 
 static void read_display_options(u32* ww, u32* wh)
 {
+    read_hdr_options();
     const char* dm = getenv("RSX_DISPLAY");
     const char* fs = getenv("RSX_FULLSCREEN");
     s_display_mode = DISP_WINDOWED;
@@ -2668,6 +2734,7 @@ static id<MTLTexture> s_eng_twin[ENG_MAX_OBJECTS];
 static u8  s_eng_twin_stale[ENG_MAX_OBJECTS];   /* a depth twin behind its target */
 static id<MTLTexture> s_eng_stencil_view[ENG_MAX_OBJECTS];   /* a depth target's stencil, for the reload */
 static u32 s_eng_pass_samples = 1;
+static int s_eng_pass_plane;   /* the pass being encoded has the HDR highlight plane as attachment 1 */
 static u32 sc_dim(u32 v) { u32 r = (u32)((float)v * s_eng_scale + 0.5f); return v && !r ? 1u : r; }
 /* [x, x+w) in guest pixels -> host pixels, as the two ends rounded, so
  * neighbouring rectangles still meet. */
@@ -2726,6 +2793,12 @@ typedef struct {
     MTLRenderPipelineDescriptor* pd;
     id<MTLRenderPipelineState>   pso_ms[2][3];
     u8                           zwrite;   /* its draws can write depth or stencil */
+    /* An HLSL that writes the HDR highlight plane (an override's
+     * rsx_hdr_plane, SV_TARGET1): its build with that plane as colour
+     * attachment 1 -- [scaled] -- on first use; plane_failed, a build that
+     * could not be made. */
+    u8                           hdr_plane, plane_failed;
+    id<MTLRenderPipelineState>   pso_plane[2];
 } EngPipeline;
 static EngPipeline s_eng_pipe[ENG_MAX_PIPES];
 static u32 s_eng_pipe_count;
@@ -2905,30 +2978,30 @@ static NSString* const kEngHelperMSL = @
  * neighbourhood has headroom), at the source's texel spacing, then the video
  * out's gamma. sharp = 0 is the plain sample. */
 "struct PresentP { float gamma; float sharp; float2 px; };\n"
+"static float3 eng_cas(texture2d<float> src, sampler s, float2 uv, float2 d, float sharp, float3 c) {\n"
+"    float3 a  = saturate(src.sample(s, uv + float2(-d.x, -d.y)).rgb);\n"
+"    float3 b  = saturate(src.sample(s, uv + float2( 0.0, -d.y)).rgb);\n"
+"    float3 cc = saturate(src.sample(s, uv + float2( d.x, -d.y)).rgb);\n"
+"    float3 l  = saturate(src.sample(s, uv + float2(-d.x,  0.0)).rgb);\n"
+"    float3 e  = saturate(c);\n"
+"    float3 r  = saturate(src.sample(s, uv + float2( d.x,  0.0)).rgb);\n"
+"    float3 g  = saturate(src.sample(s, uv + float2(-d.x,  d.y)).rgb);\n"
+"    float3 h  = saturate(src.sample(s, uv + float2( 0.0,  d.y)).rgb);\n"
+"    float3 k  = saturate(src.sample(s, uv + float2( d.x,  d.y)).rgb);\n"
+"    float3 mn = min(min(min(l, e), min(r, b)), h);\n"
+"    mn += min(mn, min(min(a, cc), min(g, k)));\n"
+"    float3 mx = max(max(max(l, e), max(r, b)), h);\n"
+"    mx += max(mx, max(max(a, cc), max(g, k)));\n"
+"    float3 amp = sqrt(saturate(min(mn, 2.0 - mx) / max(mx, 1e-5)));\n"
+"    float3 w = amp * (-1.0 / mix(8.0, 5.0, saturate(sharp)));\n"
+"    return saturate((b * w + l * w + r * w + h * w + e) / (1.0 + 4.0 * w));\n"
+"}\n"
 "fragment float4 eng_present_fs(BOut i [[stage_in]],\n"
 "                               texture2d<float> src [[texture(0)]],\n"
 "                               sampler s [[sampler(0)]],\n"
 "                               constant PresentP& p [[buffer(0)]]) {\n"
 "    float4 c = src.sample(s, i.uv);\n"
-"    if (p.sharp > 0.0) {\n"
-"        float2 d = p.px;\n"
-"        float3 a  = saturate(src.sample(s, i.uv + float2(-d.x, -d.y)).rgb);\n"
-"        float3 b  = saturate(src.sample(s, i.uv + float2( 0.0, -d.y)).rgb);\n"
-"        float3 cc = saturate(src.sample(s, i.uv + float2( d.x, -d.y)).rgb);\n"
-"        float3 l  = saturate(src.sample(s, i.uv + float2(-d.x,  0.0)).rgb);\n"
-"        float3 e  = saturate(c.rgb);\n"
-"        float3 r  = saturate(src.sample(s, i.uv + float2( d.x,  0.0)).rgb);\n"
-"        float3 g  = saturate(src.sample(s, i.uv + float2(-d.x,  d.y)).rgb);\n"
-"        float3 h  = saturate(src.sample(s, i.uv + float2( 0.0,  d.y)).rgb);\n"
-"        float3 k  = saturate(src.sample(s, i.uv + float2( d.x,  d.y)).rgb);\n"
-"        float3 mn = min(min(min(l, e), min(r, b)), h);\n"
-"        mn += min(mn, min(min(a, cc), min(g, k)));\n"
-"        float3 mx = max(max(max(l, e), max(r, b)), h);\n"
-"        mx += max(mx, max(max(a, cc), max(g, k)));\n"
-"        float3 amp = sqrt(saturate(min(mn, 2.0 - mx) / max(mx, 1e-5)));\n"
-"        float3 w = amp * (-1.0 / mix(8.0, 5.0, saturate(p.sharp)));\n"
-"        c.rgb = saturate((b * w + l * w + r * w + h * w + e) / (1.0 + 4.0 * w));\n"
-"    }\n"
+"    if (p.sharp > 0.0) c.rgb = eng_cas(src, s, i.uv, p.px, p.sharp, c.rgb);\n"
 "    if (p.gamma != 1.0) c.rgb = pow(max(c.rgb, 0.0), float3(p.gamma));\n"
 "    return c;\n"
 "}\n"
@@ -2976,6 +3049,70 @@ static NSString* const kEngHelperMSL = @
 "    }\n"
 "    if (p.gamma != 1.0) c.rgb = pow(max(c.rgb, 0.0), float3(p.gamma));\n"
 "    return c;\n"
+"}\n"
+"/* The present in HDR (RSX_HDR, the layer in EDR), as rsx_present_passes.h's\n"
+" * ps_blit_area_hdr: each tap decoded to linear light, averaged over the window\n"
+" * pixel's footprint as the area blit does, scaled to the paper white and\n"
+" * rolled off towards the peak. In EDR units, 1.0 the system's SDR white:\n"
+" * hdr = (paper white, peak, the sRGB curve instead of a 2.2 power, the plane:\n"
+" * 0 none, 1 highlights, 2 the debug view); hdr2.y the video out's gamma,\n"
+" * hdr2.z sharpening, px a source texel. The highlight plane (texture 1, the\n"
+" * frame's size): where a tap is still what the composite wrote, a = how many\n"
+" * times brighter the composite's pixel was before the game clipped it. The\n"
+" * gamma and the sharpening go on after that test, which they would fail. */\n"
+"struct HdrP { float4 hdr; float4 hdr2; float2 px; };\n"
+"static float3 hdr_decode(float3 c, float srgb) {\n"
+"    c = saturate(c);\n"
+"    if (srgb > 0.5) return select(pow((c + 0.055) / 1.055, float3(2.4)), c / 12.92, c <= 0.04045);\n"
+"    return pow(c, float3(2.2));\n"
+"}\n"
+"static float3 hdr_lin(float3 sm, float3 e, texture2d<float> plane, sampler s, float2 uv, constant HdrP& p) {\n"
+"    e = saturate(e);\n"
+"    if (p.hdr2.y != 1.0) e = pow(e, float3(p.hdr2.y));\n"
+"    float3 lin = hdr_decode(e, p.hdr.z);\n"
+"    if (p.hdr.w > 0.5) {\n"
+"        float4 pl = plane.sample(s, uv, level(0));\n"
+"        float3 dd = abs(saturate(sm) - pl.rgb);\n"
+"        bool same = max(max(dd.x, dd.y), dd.z) < 3.0 / 255.0;\n"
+"        if (p.hdr.w > 1.5) {\n"
+"            float st = saturate(log2(clamp(pl.a, 1.0, 64.0)) / 4.0);\n"
+"            return (lin * 0.25 + (same ? float3(st, 0.0, 0.0) : float3(0.0, 0.0, 0.15))) / max(p.hdr.x, 1e-3);\n"
+"        }\n"
+"        if (same) lin *= clamp(pl.a, 1.0, 64.0);\n"
+"    }\n"
+"    return lin;\n"
+"}\n"
+"fragment float4 eng_present_hdr_fs(BOut i [[stage_in]],\n"
+"                                   texture2d<float> src [[texture(0)]],\n"
+"                                   texture2d<float> plane [[texture(1)]],\n"
+"                                   sampler s [[sampler(0)]],\n"
+"                                   constant HdrP& p [[buffer(0)]]) {\n"
+"    float2 sz = float2(src.get_width(), src.get_height());\n"
+"    float2 d = float2(dfdx(i.uv.x), dfdy(i.uv.y));\n"
+"    float2 fp = abs(d) * sz;\n"
+"    float3 lin;\n"
+"    if (fp.x <= 1.25 && fp.y <= 1.25) {\n"
+"        float3 c = src.sample(s, i.uv, level(0)).rgb;\n"
+"        float3 e = p.hdr2.z > 0.0 ? eng_cas(src, s, i.uv, p.px, p.hdr2.z, c) : c;\n"
+"        lin = hdr_lin(c, e, plane, s, i.uv, p);\n"
+"    } else {\n"
+"        int nx = clamp(int(ceil(fp.x - 0.01)), 1, 4), ny = clamp(int(ceil(fp.y - 0.01)), 1, 4);\n"
+"        float3 acc = 0.0;\n"
+"        for (int y = 0; y < ny; y++)\n"
+"            for (int x = 0; x < nx; x++) {\n"
+"                float2 uv = i.uv + (float2(x + 0.5, y + 0.5) / float2(nx, ny) - 0.5) * d;\n"
+"                float3 c = src.sample(s, uv, level(0)).rgb;\n"
+"                acc += hdr_lin(c, c, plane, s, uv, p);\n"
+"            }\n"
+"        lin = acc / float(nx * ny);\n"
+"    }\n"
+"    float3 o = lin * p.hdr.x;\n"
+"    if (p.hdr.w < 1.5) {\n"
+"        float knee = max(p.hdr.x, 0.5 * p.hdr.y), room = max(p.hdr.y - knee, 1e-3);\n"
+"        float m = max(max(o.r, o.g), o.b);\n"
+"        if (m > knee) o *= (knee + room * (1.0 - exp(-(m - knee) / room))) / m;\n"
+"    }\n"
+"    return float4(o, 1.0);\n"
 "}\n"
 "/* FXAA on the finished frame (RSX_AA=fxaa), as rsx_present_passes.h's\n"
 " * ps_fxaa: luma contrast decides whether a pixel is on an edge; the edge's\n"
@@ -3429,6 +3566,7 @@ static void eng_shutdown(void* user)
         s_eng_pipe[i].fs = s_eng_pipe[i].fs_scaled = nil;
         s_eng_pipe[i].pd = nil;
         for (int a = 0; a < 2; a++) for (int b = 0; b < 3; b++) s_eng_pipe[i].pso_ms[a][b] = nil;
+        s_eng_pipe[i].pso_plane[0] = s_eng_pipe[i].pso_plane[1] = nil;
     }
     for (u32 i = 0; i < s_eng_func_count; i++) s_eng_func[i].fn = nil;
     for (u32 i = 0; i < s_eng_samp_count; i++) s_eng_samp[i].samp = nil;
@@ -4621,6 +4759,7 @@ static u32 eng_pipeline_create_locked(void* user, const char* vs_hlsl, const cha
     np.fs_scaled = fs_scaled;
     np.pd = pd;
     for (int a = 0; a < 2; a++) for (int b = 0; b < 3; b++) np.pso_ms[a][b] = nil;
+    np.hdr_plane = strstr(ps_hlsl, "rsx_hdr_plane") != NULL;
     np.zwrite = (rs->depth_test && rs->depth_write) ||
                 (rs->stencil_enable && (rs->s_write_mask & 0xFFu));
     /* CULL_FACE FRONT=0x0404 BACK=0x0405 FRONT_AND_BACK=0x0408 (front here,
@@ -4658,6 +4797,7 @@ static void eng_pipeline_release(void* user, u32 pipeline)
         s_eng_pipe[pipeline - 1].fs = s_eng_pipe[pipeline - 1].fs_scaled = nil;
         s_eng_pipe[pipeline - 1].pd = nil;
         for (int a = 0; a < 2; a++) for (int b = 0; b < 3; b++) s_eng_pipe[pipeline - 1].pso_ms[a][b] = nil;
+        s_eng_pipe[pipeline - 1].pso_plane[0] = s_eng_pipe[pipeline - 1].pso_plane[1] = nil;
     }
     pthread_mutex_unlock(&s_eng_pipe_mu);
 }
@@ -5169,6 +5309,81 @@ static id<MTLRenderPipelineState> eng_pipe_ms(u32 idx, int scaled)
     return ps;
 }
 
+/* The HDR highlight plane (RSX_HDR with highlights): RGBA16Float at the
+ * size of the target the composite draws into, which the guest never sees. A
+ * pipeline whose HLSL writes it (EngPipeline.hdr_plane) has a build with the
+ * plane as colour attachment 1, no blend, every channel written; a pass of
+ * such draws attaches it (eng_encode_records: Metal's attachments are the
+ * pass's, so those draws get a pass of their own). The present reads it for
+ * the frame it was drawn beside: the same surface, the same size, since the
+ * last present. Without HDR the override's second output goes nowhere --
+ * Metal drops a colour output its pipeline has no attachment for. */
+static id<MTLTexture>    s_eng_plane;
+static __weak id<MTLTexture> s_eng_plane_owner;   /* the surface it was drawn beside */
+static int               s_eng_plane_drawn;       /* since the last present */
+static volatile int      s_hdr_present_on;        /* the last drawable was EDR */
+
+static id<MTLTexture> eng_tex_owner(id<MTLTexture> t) { return [t parentTexture] ? [t parentTexture] : t; }
+
+/* Is this draw one for a pass with the plane? The pass then has to be
+ * single-sampled and have one target, as the D3D12 engine's. */
+static int eng_rec_plane(const EngRecord* r)
+{
+    if (!s_hdr_present_on || !s_hdr_highlights || r->kind != ENG_REC_DRAW || r->nrt != 1) return 0;
+    if (!r->pipeline || r->pipeline > s_eng_pipe_count) return 0;
+    const EngPipeline* p = &s_eng_pipe[r->pipeline - 1];
+    return p->hdr_plane && !p->plane_failed && eng_ms_samples() == 1;
+}
+
+static id<MTLRenderPipelineState> eng_pipe_plane(u32 idx, int scaled)
+{
+    EngPipeline* p = &s_eng_pipe[idx];
+    if (p->pso_plane[scaled]) return p->pso_plane[scaled];
+    if (!p->pd || p->plane_failed) return nil;
+    pthread_mutex_lock(&s_eng_pipe_mu);
+    id<MTLRenderPipelineState> ps = p->pso_plane[scaled];
+    if (!ps && !p->plane_failed) {
+        MTLRenderPipelineDescriptor* d = [p->pd copy];
+        d.fragmentFunction = (scaled && p->fs_scaled) ? p->fs_scaled : p->fs;
+        d.colorAttachments[1].pixelFormat     = MTLPixelFormatRGBA16Float;
+        d.colorAttachments[1].blendingEnabled = NO;
+        d.colorAttachments[1].writeMask       = MTLColorWriteMaskAll;
+        NSError* err = nil;
+        ps = [s_dev newRenderPipelineStateWithDescriptor:d error:&err];
+        if (!ps) {
+            fprintf(stderr, "[rsx engine/metal] HDR plane pipeline failed (pipeline %u drawn without it): %s\n",
+                    idx + 1, [[err localizedDescription] UTF8String]);
+            p->plane_failed = 1;
+        }
+        p->pso_plane[scaled] = ps;
+    }
+    pthread_mutex_unlock(&s_eng_pipe_mu);
+    return ps;
+}
+
+/* The plane at this target's size, made or remade. */
+static id<MTLTexture> eng_hdr_plane_ready(id<MTLTexture> t)
+{
+    if (!t) return nil;
+    if (!s_eng_plane || [s_eng_plane width] != [t width] || [s_eng_plane height] != [t height]) {
+        MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float
+                                                                                       width:[t width]
+                                                                                      height:[t height]
+                                                                                   mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        s_eng_plane = [s_dev newTextureWithDescriptor:td];
+        s_eng_plane_drawn = 0;
+        static int s_said;
+        if (s_eng_plane && !s_said) {
+            s_said = 1;
+            fprintf(stderr, "[RSX metal] HDR: highlight plane %lux%lu\n",
+                    (unsigned long)[t width], (unsigned long)[t height]);
+        }
+    }
+    return s_eng_plane;
+}
+
 static void eng_encode_clear_rect(id<MTLCommandBuffer> cb, const EngRecord* r)
 {
     id<MTLTexture> zbuf = eng_obj(r->depth);
@@ -5333,6 +5548,7 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
     const int use_scaled = pf != 1.0f && p->pso_scaled;
     id<MTLRenderPipelineState> ps = use_scaled ? p->pso_scaled : p->pso;
     if (s_eng_pass_samples > 1) ps = eng_pipe_ms(r->pipeline - 1, use_scaled);
+    else if (s_eng_pass_plane) ps = eng_pipe_plane(r->pipeline - 1, use_scaled);
     if (!ps) return;
     [enc setRenderPipelineState:ps];
     [enc setDepthStencilState:p->ds];
@@ -5668,6 +5884,24 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
             s_eng_twin_stale[depth - 1] = 0;
         }
 
+        /* The HDR highlight plane: a pass of the draws that write it, which
+         * attaches it -- cleared by the first since the last present, so a
+         * pixel no composite covered matches nothing -- and ends at the first
+         * draw that does not (and the other way round). */
+        const int want_plane = i < s_eng_rec_count && eng_rec_plane(&s_eng_rec[i]);
+        int plane_pass = 0;
+        if (want_plane && msn == 1 && attach == 1 && nrt == 1) {
+            id<MTLTexture> pl = eng_hdr_plane_ready(tex[0]);
+            if (pl) {
+                rp.colorAttachments[1].texture     = pl;
+                rp.colorAttachments[1].loadAction  = s_eng_plane_drawn ? MTLLoadActionLoad : MTLLoadActionClear;
+                rp.colorAttachments[1].clearColor  = MTLClearColorMake(0, 0, 0, 0);
+                rp.colorAttachments[1].storeAction = MTLStoreActionStore;
+                s_eng_plane_drawn = 1;
+                s_eng_plane_owner = eng_tex_owner(tex[0]);
+                plane_pass = 1;
+            }
+        }
         id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
         u32 cur_vis = 0;
         if (enc && msn > 1) eng_ms_reload(enc, tex, attach, depth, msn, ms_cmask, ms_zw, ms_sw);
@@ -5689,7 +5923,8 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
         while (i < s_eng_rec_count && s_eng_rec[i].kind == ENG_REC_DRAW &&
                eng_record_targets_are(&s_eng_rec[i], rt, nrt) &&
                (s_eng_rec[i].depth == depth ||
-                (!s_eng_rec[i].depth && zbuf == zfallback))) {
+                (!s_eng_rec[i].depth && zbuf == zfallback)) &&
+               eng_rec_plane(&s_eng_rec[i]) == want_plane) {
             if (s_vis_buf && s_eng_rec[i].vis != cur_vis) {
                 cur_vis = s_eng_rec[i].vis;
                 if (cur_vis) {
@@ -5702,8 +5937,10 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
             const u32 pi = s_eng_rec[i].pipeline;
             if (pi && pi <= s_eng_pipe_count && s_eng_pipe[pi - 1].zwrite) pass_zwrite = 1;
             s_eng_pass_samples = msn;
+            s_eng_pass_plane = plane_pass;
             eng_encode_draw(enc, &s_eng_rec[i], stage, pf);
             s_eng_pass_samples = 1;
+            s_eng_pass_plane = 0;
             i++;
         }
         [enc endEncoding];
@@ -5734,8 +5971,8 @@ static id<MTLRenderPipelineState> eng_present_pso(NSString* fs, MTLPixelFormat f
 /* RSX_AA=fxaa: FXAA on the finished frame at its own size, into a frame-sized
  * target the window blit then reads. Live: rsx_aa_mode is read per frame. */
 static id<MTLTexture> s_eng_fxaa_tex;
-static id<MTLRenderPipelineState> s_eng_fxaa_pso, s_eng_blit_area_pso;
-static MTLPixelFormat s_eng_fxaa_fmt, s_eng_blit_area_fmt;
+static id<MTLRenderPipelineState> s_eng_fxaa_pso, s_eng_blit_area_pso, s_eng_hdr_pso;
+static MTLPixelFormat s_eng_fxaa_fmt, s_eng_blit_area_fmt, s_eng_hdr_fmt;
 static id<MTLTexture> eng_fxaa(id<MTLCommandBuffer> cb, id<MTLTexture> src)
 {
     if (rsx_aa_mode() != 1 || !s_eng_linear_sampler) return src;
@@ -5780,6 +6017,7 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
                                 id<MTLTexture> dst, const float* lvp, const int* lrect, int part)
 {
     if (!src || !dst || !s_eng_helper_lib) return;
+    id<MTLTexture> frame = src;
     src = eng_fxaa(cb, src);
     if (!s_eng_blit_pso || s_eng_blit_pso_fmt != [dst pixelFormat]) {
         MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
@@ -5842,20 +6080,42 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
      * resolution is real supersampling. */
     const int same = (double)[src width] == vw && (double)[src height] == vh && vx == floor(vx) && vy == floor(vy);
     const int down = (double)[src width] > vw + 0.5 || (double)[src height] > vh + 0.5;
-    id<MTLRenderPipelineState> area = (down && s_eng_linear_sampler)
+    /* An EDR target (the layer in HDR, hdr_layer_update): the HDR present,
+     * which does the area average itself. */
+    id<MTLRenderPipelineState> hdr = ([dst pixelFormat] == MTLPixelFormatRGBA16Float)
+        ? eng_present_pso(@"eng_present_hdr_fs", [dst pixelFormat], &s_eng_hdr_pso, &s_eng_hdr_fmt) : nil;
+    id<MTLRenderPipelineState> area = (!hdr && down && s_eng_linear_sampler)
         ? eng_present_pso(@"eng_blit_area_fs", [dst pixelFormat], &s_eng_blit_area_pso, &s_eng_blit_area_fmt) : nil;
-    [e setRenderPipelineState:(area ? area : s_eng_blit_pso)];
+    [e setRenderPipelineState:(hdr ? hdr : area ? area : s_eng_blit_pso)];
     [e setFragmentTexture:src atIndex:0];
     [e setFragmentSamplerState:(same || !s_eng_linear_sampler ? s_eng_point_sampler : s_eng_linear_sampler)
                        atIndex:0];
     /* The video out's gamma (cellVideoOutSetGamma, the title's brightness
      * setting): out = in^gamma, as RPCS3's calibration pass applies it. The
      * sharpening taps are one source texel apart. */
-    { extern float cellAvconfExt_display_gamma(void);
-      const struct { float gamma, sharp, px[2]; } p = {
-          cellAvconfExt_display_gamma(), eng_sharpen(),
-          { 1.0f / (float)[src width], 1.0f / (float)[src height] } };
-      [e setFragmentBytes:&p length:sizeof p atIndex:0]; }
+    extern float cellAvconfExt_display_gamma(void);
+    if (hdr) {
+        /* The highlight plane when it was drawn beside this frame since the
+         * last present; otherwise the frame binds in its place, unread. */
+        id<MTLTexture> pl = (s_hdr_highlights && s_eng_plane && s_eng_plane_drawn &&
+                             s_eng_plane_owner == eng_tex_owner(frame) &&
+                             [s_eng_plane width] == [frame width] && [s_eng_plane height] == [frame height])
+                                ? s_eng_plane : nil;
+        const float white = s_hdr_white_set > 0.0f ? s_hdr_white_set : 1.0f;
+        float peak = s_edr_now > 1.0f ? s_edr_now : 1.0f;
+        if (s_hdr_peak_set > 0.0f && s_hdr_peak_set < peak) peak = s_hdr_peak_set;
+        const struct { float hdr[4], hdr2[4], px[2], pad[2]; } p = {
+            { white, peak, s_hdr_srgb ? 1.0f : 0.0f, pl ? (s_hdr_debug ? 2.0f : 1.0f) : 0.0f },
+            { 0.0f, cellAvconfExt_display_gamma(), eng_sharpen(), 0.0f },
+            { 1.0f / (float)[src width], 1.0f / (float)[src height] }, { 0.0f, 0.0f } };
+        [e setFragmentTexture:(pl ? pl : src) atIndex:1];
+        [e setFragmentBytes:&p length:sizeof p atIndex:0];
+    } else {
+        const struct { float gamma, sharp, px[2]; } p = {
+            cellAvconfExt_display_gamma(), eng_sharpen(),
+            { 1.0f / (float)[src width], 1.0f / (float)[src height] } };
+        [e setFragmentBytes:&p length:sizeof p atIndex:0];
+    }
     [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [e endEncoding];
 }
@@ -5880,7 +6140,8 @@ static id<MTLTexture> eng_window_grab_target(id<MTLTexture> like)
     char req[1024];
     snprintf(req, sizeof req, "%s.req", pre);
     if (access(req, F_OK) != 0) return nil;
-    if ([like pixelFormat] != MTLPixelFormatBGRA8Unorm && [like pixelFormat] != MTLPixelFormatRGBA8Unorm) return nil;
+    if ([like pixelFormat] != MTLPixelFormatBGRA8Unorm && [like pixelFormat] != MTLPixelFormatRGBA8Unorm &&
+        [like pixelFormat] != MTLPixelFormatRGBA16Float) return nil;
     MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:[like pixelFormat]
                                     width:[like width] height:[like height] mipmapped:NO];
     td.usage = MTLTextureUsageRenderTarget;
@@ -5888,14 +6149,47 @@ static id<MTLTexture> eng_window_grab_target(id<MTLTexture> like)
     return [s_dev newTextureWithDescriptor:td];
 }
 
-/* From the command buffer's completion: the grab is drawn by then. */
+/* From the command buffer's completion: the grab is drawn by then. An EDR
+ * window (RSX_HDR) is linear light, 1.0 the SDR white: the .ppm is that
+ * clipped at white and encoded with a 2.2 power, the values themselves go to
+ * <prefix>.pfm (float RGB, bottom row first), and a line on stderr says how
+ * much of the window is above white. */
 static void eng_window_grab_write(id<MTLTexture> t)
 {
     const char* pre = eng_window_grab_prefix();
     const size_t w = [t width], h = [t height];
-    unsigned char* px = (unsigned char*)malloc(w * h * 4);
+    const int half = [t pixelFormat] == MTLPixelFormatRGBA16Float;
+    unsigned char* px = (unsigned char*)malloc(w * h * (half ? 8 : 4));
     unsigned char* rgb = (unsigned char*)malloc(w * h * 3);
-    if (pre && px && rgb) {
+    if (pre && px && rgb && half) {
+        [t getBytes:px bytesPerRow:w * 8 fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
+        const _Float16* hp = (const _Float16*)px;
+        float* f = (float*)malloc(w * h * 3 * sizeof(float));
+        double peak = 0.0;
+        size_t above = 0;
+        for (size_t p = 0; p < w * h; ++p) {
+            float m = 0.0f;
+            for (int c = 0; c < 3; c++) {
+                const float v = (float)hp[p*4 + c];
+                if (f) f[((h - 1 - p / w) * w + p % w) * 3 + c] = v;
+                if (v > m) m = v;
+                rgb[p*3 + c] = (unsigned char)(powf(v > 0.0f ? (v < 1.0f ? v : 1.0f) : 0.0f, 1.0f / 2.2f) * 255.0f + 0.5f);
+            }
+            if (m > peak) peak = m;
+            if (m > 1.004f) above++;
+        }
+        fprintf(stderr, "[RSX metal] window grab: EDR, brightest %.3f, %.2f%% above white (headroom %.2f)\n",
+                peak, 100.0 * (double)above / (double)(w * h), (double)s_edr_now);
+        char pfm[1024];
+        snprintf(pfm, sizeof pfm, "%s.pfm", pre);
+        FILE* pf = f ? fopen(pfm, "wb") : NULL;
+        if (pf) {
+            fprintf(pf, "PF\n%zu %zu\n-1.0\n", w, h);
+            fwrite(f, sizeof(float), w * h * 3, pf);
+            fclose(pf);
+        }
+        free(f);
+    } else if (pre && px && rgb) {
         [t getBytes:px bytesPerRow:w * 4 fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
         const int bgra = [t pixelFormat] == MTLPixelFormatBGRA8Unorm;
         for (size_t p = 0; p < w * h; ++p) {
@@ -5903,6 +6197,8 @@ static void eng_window_grab_write(id<MTLTexture> t)
             rgb[p*3 + 1] = px[p*4 + 1];
             rgb[p*3 + 2] = px[p*4 + (bgra ? 0 : 2)];
         }
+    }
+    if (pre && px && rgb) {
         char req[1024], tmp[1024], out[1024];
         snprintf(req, sizeof req, "%s.req", pre);
         snprintf(tmp, sizeof tmp, "%s.ppm.tmp", pre);
@@ -6034,6 +6330,7 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
                         s_layer.drawableSize = CGSizeMake((CGFloat)pw, (CGFloat)ph);
                 }
 #endif
+                hdr_layer_apply();
                 drawable = [s_layer nextDrawable];
                 if (!drawable) {           /* compositor is busy; skip */
                     dispatch_semaphore_signal(s_inflight);
@@ -6041,6 +6338,8 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
                 }
                 dst = [drawable texture];
             }
+            /* Whether the composite's draws write the HDR highlight plane. */
+            s_hdr_present_on = dst && [dst pixelFormat] == MTLPixelFormatRGBA16Float;
         }
 
         /* No command buffer: nothing is encoded, and the records and the
@@ -6106,6 +6405,7 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
                 eng_blit_to_display(cb, present_dst, grab, lvp, lrect, part);
                 [cb addCompletedHandler:^(id<MTLCommandBuffer> _unused) { (void)_unused; eng_window_grab_write(grab); }];
             }
+            s_eng_plane_drawn = 0;
         }
         if (drawable) [cb presentDrawable:drawable];
         if (ft_e0) ps3_ft_span(PS3_FT_GPU_ENCODE, 0, present_dst ? 1u : 0u, ft_nrec, ft_e0, ps3_ft_now());
@@ -6313,6 +6613,7 @@ static void eng_rescale(void)
             id<MTLRenderPipelineState> scaled = nil;
             p->fs_scaled = nil;
             for (int b = 0; b < 3; b++) p->pso_ms[1][b] = nil;
+            p->pso_plane[1] = nil;
             if (s_eng_scale != 1.0f) {
                 id<MTLFunction> f = eng_wpos_function(p->ps_wpos, s_eng_scale);
                 p->fs_scaled = f;
@@ -6692,6 +6993,41 @@ int rsx_host_mouse_message(void* hwnd, unsigned msg, uintptr_t wp, intptr_t lp, 
     return 0;
 }
 
+/* Main thread: whether the layer should be in EDR (RSX_HDR, read_hdr_options),
+ * and the screen's headroom now, which follows the brightness and is above
+ * 1.0 only while something on the screen asks for EDR. Looked at after a
+ * settings change and every half second, which also catches the window moving
+ * to a screen with headroom or without. The render thread switches the layer
+ * (hdr_layer_apply). */
+static void hdr_layer_update(void)
+{
+    if (!s_layer || !s_window || !s_eng_active) return;
+    NSScreen* sc = [s_window screen] ? [s_window screen] : [NSScreen mainScreen];
+    const double pot = sc ? [sc maximumPotentialExtendedDynamicRangeColorComponentValue] : 1.0;
+    const int on = s_hdr_want && pot > 1.0;
+    s_hdr_layer_want = on;
+    s_edr_now = on && sc ? (float)[sc maximumExtendedDynamicRangeColorComponentValue] : 1.0f;
+    static int s_logged = -1;
+    static float s_logged_edr;
+    const int state = on ? 1 : s_hdr_want ? 2 : 0;
+    if (state != s_logged) {
+        if (state == 1)
+            fprintf(stderr, "[RSX metal] HDR: on (EDR), headroom %.2f now of %.2f, paper white %s%.2f, peak %s\n",
+                    (double)s_edr_now, pot, s_hdr_white_set > 0.0f ? "" : "auto ",
+                    s_hdr_white_set > 0.0f ? (double)s_hdr_white_set : 1.0,
+                    s_hdr_peak_set > 0.0f ? "set, at most the headroom" : "the headroom");
+        else if (state == 2 || s_logged == 1)
+            fprintf(stderr, "[RSX metal] HDR: off%s\n", state == 2 ? " (this screen has no EDR headroom)" : "");
+        s_logged = state;
+        s_logged_edr = s_edr_now;
+    } else if (on && fabsf(s_edr_now - s_logged_edr) > 0.25f * s_logged_edr) {
+        fprintf(stderr, "[RSX metal] HDR: headroom %.2f (window %s, thermal state %ld)\n", (double)s_edr_now,
+                ([s_window occlusionState] & NSWindowOcclusionStateVisible) ? "visible" : "covered",
+                (long)[[NSProcessInfo processInfo] thermalState]);
+        s_logged_edr = s_edr_now;
+    }
+}
+
 /* Main thread: the window after a display change (s_disp_window_pending).
  * V-sync is the layer's; a size or mode change restyles the window. macOS
  * full screen is its own Space, entered and left with an animation: leaving
@@ -6824,6 +7160,9 @@ static int pump_messages_impl(void)
             [NSApp sendEvent:ev];
         }
         if (s_disp_window_pending && display_apply()) s_disp_window_pending = 0;
+        { static CFAbsoluteTime s_hdr_at;
+          const CFAbsoluteTime t = CFAbsoluteTimeGetCurrent();
+          if (s_hdr_check || t - s_hdr_at >= 0.5) { s_hdr_check = 0; s_hdr_at = t; hdr_layer_update(); } }
         if (s_window && ![s_window isVisible]) s_closed = 1;
     }
 #endif
