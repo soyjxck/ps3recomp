@@ -1571,6 +1571,9 @@ static void* spu_pool_thread(void* p)
         pthread_mutex_unlock(&w->mu);
         extern void spu_task_begin(void);
         spu_task_begin();
+#if defined(__linux__)
+        { char nm[16]; snprintf(nm, sizeof nm, "spu img %d", j->image_id); pthread_setname_np(pthread_self(), nm); }
+#endif
 #if defined(__APPLE__)
         { char nm[32]; snprintf(nm, sizeof nm, "spu img %d", j->image_id); pthread_setname_np(nm); }
         /* SPU_QOS_INTERACTIVE=<image id>[,...]: those images' tasks run at

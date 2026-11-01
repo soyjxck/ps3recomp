@@ -239,6 +239,12 @@ static void* ppu_host_thread_proc(void* param)
     { extern void ppu_resv_register(ppu_context*); ppu_resv_register(&info->ctx); }
     ps3_tprof_thread('P', (uint32_t)info->ctx.thread_id);
 
+#if defined(__linux__)
+    /* The guest's name for perf, top and gdb (15 characters, the kernel's
+     * limit). Unnamed, a Linux thread keeps its creator's: every PPU thread
+     * showed as "main". */
+    { char nm[16]; snprintf(nm, sizeof nm, "%s", info->name); pthread_setname_np(pthread_self(), nm); }
+#endif
 #if defined(__APPLE__)
     pthread_setname_np(info->name);   /* for sample, Instruments, [stutter-cpu] */
     /* PPU_QOS_INTERACTIVE=<prefix>[,<prefix>...]: a guest thread whose name

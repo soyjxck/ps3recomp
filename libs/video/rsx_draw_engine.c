@@ -2078,6 +2078,8 @@ static void* eng_pipe_worker(void* arg)
     (void)arg;
 #if defined(__APPLE__)
     pthread_setname_np("rsx pipeline build");
+#elif defined(__linux__)
+    pthread_setname_np(pthread_self(), "rsx pipe build");
 #endif
     for (;;) {
         pj_lock(&s_pj_mu);
