@@ -257,6 +257,46 @@ Additional shader definitions in `rsx_d3d12_shaders.h`: solid color fill, textur
 
 ---
 
+## Host additions in the draw engine
+
+Things a port can turn on that the console never had. All three backends
+(D3D12, Vulkan, Metal) share them unless noted.
+
+- **A title's own version of a fragment program** (`RSX_FP_OVERRIDE_DIR=<dir>`,
+  `rsx_draw_engine.c` `eng_fp_override`): a program whose structure id
+  (`fp-struct`, logged by `RSX_PIPE_LOG=1`) has a file `<dir>/<fp-struct>.hlsl`
+  is built from that file instead of its translation. The file is written
+  against the translation's bindings (its `PSInput`, `rsx_tex`/`rsx_samp`
+  and `PSConstants`), so it is best made by editing a dump of the
+  translation. `RSX_FP_OVERRIDE_DEFINES=NAME[,NAME]` prepends `#define NAME
+  1`, for one file with several versions.
+- **HDR output** (`RSX_HDR=1`; `RSX_HDR_WHITE=<nits>`, `RSX_HDR_PEAK=<nits>`,
+  `RSX_HDR_GAMMA=srgb`, `RSX_HDR_HIGHLIGHTS=0`, `RSX_HDR_DEBUG=1`): where
+  the display has HDR on (`rsx_hdr_display.c` asks DXGI on Windows; Vulkan
+  elsewhere decides from the surface's formats; Metal from the screen's EDR
+  headroom), the swap chain is scRGB FP16 (Vulkan: HDR10 where scRGB is not
+  offered; Metal: extended linear sRGB) and the present pass
+  (`rsx_present_passes.h`, `kPresentHdrHLSL`) decodes the SDR frame (a 2.2
+  power, or the sRGB curve) and scales it to the paper white (1.0 = 80 nits
+  in scRGB). The settings are read again on `g_rsx_display_reload`, and the
+  display is polled as the title runs.
+- **The highlight plane**: a fragment program whose text names
+  `rsx_hdr_plane` (an override, above) may write a second output,
+  `SV_TARGET1`: rgb what it wrote to the frame, a how many times brighter
+  (linear light) the pixel was before the title clipped it. While HDR is on,
+  a pass of such a pipeline into one target (no MSAA) gets a build with a
+  host-only FP16 target there, the frame's size; the guest never sees it.
+  The HDR present multiplies a pixel by it where the frame still matches the
+  plane's rgb (within 3/255; something drawn over it later, such as a HUD,
+  does not), and rolls off above a knee (max(white, peak / 2)) toward the
+  peak. Without HDR the second output is simply dropped.
+- **A host overlay** (`rsx_overlay_set(fn, user)`, `rsx_draw_engine.h`): the
+  port's callback records into the frame's command list after the frame is
+  in the window and before the present, with the window's target bound (a
+  port's pop-ups or menu). D3D12 so far; with an HDR back buffer the
+  callback draws into an RGBA8 target that `kOverlayHdrHLSL` lays over the
+  frame at the paper white. `RSX_OVERLAY=0` leaves it out.
+
 ## Utility Headers
 
 ### Primitive Type Mapping (`rsx_primitives.h`)
