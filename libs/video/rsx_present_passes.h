@@ -27,7 +27,9 @@
  * off smoothly toward the peak (hdr.y = its nits / 80) instead of clipping.
  * hdr.w = 2 (RSX_HDR_DEBUG): the plane shown instead, within SDR's range --
  * the frame dimmed, red as far as a pixel is brightened (4 stops: full),
- * blue where something was drawn over the plane's picture. */
+ * blue where something was drawn over the plane's picture. hdr2.x = 1: the
+ * output is HDR10 instead -- the BT.2020 primaries and the PQ curve (ST
+ * 2084), for a swap chain that has no scRGB (rsx_vulkan_engine.c). */
 static const char kPresentHdrHLSL[] =
     "struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
     "VSOut vs_main(uint vid : SV_VertexID) {\n"
@@ -37,7 +39,7 @@ static const char kPresentHdrHLSL[] =
     "Texture2D<float4> src : register(t0);\n"
     "SamplerState smp : register(s1);\n"
     "Texture2D<float4> plane : register(t1);\n"
-    "cbuffer HdrConstants : register(b0) { float4 hdr; };\n"
+    "cbuffer HdrConstants : register(b0) { float4 hdr; float4 hdr2; };\n"
     "float3 decode(float3 c) {\n"
     "    c = saturate(c);\n"
     "    if (hdr.z > 0.5) return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);\n"
@@ -58,6 +60,13 @@ static const char kPresentHdrHLSL[] =
     "    }\n"
     "    return lin;\n"
     "}\n"
+    "float3 pq(float3 o) {\n"
+    "    const float3x3 m = float3x3(0.6274040, 0.3292820, 0.0433136,\n"
+    "                                0.0690970, 0.9195400, 0.0113612,\n"
+    "                                0.0163916, 0.0880132, 0.8955950);\n"
+    "    const float3 p = pow(saturate(mul(m, o) * (80.0 / 10000.0)), 0.1593017578125);\n"
+    "    return pow((0.8359375 + 18.8515625 * p) / (1.0 + 18.6875 * p), 78.84375);\n"
+    "}\n"
     "float4 ps_blit_area_hdr(VSOut i) : SV_Target {\n"
     "    uint w, h; src.GetDimensions(w, h);\n"
     "    float2 d = float2(ddx(i.uv.x), ddy(i.uv.y));\n"
@@ -73,11 +82,12 @@ static const char kPresentHdrHLSL[] =
     "        lin = acc / (float)(nx * ny);\n"
     "    }\n"
     "    float3 o = lin * hdr.x;\n"
-    "    if (hdr.w > 1.5) return float4(o, 1.0);\n"
-    "    const float knee = max(hdr.x, 0.5 * hdr.y), room = max(hdr.y - knee, 1e-3);\n"
-    "    const float m = max(max(o.r, o.g), o.b);\n"
-    "    if (m > knee) o *= (knee + room * (1.0 - exp(-(m - knee) / room))) / m;\n"
-    "    return float4(o, 1.0);\n"
+    "    if (hdr.w < 1.5) {\n"
+    "        const float knee = max(hdr.x, 0.5 * hdr.y), room = max(hdr.y - knee, 1e-3);\n"
+    "        const float m = max(max(o.r, o.g), o.b);\n"
+    "        if (m > knee) o *= (knee + room * (1.0 - exp(-(m - knee) / room))) / m;\n"
+    "    }\n"
+    "    return float4(hdr2.x > 0.5 ? pq(o) : o, 1.0);\n"
     "}\n";
 
 static const char kPresentHLSL[] =

@@ -329,6 +329,56 @@ static void eng_ms_apply(int want)
     fprintf(stderr, "[RSX vulkan] MSAA %s\n", s_ms_n > 1 ? (s_ms_n == 2 ? "x2" : s_ms_n == 4 ? "x4" : "x8") : "off");
 }
 
+/* ---- the HDR highlight plane (RSX_HDR) -------------------------------------------
+ * As the D3D12 engine's: a host-only FP16 target the size of the frame a
+ * highlight-plane pipeline (EngPipeline.hdr_plane: a title's own composite,
+ * through RSX_FP_OVERRIDE_DIR) draws into, at its second output, while HDR is
+ * on -- per pixel, what it wrote to the frame and how much brighter the pixel
+ * was before the title clipped it. The HDR present reads it for the frame it
+ * was drawn beside (s_plane_surface) and brightens the pixels that still show
+ * what the plane says. RSX_HDR_HIGHLIGHTS=0 leaves it out. */
+static u32 s_plane_obj, s_plane_surface;
+/* The plane at w x h (made or made again), for the frame `surface`; 0 if it cannot be. */
+static int eng_hdr_plane_ready(u32 surface, u32 w, u32 h)
+{
+    EngObj* o = eng_obj(s_plane_obj);
+    if (!o || o->w != w || o->h != h) {
+        if (o) eng_obj_release(NULL, s_plane_obj);   /* freed once the submits that name it have run */
+        s_plane_obj = eng_image(OBJ_COLOR, VK_FORMAT_R16G16B16A16_SFLOAT, w, h, 1, 1,
+                                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+        o = eng_obj(s_plane_obj);
+        if (!o) { s_plane_obj = 0; return 0; }
+        o->gw = o->gh = 0;   /* no guest size: eng_rescale leaves it alone */
+        o->view = make_view(o->img, o->fmt, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, k_identity);
+        o->att = make_view(o->img, o->fmt, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, k_identity);
+        fprintf(stderr, "[rsx engine/vulkan] HDR: highlight plane %ux%u\n", w, h);
+    }
+    s_plane_surface = surface;
+    return 1;
+}
+/* The pipeline's build with the plane as its second attachment. Not for a
+ * pass that needs WPOS undivided (eng_pso_for's other build). */
+static VkPipeline eng_pso_plane(u32 pipeline, int cls, int unscaled)
+{
+    if (!pipeline || pipeline > s_pipe_count) return VK_NULL_HANDLE;
+    EngPipeline* p = &s_pipe[pipeline - 1];
+    if (!p->vs || !p->hdr_plane || p->rt_count != 1 || (unscaled && p->ps_plain && s_scale != 1.0f)) return VK_NULL_HANDLE;
+    if (p->psoh[cls]) return p->psoh[cls];
+    if (p->failedh[cls]) return VK_NULL_HANDLE;
+    AcquireSRWLockExclusive(&s_pipe_lock);
+    if (!p->psoh[cls] && !p->failedh[cls]) {
+        s_build_plane = 1;
+        p->psoh[cls] = p->fs ? eng_build_pso(p, cls, p->fs) : VK_NULL_HANDLE;
+        s_build_plane = 0;
+        if (!p->psoh[cls]) {
+            p->failedh[cls] = 1;
+            fprintf(stderr, "[rsx engine/vulkan] HDR: highlight-plane pipeline failed (pipeline %u)\n", pipeline);
+        }
+    }
+    ReleaseSRWLockExclusive(&s_pipe_lock);
+    return p->psoh[cls];
+}
+
 static void eng_encode_draw(const EngRecord* r)
 {
     /* Attachments: target A's size rules, as the D3D12 backend. */
@@ -358,9 +408,19 @@ static void eng_encode_draw(const EngRecord* r)
         ms = eng_ms_make(depth);
         for (u32 k = 0; ms && k < nrt; k++) ms = eng_ms_make(r->rt[k]);
     }
-    const VkPipeline pso = ms ? eng_pso_ms(r->pipeline, topo_class(r->topology))
-                              : eng_pso_for(r->pipeline, topo_class(r->topology), !scaled);
+    VkPipeline pso = ms ? eng_pso_ms(r->pipeline, topo_class(r->topology))
+                        : eng_pso_for(r->pipeline, topo_class(r->topology), !scaled);
     if (!pso) return;
+    /* A highlight-plane pipeline into one target while HDR is on: the plane
+     * as its second attachment, in a rendering instance of its own. */
+    u32 plane = 0;
+    if (!ms && nrt == 1 && s_hdr_on && s_hdr_highlights && s_pipe[r->pipeline - 1].hdr_plane) {
+        EngObj* t0 = eng_owner(r->rt[0]);
+        const VkPipeline ph = t0 ? eng_pso_plane(r->pipeline, topo_class(r->topology), !scaled) : VK_NULL_HANDLE;
+        if (ph && t0->w >= tw && t0->h >= th && eng_hdr_plane_ready((u32)(t0 - s_obj) + 1, t0->w, t0->h)) {
+            pso = ph; plane = 1;
+        }
+    }
     if (ms) {
         int st = z->ms_stale;
         for (u32 k = 0; k < nrt; k++) st |= eng_obj(r->rt[k])->ms_stale;
@@ -399,10 +459,11 @@ static void eng_encode_draw(const EngRecord* r)
     d.fs_buf = fs_st ? fs_st->buf : s_zero_buf;
 
     /* Layouts: anything to change ends the pass. */
-    int same = s_in_render && s_cur_nrt == nrt && s_cur_depth == depth && s_cur_tw == tw && s_cur_th == th && s_cur_ms == ms;
+    int same = s_in_render && s_cur_nrt == nrt + plane && s_cur_depth == depth && s_cur_tw == tw && s_cur_th == th && s_cur_ms == ms;
     for (u32 k = 0; same && k < nrt; k++) same = s_cur_rt[k] == r->rt[k];
     int change = 0;
     for (u32 k = 0; k < nrt; k++) change |= obj_needs(eng_owner(r->rt[k]), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    if (plane) change |= obj_needs(eng_obj(s_plane_obj), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     change |= obj_needs(z, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
     for (u32 u = 0; u < 20; u++) change |= obj_needs(tex_obj[u], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     if (ms) {
@@ -412,6 +473,7 @@ static void eng_encode_draw(const EngRecord* r)
     if (!same || change) {
         render_end();
         for (u32 k = 0; k < nrt; k++) obj_layout(eng_owner(r->rt[k]), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        if (plane) obj_layout(eng_obj(s_plane_obj), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
         obj_layout(z, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
         if (ms) {
             for (u32 k = 0; k < nrt; k++) { EngObj* o = eng_obj(r->rt[k]);
@@ -421,7 +483,8 @@ static void eng_encode_draw(const EngRecord* r)
         for (u32 u = 0; u < 20; u++) obj_layout(tex_obj[u], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         u32 rts[RSX_BE_MAX_COLOR_TARGETS];
         for (u32 k = 0; k < nrt; k++) rts[k] = r->rt[k];
-        render_begin(rts, nrt, depth, tw, th, ms);
+        if (plane) rts[nrt] = s_plane_obj;   /* the next draw that has no plane begins again */
+        render_begin(rts, nrt + plane, depth, tw, th, ms);
         s_cur_pso = VK_NULL_HANDLE;
     }
 
@@ -466,14 +529,32 @@ static void eng_encode_draw(const EngRecord* r)
     }
 }
 
-/* A present pass: the whole of `src` through `pso` into `dst` (both RGBA8
- * engine objects), linear sampler. */
+/* The next present pass's t1 (an engine object; the null texture otherwise)
+ * and its constants at b1 (n of 8 floats; zeros otherwise). */
+static u32 s_helper_t1; static int s_helper_cb;
+static void eng_helper_t1(u32 handle) { s_helper_t1 = handle; }
+static void eng_helper_constants(const float* v, u32 n)
+{
+    u8* base = s_hdr_cb ? mem_ptr(&s_hdr_cb_mem) : NULL;
+    if (!base) return;
+    float* dst = (float*)(base + s_slot * 256u);   /* this slot's: its last submit has run */
+    memset(dst, 0, 32);
+    memcpy(dst, v, (n < 8 ? n : 8) * sizeof(float));
+    s_helper_cb = 1;
+}
+
+/* A present pass: the whole of `src` through `pso` into `dst` (engine
+ * objects; `src` RGBA8), linear sampler. */
 static void eng_present_pass(VkPipeline pso, u32 src_h, u32 dst_h)
 {
     EngObj* src = eng_owner(src_h); EngObj* dst = eng_obj(dst_h);
+    EngObj* t1 = eng_obj(s_helper_t1);
+    const int cb = s_helper_cb;
+    s_helper_t1 = 0; s_helper_cb = 0;
     if (!src || !dst || !pso) return;
     render_end();
     obj_layout(src, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    if (t1) obj_layout(t1, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     obj_layout(dst, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     const u32 rt[1] = { dst_h };
     render_begin(rt, 1, 0, dst->w, dst->h, 0);
@@ -489,31 +570,35 @@ static void eng_present_pass(VkPipeline pso, u32 src_h, u32 dst_h)
     for (u32 u = 0; u < 16; u++) { d.fs_view[u] = null_view(0); d.fs_smp[u] = s_linear_sampler; }
     for (u32 u = 0; u < 4; u++) { d.vs_view[u] = null_view(0); d.vs_smp[u] = s_point_sampler; }
     d.fs_view[0] = eng_obj(src_h) && eng_obj(src_h)->kind == OBJ_VIEW ? eng_obj(src_h)->view : src->view;
+    if (t1) d.fs_view[1] = t1->view;
     d.vs_buf = d.fs_buf = s_zero_buf;
+    if (cb) d.fs_buf = s_hdr_cb;
     const VkDescriptorSet set = eng_set(&d);
     if (!set) { render_end(); return; }
-    const u32 dyn[2] = { 0, 0 };
+    const u32 dyn[2] = { 0, cb ? s_slot * 256u : 0u };
     vkCmdBindDescriptorSets(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pl, 0, 1, &set, 2, dyn);
     vkCmdDraw(s_cmd, 3, 1, 0, 0);
     render_end();
 }
 
-/* An RGBA8 target for a present pass, remade when the size changes. No guest
- * size: nothing treats it as scaled, and eng_rescale leaves it alone. */
-static u32 eng_present_target(u32* slot, u32 w, u32 h)
+/* A target for a present pass (RGBA8, or the HDR pass's the swap chain's
+ * format), remade when the size or format changes. No guest size: nothing
+ * treats it as scaled, and eng_rescale leaves it alone. */
+static u32 eng_present_target_fmt(u32* slot, u32 w, u32 h, VkFormat fmt)
 {
     EngObj* o = eng_obj(*slot);
-    if (o && o->w == w && o->h == h) return *slot;
+    if (o && o->w == w && o->h == h && o->fmt == fmt) return *slot;
     if (o) eng_obj_release(NULL, *slot);
-    *slot = eng_image(OBJ_COLOR, VK_FORMAT_R8G8B8A8_UNORM, w, h, 1, 1,
+    *slot = eng_image(OBJ_COLOR, fmt, w, h, 1, 1,
                       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
     o = eng_obj(*slot);
     if (!o) return 0;
     o->gw = o->gh = 0;
-    o->view = make_view(o->img, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, k_identity);
-    o->att = make_view(o->img, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, k_identity);
+    o->view = make_view(o->img, fmt, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, k_identity);
+    o->att = make_view(o->img, fmt, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, k_identity);
     return *slot;
 }
+static u32 eng_present_target(u32* slot, u32 w, u32 h) { return eng_present_target_fmt(slot, w, h, VK_FORMAT_R8G8B8A8_UNORM); }
 
 /* The depth resolve passes: the depth plane drawn into a colour snapshot. */
 static void eng_encode_depth_resolve(const EngRecord* r)
@@ -770,7 +855,25 @@ static void eng_submit(u32 present_surface, int wait)
                 u32 vw = (u32)(lvp[2] + 0.5f), vh = (u32)(lvp[3] + 0.5f);
                 if (vw < 1) vw = 1;
                 if (vh < 1) vh = 1;
-                if (s_area_pso && vw <= 16384 && vh <= 16384 &&
+                if (s_hdr_on && s_present_hdr_pso && vw <= 16384 && vh <= 16384) {
+                    /* RSX_HDR: the HDR pass -- decoded, area-averaged, the
+                     * highlights -- at that size in the swap chain's format,
+                     * then the same blit. */
+                    const u32 ho = eng_present_target_fmt(&s_hdr_obj, vw, vh, s_swap_fmt);
+                    if (ho) {
+                        const EngObj* pl = eng_obj(s_plane_obj);
+                        const int hl = s_hdr_highlights && pl && s_plane_surface &&
+                                       eng_owner(s_plane_surface) == src && pl->w == src->w && pl->h == src->h;
+                        static int dbg = -1;   /* RSX_HDR_DEBUG=1: the plane shown (kPresentHdrHLSL) */
+                        if (dbg < 0) { const char* e = getenv("RSX_HDR_DEBUG"); dbg = e && *e && *e != '0'; }
+                        const float k[8] = { s_hdr_white / 80.0f, s_hdr_peak / 80.0f, s_hdr_srgb ? 1.0f : 0.0f,
+                                             hl ? (dbg ? 2.0f : 1.0f) : 0.0f, s_hdr_pq ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f };
+                        eng_helper_constants(k, 8);
+                        if (hl) eng_helper_t1(s_plane_obj);
+                        eng_present_pass(s_present_hdr_pso, shown, ho);
+                        shown = ho;
+                    }
+                } else if (s_area_pso && vw <= 16384 && vh <= 16384 &&
                     (src->w > vw + vw / 4 || src->h > vh + vh / 4)) {
                     const u32 ar2 = eng_present_target(&s_area_obj, vw, vh);
                     if (ar2) { eng_present_pass(s_area_pso, shown, ar2); shown = ar2; }
@@ -1092,6 +1195,26 @@ static int has_ext(const VkExtensionProperties* e, u32 n, const char* name)
     return 0;
 }
 
+/* The HDR present pass into `fmt` (the swap chain's), kept for the last
+ * format asked. */
+static VkPipeline eng_hdr_pso(VkFormat fmt)
+{
+    static VkFormat built;
+    if (s_present_hdr_pso && built == fmt) return s_present_hdr_pso;
+    if (s_present_hdr_pso) { vkDeviceWaitIdle(s_dev); vkDestroyPipeline(s_dev, s_present_hdr_pso, NULL); s_present_hdr_pso = VK_NULL_HANDLE; }
+    s_present_hdr_pso = eng_helper_pso(s_present_hdr_ps, fmt);
+    built = fmt;
+    return s_present_hdr_pso;
+}
+/* A format the HDR pass can draw into and blit from to the swap chain's image. */
+static int eng_hdr_format_ok(VkFormat f)
+{
+    VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(s_phys, f, &fp);
+    const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_BLIT_SRC_BIT |
+                                      VK_FORMAT_FEATURE_BLIT_DST_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+    return (fp.optimalTilingFeatures & need) == need;
+}
+
 static int eng_swapchain_create(void)
 {
     VkSurfaceCapabilitiesKHR caps;
@@ -1116,6 +1239,36 @@ static int eng_swapchain_create(void)
     for (u32 i = 0; i < nf; i++)
         if ((fmts[i].format == VK_FORMAT_B8G8R8A8_UNORM || fmts[i].format == VK_FORMAT_R8G8B8A8_UNORM) &&
             fmts[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) { sf = fmts[i]; break; }
+    /* RSX_HDR: scRGB, else HDR10, where the display has HDR on (with no
+     * display found, what the surface offers decides). */
+    s_hdr_on = s_hdr_pq = 0;
+    if (s_hdr_want && s_present_hdr_ps) {
+        const rsx_hdr_display hd = rsx_hdr_display_query(s_hwnd);
+        eng_hdr_levels(&hd);
+        int pick = -1;
+        if (hd.hdr || !hd.found) {
+            for (u32 i = 0; i < nf && pick < 0; i++)
+                if (fmts[i].format == VK_FORMAT_R16G16B16A16_SFLOAT &&
+                    fmts[i].colorSpace == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT && eng_hdr_format_ok(fmts[i].format)) pick = (int)i;
+            for (u32 i = 0; i < nf && pick < 0; i++)
+                if ((fmts[i].format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || fmts[i].format == VK_FORMAT_A2R10G10B10_UNORM_PACK32) &&
+                    fmts[i].colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT && eng_hdr_format_ok(fmts[i].format)) pick = (int)i;
+        }
+        if (pick >= 0 && eng_hdr_pso(fmts[pick].format)) {
+            sf = fmts[pick];
+            s_hdr_on = 1;
+            s_hdr_pq = sf.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT;
+            fprintf(stderr, "[rsx engine/vulkan] HDR: %s, paper white %.0f nits (%s), peak %.0f nits (%s), %s decode\n",
+                    s_hdr_pq ? "HDR10 (10-bit PQ)" : "scRGB FP16",
+                    s_hdr_white, s_hdr_white_set > 0.0f ? "RSX_HDR_WHITE" : hd.white > 0.0f ? "Windows' SDR white level" : "default",
+                    s_hdr_peak, s_hdr_peak_set > 0.0f ? "RSX_HDR_PEAK" : hd.peak > 0.0f ? "the display's" : "default",
+                    s_hdr_srgb ? "sRGB" : "2.2");
+        } else {
+            fprintf(stderr, "[rsx engine/vulkan] HDR: %s; the picture stays SDR\n",
+                    hd.found && !hd.hdr ? "Windows has HDR off for this display (Settings > Display > Use HDR)"
+                                        : "the driver offers no HDR swap chain here");
+        }
+    }
     u32 npm = 0; vkGetPhysicalDeviceSurfacePresentModesKHR(s_phys, s_surface, &npm, NULL);
     VkPresentModeKHR pms[16]; if (npm > 16) npm = 16;
     vkGetPhysicalDeviceSurfacePresentModesKHR(s_phys, s_surface, &npm, pms);
@@ -1213,6 +1366,15 @@ static int eng_init_device(void)
         next = n;
     }
 #endif
+    /* The HDR colour spaces (RSX_HDR): offered by the surface only with this. */
+    if (!s_headless) {
+        u32 n = 0; vkEnumerateInstanceExtensionProperties(NULL, &n, NULL);
+        VkExtensionProperties* ep = (VkExtensionProperties*)calloc(n ? n : 1, sizeof *ep);
+        if (ep && vkEnumerateInstanceExtensionProperties(NULL, &n, ep) == VK_SUCCESS &&
+            has_ext(ep, n, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME))
+            exts[next++] = VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME;
+        free(ep);
+    }
     const char* layers[1]; u32 nlay = 0;
     const int validate = getenv("RSX_VK_VALIDATION") && getenv("RSX_VK_VALIDATION")[0] == '1';
     if (validate) {
@@ -1394,6 +1556,10 @@ static int eng_init_device(void)
     s_zero_buf = make_buffer(ENG_UBO_RANGE, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, HOST_MEM, &s_zero_mem);
     if (!s_zero_buf) return -1;
     memset(mem_ptr(&s_zero_mem), 0, ENG_UBO_RANGE);
+    /* The HDR pass's constants (eng_helper_constants): 256 bytes a frame slot,
+     * read through the fragment buffer's whole range. */
+    s_hdr_cb = make_buffer(ENG_FRAMES * 256u + ENG_UBO_RANGE, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, HOST_MEM, &s_hdr_cb_mem);
+    if (s_hdr_cb) memset(mem_ptr(&s_hdr_cb_mem), 0, ENG_FRAMES * 256u + ENG_UBO_RANGE);
     { VkSamplerCreateInfo si = { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
       si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
       si.maxAnisotropy = 1.0f;
@@ -1458,6 +1624,28 @@ static int eng_init_device(void)
           }
           free(t);
       } }
+    /* RSX_HDR's present pass (kPresentHdrHLSL): its entry renamed main, its
+     * sampler at s0 and its constants at b1, the fragment stage's buffer. Its
+     * pipeline is made for the swap chain's format (eng_hdr_pso). */
+    eng_read_hdr();
+    if (!s_headless) {
+        size_t n = strlen(kPresentHdrHLSL);
+        char* t = (char*)malloc(n + 16);
+        if (t) {
+            memcpy(t, kPresentHdrHLSL, n + 1);
+            char* r = strstr(t, "register(s1)"); if (r) r[10] = '0';
+            r = strstr(t, "register(b0)"); if (r) r[10] = '1';
+            char* f = strstr(t, "float4 ps_blit_area_hdr(");
+            if (f) {
+                const size_t from = strlen("float4 ps_blit_area_hdr(");
+                memmove(f + 12, f + from, strlen(f + from) + 1);
+                memcpy(f, "float4 main(", 12);
+                s_present_hdr_ps = eng_module(t, RSX_SPV_STAGE_FRAGMENT, "present hdr");
+            }
+            free(t);
+        }
+        if (s_hdr_want && !s_present_hdr_ps) fprintf(stderr, "[rsx engine/vulkan] HDR: its present pass did not build; the picture stays SDR\n");
+    }
 
     if (!s_headless && eng_swapchain_create() != 0) { fprintf(stderr, "[RSX vulkan] swap chain creation failed\n"); return -1; }
     return 0;
@@ -1473,6 +1661,7 @@ static void eng_shutdown(void* user)
         for (int k = 0; k < 3; k++) {
             if (s_pipe[i].pso[k]) vkDestroyPipeline(s_dev, s_pipe[i].pso[k], NULL);
             if (s_pipe[i].pso1[k]) vkDestroyPipeline(s_dev, s_pipe[i].pso1[k], NULL);
+            if (s_pipe[i].psoh[k]) vkDestroyPipeline(s_dev, s_pipe[i].psoh[k], NULL);
         }
         free(s_pipe[i].ps_plain);
     }
@@ -1502,7 +1691,11 @@ static void eng_release_device(void)
         if (s_linear_sampler) vkDestroySampler(s_dev, s_linear_sampler, NULL);
         if (s_fxaa_pso) vkDestroyPipeline(s_dev, s_fxaa_pso, NULL);
         if (s_area_pso) vkDestroyPipeline(s_dev, s_area_pso, NULL);
+        if (s_present_hdr_pso) vkDestroyPipeline(s_dev, s_present_hdr_pso, NULL);
+        s_present_hdr_pso = VK_NULL_HANDLE; s_present_hdr_ps = VK_NULL_HANDLE;
         if (s_zero_buf) vkDestroyBuffer(s_dev, s_zero_buf, NULL);
+        if (s_hdr_cb) vkDestroyBuffer(s_dev, s_hdr_cb, NULL);
+        s_hdr_cb = VK_NULL_HANDLE;
         if (s_rb_buf) vkDestroyBuffer(s_dev, s_rb_buf, NULL);
         if (s_pl) vkDestroyPipelineLayout(s_dev, s_pl, NULL);
         if (s_dsl) vkDestroyDescriptorSetLayout(s_dev, s_dsl, NULL);
@@ -1525,6 +1718,7 @@ static void eng_release_device(void)
     if (s_dbg && vkDestroyDebugUtilsMessengerEXT) vkDestroyDebugUtilsMessengerEXT(s_inst, s_dbg, NULL);
     vkDestroyInstance(s_inst, NULL);
     s_inst = VK_NULL_HANDLE; s_dev = VK_NULL_HANDLE; s_surface = VK_NULL_HANDLE; s_swap = VK_NULL_HANDLE;
+    rsx_hdr_display_release();
 #ifdef _WIN32
     if (s_hwnd) { DestroyWindow(s_hwnd); s_hwnd = NULL; }
 #else
@@ -1628,6 +1822,8 @@ static void eng_rescale(void)
         for (int k = 0; k < 3; k++) {
             if (p->pso[k]) vkDestroyPipeline(s_dev, p->pso[k], NULL);
             p->pso[k] = VK_NULL_HANDLE; p->failed[k] = 0;
+            if (p->psoh[k]) vkDestroyPipeline(s_dev, p->psoh[k], NULL);
+            p->psoh[k] = VK_NULL_HANDLE; p->failedh[k] = 0;
         }
         np++;
     }
@@ -1692,8 +1888,8 @@ static void eng_rescale(void)
             s_scale, sc_dim(s_width), sc_dim(s_height), nt, np);
 }
 
-/* g_rsx_display_reload: RSX_VSYNC / RSX_DISPLAY / RSX_WINDOW / RSX_SCALE
- * changed (the settings page). On the window's thread, at the pump. */
+/* g_rsx_display_reload: RSX_VSYNC / RSX_DISPLAY / RSX_WINDOW / RSX_SCALE /
+ * RSX_HDR* changed (the settings page). On the window's thread, at the pump. */
 static void eng_display_reload(void)
 {
     g_rsx_display_reload = 0;
@@ -1701,6 +1897,13 @@ static void eng_display_reload(void)
     const u32 ow = s_win_w, oh = s_win_h;
     const int ov = s_vsync;
     const float os = s_scale;
+    const int ohdr = s_hdr_want;
+    eng_read_hdr();
+    /* HDR switched, or the display's changed (eng_hdr_poll): a new swap
+     * chain; only the levels: from the next present. */
+    const int hdr_new = s_hdr_want != ohdr || s_hdr_force;
+    s_hdr_force = 0;
+    if (!hdr_new && s_hdr_on) { const rsx_hdr_display d = rsx_hdr_display_query(s_hwnd); eng_hdr_levels(&d); }
     { const char* v = getenv("RSX_VSYNC"); s_vsync = (v && *v) ? (atoi(v) ? 1 : 0) : 1; }
     eng_read_scale();
     { const char* dm = getenv("RSX_DISPLAY");
@@ -1717,7 +1920,7 @@ static void eng_display_reload(void)
       else eng_screen_size(&s_win_w, &s_win_h); }
     if (s_scale != os) eng_rescale();
     if ((u32)eng_ms_want() != s_ms_n) eng_ms_apply(eng_ms_want());
-    if (s_display == od && s_win_w == ow && s_win_h == oh && s_vsync == ov) return;
+    if (s_display == od && s_win_w == ow && s_win_h == oh && s_vsync == ov && !hdr_new) return;
     vkDeviceWaitIdle(s_dev);
     if (s_display != od || s_win_w != ow || s_win_h != oh) {
 #ifndef _WIN32
@@ -1748,9 +1951,27 @@ static void eng_display_reload(void)
             s_display == DISP_BORDERLESS ? "borderless" : "windowed", s_win_w, s_win_h, s_vsync);
 }
 
+/* RSX_HDR: every 60th pump, whether the displays changed or the window moved
+ * to another (rsx_hdr_display_stale); then whether HDR is on for the one it
+ * is on now, and a new swap chain if that is not what it has. */
+static void eng_hdr_poll(void)
+{
+    static u32 n;
+    if (!s_hdr_want || ++n % 60 || !rsx_hdr_display_stale(s_hwnd)) return;
+    const rsx_hdr_display d = rsx_hdr_display_query(s_hwnd);
+    if ((d.hdr && s_present_hdr_ps) != s_hdr_on) {
+        fprintf(stderr, "[rsx engine/vulkan] HDR: the display %s HDR now; a new swap chain\n", d.hdr ? "has" : "has no");
+        s_hdr_force = 1;
+        g_rsx_display_reload = 1;
+    } else if (s_hdr_on) {
+        eng_hdr_levels(&d);
+    }
+}
+
 int rsx_vulkan_engine_pump_messages(void)
 {
     if (s_headless) return 0;
+    if (s_ready && s_swap) eng_hdr_poll();
     if (g_rsx_display_reload && s_ready && s_swap) eng_display_reload();
 #ifdef _WIN32
     MSG msg;

@@ -28,7 +28,9 @@
  * Switches: RSX_BACKEND=vulkan selects it; RSX_VK_VALIDATION=1 turns the
  * Khronos validation layer on; RSX_SCALE, RSX_SCALE_MIN, RSX_DISPLAY,
  * RSX_WINDOW and RSX_VSYNC as the D3D12 backend (exclusive full screen is
- * borderless here).
+ * borderless here); RSX_HDR and the rest of its settings as the D3D12
+ * backend too (eng_read_hdr), in scRGB or, where the driver offers no scRGB,
+ * HDR10.
  */
 #if (defined(_WIN32) || defined(__linux__)) && defined(PS3RECOMP_HAVE_VULKAN)
 
@@ -72,6 +74,7 @@
 #include "rsx_host_mouse.h"
 #include "rsx_present_pace.h"
 #include "rsx_present_passes.h"
+#include "rsx_hdr_display.h"
 
 #define ENG_MAX_OBJECTS   4096
 #define ENG_MAX_PIPES     4096
@@ -225,6 +228,11 @@ typedef struct {
     u32 cube_mask;                         /* fragment units the program declares TextureCube */
     int no_depth;                          /* drawn without a depth attachment (the helpers) */
     int live;
+    /* A fragment program whose text names rsx_hdr_plane writes the HDR
+     * highlight plane at its second output (eng_hdr_plane_*): the build with
+     * that second attachment, for a pass into one target while HDR is on. */
+    int hdr_plane;
+    VkPipeline psoh[3]; int failedh[3];
 } EngPipeline;
 
 typedef struct { u64 hash; VkShaderModule mod; } EngModule;
@@ -335,6 +343,55 @@ static VkShaderModule s_helper_ps_copy;     /* a target into its MSAA twin */
 static VkPipeline s_fxaa_pso, s_area_pso;   /* rsx_present_passes.h */
 static u32 s_aa_obj, s_area_obj;            /* their targets: frame-sized, window-sized */
 int rsx_aa_mode(void);                      /* rsx_draw_engine.c */
+
+/* ---- HDR output ----------------------------------------------------------------
+ * RSX_HDR=1, as the D3D12 engine: where the display under the window has HDR
+ * on (rsx_hdr_display.c), the swap chain is scRGB (FP16, linear light, the
+ * sRGB primaries, 1.0 at 80 nits) -- or, where the driver offers no scRGB,
+ * HDR10 (10 bits, the PQ curve, the BT.2020 primaries) -- and the present
+ * pass (kPresentHdrHLSL) decodes the frame to linear light, scales it to the
+ * paper white (RSX_HDR_WHITE=<nits>, else Windows' SDR white level for that
+ * display) and lets the highlights the title's composite left in the plane
+ * (eng_hdr_plane_*) go above it, rolled off toward the peak (RSX_HDR_PEAK=
+ * <nits>, else the display's). RSX_HDR_GAMMA=srgb: the sRGB curve instead of
+ * a 2.2 power; RSX_HDR_HIGHLIGHTS=0: no plane; RSX_HDR_DEBUG=1: the plane
+ * shown. Read again when the settings page changes it (eng_display_reload);
+ * Windows' HDR switch and the display under the window are checked as the
+ * game runs (eng_hdr_poll). */
+static int s_hdr_want;                          /* RSX_HDR */
+static int s_hdr_on;                            /* the swap chain is HDR */
+static int s_hdr_pq;                            /* ... HDR10 (else scRGB) */
+static int s_hdr_force;                         /* the display's HDR changed: a new swap chain */
+static float s_hdr_white_set, s_hdr_peak_set;   /* nits; 0 = the display's */
+static int s_hdr_srgb;                          /* RSX_HDR_GAMMA=srgb */
+static int s_hdr_highlights = 1;                /* RSX_HDR_HIGHLIGHTS=0: no highlight plane */
+static float s_hdr_white = 200.0f, s_hdr_peak = 1000.0f;   /* in use, nits */
+static VkShaderModule s_present_hdr_ps;         /* kPresentHdrHLSL */
+static VkPipeline s_present_hdr_pso;            /* ... into the swap chain's format (eng_hdr_pso) */
+static u32 s_hdr_obj;                           /* its target: window-sized, in that format */
+static VkBuffer s_hdr_cb; static MemAlloc s_hdr_cb_mem;   /* its constants: 256 bytes a frame slot */
+
+static void eng_read_hdr(void)
+{
+    const char* e = getenv("RSX_HDR");
+    s_hdr_want = e && *e && e[0] != '0';
+    e = getenv("RSX_HDR_WHITE");
+    s_hdr_white_set = e && *e ? (float)atof(e) : 0.0f;
+    e = getenv("RSX_HDR_PEAK");
+    s_hdr_peak_set = e && *e ? (float)atof(e) : 0.0f;
+    e = getenv("RSX_HDR_GAMMA");
+    s_hdr_srgb = e && !_stricmp(e, "srgb");
+    e = getenv("RSX_HDR_HIGHLIGHTS");
+    s_hdr_highlights = !(e && e[0] == '0');
+}
+
+/* The paper white and the peak from the settings, else from the display. */
+static void eng_hdr_levels(const rsx_hdr_display* d)
+{
+    s_hdr_white = s_hdr_white_set > 0.0f ? s_hdr_white_set : d->white > 0.0f ? d->white : 200.0f;
+    s_hdr_peak = s_hdr_peak_set > 0.0f ? s_hdr_peak_set : d->peak > 0.0f ? d->peak : 1000.0f;
+    if (s_hdr_peak < s_hdr_white) s_hdr_peak = s_hdr_white;   /* a paper white above the peak is the peak's */
+}
 static EngView s_view[ENG_MAX_VIEWS]; static u32 s_view_count;
 static EngRecord s_rec[ENG_MAX_RECORDS]; static u32 s_rec_count, s_dropped;
 static EngRecord s_pending;
@@ -1239,6 +1296,8 @@ static u32 eng_cube_mask(const char* ps)
 /* The sample count eng_build_pso builds with: 1, or s_ms_n for the MSAA
  * builds -- set under s_pipe_lock, which every build holds. */
 static VkSampleCountFlagBits s_build_samples = VK_SAMPLE_COUNT_1_BIT;
+/* 1: with the HDR highlight plane as one more attachment (eng_pso_plane). */
+static int s_build_plane;
 static VkPipeline eng_build_pso(EngPipeline* p, int cls, VkShaderModule fs)
 {
     VkPipelineShaderStageCreateInfo st[2] = { { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO },
@@ -1314,9 +1373,16 @@ static VkPipeline eng_build_pso(EngPipeline* p, int cls, VkShaderModule fs)
     }
     VkPipelineColorBlendAttachmentState bas[RSX_BE_MAX_COLOR_TARGETS];
     VkFormat fmts[RSX_BE_MAX_COLOR_TARGETS];
-    for (u32 r = 0; r < p->rt_count; r++) { bas[r] = ba; fmts[r] = p->rt_fmt; }
+    u32 natt = p->rt_count;
+    for (u32 r = 0; r < natt; r++) { bas[r] = ba; fmts[r] = p->rt_fmt; }
+    if (s_build_plane && natt < RSX_BE_MAX_COLOR_TARGETS) {   /* the plane: written whole, never blended */
+        memset(&bas[natt], 0, sizeof bas[natt]);
+        bas[natt].colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                   VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        fmts[natt++] = VK_FORMAT_R16G16B16A16_SFLOAT;
+    }
     VkPipelineColorBlendStateCreateInfo cb = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
-    cb.attachmentCount = p->rt_count; cb.pAttachments = bas;
+    cb.attachmentCount = natt; cb.pAttachments = bas;
 
     VkDynamicState dyn[4] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
                               VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY };
@@ -1324,7 +1390,7 @@ static VkPipeline eng_build_pso(EngPipeline* p, int cls, VkShaderModule fs)
     dy.dynamicStateCount = 4; dy.pDynamicStates = dyn;
 
     VkPipelineRenderingCreateInfo ri = { VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
-    ri.colorAttachmentCount = p->rt_count; ri.pColorAttachmentFormats = fmts;
+    ri.colorAttachmentCount = natt; ri.pColorAttachmentFormats = fmts;
     ri.depthAttachmentFormat = p->no_depth ? VK_FORMAT_UNDEFINED : ENG_DEPTH_FMT;
     ri.stencilAttachmentFormat = ri.depthAttachmentFormat;
 
@@ -1401,6 +1467,7 @@ static u32 eng_pipeline_create_locked(const char* vs_hlsl, const char* ps_hlsl, 
     p->rt_fmt = eng_vkfmt(rt_fmt);
     p->rt_count = rt_count;
     p->cube_mask = eng_cube_mask(ps_hlsl);
+    p->hdr_plane = strstr(ps_hlsl, "rsx_hdr_plane") != NULL;
     p->live = 1;
     return ++s_pipe_count;
 }

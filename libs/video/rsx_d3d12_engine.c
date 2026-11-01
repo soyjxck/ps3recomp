@@ -55,6 +55,7 @@
 #include "rsx_d3d12_engine.h"
 #include "rsx_host_mouse.h"
 #include "rsx_present_pace.h"
+#include "rsx_hdr_display.h"
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -1886,9 +1887,7 @@ static float s_hdr_white_set, s_hdr_peak_set;   /* nits; 0 = the display's */
 static int s_hdr_srgb;                          /* RSX_HDR_GAMMA=srgb */
 static int s_hdr_highlights = 1;                /* RSX_HDR_HIGHLIGHTS=0: no highlight plane */
 static float s_hdr_white = 200.0f, s_hdr_peak = 1000.0f;   /* in use, nits */
-static IDXGIFactory1* s_hdr_factory;            /* stale (IsCurrent) once the displays change */
-static HMONITOR s_hdr_monitor;
-typedef struct { int found, hdr; float peak, white; } EngHdrDisplay;
+typedef rsx_hdr_display EngHdrDisplay;          /* rsx_hdr_display.h */
 
 static void eng_read_hdr(void)
 {
@@ -1904,71 +1903,9 @@ static void eng_read_hdr(void)
     s_hdr_highlights = !(e && e[0] == '0');
 }
 
-/* Windows' SDR white level for the display gdi names (\\.\DISPLAYn), in nits;
- * 0 when it cannot be read. */
-static float eng_sdr_white_nits(const wchar_t* gdi)
-{
-    UINT32 np = 0, nm = 0;
-    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &np, &nm) != ERROR_SUCCESS || !np) return 0.0f;
-    DISPLAYCONFIG_PATH_INFO* paths = (DISPLAYCONFIG_PATH_INFO*)calloc(np, sizeof *paths);
-    DISPLAYCONFIG_MODE_INFO* modes = (DISPLAYCONFIG_MODE_INFO*)calloc(nm ? nm : 1, sizeof *modes);
-    float nits = 0.0f;
-    if (paths && modes && QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &np, paths, &nm, modes, NULL) == ERROR_SUCCESS) {
-        for (UINT32 i = 0; i < np && nits == 0.0f; i++) {
-            DISPLAYCONFIG_SOURCE_DEVICE_NAME src;
-            memset(&src, 0, sizeof src);
-            src.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
-            src.header.size = sizeof src;
-            src.header.adapterId = paths[i].sourceInfo.adapterId;
-            src.header.id = paths[i].sourceInfo.id;
-            if (DisplayConfigGetDeviceInfo(&src.header) != ERROR_SUCCESS || wcscmp(src.viewGdiDeviceName, gdi) != 0) continue;
-            DISPLAYCONFIG_SDR_WHITE_LEVEL wl;
-            memset(&wl, 0, sizeof wl);
-            wl.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
-            wl.header.size = sizeof wl;
-            wl.header.adapterId = paths[i].targetInfo.adapterId;
-            wl.header.id = paths[i].targetInfo.id;
-            if (DisplayConfigGetDeviceInfo(&wl.header) == ERROR_SUCCESS && wl.SDRWhiteLevel)
-                nits = (float)wl.SDRWhiteLevel / 1000.0f * 80.0f;   /* in thousandths of 80 nits */
-        }
-    }
-    free(paths); free(modes);
-    return nits;
-}
-
 /* The display the window is on: is HDR on for it in Windows, its peak, and
- * its SDR white level. Keeps the factory it asked, for eng_hdr_poll. */
-static EngHdrDisplay eng_hdr_display(void)
-{
-    EngHdrDisplay d = { 0, 0, 0.0f, 0.0f };
-    if (!s_hwnd) return d;
-    HMONITOR mon = MonitorFromWindow(s_hwnd, MONITOR_DEFAULTTONEAREST);
-    RELEASE(s_hdr_factory);
-    if (!mon || FAILED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void**)&s_hdr_factory))) return d;
-    s_hdr_monitor = mon;
-    IDXGIAdapter1* ad = NULL;
-    for (UINT a = 0; !d.found && CALL(s_hdr_factory, EnumAdapters1, a, &ad) != DXGI_ERROR_NOT_FOUND; a++) {
-        IDXGIOutput* out = NULL;
-        for (UINT o = 0; !d.found && CALL(ad, EnumOutputs, o, &out) != DXGI_ERROR_NOT_FOUND; o++) {
-            DXGI_OUTPUT_DESC od;
-            IDXGIOutput6* o6 = NULL;
-            if (SUCCEEDED(CALL(out, GetDesc, &od)) && od.Monitor == mon &&
-                SUCCEEDED(CALL(out, QueryInterface, &IID_IDXGIOutput6, (void**)&o6))) {
-                DXGI_OUTPUT_DESC1 d1;
-                if (SUCCEEDED(CALL(o6, GetDesc1, &d1))) {
-                    d.found = 1;
-                    d.hdr = d1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
-                    d.peak = d1.MaxLuminance;
-                    d.white = eng_sdr_white_nits(od.DeviceName);
-                }
-                RELEASE(o6);
-            }
-            RELEASE(out);
-        }
-        RELEASE(ad);
-    }
-    return d;
-}
+ * its SDR white level (rsx_hdr_display.c). */
+static EngHdrDisplay eng_hdr_display(void) { return rsx_hdr_display_query(s_hwnd); }
 
 /* The paper white and the peak from the settings, else from the display. */
 static void eng_hdr_levels(const EngHdrDisplay* d)
@@ -4797,9 +4734,9 @@ static void eng_submit(u32 present_surface, int wait)
                                s_plane_w == src->w && s_plane_h == src->h;
                 static int dbg = -1;   /* RSX_HDR_DEBUG=1: the plane shown (kPresentHdrHLSL) */
                 if (dbg < 0) { const char* e = getenv("RSX_HDR_DEBUG"); dbg = e && *e && *e != '0'; }
-                const float k[4] = { s_hdr_white / 80.0f, s_hdr_peak / 80.0f, s_hdr_srgb ? 1.0f : 0.0f,
-                                     hl ? (dbg ? 2.0f : 1.0f) : 0.0f };
-                eng_helper_constants(k, 4);
+                const float k[8] = { s_hdr_white / 80.0f, s_hdr_peak / 80.0f, s_hdr_srgb ? 1.0f : 0.0f,
+                                     hl ? (dbg ? 2.0f : 1.0f) : 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+                eng_helper_constants(k, 8);
                 if (hl) {
                     res_transition(s_plane, &s_plane_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
                     bar_flush();
@@ -5103,7 +5040,7 @@ static void eng_release_device(void)
     if (s_swap && s_display == DISP_FULLSCREEN) CALL(s_swap, SetFullscreenState, FALSE, NULL);
     RELEASE(s_zero_cb); RELEASE(s_readback); s_readback_cap = 0; RELEASE(s_aux_alloc);
     RELEASE(s_null_tex); RELEASE(s_blit_pso); RELEASE(s_depth_pso); RELEASE(s_depth_pack_pso);
-    RELEASE(s_present_pso); RELEASE(s_fxaa_pso); RELEASE(s_present_hdr_pso); RELEASE(s_hdr_factory);
+    RELEASE(s_present_pso); RELEASE(s_fxaa_pso); RELEASE(s_present_hdr_pso); rsx_hdr_display_release();
     RELEASE(s_plane); RELEASE(s_plane_rtv); RELEASE(s_plane_srv); s_plane_w = s_plane_h = s_plane_surface = 0;
     RELEASE(s_depth_ms_pso); RELEASE(s_depth_pack_ms_pso); RELEASE(s_zcopy_ms_pso);
     RELEASE(s_helper_vs_blob); RELEASE(s_helper_blit_blob);
@@ -5198,9 +5135,7 @@ static void eng_hdr_poll(void)
 {
     static u32 n;
     if (!s_hdr_want || ++n % 60) return;
-    if (s_hdr_factory && CALL0(s_hdr_factory, IsCurrent) &&
-        MonitorFromWindow(s_hwnd, MONITOR_DEFAULTTONEAREST) == s_hdr_monitor)
-        return;
+    if (!rsx_hdr_display_stale(s_hwnd)) return;
     const EngHdrDisplay d = eng_hdr_display();
     if ((d.hdr && s_present_hdr_pso) != s_hdr_on) {
         fprintf(stderr, "[rsx engine/d3d12] HDR: the display %s HDR now; a new swap chain\n", d.hdr ? "has" : "has no");
