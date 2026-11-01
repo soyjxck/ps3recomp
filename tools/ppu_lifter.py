@@ -5505,7 +5505,13 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
                                 continue
                             if count is None or _c > count:
                                 count = _c
-            if count is None or count < 0 or count > 4096:
+            # No bounds check found at all (an index kept on the stack and
+            # reloaded for the compare and for the table: Drakengard 3's -O0
+            # func_00E04D14 reads it from 0x34(r31) twice): the 256 fallback
+            # must not become the table's length. Scan as far as a table can
+            # go and keep the result only if it ends structurally (below).
+            _no_bound = count is None or count < 0 or count > 4096
+            if _no_bound:
                 count = 256
             # The cmp-derived count is a HINT, never a hard cap. It keeps UNDER-
             # counting: the backward window spans sibling basic blocks, so it can
@@ -5519,7 +5525,7 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
             # labels -- and the boot died in a storm of vcalls through a job
             # descriptor's name string.) The per-entry validation below already
             # finds the true end, so scan generously and let it terminate.
-            scan = min(max(count + 1, 256), 4096)
+            scan = 4096 if _no_bound else min(max(count + 1, 256), 4096)
 
             # Multi-TOC executables (e.g. LBP: two TOCs, ~3.6k/2.2k functions each)
             # load the table base relative to WHICHEVER r2 their function runs
@@ -5545,7 +5551,11 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
                 if table_base is None:
                     continue
                 targets = []
+                _structural_end = False
+                _old_read = None   # the targets of the first 257 entries: the old fallback's read
                 for k in range(scan):
+                    if k == 257:
+                        _old_read = list(targets)
                     ea = (table_base + k * 4) & 0xFFFFFFFF
                     # Structural end-of-table: a jump table never overlaps the code
                     # it dispatches to, so once the cursor reaches the lowest case
@@ -5557,6 +5567,7 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
                     fwd = [t for t in targets if t > table_base]
                     if fwd and ea >= min(fwd):
                         _dbg(all_insns[i].addr, f"  stop at k={k}: cursor 0x{ea:X} reached first case 0x{min(fwd):X}")
+                        _structural_end = True
                         break
                     v = read_u32(ea)
                     if v is None:
@@ -5580,6 +5591,10 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
                         # that is simply wrong still fails fast instead of scanning
                         # into unrelated data.
                         break
+                if _no_bound and not _structural_end and _old_read is not None:
+                    # Unbounded and with no structural end: the old 257-entry
+                    # read, rather than whatever the scan ran into past it.
+                    targets = _old_read
                 _dbg(all_insns[i].addr, f"decoded {len(targets)} targets")
                 # Rank by targets NEAR the bctr first: case blocks belong to the
                 # dispatcher's own function. A wrong TOC can decode a bogus

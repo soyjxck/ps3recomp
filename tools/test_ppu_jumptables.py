@@ -356,6 +356,46 @@ def test_bound_compare_beyond_window():
           [first + 4 * k for k in range(n)])
 
 
+def test_unbounded_table_ends_at_its_cases():
+    """No bounds compare is recognised, and the table is longer than 257.
+
+        slwi r9,r3,2; lwz r11,16(r2); lwzx r0,r9,r11; add r0,r0,r11; mtctr r0; bctr
+
+    Drakengard 3 (BLUS31197 1.01) func_00E04D14, a 373-entry switch built at
+    -O0: the index lives at 0x34(r31) and is loaded separately for the
+    `cmplwi 0x174` and for the table, so the compare is on another register's
+    chain and is never matched. The 256 fallback then also capped the scan at
+    257 entries, which the structural end cannot extend: cases 257+ lifted to
+    unresolved indirect calls, and the title screen stopped on its attract
+    sequence. With no bound found, the scan now runs to the table's
+    structural end -- its first case, right after it.
+    """
+    n, table = 373, 0x11000
+    first = table + 4 * n                            # cases right after the table
+    mem = {TOC + 16: table}
+    for k in range(n):
+        mem[table + 4 * k] = first + 4 * k - table
+    got = discover([w_slwi(9, 3, 2), w_lwz(11, 2, 16), w_lwzx(0, 9, 11),
+                    w_add(0, 0, 11), w_mtctr(0), w_bctr()], mem)
+    check("no bound, table ends at its first case (373 entries)", got,
+          [first + 4 * k for k in range(n)])
+
+
+def test_unbounded_table_without_structural_end_keeps_old_read():
+    """No bound and no structural end (the cases lie BEFORE the table): the
+    scan keeps the old 257-entry read instead of running on into whatever
+    follows, so an unbounded table can only grow when it ends by structure."""
+    n, table = 300, 0x12000
+    first = 0x11000                                  # cases behind the table
+    mem = {TOC + 16: table}
+    for k in range(n):
+        mem[table + 4 * k] = (first + 4 * k - table) & 0xFFFFFFFF
+    got = discover([w_slwi(9, 3, 2), w_lwz(11, 2, 16), w_lwzx(0, 9, 11),
+                    w_add(0, 0, 11), w_mtctr(0), w_bctr()], mem)
+    check("no bound, no structural end: the old 257-entry read", got,
+          [first + 4 * k for k in range(257)])
+
+
 def main() -> int:
     test_encodings()
     test_absolute_base_is_second_operand()
@@ -371,6 +411,8 @@ def main() -> int:
     test_multi_toc_prefers_targets_near_the_dispatcher()
     test_bound_compare_beyond_window()
     test_spilled_base_reused_as_target()
+    test_unbounded_table_ends_at_its_cases()
+    test_unbounded_table_without_structural_end_keeps_old_read()
     if FAILS:
         print(f"FAILED: {', '.join(FAILS)}")
         return 1
