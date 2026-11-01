@@ -2759,6 +2759,17 @@ static void icall_hist(ppu_context* ctx, uint32_t tgt, int phase)
 
 static void ps3_indirect_call_full(ppu_context* ctx);
 
+/* The distance from g_trampoline_fn to g_dispatch_depth, both this file's
+ * thread-locals: the same on every thread, as a thread's thread-locals are one
+ * block laid out once for the image. On macOS each access to a __thread
+ * variable is a call (tlv_get_addr, a lookup through the thread's TSD), and the
+ * fast path's two -- the depth before the call, the trampoline after it --
+ * were a fifth of the game thread while a level loads: Unreal's package loader
+ * is virtual calls through and through. One lookup and this offset reach both.
+ * Where a thread-local is a load off a register (Windows, Linux) it saves an
+ * instruction or two. 0 until the first call works it out. */
+static ptrdiff_t s_tramp_to_depth;
+
 /* ps3_indirect_call_to: dispatch to an explicit guest target with CTR left as
  * the guest had it (b<cond>lrl branches through LR; CTR must not change). The
  * target travels to ps3_indirect_call_impl in a thread-local, so this takes
@@ -2793,17 +2804,27 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
               const uint64_t e = __atomic_load_n(&g_icall_cache[icall_cache_slot(addr)], __ATOMIC_RELAXED);
               if ((uint32_t)(e >> 32) == addr && e != 0) dist = (int32_t)(uint32_t)e;
           }
-          if (__builtin_expect(dist != 0 && s_icall_depth <= 4000, 1)) {
-              const ppu_fn fn = (ppu_fn)(base + dist);
-              s_icall_depth++;
-              fn(ctx);
-              while (g_trampoline_fn) {
-                  void (*tf)(void*) = g_trampoline_fn;
-                  g_trampoline_fn = 0;
-                  tf(ctx);
+          if (__builtin_expect(dist != 0, 1)) {
+              /* The depth and the trampoline through one thread-local
+               * lookup (s_tramp_to_depth). */
+              void (**const tramp)(void*) = &g_trampoline_fn;
+              ptrdiff_t d = __atomic_load_n(&s_tramp_to_depth, __ATOMIC_RELAXED);
+              if (__builtin_expect(!d, 0)) {
+                  d = (char*)&g_dispatch_depth - (char*)tramp;
+                  __atomic_store_n(&s_tramp_to_depth, d, __ATOMIC_RELAXED);
               }
-              s_icall_depth--;
-              return;
+              int* const depth = (int*)((char*)tramp + d);
+              if (__builtin_expect(*depth <= 4000, 1)) {
+                  const ppu_fn fn = (ppu_fn)(base + dist);
+                  ++*depth;
+                  fn(ctx);
+                  while (void (*tf)(void*) = *tramp) {
+                      *tramp = 0;
+                      tf(ctx);
+                  }
+                  --*depth;
+                  return;
+              }
           }
       } }
     ps3_indirect_call_full(ctx);
