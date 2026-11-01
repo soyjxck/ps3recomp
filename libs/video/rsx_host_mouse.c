@@ -173,6 +173,10 @@ void rsx_host_window_escape_closes(int on) { InterlockedExchange(&s_escape_close
 
 /* The Metal backend's window: rsx_metal_backend.m has these. */
 
+#elif defined(__linux__) && defined(PS3RECOMP_VULKAN_ENGINE_SDL)
+
+/* The Vulkan engine's SDL window: rsx_vulkan_engine.c has these. */
+
 #else
 
 void rsx_host_mouse_capture(int on) { (void)on; }

@@ -271,6 +271,9 @@ endif()
 #           (glslang-tools only because the packaged CMake config declares
 #           the standalone binary as an imported target and fails to load
 #           without it)
+# PS3RECOMP_MSL=OFF leaves it out where nothing presents through Metal: a
+# Linux port's release, which would otherwise carry libspirv-cross for it.
+option(PS3RECOMP_MSL "Build the HLSL -> MSL translator (Metal; on Linux for its tests)" ON)
 set(PS3RECOMP_MSL_TRANSLATION OFF)
 if(UNIX)
     find_package(glslang CONFIG QUIET)
@@ -303,7 +306,7 @@ if(UNIX)
         endif()
     endif()
 
-    if(glslang_FOUND AND SPVC_OK
+    if(PS3RECOMP_MSL AND glslang_FOUND AND SPVC_OK
        AND TARGET glslang::glslang AND TARGET glslang::SPIRV)
         add_library(ps3recomp_msl_translation INTERFACE)
         target_compile_definitions(ps3recomp_msl_translation INTERFACE
@@ -356,6 +359,21 @@ if(PS3RECOMP_RSX_VULKAN)
         set(PS3RECOMP_SPIRV_TRANSLATION ON)
         message(STATUS "  Vulkan:       guest programs available (glslang ${glslang_VERSION}); "
                        "opt in with PS3RECOMP_VK_GUEST_PROGRAMS=1")
+        # The draw engine over Vulkan 1.3 (rsx_vulkan_engine.c), the one the
+        # Windows build runs with RSX_BACKEND=vulkan, in an SDL2 window: what a
+        # port boots on Linux (rsx_vulkan_engine_init). It brings the mouse
+        # (rsx_host_mouse.h) with its window, so rsx_host_mouse.c stands down.
+        if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            set_property(SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_vulkan_engine.c"
+                         APPEND PROPERTY COMPILE_DEFINITIONS PS3RECOMP_HAVE_VULKAN=1)
+            set_property(SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_vulkan_engine.c"
+                         APPEND PROPERTY INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/runtime/platform")
+            set_property(SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_host_mouse.c"
+                         APPEND PROPERTY COMPILE_DEFINITIONS PS3RECOMP_VULKAN_ENGINE_SDL=1)
+            # PUBLIC: a port selects its renderer on it
+            target_compile_definitions(ps3recomp_runtime PUBLIC PS3RECOMP_VULKAN_ENGINE_SDL=1)
+            message(STATUS "  Vulkan:       draw engine (rsx_vulkan_engine.c) in an SDL2 window")
+        endif()
     else()
         message(STATUS "  Vulkan:       glslang not found; guest programs unavailable")
     endif()

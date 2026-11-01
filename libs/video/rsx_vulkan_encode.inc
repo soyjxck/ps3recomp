@@ -1069,9 +1069,16 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL eng_debug_cb(VkDebugUtilsMessageSeverityFl
 
 static int eng_load_vulkan(void)
 {
+#ifdef _WIN32
     s_vk_dll = LoadLibraryA("vulkan-1.dll");
     if (!s_vk_dll) { fprintf(stderr, "[RSX vulkan] vulkan-1.dll not found (no Vulkan driver)\n"); return -1; }
     vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)(void*)GetProcAddress(s_vk_dll, "vkGetInstanceProcAddr");
+#else
+    s_vk_dll = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (!s_vk_dll) s_vk_dll = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
+    if (!s_vk_dll) { fprintf(stderr, "[RSX vulkan] libvulkan.so.1 not found (no Vulkan loader): %s\n", dlerror()); return -1; }
+    vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)dlsym(s_vk_dll, "vkGetInstanceProcAddr");
+#endif
     if (!vkGetInstanceProcAddr) return -1;
 #define VK_LOAD_G(n) n = (PFN_##n)vkGetInstanceProcAddr(VK_NULL_HANDLE, #n);
     VK_GLOBAL_FNS(VK_LOAD_G)
@@ -1089,6 +1096,18 @@ static int eng_swapchain_create(void)
 {
     VkSurfaceCapabilitiesKHR caps;
     if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(s_phys, s_surface, &caps) != VK_SUCCESS) return -1;
+    if (caps.currentExtent.width == 0xFFFFFFFFu) {
+        /* The surface leaves the size to the swap chain (Wayland): the window's, in pixels. */
+        int w = (int)s_win_w, h = (int)s_win_h;
+#ifndef _WIN32
+        if (s_hwnd) SDL_Vulkan_GetDrawableSize(s_hwnd, &w, &h);
+#endif
+        if (w < (int)caps.minImageExtent.width) w = (int)caps.minImageExtent.width;
+        if (h < (int)caps.minImageExtent.height) h = (int)caps.minImageExtent.height;
+        if (w > (int)caps.maxImageExtent.width) w = (int)caps.maxImageExtent.width;
+        if (h > (int)caps.maxImageExtent.height) h = (int)caps.maxImageExtent.height;
+        caps.currentExtent.width = (u32)w; caps.currentExtent.height = (u32)h;
+    }
     if (caps.currentExtent.width == 0 || caps.currentExtent.height == 0) return -1;   /* minimised */
     u32 nf = 0; vkGetPhysicalDeviceSurfaceFormatsKHR(s_phys, s_surface, &nf, NULL);
     VkSurfaceFormatKHR fmts[64]; if (nf > 64) nf = 64;
@@ -1179,8 +1198,21 @@ static int eng_init_device(void)
     if (vkEnumerateInstanceVersion) vkEnumerateInstanceVersion(&api);
     if (api < VK_API_VERSION_1_3) { fprintf(stderr, "[RSX vulkan] the loader is Vulkan %u.%u; 1.3 is needed\n", VK_API_VERSION_MAJOR(api), VK_API_VERSION_MINOR(api)); return -1; }
 
-    const char* exts[4]; u32 next = 0;
+    const char* exts[8]; u32 next = 0;
+#ifdef _WIN32
     if (!s_headless) { exts[next++] = VK_KHR_SURFACE_EXTENSION_NAME; exts[next++] = VK_KHR_WIN32_SURFACE_EXTENSION_NAME; }
+#else
+    /* the surface extensions SDL needs for this window (X11 or Wayland) */
+    if (!s_headless) {
+        unsigned n = 0;
+        if (!SDL_Vulkan_GetInstanceExtensions(s_hwnd, &n, NULL) || n > 6 ||
+            !SDL_Vulkan_GetInstanceExtensions(s_hwnd, &n, exts)) {
+            fprintf(stderr, "[RSX vulkan] SDL_Vulkan_GetInstanceExtensions: %s\n", SDL_GetError());
+            return -1;
+        }
+        next = n;
+    }
+#endif
     const char* layers[1]; u32 nlay = 0;
     const int validate = getenv("RSX_VK_VALIDATION") && getenv("RSX_VK_VALIDATION")[0] == '1';
     if (validate) {
@@ -1216,9 +1248,16 @@ static int eng_init_device(void)
         }
     }
     if (!s_headless) {
+#ifdef _WIN32
         VkWin32SurfaceCreateInfoKHR si = { VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR };
         si.hinstance = GetModuleHandle(NULL); si.hwnd = s_hwnd;
         VKCHECK(vkCreateWin32SurfaceKHR(s_inst, &si, NULL, &s_surface), "vkCreateWin32SurfaceKHR");
+#else
+        if (!SDL_Vulkan_CreateSurface(s_hwnd, s_inst, &s_surface)) {
+            fprintf(stderr, "[RSX vulkan] SDL_Vulkan_CreateSurface: %s\n", SDL_GetError());
+            return -1;
+        }
+#endif
     }
 
     /* A device with Vulkan 1.3 and a graphics queue that can present; a
@@ -1486,7 +1525,11 @@ static void eng_release_device(void)
     if (s_dbg && vkDestroyDebugUtilsMessengerEXT) vkDestroyDebugUtilsMessengerEXT(s_inst, s_dbg, NULL);
     vkDestroyInstance(s_inst, NULL);
     s_inst = VK_NULL_HANDLE; s_dev = VK_NULL_HANDLE; s_surface = VK_NULL_HANDLE; s_swap = VK_NULL_HANDLE;
+#ifdef _WIN32
     if (s_hwnd) { DestroyWindow(s_hwnd); s_hwnd = NULL; }
+#else
+    if (s_hwnd) { SDL_DestroyWindow(s_hwnd); s_hwnd = NULL; }
+#endif
 }
 
 /* ---- public API ---------------------------------------------------------------------- */
@@ -1506,10 +1549,12 @@ int rsx_vulkan_engine_init(u32 width, u32 height, const char* title)
     s_width = width ? width : 1280; s_height = height ? height : 720;
     { const char* v = getenv("RSX_VSYNC"); if (v && *v) s_vsync = atoi(v) ? 1 : 0; }
     eng_read_scale();
+#ifdef _WIN32
     { HMODULE u32m = GetModuleHandleA("user32.dll");
       typedef BOOL (WINAPI *SetCtxFn)(DPI_AWARENESS_CONTEXT);
       SetCtxFn set_ctx = u32m ? (SetCtxFn)(void*)GetProcAddress(u32m, "SetProcessDpiAwarenessContext") : NULL;
       if (!set_ctx || !set_ctx(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)) SetProcessDPIAware(); }
+#endif
     s_win_w = s_width; s_win_h = s_height;
     { const char* dm = getenv("RSX_DISPLAY");
       const char* fs = getenv("RSX_FULLSCREEN");
@@ -1521,7 +1566,7 @@ int rsx_vulkan_engine_init(u32 width, u32 height, const char* title)
       unsigned ww = 0, wh = 0;
       const int have_ws = ws && *ws && sscanf(ws, "%ux%u", &ww, &wh) == 2 && ww >= 320 && wh >= 240 && ww <= 16384 && wh <= 16384;
       if (s_display == DISP_WINDOWED) { if (have_ws) { s_win_w = ww; s_win_h = wh; } }
-      else { s_win_w = (u32)GetSystemMetrics(SM_CXSCREEN); s_win_h = (u32)GetSystemMetrics(SM_CYSCREEN); } }
+      else eng_screen_size(&s_win_w, &s_win_h); }
 
     rsx_draw_engine_set_backend(&s_engine_backend);
     rsx_draw_engine_set_default(1);
@@ -1669,12 +1714,22 @@ static void eng_display_reload(void)
       const int have_ws = ws && *ws && sscanf(ws, "%ux%u", &ww, &wh) == 2 && ww >= 320 && wh >= 240 && ww <= 16384 && wh <= 16384;
       s_win_w = s_width; s_win_h = s_height;
       if (s_display == DISP_WINDOWED) { if (have_ws) { s_win_w = ww; s_win_h = wh; } }
-      else { s_win_w = (u32)GetSystemMetrics(SM_CXSCREEN); s_win_h = (u32)GetSystemMetrics(SM_CYSCREEN); } }
+      else eng_screen_size(&s_win_w, &s_win_h); }
     if (s_scale != os) eng_rescale();
     if ((u32)eng_ms_want() != s_ms_n) eng_ms_apply(eng_ms_want());
     if (s_display == od && s_win_w == ow && s_win_h == oh && s_vsync == ov) return;
     vkDeviceWaitIdle(s_dev);
     if (s_display != od || s_win_w != ow || s_win_h != oh) {
+#ifndef _WIN32
+        if (s_display == DISP_WINDOWED) {
+            SDL_SetWindowFullscreen(s_hwnd, 0);
+            SDL_SetWindowResizable(s_hwnd, SDL_TRUE);
+            SDL_SetWindowSize(s_hwnd, (int)s_win_w, (int)s_win_h);
+            SDL_SetWindowPosition(s_hwnd, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+        } else {
+            SDL_SetWindowFullscreen(s_hwnd, SDL_WINDOW_FULLSCREEN_DESKTOP);
+        }
+#else
         if (s_display == DISP_WINDOWED) {
             RECT wr = {0, 0, (LONG)s_win_w, (LONG)s_win_h};
             AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
@@ -1686,6 +1741,7 @@ static void eng_display_reload(void)
             SetWindowLongPtrA(s_hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
             SetWindowPos(s_hwnd, HWND_TOP, 0, 0, (int)s_win_w, (int)s_win_h, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
         }
+#endif
     }
     if (eng_swapchain_create() != 0) fprintf(stderr, "[RSX vulkan] could not remake the swap chain\n");
     fprintf(stderr, "[RSX vulkan] display: %s %ux%u, vsync %d\n",
@@ -1696,11 +1752,17 @@ int rsx_vulkan_engine_pump_messages(void)
 {
     if (s_headless) return 0;
     if (g_rsx_display_reload && s_ready && s_swap) eng_display_reload();
+#ifdef _WIN32
     MSG msg;
     while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
         if (msg.message == WM_QUIT) return -1;
         TranslateMessage(&msg);
         DispatchMessageA(&msg);
     }
+#else
+    SDL_Event e;
+    while (SDL_PollEvent(&e)) eng_sdl_event(&e);
+    eng_mouse_apply();
+#endif
     return s_window_closed ? -1 : 0;
 }

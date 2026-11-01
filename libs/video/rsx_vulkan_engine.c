@@ -30,8 +30,9 @@
  * RSX_WINDOW and RSX_VSYNC as the D3D12 backend (exclusive full screen is
  * borderless here).
  */
-#if defined(_WIN32) && defined(PS3RECOMP_HAVE_VULKAN)
+#if (defined(_WIN32) || defined(__linux__)) && defined(PS3RECOMP_HAVE_VULKAN)
 
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -42,10 +43,27 @@
 #define VK_NO_PROTOTYPES
 #define VK_USE_PLATFORM_WIN32_KHR
 #include <vulkan/vulkan.h>
+#include <io.h>
+#else
+/* Linux: the window is SDL2's (SDL_Vulkan_CreateSurface picks X11 or
+ * Wayland), libvulkan.so.1 is opened at run time as vulkan-1.dll is on
+ * Windows, and the Win32 locks and clocks come from the toolkit's shim. */
+#include "win32_compat.h"
+#define VK_NO_PROTOTYPES
+#include <vulkan/vulkan.h>
+#include <SDL2/SDL.h>
+#include <SDL2/SDL_vulkan.h>
+#include <dlfcn.h>
+#include <strings.h>
+#include <unistd.h>
+#define _stricmp strcasecmp
+#define _access access
+#define _strdup strdup
+#define _aligned_free free   /* the draw engine's buffer_wrap blocks: posix_memalign off Windows */
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <io.h>
 
 #include "rsx_draw_engine.h"
 #include "rsx_texture_layout.h"
@@ -80,6 +98,13 @@
 
 /* ---- the loader ------------------------------------------------------------ */
 
+/* The one entry point that names the window system: the Win32 surface on
+ * Windows; on Linux SDL_Vulkan_CreateSurface makes it (X11 or Wayland). */
+#ifdef _WIN32
+#define VK_PLATFORM_SURFACE_FN(X) X(vkCreateWin32SurfaceKHR)
+#else
+#define VK_PLATFORM_SURFACE_FN(X)
+#endif
 #define VK_GLOBAL_FNS(X) \
     X(vkCreateInstance) X(vkEnumerateInstanceExtensionProperties) X(vkEnumerateInstanceLayerProperties) \
     X(vkEnumerateInstanceVersion)
@@ -88,7 +113,7 @@
     X(vkGetPhysicalDeviceQueueFamilyProperties) X(vkGetPhysicalDeviceMemoryProperties) \
     X(vkGetPhysicalDeviceFeatures2) X(vkGetPhysicalDeviceFormatProperties) X(vkCreateDevice) \
     X(vkGetDeviceProcAddr) X(vkEnumerateDeviceExtensionProperties) \
-    X(vkCreateWin32SurfaceKHR) X(vkDestroySurfaceKHR) X(vkGetPhysicalDeviceSurfaceSupportKHR) \
+    VK_PLATFORM_SURFACE_FN(X) X(vkDestroySurfaceKHR) X(vkGetPhysicalDeviceSurfaceSupportKHR) \
     X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR) X(vkGetPhysicalDeviceSurfaceFormatsKHR) \
     X(vkGetPhysicalDeviceSurfacePresentModesKHR)
 #define VK_DEVICE_FNS(X) \
@@ -113,7 +138,11 @@
     X(vkCmdSetPrimitiveTopology) X(vkCmdBeginQuery) X(vkCmdEndQuery) X(vkCmdResetQueryPool) \
     X(vkCmdCopyQueryPoolResults)
 
+#ifdef _WIN32
 static HMODULE s_vk_dll;
+#else
+static void* s_vk_dll;   /* libvulkan.so.1 */
+#endif
 static PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr;
 #define VK_DECL(n) static PFN_##n n;
 VK_GLOBAL_FNS(VK_DECL) VK_INSTANCE_FNS(VK_DECL) VK_DEVICE_FNS(VK_DECL)
@@ -260,7 +289,11 @@ typedef struct {
 typedef enum { DISP_WINDOWED = 0, DISP_BORDERLESS, DISP_FULLSCREEN } EngDisplayMode;
 static EngDisplayMode s_display = DISP_WINDOWED;
 static int s_active, s_headless, s_ready, s_vsync = 1;
+#ifdef _WIN32
 static HWND s_hwnd; static int s_window_closed;
+#else
+static SDL_Window* s_hwnd; static int s_window_closed;   /* the SDL window off Windows; the name kept */
+#endif
 static u32 s_width, s_height, s_win_w, s_win_h;
 
 static VkInstance s_inst;
@@ -973,6 +1006,7 @@ static void eng_collect_retired_buffers(void)
 
 /* ---- window ---------------------------------------------------------------------- */
 
+#ifdef _WIN32
 static LRESULT CALLBACK eng_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     /* The mouse, for a port played with it (rsx_host_mouse.h); and Escape,
@@ -1011,6 +1045,158 @@ static HWND eng_create_window(u32 width, u32 height, const char* title)
                            CW_USEDEFAULT, CW_USEDEFAULT, wr.right - wr.left, wr.bottom - wr.top,
                            NULL, NULL, GetModuleHandle(NULL), NULL);
 }
+
+/* The screen the window is (to be) on, in pixels: what a borderless window
+ * covers. */
+static void eng_screen_size(u32* w, u32* h)
+{
+    *w = (u32)GetSystemMetrics(SM_CXSCREEN);
+    *h = (u32)GetSystemMetrics(SM_CYSCREEN);
+}
+#else   /* Linux: an SDL2 window */
+
+/* What the window was sent, for the port's keyboard and mouse
+ * (rsx_vulkan_engine.h): keys by SDL scancode -- a place on the keyboard,
+ * whatever the layout prints on it, as the Metal backend's virtual keycodes
+ * are -- the mouse's buttons and the focus. Written by the pump (the
+ * window's thread), read from any. Let go when the focus goes, so nothing
+ * stays held behind another window. */
+static volatile unsigned char s_key_down[SDL_NUM_SCANCODES];
+static volatile LONG s_mouse_buttons;   /* bit b: 0 left, 1 right, 2 middle, 3, 4 */
+static volatile LONG s_focused;
+/* The mouse of rsx_host_mouse.h, as rsx_host_mouse.c has it on Windows:
+ * relative motion and the wheel's notches, counted only while captured. */
+static volatile LONG s_m_want, s_m_held, s_m_dx, s_m_dy, s_m_wheel;
+static volatile LONG s_escape_closes = 1;
+
+static int eng_sdl_video(void)
+{
+    static int ok = -1;
+    if (ok < 0) {
+        ok = SDL_InitSubSystem(SDL_INIT_VIDEO) == 0;
+        if (!ok) fprintf(stderr, "[RSX vulkan] SDL video: %s\n", SDL_GetError());
+    }
+    return ok;
+}
+
+static void eng_screen_size(u32* w, u32* h)
+{
+    SDL_DisplayMode dm;
+    const int d = s_hwnd ? SDL_GetWindowDisplayIndex(s_hwnd) : 0;
+    if (eng_sdl_video() && SDL_GetDesktopDisplayMode(d < 0 ? 0 : d, &dm) == 0 && dm.w > 0 && dm.h > 0) {
+        *w = (u32)dm.w; *h = (u32)dm.h;
+    } else {
+        *w = 1920; *h = 1080;
+    }
+}
+
+static SDL_Window* eng_create_window(u32 width, u32 height, const char* title)
+{
+    if (!eng_sdl_video()) return NULL;
+    SDL_DisableScreenSaver();   /* SetThreadExecutionState's counterpart */
+    Uint32 flags = SDL_WINDOW_VULKAN | SDL_WINDOW_SHOWN | SDL_WINDOW_ALLOW_HIGHDPI;
+    flags |= s_display != DISP_WINDOWED ? SDL_WINDOW_FULLSCREEN_DESKTOP : SDL_WINDOW_RESIZABLE;
+    SDL_Window* w = SDL_CreateWindow(title ? title : "ps3recomp (Vulkan)", SDL_WINDOWPOS_CENTERED,
+                                     SDL_WINDOWPOS_CENTERED, (int)width, (int)height, flags);
+    if (!w) fprintf(stderr, "[RSX vulkan] SDL_CreateWindow: %s\n", SDL_GetError());
+    else s_focused = (SDL_GetWindowFlags(w) & SDL_WINDOW_INPUT_FOCUS) != 0;
+    return w;
+}
+
+/* On the window's thread: take the cursor (relative mode: hidden, held in
+ * the window, motion unaccelerated) while it is asked for and the window has
+ * the focus, give it back otherwise. */
+static void eng_mouse_apply(void)
+{
+    if (!s_hwnd) return;
+    const int hold = s_m_want && s_focused && !(SDL_GetWindowFlags(s_hwnd) & SDL_WINDOW_MINIMIZED);
+    if ((SDL_GetRelativeMouseMode() == SDL_TRUE) != (hold != 0)) SDL_SetRelativeMouseMode(hold ? SDL_TRUE : SDL_FALSE);
+    if (hold && !s_m_held) {   /* what the mouse did while it was someone else's is not ours */
+        InterlockedExchange(&s_m_dx, 0);
+        InterlockedExchange(&s_m_dy, 0);
+        InterlockedExchange(&s_m_wheel, 0);
+    }
+    InterlockedExchange(&s_m_held, hold ? 1 : 0);
+    /* The cursor over the window: hidden while it has the focus, taken or not
+     * -- a pad player has no use for it, and on a Steam Deck the trackpad
+     * moves it whether or not the game reads the mouse. */
+    static int shown = -1;
+    const int show = !s_focused;
+    if (show != shown) { SDL_ShowCursor(show ? SDL_ENABLE : SDL_DISABLE); shown = show; }
+}
+
+static void eng_sdl_event(const SDL_Event* e)
+{
+    switch (e->type) {
+    case SDL_QUIT: s_window_closed = 1; break;
+    case SDL_WINDOWEVENT:
+        if (e->window.event == SDL_WINDOWEVENT_CLOSE) s_window_closed = 1;
+        else if (e->window.event == SDL_WINDOWEVENT_FOCUS_GAINED) s_focused = 1;
+        else if (e->window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
+            s_focused = 0;
+            memset((void*)s_key_down, 0, sizeof s_key_down);
+            InterlockedExchange(&s_mouse_buttons, 0);
+        }
+        break;
+    case SDL_KEYDOWN:
+    case SDL_KEYUP:
+        if ((unsigned)e->key.keysym.scancode < SDL_NUM_SCANCODES)
+            s_key_down[e->key.keysym.scancode] = e->type == SDL_KEYDOWN;
+        /* Escape closes the window unless the port wants the key (Alt+F4 always does) */
+        if (e->type == SDL_KEYDOWN && e->key.keysym.scancode == SDL_SCANCODE_ESCAPE && s_escape_closes)
+            s_window_closed = 1;
+        break;
+    case SDL_MOUSEBUTTONDOWN:
+    case SDL_MOUSEBUTTONUP: {
+        /* SDL's 1 left, 2 middle, 3 right, 4 and 5 the side buttons */
+        static const int map[6] = { -1, 0, 2, 1, 3, 4 };
+        const int b = e->button.button < 6 ? map[e->button.button] : -1;
+        if (b < 0) break;
+        LONG m = s_mouse_buttons;
+        m = e->type == SDL_MOUSEBUTTONDOWN ? (m | (1 << b)) : (m & ~(1 << b));
+        InterlockedExchange(&s_mouse_buttons, m);
+        break;
+    }
+    case SDL_MOUSEMOTION:
+        if (s_m_held) {
+            InterlockedExchangeAdd(&s_m_dx, e->motion.xrel);
+            InterlockedExchangeAdd(&s_m_dy, e->motion.yrel);
+        }
+        break;
+    case SDL_MOUSEWHEEL:
+        if (s_m_held) {
+            const int y = e->wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -e->wheel.y : e->wheel.y;
+            InterlockedExchangeAdd(&s_m_wheel, y);
+        }
+        break;
+    }
+}
+
+int rsx_vulkan_engine_key_down(unsigned scancode)
+{
+    return scancode < SDL_NUM_SCANCODES && s_key_down[scancode];
+}
+int rsx_vulkan_engine_mouse_button_down(unsigned button) { return button < 5 && (s_mouse_buttons >> button) & 1; }
+int rsx_vulkan_engine_window_focused(void) { return s_hwnd && s_focused; }
+
+/* rsx_host_mouse.h: the engine's window has them on Linux (rsx_host_mouse.c
+ * leaves them to it). Requests are applied at the next pump. */
+void rsx_host_mouse_capture(int on) { InterlockedExchange(&s_m_want, on ? 1 : 0); }
+int rsx_host_mouse_captured(void) { return (int)s_m_held; }
+void rsx_host_mouse_take_motion(int* dx, int* dy)
+{
+    *dx = (int)InterlockedExchange(&s_m_dx, 0);
+    *dy = (int)InterlockedExchange(&s_m_dy, 0);
+}
+int rsx_host_mouse_take_wheel(void) { return (int)InterlockedExchange(&s_m_wheel, 0); }
+void rsx_host_window_escape_closes(int on) { InterlockedExchange(&s_escape_closes, on ? 1 : 0); }
+void rsx_host_mouse_attach(void* hwnd) { (void)hwnd; }
+int rsx_host_mouse_message(void* hwnd, unsigned msg, uintptr_t wp, intptr_t lp, intptr_t* result)
+{
+    (void)hwnd; (void)msg; (void)wp; (void)lp; (void)result;
+    return 0;
+}
+#endif
 
 /* ---- shaders and pipelines ---------------------------------------------------------- */
 
@@ -1282,7 +1468,11 @@ static VkPipeline eng_pso_for(u32 pipeline, int cls, int unscaled)
  * inputs) carry data that spreading samples corrupts -- 16x over them put red
  * and cyan speckle on the ground and the cloth. 1 is off. */
 static int s_has_aniso;
+#ifdef _WIN32
 extern int g_rsx_aniso;   /* rsx_d3d12_engine.c */
+#else
+int g_rsx_aniso;          /* 0 until read from RSX_ANISO; the port's settings page sets it live */
+#endif
 static int eng_aniso(void)
 {
     int a = g_rsx_aniso;
@@ -1535,9 +1725,32 @@ static void eng_query_report(void* user, u32 query, u32 report_index)
 
 /* ---- recording ---------------------------------------------------------------------- */
 
+/* RSX_VK_SUBMIT_EVERY=<n> (default 0, off): hand the GPU what is recorded
+ * every n records, so it runs the frame while the walker records the rest --
+ * the D3D12 engine's eng_submit_early (RSX_SUBMIT_EVERY, on at 256 there: 95
+ * -> 109 fps in Drakengard 3's heaviest parts). Off here: on a Steam Deck
+ * (RADV, a GPU about half busy) 256 measured -0.04 +/- 2.20 fps over 24
+ * pairs in the chapter 1 battle, with twice the frames over 25 ms. Made where
+ * a draw begins, before anything of it is staged: a submit closes the stage
+ * chain, and the vertex constants' reuse (eng_reuse_vs_constants) sees the
+ * new submit and stages them again. Its own setting, apart from D3D12's, so
+ * neither engine's default moves the other's; main.cpp's DOD3_AB=earlysubmit
+ * switches it in a run on Linux. */
+int g_vk_submit_every = -1;
+static void eng_submit_early(void)
+{
+    if (g_vk_submit_every < 0) {
+        const char* e = getenv("RSX_VK_SUBMIT_EVERY");
+        g_vk_submit_every = e ? atoi(e) : 0;
+    }
+    if (g_vk_submit_every <= 0 || s_rec_count < (u32)g_vk_submit_every) return;
+    eng_submit(0, 0);
+}
+
 static void eng_bind_targets(void* user, const u32* surfaces, u32 count, u32 depth)
 {
     (void)user;
+    eng_submit_early();
     if (count > RSX_BE_MAX_COLOR_TARGETS) count = RSX_BE_MAX_COLOR_TARGETS;
     for (u32 i = 0; i < RSX_BE_MAX_COLOR_TARGETS; i++) s_pending.rt[i] = (i < count) ? surfaces[i] : 0;
     s_pending.nrt = count;
