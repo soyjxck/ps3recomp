@@ -18,7 +18,16 @@
  * scRGB, linear light with 1.0 at 80 nits. The frame is an SDR picture: each
  * tap is decoded to linear light (a 2.2 power, what an SDR display shows it
  * with; hdr.z = 1: the sRGB curve) before the area average, then scaled to
- * the paper white (hdr.x = its nits / 80) and held under the peak (hdr.y). */
+ * the paper white (hdr.x = its nits / 80). With hdr.w = 1, t1 is the
+ * highlight plane (the title's own composite wrote it: rgb what it wrote to
+ * the frame, a how many times brighter, in linear light, the pixel was
+ * before its clip): a tap whose frame pixel is still what the plane says --
+ * nothing drawn over it since, as the HUD is -- is that many times brighter.
+ * Above a knee (half the peak, at least the paper white) the light rolls
+ * off smoothly toward the peak (hdr.y = its nits / 80) instead of clipping.
+ * hdr.w = 2 (RSX_HDR_DEBUG): the plane shown instead, within SDR's range --
+ * the frame dimmed, red as far as a pixel is brightened (4 stops: full),
+ * blue where something was drawn over the plane's picture. */
 static const char kPresentHdrHLSL[] =
     "struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
     "VSOut vs_main(uint vid : SV_VertexID) {\n"
@@ -27,27 +36,48 @@ static const char kPresentHdrHLSL[] =
     "}\n"
     "Texture2D<float4> src : register(t0);\n"
     "SamplerState smp : register(s1);\n"
+    "Texture2D<float4> plane : register(t1);\n"
     "cbuffer HdrConstants : register(b0) { float4 hdr; };\n"
     "float3 decode(float3 c) {\n"
     "    c = saturate(c);\n"
     "    if (hdr.z > 0.5) return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);\n"
     "    return pow(c, 2.2);\n"
     "}\n"
+    "float3 tap(float2 uv) {\n"
+    "    float3 s = src.SampleLevel(smp, uv, 0).rgb;\n"
+    "    float3 lin = decode(s);\n"
+    "    if (hdr.w > 0.5) {\n"
+    "        float4 p = plane.SampleLevel(smp, uv, 0);\n"
+    "        float3 dd = abs(saturate(s) - p.rgb);\n"
+    "        const bool same = max(max(dd.x, dd.y), dd.z) < 3.0 / 255.0;\n"
+    "        if (hdr.w > 1.5) {\n"
+    "            const float st = saturate(log2(clamp(p.a, 1.0, 64.0)) / 4.0);\n"
+    "            return (lin * 0.25 + (same ? float3(st, 0.0, 0.0) : float3(0.0, 0.0, 0.15))) / max(hdr.x, 1e-3);\n"
+    "        }\n"
+    "        if (same) lin *= clamp(p.a, 1.0, 64.0);\n"
+    "    }\n"
+    "    return lin;\n"
+    "}\n"
     "float4 ps_blit_area_hdr(VSOut i) : SV_Target {\n"
     "    uint w, h; src.GetDimensions(w, h);\n"
     "    float2 d = float2(ddx(i.uv.x), ddy(i.uv.y));\n"
     "    float2 fp = abs(d) * float2(w, h);\n"
     "    float3 lin;\n"
-    "    if (fp.x <= 1.25 && fp.y <= 1.25) lin = decode(src.SampleLevel(smp, i.uv, 0).rgb);\n"
+    "    if (fp.x <= 1.25 && fp.y <= 1.25) lin = tap(i.uv);\n"
     "    else {\n"
     "        int nx = clamp((int)ceil(fp.x - 0.01), 1, 4), ny = clamp((int)ceil(fp.y - 0.01), 1, 4);\n"
     "        float3 acc = 0;\n"
     "        for (int y = 0; y < ny; y++)\n"
     "            for (int x = 0; x < nx; x++)\n"
-    "                acc += decode(src.SampleLevel(smp, i.uv + (float2(x + 0.5, y + 0.5) / float2(nx, ny) - 0.5) * d, 0).rgb);\n"
+    "                acc += tap(i.uv + (float2(x + 0.5, y + 0.5) / float2(nx, ny) - 0.5) * d);\n"
     "        lin = acc / (float)(nx * ny);\n"
     "    }\n"
-    "    return float4(min(lin * hdr.x, hdr.y), 1.0);\n"
+    "    float3 o = lin * hdr.x;\n"
+    "    if (hdr.w > 1.5) return float4(o, 1.0);\n"
+    "    const float knee = max(hdr.x, 0.5 * hdr.y), room = max(hdr.y - knee, 1e-3);\n"
+    "    const float m = max(max(o.r, o.g), o.b);\n"
+    "    if (m > knee) o *= (knee + room * (1.0 - exp(-(m - knee) / room))) / m;\n"
+    "    return float4(o, 1.0);\n"
     "}\n";
 
 static const char kPresentHLSL[] =

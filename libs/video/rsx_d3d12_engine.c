@@ -213,6 +213,12 @@ typedef struct {
     /* The MSAA build (s_ms_n samples), for passes into MSAA twins. */
     ID3D12PipelineState* psoms[3];
     int failedms[3];
+    /* A fragment program whose text names rsx_hdr_plane writes the HDR
+     * highlight plane at SV_TARGET1 (eng_hdr_plane_*): the build with that
+     * second target, for a pass into one target while HDR is on. */
+    int hdr_plane;
+    ID3D12PipelineState* psoh[3];
+    int failedh[3];
 } EngPipeline;
 static const char kSnapCopyHLSL[] =
     "Texture2D rsx_tex[16] : register(t0);\n"
@@ -1826,7 +1832,7 @@ static int eng_make_root_signatures(void)
      * present passes, rsx_present_passes.h); ENG_HELPER_CONSTANTS 32-bit
      * root constants at b0 (eng_helper_constants). */
     D3D12_DESCRIPTOR_RANGE hr_srv = {0};
-    hr_srv.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; hr_srv.NumDescriptors = 1;
+    hr_srv.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; hr_srv.NumDescriptors = 2;   /* t1: eng_helper_t1 */
     D3D12_ROOT_PARAMETER hp[2] = {0};
     hp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; hp[0].DescriptorTable.NumDescriptorRanges = 1;
     hp[0].DescriptorTable.pDescriptorRanges = &hr_srv; hp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
@@ -1878,6 +1884,7 @@ static int s_hdr_on;                            /* the swap chain is scRGB */
 static int s_hdr_force;                         /* the display's HDR changed: a new swap chain */
 static float s_hdr_white_set, s_hdr_peak_set;   /* nits; 0 = the display's */
 static int s_hdr_srgb;                          /* RSX_HDR_GAMMA=srgb */
+static int s_hdr_highlights = 1;                /* RSX_HDR_HIGHLIGHTS=0: no highlight plane */
 static float s_hdr_white = 200.0f, s_hdr_peak = 1000.0f;   /* in use, nits */
 static IDXGIFactory1* s_hdr_factory;            /* stale (IsCurrent) once the displays change */
 static HMONITOR s_hdr_monitor;
@@ -1893,6 +1900,8 @@ static void eng_read_hdr(void)
     s_hdr_peak_set = e && *e ? (float)atof(e) : 0.0f;
     e = getenv("RSX_HDR_GAMMA");
     s_hdr_srgb = e && !_stricmp(e, "srgb");
+    e = getenv("RSX_HDR_HIGHLIGHTS");
+    s_hdr_highlights = !(e && e[0] == '0');
 }
 
 /* Windows' SDR white level for the display gdi names (\\.\DISPLAYn), in nits;
@@ -2297,7 +2306,7 @@ static void eng_shutdown(void* user)
     s_ntheap = 0;
     for (u32 i = 0; i < s_pipe_count; i++) {
         RELEASE(s_pipe[i].vs); RELEASE(s_pipe[i].ps);
-        for (int k = 0; k < 3; k++) RELEASE(s_pipe[i].pso[k]);
+        for (int k = 0; k < 3; k++) { RELEASE(s_pipe[i].pso[k]); RELEASE(s_pipe[i].psoh[k]); }
     }
     s_pipe_count = 0;
     for (u32 i = 0; i < s_blob_count; i++) RELEASE(s_blob[i].blob);
@@ -2702,6 +2711,7 @@ static u32 eng_pipeline_create_locked(ID3DBlob* vs, ID3DBlob* ps, const char* ps
     CALL0(vs, AddRef); CALL0(ps, AddRef);
     p->vs = vs; p->ps = ps;
     if (wp) p->ps_plain = _strdup(ps_hlsl);   /* at any scale: a rescale rebuilds from it */
+    p->hdr_plane = strstr(ps_hlsl, "rsx_hdr_plane") != NULL;
     /* Input slot i carries attribute attrs[i] at i*16: the layout SLOT, as
      * rsx_metal_backend.m's eng_pipeline_create explains. */
     for (u32 slot = 0; slot < layout->count && slot < RSX_DSP_NUM_VERTEX_ATTR; slot++) {
@@ -3335,6 +3345,10 @@ static D3D12_GPU_DESCRIPTOR_HANDLE eng_smp_table(const int* slots)
     return t->gpu;
 }
 
+/* The next helper pass's t1 (the null texture otherwise). */
+static D3D12_CPU_DESCRIPTOR_HANDLE s_helper_t1; static int s_helper_t1_set;
+static void eng_helper_t1(D3D12_CPU_DESCRIPTOR_HANDLE srv) { s_helper_t1 = srv; s_helper_t1_set = 1; }
+
 /* A helper pass over a whole colour target: dst bound, src sampled at t0. */
 /* The source drawn over a w x h target; or, with at (rsx_present_layout's
  * viewport and rectangle), over that viewport and only within that rectangle. */
@@ -3354,7 +3368,9 @@ static void eng_fullscreen_pass_at(ID3D12PipelineState* pso, D3D12_CPU_DESCRIPTO
     CALL(s_list, SetPipelineState, pso);
     CALL(s_list, IASetPrimitiveTopology, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     s_cur_topo = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-    CALL(s_list, SetGraphicsRootDescriptorTable, 0, eng_srv_table(&src_srv, 1));
+    const D3D12_CPU_DESCRIPTOR_HANDLE two[2] = { src_srv, s_helper_t1_set ? s_helper_t1 : obj_srv(0) };
+    s_helper_t1_set = 0;
+    CALL(s_list, SetGraphicsRootDescriptorTable, 0, eng_srv_table(two, 2));
     CALL(s_list, DrawInstanced, 3, 1, 0, 0);
     s_cur_pso = NULL; s_cur_targets_valid = 0;
 }
@@ -3629,10 +3645,82 @@ static void eng_ms_depth_sync(u32 h)
     CALL(s_list, SetPipelineState, s_zcopy_ms_pso);
     CALL(s_list, IASetPrimitiveTopology, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     s_cur_topo = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-    const D3D12_CPU_DESCRIPTOR_HANDLE srv = obj_srv_ms(h);
-    CALL(s_list, SetGraphicsRootDescriptorTable, 0, eng_srv_table(&srv, 1));
+    const D3D12_CPU_DESCRIPTOR_HANDLE srv[2] = { obj_srv_ms(h), obj_srv(0) };   /* the helper table is two wide */
+    CALL(s_list, SetGraphicsRootDescriptorTable, 0, eng_srv_table(srv, 2));
     CALL(s_list, DrawInstanced, 3, 1, 0, 0);
     s_cur_pso = NULL; s_cur_targets_valid = 0;
+}
+
+/* ---- the HDR highlight plane (RSX_HDR) ---------------------------------------
+ * A host-only FP16 target the size of the frame a highlight-plane pipeline
+ * (EngPipeline.hdr_plane: a title's own composite, through
+ * RSX_FP_OVERRIDE_DIR) draws into, at its second target, while HDR is on:
+ * per pixel, what it wrote to the frame and how much brighter the pixel was
+ * before the title clipped it. The HDR present pass reads it for the frame
+ * it was drawn beside (s_plane_surface) and brightens the pixels that still
+ * show what the plane says. RSX_HDR_HIGHLIGHTS=0 leaves it out. */
+static ID3D12Resource* s_plane; static D3D12_RESOURCE_STATES s_plane_state;
+static u32 s_plane_w, s_plane_h, s_plane_surface;
+static ID3D12DescriptorHeap* s_plane_rtv; static ID3D12DescriptorHeap* s_plane_srv;
+/* The plane at w x h (made or made again), for the frame `surface`; 0 if it cannot be. */
+static int eng_hdr_plane_ready(u32 surface, u32 w, u32 h)
+{
+    if (!s_plane_rtv) s_plane_rtv = eng_make_heap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, 0);
+    if (!s_plane_srv) s_plane_srv = eng_make_heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, 0);
+    if (!s_plane_rtv || !s_plane_srv) return 0;
+    if (!s_plane || s_plane_w != w || s_plane_h != h) {
+        /* A new size (rare): the old one may still be named by the open list
+         * or one in flight; released once the submit after it has run. */
+        static ID3D12Resource* dead; static u64 dead_fence;
+        if (dead) { fence_wait(dead_fence); RELEASE(dead); }
+        if (s_plane) { dead = s_plane; dead_fence = eng_retire_fence(); s_plane = NULL; }
+        D3D12_CLEAR_VALUE cv = {0}; cv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        s_plane = make_texture(DXGI_FORMAT_R16G16B16A16_FLOAT, w, h, 1, 1, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                               D3D12_RESOURCE_STATE_RENDER_TARGET, &cv);
+        if (!s_plane) return 0;
+        s_plane_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        s_plane_w = w; s_plane_h = h;
+        CALL(s_dev, CreateRenderTargetView, s_plane, NULL, cpu_handle(s_plane_rtv, s_rtv_step, 0));
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd = {0};
+        sd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; sd.Texture2D.MipLevels = 1;
+        CALL(s_dev, CreateShaderResourceView, s_plane, &sd, cpu_handle(s_plane_srv, s_srv_step, 0));
+        fprintf(stderr, "[rsx engine/d3d12] HDR: highlight plane %ux%u\n", w, h);
+    }
+    s_plane_surface = surface;
+    return 1;
+}
+/* The pipeline's build with the plane as its second target. */
+static ID3D12PipelineState* eng_pso_plane(u32 pipeline, int cls)
+{
+    if (!pipeline || pipeline > s_pipe_count) return NULL;
+    EngPipeline* p = &s_pipe[pipeline - 1];
+    if (!p->vs || !p->hdr_plane || p->failedh[cls]) return NULL;
+    if (p->psoh[cls]) return p->psoh[cls];
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = p->desc;
+    pd.InputLayout.pInputElementDescs = pd.InputLayout.NumElements ? p->il : NULL;
+    pd.PrimitiveTopologyType = cls == 0 ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT
+                             : cls == 1 ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE
+                                        : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    if (pd.NumRenderTargets != 1) return NULL;
+    pd.NumRenderTargets = 2;
+    pd.RTVFormats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    pd.BlendState.RenderTarget[1] = pd.BlendState.RenderTarget[0];
+    pd.BlendState.RenderTarget[1].BlendEnable = FALSE;
+    pd.BlendState.RenderTarget[1].LogicOpEnable = FALSE;
+    pd.BlendState.RenderTarget[1].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.BlendState.IndependentBlendEnable = TRUE;
+    ID3D12PipelineState* pso = NULL;
+    const HRESULT hr = eng_create_pso(&pd, &pso);
+    AcquireSRWLockExclusive(&s_pipe_lock);
+    if (p->psoh[cls]) RELEASE(pso);
+    else if (FAILED(hr)) {
+        fprintf(stderr, "[rsx engine/d3d12] HDR: highlight-plane pipeline state failed: 0x%08lX (pipeline %u)\n", (long)hr, pipeline);
+        p->failedh[cls] = 1;
+    }
+    else p->psoh[cls] = pso;
+    ReleaseSRWLockExclusive(&s_pipe_lock);
+    return p->psoh[cls];
 }
 
 static ID3D12PipelineState* eng_pso_ms(u32 pipeline, int cls)
@@ -3742,6 +3830,18 @@ static void eng_encode_draw(const EngRecord* r)
     ID3D12PipelineState* pso = ms ? eng_pso_ms(r->pipeline, topo_class(r->topology))
                                   : eng_pso_for(r->pipeline, topo_class(r->topology), !scaled);
     if (!pso) return;
+    /* A highlight-plane pipeline into one target while HDR is on: the plane
+     * as its second target (bound below, after the guest's). */
+    int plane = 0;
+    if (!ms && nrt == 1 && s_hdr_on && s_hdr_highlights && r->pipeline && r->pipeline <= s_pipe_count &&
+        s_pipe[r->pipeline - 1].hdr_plane) {
+        EngObj* t0 = eng_owner(r->rt[0]);
+        ID3D12PipelineState* ph = t0 ? eng_pso_plane(r->pipeline, topo_class(r->topology)) : NULL;
+        if (ph && eng_hdr_plane_ready((u32)(t0 - s_obj) + 1, t0->w, t0->h)) {
+            pso = ph; plane = 1;
+            res_transition(s_plane, &s_plane_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        }
+    }
     if (ms) {
         for (u32 k = 0; k < nrt; k++) {
             if (eng_obj(r->rt[k])->ms_stale) eng_ms_refresh(r->rt[k]);
@@ -3819,9 +3919,15 @@ static void eng_encode_draw(const EngRecord* r)
     if (!s_cur_targets_valid || rebind) b.valid = 0;
 
     static int s_cur_ms;
-    int same_targets = s_cur_targets_valid && s_cur_nrt == nrt && s_cur_depth == depth && s_cur_ms == ms;
+    int same_targets = s_cur_targets_valid && s_cur_nrt == nrt && s_cur_depth == depth && s_cur_ms == ms && !plane;
     for (u32 k = 0; same_targets && k < nrt; k++) same_targets = s_cur_rt[k] == r->rt[k];
-    if (!same_targets) {
+    if (plane) {
+        /* the guest's target and the plane; the next draw binds its own again */
+        D3D12_CPU_DESCRIPTOR_HANDLE dsv = obj_dsv(depth);
+        const D3D12_CPU_DESCRIPTOR_HANDLE two[2] = { rtv[0], cpu_handle(s_plane_rtv, s_rtv_step, 0) };
+        CALL(s_list, OMSetRenderTargets, 2, two, FALSE, &dsv);
+        s_cur_targets_valid = 0;
+    } else if (!same_targets) {
         s_cur_ms = ms;
         D3D12_CPU_DESCRIPTOR_HANDLE dsv = ms ? obj_dsv_ms(depth) : obj_dsv(depth);
         CALL(s_list, OMSetRenderTargets, nrt, nrt ? rtv : NULL, FALSE, &dsv);
@@ -4529,7 +4635,7 @@ static void eng_rescale(void)
         p->ps = ps;
         p->desc.PS.pShaderBytecode = CALL0(ps, GetBufferPointer);
         p->desc.PS.BytecodeLength = CALL0(ps, GetBufferSize);
-        for (int c = 0; c < 3; c++) { RELEASE(p->pso[c]); p->failed[c] = 0; }
+        for (int c = 0; c < 3; c++) { RELEASE(p->pso[c]); p->failed[c] = 0; RELEASE(p->psoh[c]); p->failedh[c] = 0; }
         np++;
     }
     ReleaseSRWLockExclusive(&s_pipe_lock);
@@ -4550,6 +4656,7 @@ static void eng_rescale(void)
         if (nw == o->w && nh == o->h) continue;
         RELEASE(o->res);
         RELEASE(o->ms);   /* made again at its next MSAA pass */
+        if (s_plane && s_plane_surface == h) { RELEASE(s_plane); s_plane_w = s_plane_h = s_plane_surface = 0; }
         o->ms_dirty = o->ms_stale = 0;
         D3D12_CLEAR_VALUE cv = {0};
         if (o->kind == OBJ_COLOR) {
@@ -4685,8 +4792,19 @@ static void eng_submit(u32 present_surface, int wait)
             }
             ID3D12PipelineState* ppso = s_present_pso && !s_headless ? s_present_pso : s_blit_pso;
             if (!s_headless && s_hdr_on && s_present_hdr_pso) {
-                const float k[4] = { s_hdr_white / 80.0f, s_hdr_peak / 80.0f, s_hdr_srgb ? 1.0f : 0.0f, 0.0f };
+                const int hl = s_hdr_highlights && s_plane && s_plane_surface &&
+                               eng_owner(s_plane_surface) == eng_owner(present_surface) &&
+                               s_plane_w == src->w && s_plane_h == src->h;
+                static int dbg = -1;   /* RSX_HDR_DEBUG=1: the plane shown (kPresentHdrHLSL) */
+                if (dbg < 0) { const char* e = getenv("RSX_HDR_DEBUG"); dbg = e && *e && *e != '0'; }
+                const float k[4] = { s_hdr_white / 80.0f, s_hdr_peak / 80.0f, s_hdr_srgb ? 1.0f : 0.0f,
+                                     hl ? (dbg ? 2.0f : 1.0f) : 0.0f };
                 eng_helper_constants(k, 4);
+                if (hl) {
+                    res_transition(s_plane, &s_plane_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                    bar_flush();
+                    eng_helper_t1(cpu_handle(s_plane_srv, s_srv_step, 0));
+                }
                 ppso = s_present_hdr_pso;
             }
             eng_fullscreen_pass_at(ppso, rtv, s_win_w, s_win_h,
@@ -4986,6 +5104,7 @@ static void eng_release_device(void)
     RELEASE(s_zero_cb); RELEASE(s_readback); s_readback_cap = 0; RELEASE(s_aux_alloc);
     RELEASE(s_null_tex); RELEASE(s_blit_pso); RELEASE(s_depth_pso); RELEASE(s_depth_pack_pso);
     RELEASE(s_present_pso); RELEASE(s_fxaa_pso); RELEASE(s_present_hdr_pso); RELEASE(s_hdr_factory);
+    RELEASE(s_plane); RELEASE(s_plane_rtv); RELEASE(s_plane_srv); s_plane_w = s_plane_h = s_plane_surface = 0;
     RELEASE(s_depth_ms_pso); RELEASE(s_depth_pack_ms_pso); RELEASE(s_zcopy_ms_pso);
     RELEASE(s_helper_vs_blob); RELEASE(s_helper_blit_blob);
     RELEASE(s_rootsig); RELEASE(s_helper_rootsig);

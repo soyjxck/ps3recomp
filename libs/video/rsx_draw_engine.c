@@ -1645,7 +1645,9 @@ static int eng_fp_sat_alpha(const u8* fp_uc, u32 fp_size)
  * its translation -- a title's own version of one of its shaders, written
  * against the translation's bindings (the PSInput, rsx_tex/rsx_samp and
  * PSConstants of rsx_fp_decompiler.c's output, which the file starts from).
- * Read at pipeline creation; 1 when *hlsl now holds the file's text. */
+ * Read at pipeline creation; 1 when *hlsl now holds the file's text. A file
+ * that names rsx_hdr_plane writes the D3D12 engine's HDR highlight plane at
+ * its second target (rsx_d3d12_engine.c). */
 static int eng_fp_override(const u8* fp_uc, u32 fp_size, char* hlsl, size_t cap)
 {
     static const char* dir = (const char*)1;
@@ -1665,8 +1667,22 @@ static int eng_fp_override(const u8* fp_uc, u32 fp_size, char* hlsl, size_t cap)
         free(text);
         return 0;
     }
-    memcpy(hlsl, text, n);
-    hlsl[n] = 0;
+    /* RSX_FP_OVERRIDE_DEFINES=<NAME>[,<NAME>...]: "#define NAME 1" above the
+     * file's text, for a file that has more than one version of itself. */
+    size_t at = 0;
+    const char* defs = getenv("RSX_FP_OVERRIDE_DEFINES");
+    while (defs && *defs) {
+        const char* end = defs + strcspn(defs, ", ");
+        if (end > defs) {
+            const int k = snprintf(hlsl + at, cap - at, "#define %.*s 1\n", (int)(end - defs), defs);
+            if (k < 0 || (size_t)k >= cap - at) { at = 0; break; }
+            at += (size_t)k;
+        }
+        defs = *end ? end + 1 : end;
+    }
+    if (at + n >= cap) at = 0;
+    memcpy(hlsl + at, text, n);
+    hlsl[at + n] = 0;
     free(text);
     static u64 said[32]; static u32 nsaid;
     int seen = 0;
