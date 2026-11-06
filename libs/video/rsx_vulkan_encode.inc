@@ -5,13 +5,52 @@
 
 static VkImageMemoryBarrier s_bar[64]; static u32 s_nbar; static int s_bar_global;
 
+/* Layout-specific image dependencies for the feedback-copy path. Global
+ * dependencies and unfamiliar layouts retain the original broad barrier. */
+static int snap_layout_scope(VkImageLayout layout, VkPipelineStageFlags* stage, VkAccessFlags* access)
+{
+    switch(layout) {
+    case VK_IMAGE_LAYOUT_UNDEFINED: *stage=VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;*access=0;return 1;
+    case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
+        *stage=VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        *access=VK_ACCESS_COLOR_ATTACHMENT_READ_BIT|VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;return 1;
+    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
+        *stage=VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT|VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+        *access=VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT|VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;return 1;
+    case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
+        *stage=VK_PIPELINE_STAGE_TRANSFER_BIT;*access=VK_ACCESS_TRANSFER_READ_BIT;return 1;
+    case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
+        *stage=VK_PIPELINE_STAGE_TRANSFER_BIT;*access=VK_ACCESS_TRANSFER_WRITE_BIT;return 1;
+    case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+        *stage=VK_PIPELINE_STAGE_VERTEX_SHADER_BIT|VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        *access=VK_ACCESS_SHADER_READ_BIT;return 1;
+    default:return 0;
+    }
+}
+
 static void bar_flush(void)
 {
     if (!s_nbar && !s_bar_global) return;
     VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
     mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-    vkCmdPipelineBarrier(s_cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+    VkPipelineStageFlags src_stage=VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,dst_stage=VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    static int images=-1;
+    if(images<0) {const char* e=getenv("RSX_SNAPSHOT_IMAGE_BARRIERS");images=e && !strcmp(e,"1");}
+    if(images && !s_bar_global && s_nbar && s_ms_n<=1 && !s_hdr_on) {
+        VkPipelineStageFlags ss=0,ds=0;VkAccessFlags sa[64],da[64];int known=1;
+        for(u32 i=0;i<s_nbar;i++) {
+            VkPipelineStageFlags a,b;
+            if(!snap_layout_scope(s_bar[i].oldLayout,&a,&sa[i]) ||
+               !snap_layout_scope(s_bar[i].newLayout,&b,&da[i])) {known=0;break;}
+            ss|=a;ds|=b;
+        }
+        if(known) {
+            src_stage=ss;dst_stage=ds;
+            for(u32 i=0;i<s_nbar;i++) {s_bar[i].srcAccessMask=sa[i];s_bar[i].dstAccessMask=da[i];}
+        }
+    }
+    vkCmdPipelineBarrier(s_cmd, src_stage, dst_stage, 0,
                          s_bar_global ? 1 : 0, &mb, 0, NULL, s_nbar, s_bar);
     s_nbar = 0; s_bar_global = 0;
 }
@@ -174,6 +213,9 @@ static void eng_vp_sc(const EngRecord* r, int scaled, u32 tw, u32 th, VkViewport
 }
 
 static VkImageView null_view(int cube) { EngObj* o = eng_obj(cube ? s_null_cube : s_null_tex); return o ? o->view : VK_NULL_HANDLE; }
+
+#include "rsx_vulkan_snapshot_rect.inc"
+#include "rsx_vulkan_snapshot_channels.inc"
 
 /* ---- MSAA --------------------------------------------------------------------------
  *
@@ -635,6 +677,8 @@ static void eng_encode_depth_resolve(const EngRecord* r)
 
 static void eng_encode_records(void)
 {
+    int last_encoded_color_copy = -1;
+    eng_snap_channels_prepare();
     s_in_render = 0; s_cur_pso = VK_NULL_HANDLE; s_cur_set = VK_NULL_HANDLE; s_cur_set_key = 0;
     s_cur_topo = VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
     for (u32 i = 0; i < s_clear_new_n; i++) {
@@ -656,6 +700,7 @@ static void eng_encode_records(void)
     s_clear_new_n = 0;
     for (u32 i = 0; i < s_rec_count; i++) {
         const EngRecord* r = &s_rec[i];
+        eng_snap_channels_note_write(r);
         switch (r->kind) {
         case ENG_REC_DRAW:
             eng_encode_draw(r);
@@ -757,18 +802,45 @@ static void eng_encode_records(void)
         case ENG_REC_COLOR_COPY: {
             EngObj* src = eng_owner(r->depth); EngObj* dst = eng_owner(r->resolve_dst);
             if (!src || !dst) break;
+            if(eng_snap_channels_can_skip(i,src,dst)) {s_snap_skipped[i]=1;s_ch_skipped++;break;}
+            VkRect2D dirty = {{0,0},{src->w < dst->w ? src->w : dst->w,src->h < dst->h ? src->h : dst->h}};
+            if(!eng_snap_any_reuse_enabled() || s_ch_valid[(u32)(dst-s_obj)]) eng_snap_copy_rect(i,src,&dirty);
+            if (!dirty.extent.width || !dirty.extent.height) {eng_snap_channels_mark_copy(src,dst,0);break;}
+            static int scoped = -1;
+            if (scoped < 0) { const char* e=getenv("RSX_SNAPSHOT_SCOPED_BARRIERS"); scoped=e && !strcmp(e,"1"); }
+            const int narrow = scoped && s_ms_n<=1 && !s_hdr_on;
+            /* The feedback chain's preceding pass contains exactly one
+             * reviewed draw: one colour target, no depth/stencil writes.
+             * Its only write is synchronized by src's image barrier.
+             * The copy's only write is dst, transitioned before sampling.
+             * Keep the general memory barrier for every other case. */
+            int only_source = 0;
+            if (narrow && i>=2 && last_encoded_color_copy==(int)i-2 && s_in_render && s_cur_nrt==1 &&
+                eng_owner(s_cur_rt[0])==src) {
+                const EngRecord* d=&s_rec[i-1];const EngRecord* c0=&s_rec[i-2];
+                if(d->kind==ENG_REC_DRAW && d->pipeline && d->pipeline<=s_pipe_count &&
+                   d->nrt==1 && eng_owner(d->rt[0])==src &&
+                   s_pipe[d->pipeline-1].snapshot_linear_position &&
+                   !s_pipe[d->pipeline-1].rs.depth_write && !s_pipe[d->pipeline-1].rs.stencil_enable &&
+                   c0->kind==ENG_REC_COLOR_COPY && eng_owner(c0->depth)==src) only_source=1;
+            }
             render_end();
             obj_layout(src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
             obj_layout(dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            if (only_source) s_bar_global=0;
             bar_flush();
             VkImageCopy c = {0};
             c.srcSubresource.aspectMask = c.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
             c.srcSubresource.layerCount = c.dstSubresource.layerCount = 1;
-            c.extent.width = src->w < dst->w ? src->w : dst->w;
-            c.extent.height = src->h < dst->h ? src->h : dst->h;
+            c.srcOffset.x=c.dstOffset.x=dirty.offset.x;
+            c.srcOffset.y=c.dstOffset.y=dirty.offset.y;
+            c.extent.width = dirty.extent.width;
+            c.extent.height = dirty.extent.height;
             c.extent.depth = 1;
             vkCmdCopyImage(s_cmd, src->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
-            s_bar_global = 1;
+            eng_snap_channels_mark_copy(src,dst,1);
+            last_encoded_color_copy=(int)i;
+            s_bar_global = narrow ? 0 : 1;
             break; }
         case ENG_REC_DEPTH_RESOLVE:
             eng_encode_depth_resolve(r);
@@ -777,6 +849,7 @@ static void eng_encode_records(void)
     }
     render_end();
     bar_flush();
+    eng_snap_channels_finish();
 }
 
 /* ---- submit ------------------------------------------------------------------------- */

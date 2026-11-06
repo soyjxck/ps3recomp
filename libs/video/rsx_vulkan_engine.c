@@ -206,6 +206,7 @@ typedef struct {
     u32 gw, gh;                /* guest pixels */
     VkImageLayout layout;      /* the owner's */
     int retired;
+    VkComponentSwizzle sample_alpha; /* logical alpha's physical component for a view */
     /* MSAA: the multisampled twin a 3D pass draws into (eng_ms_*), resolved
      * into this image at the end of every such pass. ms_stale: this image
      * was written another way, so the twin is refreshed before its next pass. */
@@ -232,6 +233,8 @@ typedef struct {
      * highlight plane at its second output (eng_hdr_plane_*): the build with
      * that second attachment, for a pass into one target while HDR is on. */
     int hdr_plane;
+    int snapshot_linear_position; /* exact, reviewed DOD3 vertex program */
+    int snapshot_alpha_kind; /* reviewed particle FP: readers 1/2, alpha-preserving writer 3 */
     VkPipeline psoh[3]; int failedh[3];
 } EngPipeline;
 
@@ -276,6 +279,7 @@ typedef struct {
 
 typedef struct {
     VkBuffer buf; MemAlloc mem; u8* mapped;
+    u8* cpu_copy;      /* optional cached CPU copy of eng_stage_copy writes */
     u32 cap;
     u32 base, used;   /* in a chain: where it starts in the records' offsets, and its fill */
     u64 fence;        /* the submit that last used it */
@@ -895,6 +899,16 @@ static void eng_obj_release(void* user, u32 handle)
 
 static void eng_submit(u32 present_surface, int wait);
 
+/* Bounds inspection must not read write-combined upload memory. Preserve
+ * cached copies only for stage_copy data (constants/vertices/indices); row
+ * uploads reserve directly and never need CPU inspection. The flag is fixed
+ * for the process, and allocation failure retains the original safe path. */
+static int eng_stage_cpu_copy_enabled(void)
+{
+    static int enabled=-1;
+    if(enabled<0) {const char* e=getenv("RSX_SNAPSHOT_CPU_SHADOW");enabled=e && !strcmp(e,"1");}
+    return enabled;
+}
 static int eng_stage_make(EngStage* s, u32 cap)
 {
     s->buf = make_buffer((VkDeviceSize)cap + ENG_UBO_RANGE,
@@ -904,10 +918,12 @@ static int eng_stage_make(EngStage* s, u32 cap)
     if (!s->buf) return 0;
     s->mapped = mem_ptr(&s->mem);
     s->cap = cap;
+    if(s->mapped && eng_stage_cpu_copy_enabled()) s->cpu_copy=(u8*)malloc(cap);
     return s->mapped != NULL;
 }
 static void eng_stage_free(EngStage* s)
 {
+    free(s->cpu_copy);
     if (s->buf) vkDestroyBuffer(s_dev, s->buf, NULL);
     mem_free(&s->mem);
     memset(s, 0, sizeof *s);
@@ -981,7 +997,14 @@ static int eng_stage_copy(const void* src, u32 bytes, u32* out_off)
 {
     if (!bytes) { *out_off = 0; return 1; }
     if (!eng_stage_reserve(bytes, out_off)) return 0;
-    memcpy(eng_stage_ptr(*out_off), src, bytes);
+    EngStage* s=&s_stage[s_chain[s_chain_n-1]];
+    if(s->cpu_copy) {
+        u8* copy=s->cpu_copy+(*out_off-s->base);
+        memcpy(copy,src,bytes);
+        /* Use this exact byte snapshot for both consumers, even if the
+         * caller's source changes while the upload is being prepared. */
+        memcpy(eng_stage_ptr(*out_off),copy,bytes);
+    } else memcpy(eng_stage_ptr(*out_off),src,bytes);
     return 1;
 }
 
@@ -1477,6 +1500,14 @@ static u32 eng_pipeline_create_locked(const char* vs_hlsl, const char* ps_hlsl, 
     p->rt_count = rt_count;
     p->cube_mask = eng_cube_mask(ps_hlsl);
     p->hdr_plane = strstr(ps_hlsl, "rsx_hdr_plane") != NULL;
+    p->snapshot_linear_position = vertex_stride == 64 && layout->mask == 293 &&
+        layout->count == 4 && layout->attrs[0] == 0 && strlen(vs_hlsl) == 13949 &&
+        fnv1a64(vs_hlsl, strlen(vs_hlsl), 1469598103934665603ull) == 0x703b54230ab7e48dull;
+    const size_t ps_len=strlen(ps_hlsl);
+    const u64 ps_hash=fnv1a64(ps_hlsl,ps_len,1469598103934665603ull);
+    if(ps_len==5373 && ps_hash==0x6913a23a6ffb37ceull) p->snapshot_alpha_kind=1;
+    if(ps_len==5442 && ps_hash==0x852f3fc5e0383977ull) p->snapshot_alpha_kind=2;
+    if(ps_len==3119 && ps_hash==0xb05289fbe01da8fcull) p->snapshot_alpha_kind=3;
     p->live = 1;
     return ++s_pipe_count;
 }
@@ -1692,6 +1723,7 @@ static u32 eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_format)
     EngObj* v = &s_obj[handle - 1];
     o = eng_obj(surface);
     v->alias = surface; v->fmt = o->fmt; v->w = o->w; v->h = o->h; v->gw = o->gw; v->gh = o->gh; v->mips = 1; v->faces = 1;
+    v->sample_alpha=eng_mapping(remap,rsx_format).a;
     v->view = make_view(o->img, o->fmt, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, eng_mapping(remap, rsx_format));
     s_view[s_view_count].surface = surface; s_view[s_view_count].remap = remap;
     s_view[s_view_count].format = rsx_format; s_view[s_view_count].view = handle;
