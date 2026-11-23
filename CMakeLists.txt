@@ -80,6 +80,8 @@ list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_spirv
 file(GLOB AT3_SOURCES "third_party/at3_standalone/*.cpp")
 set_source_files_properties(${AT3_SOURCES} PROPERTIES COMPILE_OPTIONS "-w")  # upstream code
 list(APPEND HLE_SOURCES ${AT3_SOURCES})
+# cellSail's host movie decoder (Media Foundation on Windows; a stub elsewhere).
+list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/codec/sail_movie_mf.cpp")
 
 # Runtime core (syscalls, PPU, SPU, memory)
 file(GLOB_RECURSE RUNTIME_SOURCES
@@ -135,6 +137,7 @@ if(WIN32)
         ws2_32      # Winsock for network modules
         ole32       # COM for WASAPI audio
         bcrypt      # BCryptGenRandom for SSL RNG
+        mfplat mfreadwrite mfuuid   # Media Foundation: cellSail movies (sail_movie_mf.cpp)
     )
 endif()
 
