@@ -535,16 +535,39 @@ static void sys_lwcond_wait(ppu_context* ctx)
         vm_write32(lwmutex + LWM_OWNER, 0);
         ppu_thread_note_block(ctx->thread_id);
         lwm_release(sl);
+        int timed_out = 0;
         if (g) {
-            uint32_t max_us = lwc_poll_us();
-            if (timeout_us && timeout_us < max_us) max_us = (uint32_t)timeout_us;
-            if (g->load(std::memory_order_acquire) == seen) lwc_wait(g, seen, max_us);
+            /* Return only once signalled (the generation moved) or, with a
+             * guest timeout, at its end with ETIMEDOUT -- as lv2 does. The
+             * poll interval only bounds each host wait. Returning CELL_OK at
+             * every poll interval was a spurious wake-up, and not every guest
+             * loops on its predicate: PhyreEngine's event wait
+             * takes a 0 return as "set", so its render thread
+             * ran ahead of the 16-slot command ring the main thread fills, and
+             * the main thread then waited for ever for a command completion
+             * (the intermittent boot freeze). PS3_LWCOND_SPURIOUS=1: the old
+             * return-after-one-interval behaviour. */
+            static int spurious = -1;
+            if (spurious < 0) spurious = getenv("PS3_LWCOND_SPURIOUS") ? 1 : 0;
+            const long long t0 = lwm_now_us();
+            for (;;) {
+                if (g->load(std::memory_order_acquire) != seen) break;
+                uint32_t max_us = lwc_poll_us();
+                if (timeout_us) {
+                    const long long el = lwm_now_us() - t0;
+                    if (el >= (long long)timeout_us) { timed_out = 1; break; }
+                    if ((uint64_t)(timeout_us - (uint64_t)el) < max_us) max_us = (uint32_t)(timeout_us - (uint64_t)el);
+                }
+                lwc_wait(g, seen, max_us);
+                if (spurious) break;
+            }
         } else {
             Sleep(1);
         }
         lwm_acquire(sl, 0);
         vm_write32(lwmutex + LWM_OWNER, own);
         vm_write32(lwmutex + LWM_RECUR, rc ? rc : 1);
+        if (timed_out) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Bu; return; }   /* CELL_ETIMEDOUT */
     }
     ctx->gpr[3] = 0;
 }
@@ -709,6 +732,7 @@ extern "C" void ps3_net_host_register(unsigned int (*guest_alloc)(unsigned int, 
 extern "C" void np_score_register_ctx(void);   /* libs/network/sceNpScore.c */
 extern "C" void cellSaveData_register_ctx_handlers(void); /* libs/system/cellSaveData.c */
 extern "C" void avconf_register_ctx(void);     /* libs/misc/cellAvconfExt.c */
+extern "C" void audio_register_ctx(void);      /* libs/audio/cellAudio.c */
 static uint32_t g_net_errno_ea = 0;
 static void hle_net_errno_loc(ppu_context* ctx)
 {
@@ -1048,6 +1072,8 @@ extern "C" void ppu_sysprx_register(void)
     cellSaveData_register_ctx_handlers();
     /* cellVideoOutSetGamma's float argument is in f1. */
     avconf_register_ctx();
+    /* cellAudioAdd*Data take their volume in f1 too. */
+    audio_register_ctx();
     /* sys_net offline model (NIDs from PSL1GHT libnet exports). Covers every
      * sys_net NID LBP imports so none fall to the unresolved-NID default. */
     ps3_hle_register_ctx(0x6005CDE1u, "_sys_net_errno_loc",     hle_net_errno_loc);

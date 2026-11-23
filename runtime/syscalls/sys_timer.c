@@ -199,8 +199,7 @@ int64_t sys_timer_usleep(ppu_context* ctx)
 {
     uint64_t usec = LV2_ARG_U64(ctx, 0);
     ppu_thread_note_block(ctx->thread_id);   /* PS3_PRIO_START */
-    if (g_lv2_usleep_pre) g_lv2_usleep_pre(ctx, &usec);
-    if (g_lv2_usleep_hook && g_lv2_usleep_hook((uint32_t)ctx->lr, usec)) return CELL_OK;
+    if (g_lv2_usleep_pre) g_lv2_usleep_pre(ctx, &usec);    if (g_lv2_usleep_hook && g_lv2_usleep_hook((uint32_t)ctx->lr, usec)) return CELL_OK;
     /* A single sleep longer than a second is almost always a computed delay
      * gone wrong (a negative interval, a timebase in the wrong units) -- and a
      * thread asleep for an hour looks exactly like a hang. Say so. */
@@ -324,6 +323,34 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         ppu_log_host_chain("usleep1ms"); } }
 
 #ifdef _WIN32
+    /* PS3_USLEEP_SPIN_US=<n>: spin at most the last n us of a sub-millisecond
+     * sleep and wait on the thread's high-resolution timer for the rest
+     * (default: the behaviour below -- under g_usleep_spin_below the whole
+     * sleep spins, 0.5-1 ms spin the last 250 us). 0 = never spin: a poll loop
+     * such as PhyreEngine's usleep(300) flip and fence waits then costs no CPU,
+     * at the price of the timer's granularity (~0.5 ms) on each sleep. */
+    { static long s_spin = -2;
+      if (s_spin == -2) { const char* e = getenv("PS3_USLEEP_SPIN_US"); s_spin = e ? atol(e) : -1; }
+      if (s_spin >= 0 && usec > 0 && usec < 1000) {
+        static __declspec(thread) HANDLE ht = NULL;
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+        if (!ht) ht = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        ensure_qpc_init();
+        LARGE_INTEGER q0, qn;
+        QueryPerformanceCounter(&q0);
+        const int64_t deadline = q0.QuadPart + (int64_t)((usec * (uint64_t)s_qpc_freq.QuadPart) / 1000000ULL);
+        if (ht && usec > (uint64_t)s_spin) {
+            LARGE_INTEGER due;
+            due.QuadPart = -((LONGLONG)(usec - (uint64_t)s_spin) * 10);
+            SetWaitableTimer(ht, &due, 0, NULL, NULL, FALSE);
+            WaitForSingleObject(ht, INFINITE);
+        }
+        if (s_spin > 0 || !ht)
+            do { SwitchToThread(); QueryPerformanceCounter(&qn); } while (qn.QuadPart < deadline);
+        return CELL_OK;
+      } }
     /* A high-resolution waitable timer, one per thread and kept: a plain
      * waitable timer rounds to the scheduler's clock interval (1 ms with
      * timeBeginPeriod(1), 15.6 ms otherwise, and since Windows 10 2004 the

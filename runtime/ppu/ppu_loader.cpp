@@ -2013,8 +2013,20 @@ static __attribute__((noinline, cold)) void barrier_watch_hit_slow(uint32_t a, u
                      getenv("PPU_WWATCH") || getenv("PPU_WW_GUARD")) ? 1 : 0;
     /* GCM_PARK_WRITE_LOG=1: a 32-bit store of a JUMP-to-itself into the GCM
      * FIFO window (value 0x20000000 | own IO offset) -- the PPU parking the RSX. */
-    { static int s_pk = -1; if (s_pk < 0) s_pk = getenv("GCM_PARK_WRITE_LOG") ? 1 : 0;
-      if (s_pk && width == 4 && a >= 0x40000000u && a < 0x40300000u && v == (0x20000000u | (a - 0x40000000u))) {
+    /* GCM_PARK_WRITE_LOG=<hex EA>: the FIFO's base EA, when its IO offset 0 is
+     * not at 0x40000000 (e.g. 0x40700000). */
+    { static int s_pk = -1; static uint32_t s_pk_base = 0x40000000u;
+      if (s_pk < 0) { const char* e = getenv("GCM_PARK_WRITE_LOG"); s_pk = e ? 1 : 0;
+                      if (e) { uint32_t b = (uint32_t)strtoul(e, 0, 16); if (b > 1) s_pk_base = b; } }
+      if (s_pk && width == 4 && a >= s_pk_base && a < s_pk_base + 0x01000000u &&
+          v == (0x20000000u | (a - s_pk_base + 4))) {
+          /* ...and the matching un-park: a JUMP to the next word over it. */
+          extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
+          fprintf(stderr, "[park-clear] ea=0x%08X <- %08X tid=%u lr=0x%08X\n", a, v,
+                  g_active_ctx ? (unsigned)g_active_ctx->thread_id : 0u,
+                  g_active_ctx ? (uint32_t)g_active_ctx->lr : 0u); }
+      if (s_pk && width == 4 && a >= s_pk_base && a < s_pk_base + 0x01000000u &&
+          v == (0x20000000u | (a - s_pk_base))) {
           extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
           fprintf(stderr, "[park-write] ea=0x%08X <- %08X tid=%u lr=0x%08X\n", a, v,
                   g_active_ctx ? (unsigned)g_active_ctx->thread_id : 0u,

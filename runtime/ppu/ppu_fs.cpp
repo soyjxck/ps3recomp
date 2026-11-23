@@ -214,6 +214,24 @@ static FILE* g_files[FS_MAX];
 static uint8_t g_fd_usm[FS_MAX];
 static char    g_fd_path[FS_MAX][192];   /* guest path per fd (diagnostics) */   /* 1 if this fd is an open .usm movie (read tracker) */
 static DIR*  g_dirs[FS_MAX];
+
+/* A title's read overlay -- a virtual file over a real one (a translation
+ * served over a game archive, without touching the dump). The read hook is
+ * asked after every cellFsRead / cellFsAioRead with the guest path the fd was
+ * opened with, the file offset, the guest buffer and the bytes read; it may
+ * change bytes and return a different count (a virtual file longer than the
+ * host one: the fd position follows it). The size hook gives that file's size
+ * for cellFsFstat / cellFsStat / cellFsLseek(SEEK_END). Both NULL = unchanged;
+ * both must be cheap for paths they do not serve (they see every file). */
+extern "C" {
+size_t  (*ps3_fs_read_hook)(const char* gpath, uint64_t off, uint8_t* buf, size_t want, size_t got) = nullptr;
+int64_t (*ps3_fs_size_hook)(const char* gpath, int64_t host_size) = nullptr;
+}
+static int64_t fs_hooked_size(int fd, int64_t host_size)
+{
+    if (!ps3_fs_size_hook || fd < 0 || fd >= FS_MAX || !g_fd_path[fd][0]) return host_size;
+    return ps3_fs_size_hook(g_fd_path[fd], host_size);
+}
 /* Last transfer direction on each fd's stream: 0 none, 1 read, 2 write.
  *
  * C allows a read after a write on one stream only once it has been flushed or
@@ -471,6 +489,25 @@ static void cellFsClose(ppu_context* ctx)
  * Touch each page read-then-write so the fault happens here, in user mode,
  * where the handler can commit it. Read-then-write rather than a plain store so
  * nothing already in the buffer is disturbed. */
+/* A read into the first 64 KB: unmapped on a PS3, so the kernel answers
+ * CELL_EFAULT and writes nothing. Here that range is ordinary memory, and a
+ * read into a NULL buffer (an allocation the title did not check) would land
+ * the file over page 0 and on up, corrupting whatever a later NULL-plus-offset
+ * read finds there -- silently, with the damage surfacing far away. Refuse it
+ * as hardware does, and say who asked (first four). */
+extern "C" void ppu_dump_guest_stack(ppu_context*, const char*);
+extern "C" int fs_bad_read_buf(ppu_context* ctx, const char* kind, int fd, uint32_t buf, uint64_t len)
+{
+    if (!len || buf >= 0x10000u) return 0;
+    static long s_n = 0;
+    if (PS3_LOG_FIRST(s_n, 4)) {
+        fprintf(stderr, "[fs] %s fd=%d into guest 0x%08X (+0x%llX): unmapped on PS3 -> CELL_EFAULT\n",
+                kind, fd, buf, (unsigned long long)len);
+        if (ctx) ppu_dump_guest_stack(ctx, "fs-bad-buf");
+        fflush(stderr);
+    }
+    return 1;
+}
 static inline void fs_prefault(uint32_t buf, uint64_t len)
 {
     if (!vm_base || !len) return;
@@ -493,13 +530,23 @@ static void cellFsRead(ppu_context* ctx)
     uint32_t nread_ptr = (uint32_t)ctx->gpr[6];
     FILE* f = fd_file(fd);
     if (!f) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    if (fs_bad_read_buf(ctx, "read", fd, buf, nbytes)) {
+        if (nread_ptr >= 0x10000u) vm_write64(nread_ptr, 0);
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Du;   /* CELL_EFAULT */
+        return;
+    }
     uint64_t raw_nbytes = ctx->gpr[5];
     long fpos_before = ftell(f);
     if (ppu_vm_size && (uint64_t)buf + nbytes > ppu_vm_size) nbytes = ppu_vm_size - buf;
     fs_prefault(buf, nbytes);
     fs_set_dir(fd, f, 1);
     const double t_rd = fs_read_time_start();
+    const int64_t pos64 = ps3_fs_read_hook ? FS_TELL64(f) : 0;   /* ftell is 32-bit on Windows */
     size_t n = fread(vm_base + buf, 1, (size_t)nbytes, f);   /* raw bytes, no swap */
+    if (ps3_fs_read_hook && fd >= 0 && fd < FS_MAX && g_fd_path[fd][0] && pos64 >= 0) {
+        const size_t n2 = ps3_fs_read_hook(g_fd_path[fd], (uint64_t)pos64, vm_base + buf, (size_t)nbytes, n);
+        if (n2 != n) { FS_SEEK64(f, pos64 + (int64_t)n2, SEEK_SET); n = n2; }
+    }
     fs_read_time_log("read", fd, (uint64_t)fpos_before, nbytes, n, t_rd);
     /* PS3_FSLOG_EOF=<fd>,<bytes>: report end-of-file past <bytes> on one descriptor.
      * The intro cinematic is 28 seconds and this port renders it at a few frames
@@ -652,6 +699,14 @@ static void cellFsLseek(ppu_context* ctx)
     if (getenv("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
         fprintf(stderr, "[fs] lseek fd=%d off=%lld whence=%u  (by %s)\n", fd, (long long)off, wh, w); }
     int worigin = (wh == CELL_FS_SEEK_END) ? SEEK_END : (wh == CELL_FS_SEEK_CUR) ? SEEK_CUR : SEEK_SET;
+    if (wh == CELL_FS_SEEK_END && ps3_fs_size_hook) {   /* a virtual file's end (read hook) */
+        int64_t cur = FS_TELL64(f);
+        FS_SEEK64(f, 0, SEEK_END);
+        const int64_t host = FS_TELL64(f);
+        const int64_t vsz = fs_hooked_size(fd, host);
+        if (vsz != host) FS_SEEK64(f, vsz + off, SEEK_SET);
+        else { FS_SEEK64(f, cur, SEEK_SET); FS_SEEK64(f, off, SEEK_END); }
+    } else
     FS_SEEK64(f, off, worigin);
     int64_t p = FS_TELL64(f);
     if (pos_ptr) vm_write64(pos_ptr, (uint64_t)p);
@@ -692,7 +747,9 @@ static void cellFsStat(ppu_context* ctx)
     if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] stat '%s' -> OK (size=%lld)\n", gpath, (long long)st.st_size);
     uint32_t mode = (st.st_mode & S_IFDIR) ? (CELL_FS_S_IFDIR | 0x1FF)
                                            : (CELL_FS_S_IFREG | 0x1B6);
-    if (sb) write_stat(sb, mode, (uint64_t)st.st_size);
+    int64_t ssz = (int64_t)st.st_size;
+    if (ps3_fs_size_hook && !(st.st_mode & S_IFDIR)) ssz = ps3_fs_size_hook(gpath, ssz);
+    if (sb) write_stat(sb, mode, (uint64_t)ssz);
     if (getenv("PS3_FSLOG") && strstr(gpath,".toc")) fprintf(stderr,"[FSDBG] cellFsStat('%s') -> size=0x%llX\n",gpath,(unsigned long long)st.st_size);
     ctx->gpr[3] = CELL_OK;
 }
@@ -707,7 +764,7 @@ static void cellFsFstat(ppu_context* ctx)
         fprintf(stderr, "[fs] fstat fd=%d  (by %s)\n", fd, w); }
     int64_t cur = FS_TELL64(f);
     FS_SEEK64(f, 0, SEEK_END);
-    int64_t sz = FS_TELL64(f);
+    int64_t sz = fs_hooked_size(fd, FS_TELL64(f));
     FS_SEEK64(f, cur, SEEK_SET);
     /* FS_FSTAT_CAP=<bytes>: DIAGNOSTIC. Report a smaller size than the file
      * has. You Don't Know Jack reads a 100 KB archive whole but only probes
@@ -965,7 +1022,8 @@ static void cellFsAioRead(ppu_context* ctx)
 
     size_t n = 0;
     int32_t err = CELL_FS_ENOENT;
-    if (FILE* f = fd_file(fd)) {
+    if (fs_bad_read_buf(ctx, "aio read", fd, buf, size)) err = (int32_t)0x8001000Du;   /* CELL_EFAULT */
+    else if (FILE* f = fd_file(fd)) {
         if (ppu_vm_size && (uint64_t)buf + size > ppu_vm_size) size = ppu_vm_size - buf;
         fs_prefault(buf, size);
         /* AIO reads are absolute: they must not move the fd's own position,
@@ -982,6 +1040,8 @@ static void cellFsAioRead(ppu_context* ctx)
             n = fread(vm_base + buf, 1, (size_t)size, f);
         if (pos >= 0) HOST_FSEEK64(f, pos);
         HOST_UNLOCKFILE(f);
+        if (ps3_fs_read_hook && fd >= 0 && fd < FS_MAX && g_fd_path[fd][0])
+            n = ps3_fs_read_hook(g_fd_path[fd], offset, vm_base + buf, (size_t)size, n);
         fs_read_time_log("aio", fd, offset, size, n, t_rd);
         err = CELL_OK;
     }
