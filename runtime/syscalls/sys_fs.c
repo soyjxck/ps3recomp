@@ -618,6 +618,12 @@ int64_t sys_fs_read(ppu_context* ctx)
     if (!f->active || !f->fp)
         return (int64_t)(int32_t)CELL_EBADF;
 
+    /* Into the first 64 KB: CELL_EFAULT, as the kernel answers (ppu_fs.cpp). */
+    { extern int fs_bad_read_buf(ppu_context*, const char*, int, uint32_t, uint64_t);
+      if (fs_bad_read_buf(ctx, "lv2 read", fd, buf_addr, size)) {
+          if (nread_addr >= 0x10000u) write_be64(nread_addr, 0);
+          return (int64_t)(int32_t)CELL_EFAULT;
+      } }
     void* buf = vm_to_host(buf_addr);
     long pos_before = ftell(f->fp);
     /* The VM commits pages on first user-mode touch; a read the CRT hands to

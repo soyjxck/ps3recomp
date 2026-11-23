@@ -198,6 +198,17 @@ int64_t sys_cond_wait(ppu_context* ctx)
         }
     }
 #endif
+    /* PS3_COND_TIMEOUT_LOG=1: name every wait that ran out its timeout (first
+     * 300). A title that polls a cond with a short timeout for an event that
+     * never signals it runs at the timeout's pace, and nothing else shows it. */
+    if (result == (int32_t)CELL_ETIMEDOUT) {
+        static int tl = -1; static int tn = 0;
+        if (tl < 0) tl = getenv("PS3_COND_TIMEOUT_LOG") ? 1 : 0;
+        if (tl && tn < 300) { tn++;
+            fprintf(stderr, "[condto] cond=%u mutex=%u timeout=%lluus tid=%u lr=0x%08X\n",
+                    LV2_ARG_U32(ctx, 0), c->mutex_id, (unsigned long long)timeout,
+                    (unsigned)ctx->thread_id, (unsigned)ctx->lr); }
+    }
     struct sys_cond_waiter** link = &c->waiters;
     while (*link != &waiter) link = &(*link)->next;
     *link = waiter.next;
