@@ -51,6 +51,7 @@
 #include <direct.h>
 
 #include "rsx_draw_engine.h"
+#include "rsx_fp_decompiler.h"
 #include "rsx_texture_layout.h"
 #include "rsx_d3d12_engine.h"
 #include "rsx_host_mouse.h"
@@ -109,6 +110,7 @@ typedef struct {
     DXGI_FORMAT fmt;
     u32 w, h, mips, faces;      /* host pixels                           */
     u32 gw, gh;                 /* guest pixels; w,h = gw,gh * the scale  */
+    int shadow;                 /* made for a depth-only pass: the shadow scale */
     D3D12_RESOURCE_STATES state;
     int has_rtv, has_dsv;       /* RTV/DSV written at slot handle-1      */
     int retired;
@@ -162,17 +164,50 @@ extern volatile int g_rsx_display_reload;   /* rsx_draw_engine.c */
 static u32 s_win_w, s_win_h;                 /* the window and swap chain */
 typedef enum { DISP_WINDOWED = 0, DISP_BORDERLESS, DISP_FULLSCREEN } EngDisplayMode;
 static EngDisplayMode s_display = DISP_WINDOWED;
-static u32 sc_dim(u32 v) { u32 r = (u32)((float)v * s_scale + 0.5f); return v && !r ? 1u : r; }
-static u32 sc_pos(u32 v) { return (u32)((float)v * s_scale + 0.5f); }
+static u32 sc_dimf(u32 v, float f) { u32 r = (u32)((float)v * f + 0.5f); return v && !r ? 1u : r; }
+static u32 sc_posf(u32 v, float f) { return (u32)((float)v * f + 0.5f); }
+static u32 sc_dim(u32 v) { return sc_dimf(v, s_scale); }
 /* [x, x+w) in guest pixels -> host pixels, as the two ends rounded, so
  * neighbouring rectangles still meet. */
-static void sc_rect(u32* x, u32* y, u32* w, u32* h)
+static void sc_rectf(u32* x, u32* y, u32* w, u32* h, float f)
 {
-    const u32 x0 = sc_pos(*x), y0 = sc_pos(*y), x1 = sc_pos(*x + *w), y1 = sc_pos(*y + *h);
+    const u32 x0 = sc_posf(*x, f), y0 = sc_posf(*y, f), x1 = sc_posf(*x + *w, f), y1 = sc_posf(*y + *h, f);
     *x = x0; *y = y0; *w = x1 - x0; *h = y1 - y0;
 }
-/* Whether a target of this guest size is created at the internal resolution. */
-static int eng_scales(u32 w, u32 h) { return s_scale != 1.0f && w >= s_scale_min && h >= s_scale_min; }
+/* Shadow maps (RSX_SHADOW_QUALITY / RSX_SHADOW_SCALE, rsx_fp_decompiler.h):
+ * the targets of a depth-only pass -- the draw engine says which through
+ * target_class before it creates one -- take a scale of their own, so the
+ * shadow map can be finer than the scene. A 1024x1024 map is
+ * 2048 at RSX_SCALE=2 and 4096 at high. Everything that
+ * follows from a target's scale (viewports, scissors, clear rectangles,
+ * depth snapshots) uses the target's own factor (eng_obj_fx). Not covered:
+ * a depth-only pass whose fragment program reads WPOS (it gets the
+ * undivided build) and an occlusion count from one (divided by RSX_SCALE
+ * squared). */
+static int s_next_shadow;                    /* target_class: the next target's class */
+static float eng_class_fx(int shadow)
+{
+    if (!shadow) return s_scale;
+    float m = 0.0f; int absolute = 0;
+    rsx_shadow_quality(NULL, &m, &absolute);
+    if (m == 0.0f) return s_scale;
+    return absolute ? m : (m > s_scale ? m : s_scale);
+}
+/* The scale a new target of this guest size and class is made at; 1 = the
+ * guest size. A target smaller than RSX_SCALE_MIN stays unscaled; a shadow
+ * target is kept within 8192 host pixels (its depth format is 8 bytes a
+ * pixel: 5120x4096 is 160 MB). */
+static float eng_target_fx(u32 w, u32 h, int shadow)
+{
+    if (w < s_scale_min || h < s_scale_min) return 1.0f;
+    float f = eng_class_fx(shadow);
+    const u32 m = w > h ? w : h;
+    if (shadow && (float)m * f > 8192.0f) f = 8192.0f / (float)m;
+    return f;
+}
+/* Whether a scene target of this guest size is created at the internal resolution. */
+static int eng_scales(u32 w, u32 h) { return eng_target_fx(w, h, 0) != 1.0f; }
+static void eng_target_class(void* user, u32 depth_only) { (void)user; s_next_shadow = depth_only ? 1 : 0; }
 static void eng_read_scale(void)
 {
     const char* m = getenv("RSX_SCALE_MIN");
@@ -271,6 +306,8 @@ typedef struct {
     float vp[4];
     u32   sc[4];
     u32   stencil_ref;
+    INT   depth_bias;    /* polygon offset (eng_set_depth_bias), in D3D12 units */
+    float depth_slope;
     float clear_rgba[4];
     u32   clear_flags;
     float clear_depth;
@@ -279,6 +316,7 @@ typedef struct {
     u32   resolve_packed;
     u32   vis;
     u32   vbuf;
+    u32   draw_cls;      /* RSX_BE_DRAW_* (eng_draw_class): MSAA twins only for ordinary 3D draws */
     u32   clear_rect[4];
     /* ENG_REC_UPLOAD: stage offset, subresource and footprint. */
     u32   up_off, up_sub, up_w, up_h, up_pitch;
@@ -450,6 +488,7 @@ static DXGI_FORMAT eng_dxgi(rsx_be_format f)
     case RSX_BE_FMT_R16G16B16A16F:   return DXGI_FORMAT_R16G16B16A16_FLOAT;
     case RSX_BE_FMT_R32F:            return DXGI_FORMAT_R32_FLOAT;
     case RSX_BE_FMT_R32G32B32A32F:   return DXGI_FORMAT_R32G32B32A32_FLOAT;
+    case RSX_BE_FMT_R16G16B16A16:    return DXGI_FORMAT_R16G16B16A16_UNORM;   /* RSX_RT_16BIT */
     default:                         return DXGI_FORMAT_R8_UNORM;
     }
 }
@@ -461,7 +500,7 @@ static u32 eng_bpp(DXGI_FORMAT f)
     case DXGI_FORMAT_R8G8_UNORM: case DXGI_FORMAT_R16_UNORM: return 2;
     case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R16G16_UNORM:
     case DXGI_FORMAT_R16G16_FLOAT: case DXGI_FORMAT_R32_FLOAT: return 4;
-    case DXGI_FORMAT_R16G16B16A16_FLOAT: return 8;
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: case DXGI_FORMAT_R16G16B16A16_UNORM: return 8;
     case DXGI_FORMAT_R32G32B32A32_FLOAT: return 16;
     default: return 4;
     }
@@ -598,16 +637,27 @@ static EngObj* eng_owner(u32 handle)
     if (o && o->kind == OBJ_VIEW) o = eng_obj(o->alias);
     return o && o->res ? o : NULL;
 }
-/* Whether a target (or the surface a view aliases) is at the internal
- * resolution: then its pass's guest-pixel coordinates are scaled. */
-static int eng_obj_scaled(u32 handle)
+/* The scale of a target (or of the surface a view aliases), by which its
+ * pass's guest-pixel coordinates are scaled: 1 at the guest size, else what
+ * its class was made at. */
+static float eng_obj_fx(u32 handle)
 {
     const EngObj* o = eng_owner(handle);
-    return o && o->gw && o->gh && (o->w != o->gw || o->h != o->gh);
+    if (!o || !o->gw || !o->gh || (o->w == o->gw && o->h == o->gh)) return 1.0f;
+    return o->shadow ? eng_target_fx(o->gw, o->gh, 1) : s_scale;
 }
 
-static ID3D12Resource* make_buffer(D3D12_HEAP_TYPE type, u64 bytes, D3D12_RESOURCE_STATES st)
+/* RSX_MEMLOG=1: every buffer of 1 MB or more the engine creates, with its heap type, the source line that
+ * asked and a running total per type (where the process's committed memory goes; CPU-visible UPLOAD and
+ * READBACK buffers are committed system memory). */
+static ID3D12Resource* make_buffer_at(D3D12_HEAP_TYPE type, u64 bytes, D3D12_RESOURCE_STATES st, int line);
+#define make_buffer(t, b, s) make_buffer_at((t), (b), (s), __LINE__)
+static ID3D12Resource* make_buffer_at(D3D12_HEAP_TYPE type, u64 bytes, D3D12_RESOURCE_STATES st, int line)
 {
+    { static int ml = -1; static u64 tot[8]; if (ml < 0) ml = getenv("RSX_MEMLOG") ? 1 : 0;
+      if (ml && bytes >= (1u << 20)) { const int t = (int)type & 7; tot[t] += bytes;
+          fprintf(stderr, "[memlog] buffer %.1f MB heap %d line %d (heap %d total %.0f MB)\n",
+                  bytes / 1048576.0, (int)type, line, (int)type, tot[t] / 1048576.0); } }
     D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = type;
     D3D12_RESOURCE_DESC bd = {0};
     bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = bytes; bd.Height = 1;
@@ -746,6 +796,7 @@ static ID3D12Resource* make_placed_texture(DXGI_FORMAT fmt, u32 w, u32 h, u32 mi
         hd.SizeInBytes = TEX_HEAP_BYTES; hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
         hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
         if (FAILED(CALL(s_dev, CreateHeap, &hd, &IID_ID3D12Heap, (void**)&t->heap))) { t->heap = NULL; return NULL; }
+        if (getenv("RSX_MEMLOG")) fprintf(stderr, "[memlog] texture heap %u (64 MB, default)\n", i + 1);
         if (i == s_ntheap) s_ntheap++;
         mem_fresh(&t->m, TEX_HEAP_BYTES);
         if (!mem_take(&t->m, ai.SizeInBytes, ai.Alignment, &o)) return NULL;
@@ -1802,7 +1853,7 @@ static void eng_pso_list_init(void)
     if (n > 8) n = 8;
     QueryPerformanceCounter(&s_pso_t0);
     for (u32 t = 0; t < n; t++) {
-        HANDLE th = CreateThread(NULL, 1u << 20, pso_prewarm_worker, NULL, 0, NULL);
+        HANDLE th = CreateThread(NULL, 1u << 20, pso_prewarm_worker, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
         if (!th) break;
         SetThreadDescription(th, L"rsx pipeline prewarm");
         s_pso_threads[s_pso_nthreads++] = th;
@@ -2359,8 +2410,9 @@ static u32 eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 h,
     (void)user;
     if (!s_dev || !w || !h) return 0;
     const DXGI_FORMAT df = eng_dxgi(fmt);
-    const int scaled = eng_scales(w, h);
-    const u32 sw = scaled ? sc_dim(w) : w, sh = scaled ? sc_dim(h) : h;
+    const int shadow = s_next_shadow;
+    const float fx = eng_target_fx(w, h, shadow);
+    const u32 sw = fx != 1.0f ? sc_dimf(w, fx) : w, sh = fx != 1.0f ? sc_dimf(h, fx) : h;
     D3D12_CLEAR_VALUE cv = {0}; cv.Format = df;
     ID3D12Resource* t = make_texture(df, sw, sh, 1, 1, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
                                      D3D12_RESOURCE_STATE_RENDER_TARGET, &cv);
@@ -2368,9 +2420,21 @@ static u32 eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 h,
     s_stat_rt++;
     if (!handle) return 0;
     s_obj[handle - 1].gw = w; s_obj[handle - 1].gh = h;
+    s_obj[handle - 1].shadow = shadow;
     eng_write_srv(handle, t, df, 1, 1, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
     CALL(s_dev, CreateRenderTargetView, t, NULL, obj_rtv(handle));
     s_obj[handle - 1].has_rtv = 1;
+    /* A 16-bit target (RSX_RT_16BIT) is seeded from R,G,B,A byte rows. */
+    u16* wide = NULL;
+    if (seed && seed_row_bytes && df == DXGI_FORMAT_R16G16B16A16_UNORM) {
+        wide = (u16*)malloc((size_t)w * h * 8);
+        if (wide) {
+            for (u32 y = 0; y < h; y++)
+                for (u32 x = 0; x < w * 4; x++)
+                    wide[(size_t)y * w * 4 + x] = (u16)(((const u8*)seed)[(size_t)y * seed_row_bytes + x] * 257u);
+            seed = wide; seed_row_bytes = w * 8;
+        } else seed = NULL;
+    }
     if (seed && seed_row_bytes) {
         if (sw == w && sh == h) eng_upload_rows(handle, 0, w, h, seed, seed_row_bytes, h);
         else {
@@ -2389,6 +2453,7 @@ static u32 eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 h,
             }
         }
     }
+    free(wide);
     return handle;
 }
 
@@ -2431,8 +2496,15 @@ static u32 eng_depth_target_create_host(u32 w, u32 h, u32 gw, u32 gh)
 static u32 eng_depth_target_create(void* user, u32 w, u32 h)
 {
     (void)user;
-    if (!eng_scales(w, h)) return eng_depth_target_create_host(w, h, w, h);
-    return eng_depth_target_create_host(sc_dim(w), sc_dim(h), w, h);
+    const int shadow = s_next_shadow;
+    const float fx = eng_target_fx(w, h, shadow);
+    const u32 d = fx == 1.0f ? eng_depth_target_create_host(w, h, w, h)
+                             : eng_depth_target_create_host(sc_dimf(w, fx), sc_dimf(h, fx), w, h);
+    if (d) s_obj[d - 1].shadow = shadow;
+    if (d && shadow) { static u32 logs; if (logs < 4) { logs++;
+        fprintf(stderr, "[RSX d3d12] shadow depth target %ux%u -> %ux%u (x%.2f)\n", w, h,
+                s_obj[d - 1].w, s_obj[d - 1].h, (double)fx); } }
+    return d;
 }
 
 /* A depth target for a draw pass whose guest never declared a zeta: every
@@ -2491,7 +2563,7 @@ static u32 eng_depth_snapshot_common(u32 depth, u32 w, u32 h, int packed)
     if (!z || !z->res || !(packed ? s_depth_pack_pso : s_depth_pso)) return 0;
     if (s_rec_count >= ENG_MAX_RECORDS) { s_dropped++; return 0; }
     const u32 gw = w, gh = h;
-    if (eng_obj_scaled(depth)) { w = sc_dim(w); h = sc_dim(h); }
+    { const float fx = eng_obj_fx(depth); if (fx != 1.0f) { w = sc_dimf(w, fx); h = sc_dimf(h, fx); } }
     const DXGI_FORMAT df = packed ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R32_FLOAT;
     ID3D12Resource* r = NULL;
     D3D12_RESOURCE_STATES st = D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -2925,8 +2997,9 @@ static int eng_sampler_slot(const rsx_be_sampler_desc* d, int aniso_ok)
     const u64 key = ((u64)(aniso_ok ? eng_aniso() : 0) << 56) | (u64)d->min_linear | ((u64)d->mag_linear << 1)
                   | ((u64)d->mip_linear << 2) | ((u64)d->mip_present << 3)
                   | ((u64)d->wrap_s << 4) | ((u64)d->wrap_t << 8) | ((u64)d->wrap_r << 12)
-                  | ((u64)(u32)(d->min_lod * 256.0f) << 16)
-                  | ((u64)(u32)(d->max_lod * 256.0f) << 32);
+                  | ((u64)((u32)(d->min_lod * 256.0f) & 0xFFFu) << 16)
+                  | ((u64)((u32)(d->max_lod * 256.0f) & 0xFFFu) << 28)
+                  | ((u64)((u32)(int)(d->lod_bias * 256.0f) & 0x1FFFu) << 40);
     for (u32 i = 0; i < s_samp_count; i++)
         if (s_samp[i].key == key) return (int)i;
     if (s_samp_count >= ENG_MAX_SAMPLERS) return -1;
@@ -2939,6 +3012,7 @@ static int eng_sampler_slot(const rsx_be_sampler_desc* d, int aniso_ok)
     sd.MinLOD = d->min_lod;
     sd.MaxLOD = d->mip_present ? d->max_lod : 0.0f;
     if (sd.MaxLOD < sd.MinLOD) sd.MaxLOD = sd.MinLOD;
+    sd.MipLODBias = d->lod_bias < -16.0f ? -16.0f : d->lod_bias > 15.99f ? 15.99f : d->lod_bias;
     sd.MaxAnisotropy = 1;
     if (aniso_ok) {
         sd.Filter = D3D12_FILTER_ANISOTROPIC;
@@ -3040,7 +3114,26 @@ static void eng_set_viewport(void* user, float x, float y, float w, float h)
 static void eng_set_scissor(void* user, u32 x, u32 y, u32 w, u32 h)
 { (void)user; s_pending.sc[0] = x; s_pending.sc[1] = y; s_pending.sc[2] = w; s_pending.sc[3] = h; }
 static void eng_set_stencil_ref(void* user, u32 ref) { (void)user; s_pending.stencil_ref = ref; }
+/* Polygon offset. Without it every shadow-map pass ran unbiased, and a
+ * title that relies on the offset against self-shadowing (GREATER-compare
+ * shadow units, as in PhyreEngine) put diagonal shadow
+ * acne over every lit model. glPolygonOffset's units are steps of the guest
+ * depth buffer, 2^-24 for Z24S8 and 2^-16 for Z16. D3D12's DepthBias on the
+ * D32_FLOAT targets is in steps of 2^(e-23) for a primitive whose largest
+ * depth has exponent e: 2^-24 over [0.5, 1), so Z24 units carry over as they
+ * are and a Z16 unit is 256 of them (as rsx_metal_backend.m). The slope term
+ * is format-independent. D3D12 bakes both into the state object: draws with
+ * an offset take a variant of their pipeline's (eng_pso_bias). */
+static void eng_set_depth_bias(void* user, float slope, float units, u32 depth_bits)
+{
+    (void)user;
+    float u = depth_bits == 16u ? units * 256.0f : units;
+    if (u > 1.0e9f) u = 1.0e9f; else if (u < -1.0e9f) u = -1.0e9f;
+    s_pending.depth_bias  = (INT)(u < 0.0f ? u - 0.5f : u + 0.5f);
+    s_pending.depth_slope = slope;
+}
 
+static void eng_draw_class(void* user, u32 cls) { (void)user; s_pending.draw_cls = cls; }
 static void eng_draw(void* user, rsx_topology topology, const void* vertices, u32 vertex_count,
                      u32 stride, const u32* indices, u32 index_count)
 {
@@ -3097,7 +3190,7 @@ static void eng_clear_depth_stencil_rect(void* user, u32 depth, u32 flags, float
     (void)user;
     if (!w || !h) return;
     if (s_rec_count >= ENG_MAX_RECORDS) { s_dropped++; return; }
-    if (eng_obj_scaled(depth)) sc_rect(&x, &y, &w, &h);
+    { const float fx = eng_obj_fx(depth); if (fx != 1.0f) sc_rectf(&x, &y, &w, &h, fx); }
     EngRecord* r = &s_rec[s_rec_count++];
     memset(r, 0, sizeof *r);
     r->kind = ENG_REC_CLEAR_DS_RECT; r->depth = depth; r->clear_flags = flags;
@@ -3361,15 +3454,15 @@ static void eng_fullscreen_pass(ID3D12PipelineState* pso, D3D12_CPU_DESCRIPTOR_H
 
 /* A record's viewport and scissor (guest pixels) for a target of tw x th
  * host pixels, scaled if the target is. Empty ones cover the target. */
-static void eng_vp_sc(const EngRecord* r, int scaled, u32 tw, u32 th, D3D12_VIEWPORT* vp, D3D12_RECT* sc)
+static void eng_vp_sc(const EngRecord* r, float f, u32 tw, u32 th, D3D12_VIEWPORT* vp, D3D12_RECT* sc)
 {
-    const float f = scaled ? s_scale : 1.0f;
+    const int scaled = f != 1.0f;
     vp->TopLeftX = r->vp[0] * f; vp->TopLeftY = r->vp[1] * f;
     vp->Width = r->vp[2] * f;    vp->Height = r->vp[3] * f;
     vp->MinDepth = 0.0f; vp->MaxDepth = 1.0f;
     if (vp->Width <= 0.0f || vp->Height <= 0.0f) { vp->TopLeftX = vp->TopLeftY = 0.0f; vp->Width = (float)tw; vp->Height = (float)th; }
     u32 x = r->sc[0], y = r->sc[1], w = r->sc[2], h = r->sc[3];
-    if (w && h && scaled) sc_rect(&x, &y, &w, &h);
+    if (w && h && scaled) sc_rectf(&x, &y, &w, &h, f);
     if (w && h) { sc->left = (LONG)x; sc->top = (LONG)y; sc->right = (LONG)(x + w); sc->bottom = (LONG)(y + h); }
     else { sc->left = 0; sc->top = 0; sc->right = (LONG)tw; sc->bottom = (LONG)th; }
 }
@@ -3465,6 +3558,7 @@ static int eng_ms_ok(const EngObj* o)
 {
     if (s_ms_n < 2 || !o || o->retired || !o->res) return 0;
     if (o->kind != OBJ_COLOR && o->kind != OBJ_DEPTH) return 0;
+    if (o->shadow) return 0;   /* a shadow map: read through its single-sampled depth (PCF) */
     if (o->gw < 960 || o->gh < 540) return 0;
     static struct { DXGI_FORMAT f; u32 n; int ok; } cache[16]; static u32 nc;
     const DXGI_FORMAT f = o->kind == OBJ_DEPTH ? ENG_DEPTH_FMT : o->fmt;
@@ -3499,6 +3593,9 @@ static int eng_ms_make(u32 h)
         return 0;
     }
     o->ms_state = st;
+    { static u32 logs; if (logs < 16) { logs++;
+        fprintf(stderr, "[RSX d3d12] MSAA x%u twin: %s target guest %ux%u (%ux%u)\n", s_ms_n,
+                depth ? "depth" : "colour", o->gw, o->gh, o->w, o->h); } }
     if (depth) {
         D3D12_DEPTH_STENCIL_VIEW_DESC dd = {0};
         dd.Format = ENG_DEPTH_FMT; dd.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DMS;
@@ -3732,6 +3829,71 @@ static ID3D12PipelineState* eng_pso_ms(u32 pipeline, int cls)
     ReleaseSRWLockExclusive(&s_pipe_lock);
     return p->psoms[cls];
 }
+/* A pipeline's state with a polygon offset baked in (eng_set_depth_bias), by
+ * (pipeline, topology class, sample count, WPOS build, bias, slope). Built on
+ * first use; a title uses a handful of offsets (its shadow passes, decals). */
+typedef struct {
+    u32 pipeline; u8 cls, unscaled; u16 msn; INT bias; float slope;
+    ID3D12PipelineState* pso; int failed;
+} EngBiasPso;
+#define ENG_BIAS_PSO_MAX 512u
+static EngBiasPso s_bias_pso[ENG_BIAS_PSO_MAX];
+static u32 s_bias_pso_n;
+static SRWLOCK s_bias_lock = SRWLOCK_INIT;
+static ID3D12PipelineState* eng_pso_bias(u32 pipeline, int cls, int ms, int unscaled, INT bias, float slope)
+{
+    if (!pipeline || pipeline > s_pipe_count) return NULL;
+    EngPipeline* p = &s_pipe[pipeline - 1];
+    if (!p->vs) return NULL;
+    const u16 msn = ms ? (u16)s_ms_n : 1u;
+    if (ms || !p->ps_plain || s_scale == 1.0f) unscaled = 0;
+    ID3D12PipelineState* got = NULL; int found = 0;
+    AcquireSRWLockShared(&s_bias_lock);
+    for (u32 i = 0; i < s_bias_pso_n; i++) {
+        const EngBiasPso* e = &s_bias_pso[i];
+        if (e->pipeline == pipeline && e->cls == (u8)cls && e->unscaled == (u8)unscaled && e->msn == msn &&
+            e->bias == bias && e->slope == slope) { got = e->failed ? NULL : e->pso; found = 1; break; }
+    }
+    ReleaseSRWLockShared(&s_bias_lock);
+    if (found) return got;
+    /* The WPOS-undivided build's pixel shader comes from eng_pso_for. */
+    if (unscaled && !eng_pso_for(pipeline, cls, 1)) return NULL;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = p->desc;
+    pd.InputLayout.pInputElementDescs = pd.InputLayout.NumElements ? p->il : NULL;
+    pd.PrimitiveTopologyType = cls == 0 ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT
+                             : cls == 1 ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE
+                                        : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    if (unscaled && p->ps1) {
+        pd.PS.pShaderBytecode = CALL0(p->ps1, GetBufferPointer);
+        pd.PS.BytecodeLength  = CALL0(p->ps1, GetBufferSize);
+    }
+    if (msn > 1) { pd.SampleDesc.Count = msn; pd.SampleDesc.Quality = 0; pd.RasterizerState.MultisampleEnable = TRUE; }
+    pd.RasterizerState.DepthBias = bias;
+    pd.RasterizerState.DepthBiasClamp = 0.0f;
+    pd.RasterizerState.SlopeScaledDepthBias = slope;
+    ID3D12PipelineState* pso = NULL;
+    const HRESULT hr = eng_create_pso(&pd, &pso);
+    AcquireSRWLockExclusive(&s_bias_lock);
+    for (u32 i = 0; i < s_bias_pso_n; i++) {
+        const EngBiasPso* e = &s_bias_pso[i];
+        if (e->pipeline == pipeline && e->cls == (u8)cls && e->unscaled == (u8)unscaled && e->msn == msn &&
+            e->bias == bias && e->slope == slope) {
+            got = e->failed ? NULL : e->pso; found = 1; break;
+        }
+    }
+    if (found) { RELEASE(pso); }
+    else if (s_bias_pso_n < ENG_BIAS_PSO_MAX) {
+        EngBiasPso* e = &s_bias_pso[s_bias_pso_n++];
+        e->pipeline = pipeline; e->cls = (u8)cls; e->unscaled = (u8)unscaled; e->msn = msn;
+        e->bias = bias; e->slope = slope; e->failed = FAILED(hr); e->pso = FAILED(hr) ? NULL : pso;
+        got = e->pso;
+        { static int n = 0; if (n < 8 && ++n)
+            fprintf(stderr, "[rsx engine/d3d12] polygon offset: pipeline %u class %d bias %d slope %g x%u%s\n",
+                    pipeline, cls, (int)bias, slope, msn, FAILED(hr) ? " -- state FAILED" : ""); }
+    } else got = SUCCEEDED(hr) ? pso : NULL;   /* table full: used, not kept (rare) */
+    ReleaseSRWLockExclusive(&s_bias_lock);
+    return got;
+}
 /* A new sample count (or off): the twins and the MSAA builds dropped; twins
  * are made again at their next MSAA pass. Lists are drained first. */
 static void eng_ms_apply(int want)
@@ -3752,6 +3914,7 @@ static void eng_ms_apply(int want)
     ReleaseSRWLockExclusive(&s_pipe_lock);
     u32 n = (u32)want;
     while (n > 1 && !(eng_ms_format_ok(DXGI_FORMAT_R8G8B8A8_UNORM, n) && eng_ms_format_ok(DXGI_FORMAT_R16G16B16A16_FLOAT, n) &&
+                      eng_ms_format_ok(DXGI_FORMAT_R16G16B16A16_UNORM, n) &&
                       eng_ms_format_ok(ENG_DEPTH_FMT, n))) n >>= 1;
     s_ms_n = n ? n : 1;
     RELEASE(s_snap_copy_ms_ps);
@@ -3783,16 +3946,36 @@ static void eng_encode_draw(const EngRecord* r)
     const int real_depth = z != NULL;
     if (!z) { depth = eng_fallback_depth(tw, th); z = eng_owner(depth); if (!z) return; }
     if (!nrt) { tw = z->w; th = z->h; }
-    /* The pass's scale is its first colour target's, else its depth's. */
-    const int scaled = eng_obj_scaled(nrt ? r->rt[0] : depth);
+    /* The pass's scale is its first colour target's, else its depth's. A
+     * pass at another scale than RSX_SCALE (a shadow map) takes the build
+     * that leaves WPOS undivided, as an unscaled one does. */
+    const float pass_fx = eng_obj_fx(nrt ? r->rt[0] : depth);
+    const int scaled = pass_fx != 1.0f && pass_fx == s_scale;
 
-    /* MSAA: a 3D pass (a real depth target) whose attachments are all
-     * full-size targets draws into their multisampled twins. */
-    int ms = s_ms_n > 1 && real_depth && eng_ms_ok(z);
+    /* MSAA: an ordinary 3D draw (a real depth target, depth on, more than
+     * one quad) whose attachments are all full-size targets, none a shadow
+     * map, draws into their multisampled twins, made here at the first such
+     * draw. Only the scene gets twins: the post chain's targets see nothing
+     * but full-screen quads, and the UI is quads (often drawn with the
+     * depth test on, into the display buffer).
+     * (Twins for those too -- RSX_MS_ALL=1, the old rule -- cost a resolve
+     * per pass and blurred nothing worth it.) */
+    static int ms_all = -1;
+    if (ms_all < 0) { const char* e = getenv("RSX_MS_ALL"); ms_all = e && e[0] == '1'; }
+    const int scene_draw = ms_all || r->draw_cls == 0;
+    int ms = s_ms_n > 1 && real_depth && scene_draw && eng_ms_ok(z);
     for (u32 k = 0; ms && k < nrt; k++) ms = eng_ms_ok(eng_owner(r->rt[k]));
     if (ms) {
         ms = eng_ms_make(depth);
         for (u32 k = 0; ms && k < nrt; k++) ms = eng_ms_make(r->rt[k]);
+    }
+    /* Any other draw with a real depth target into targets that already have
+     * twins (a full-screen pass over the scene, a 2D sprite with depth off)
+     * joins them, so the scene is not resolved and refreshed around it. */
+    if (!ms && s_ms_n > 1 && real_depth && !scene_draw && nrt && eng_ms_ok(z)) {
+        ms = 1;
+        for (u32 k = 0; ms && k < nrt; k++) { EngObj* o = eng_owner(r->rt[k]); ms = o && o->ms != NULL; }
+        if (ms) ms = eng_ms_make(depth);
     }
     /* A pass without a real depth target (post-processing, the UI) into
      * targets that already have twins draws into the twins too, against the
@@ -3820,6 +4003,13 @@ static void eng_encode_draw(const EngRecord* r)
             pso = ph; plane = 1;
             res_transition(s_plane, &s_plane_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
         }
+    }
+    /* Polygon offset: the variant with the bias baked in. Only against a real
+     * depth target -- the fallback depth is nobody's. */
+    if (!plane && real_depth && (r->depth_bias || r->depth_slope != 0.0f)) {
+        ID3D12PipelineState* pb = eng_pso_bias(r->pipeline, topo_class(r->topology), ms, !scaled,
+                                               r->depth_bias, r->depth_slope);
+        if (pb) pso = pb;
     }
     if (ms) {
         for (u32 k = 0; k < nrt; k++) {
@@ -3918,7 +4108,7 @@ static void eng_encode_draw(const EngRecord* r)
     if (topo != s_cur_topo) { CALL(s_list, IASetPrimitiveTopology, topo); s_cur_topo = topo; }
 
     D3D12_VIEWPORT vp; D3D12_RECT sc;
-    eng_vp_sc(r, scaled, tw, th, &vp, &sc);
+    eng_vp_sc(r, pass_fx, tw, th, &vp, &sc);
     if (!b.valid || memcmp(&vp, &b.vp, sizeof vp)) { CALL(s_list, RSSetViewports, 1, &vp); b.vp = vp; }
     if (!b.valid || memcmp(&sc, &b.sc, sizeof sc)) { CALL(s_list, RSSetScissorRects, 1, &sc); b.sc = sc; }
     if (!b.valid || r->stencil_ref != b.sref) { CALL(s_list, OMSetStencilRef, r->stencil_ref); b.sref = r->stencil_ref; }
@@ -4072,7 +4262,7 @@ static ID3D12PipelineState* eng_copy_pso(u32 pipeline, int cls, DXGI_FORMAT fmt,
     if (nasked < 1024) { asked[nasked].pipeline = pipeline; asked[nasked].cls = cls; asked[nasked].fmt = fmt; asked[nasked].ms = ms; nasked++; }
     AcquireSRWLockExclusive(&s_cp_lock);
     if (!s_cp_thread_started) {
-        HANDLE th = CreateThread(NULL, 1u << 20, eng_copy_pso_worker, NULL, 0, NULL);
+        HANDLE th = CreateThread(NULL, 1u << 20, eng_copy_pso_worker, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
         if (th) { SetThreadDescription(th, L"rsx copy pipelines"); CloseHandle(th); s_cp_thread_started = 1; }
     }
     if (s_cp_thread_started && s_cp_tail - s_cp_head < 256u) {
@@ -4123,7 +4313,7 @@ static int eng_encode_copy_draw(const EngRecord* r, u32 T, u32 S)
     CALL(s_list, SetPipelineState, pso);
     CALL(s_list, IASetPrimitiveTopology, topo_d3d(r->topology));
     D3D12_VIEWPORT vp; D3D12_RECT sc;
-    eng_vp_sc(r, eng_obj_scaled(T), t->w, t->h, &vp, &sc);
+    eng_vp_sc(r, eng_obj_fx(T), t->w, t->h, &vp, &sc);
     CALL(s_list, RSSetViewports, 1, &vp);
     CALL(s_list, RSSetScissorRects, 1, &sc);
     D3D12_VERTEX_BUFFER_VIEW vbv = { vb_va, vleft, r->stride };
@@ -4443,6 +4633,124 @@ static HANDLE s_pres_thread, s_pres_go, s_pres_done;
 static volatile LONG s_pres_quit;
 static UINT s_pres_interval, s_pres_flags;
 
+/* Variable refresh (G-Sync / FreeSync) in use, as the display shows it: a
+ * fixed-refresh display refreshes at its mode's rate whatever the frame rate
+ * (825 times in 5 s at 165 Hz), a variable one once per frame. So over each
+ * 2 s window in which the presents came well below the refresh rate (the 60
+ * fps menus, say), the refresh count tells which. Variable refresh follows the
+ * foreground window only: it is measured there, and a window in the
+ * background counts as fixed (rsx_d3d12_vrr), until it has the focus again. Read
+ * by the host (rsx_d3d12_vrr) to cap the frame rate just under the refresh
+ * there, as NVIDIA Reflex games do: at the refresh a v-synced game would wait
+ * on it with frames queued, and one without v-sync would tear; either way it
+ * leaves the variable range. Presents with or without v-sync tell the same
+ * (a torn present still starts a refresh of its own on a variable display). */
+static volatile LONG s_vrr_state = -1;      /* -1 not known yet, 0 fixed, 1 variable */
+static volatile LONG s_vrr_hz = 0;          /* the window's display's refresh rate */
+
+int rsx_d3d12_vrr(int* hz)
+{
+    if (hz) *hz = (int)s_vrr_hz;
+    return s_vrr_state == 1 && GetForegroundWindow() == s_hwnd ? 1 : s_vrr_state < 0 ? -1 : 0;
+}
+
+static void eng_vrr_track(UINT interval)
+{
+    static LARGE_INTEGER qf; static double w0; static UINT n, src0;
+    (void)interval;
+    if (!s_swap) return;
+    n++;
+    LARGE_INTEGER q;
+    if (!qf.QuadPart) QueryPerformanceFrequency(&qf);
+    QueryPerformanceCounter(&q);
+    const double now = (double)q.QuadPart / (double)qf.QuadPart;
+    if (w0 > 0.0 && now - w0 < 2.0) return;
+    DXGI_FRAME_STATISTICS st;
+    const int ok = SUCCEEDED(CALL(s_swap, GetFrameStatistics, &st));
+    if (!s_vrr_hz || !w0) {
+        HMONITOR mon = MonitorFromWindow(s_hwnd, MONITOR_DEFAULTTOPRIMARY);
+        MONITORINFOEXW mi; memset(&mi, 0, sizeof mi); mi.cbSize = sizeof mi;
+        DEVMODEW dm; memset(&dm, 0, sizeof dm); dm.dmSize = sizeof dm;
+        if (GetMonitorInfoW(mon, (MONITORINFO*)&mi) && EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm))
+            s_vrr_hz = (LONG)dm.dmDisplayFrequency;
+    }
+    if (ok && w0 > 0.0 && s_vrr_hz > 60) {
+        const double dt = now - w0, hz = (double)s_vrr_hz;
+        const double rate = n / dt, refreshes = (double)(st.SyncRefreshCount - src0);
+        LONG v = s_vrr_state;   /* measured in the foreground only; rsx_d3d12_vrr asks for the foreground too */
+        if (GetForegroundWindow() == s_hwnd && rate < 0.8 * hz) v = refreshes < 0.85 * hz * dt ? 1 : 0;
+        if (v != s_vrr_state) {
+            fprintf(stderr, "[RSX d3d12] variable refresh %s (%.0f presents/s, %.0f refreshes/s, display %ld Hz)\n",
+                    v ? "in use" : "not in use", rate, refreshes / dt, (long)s_vrr_hz);
+            InterlockedExchange(&s_vrr_state, v);
+        }
+    }
+    w0 = now; n = 0;
+    if (ok) src0 = st.SyncRefreshCount; else w0 = 0.0;
+}
+
+/* RSX_PRESENT_STATS=1 (diagnostic): every 5 s, what the display did with
+ * the presents, from DXGI's frame statistics -- presents made, presents that
+ * reached the screen, display refreshes meanwhile, and the spacing of the
+ * frames on screen (SyncQPCTime) in refresh periods of the current mode: on a
+ * fixed-refresh v-synced display every frame lasts a whole number of periods
+ * and the refresh count is the mode's (825 in 5 s at 165 Hz) whatever the
+ * frame rate; with variable refresh (G-Sync, foreground window only) the
+ * refresh count follows the frame rate and SyncQPCTime is not updated for
+ * every frame, so the spacing figures mean nothing there. */
+static void eng_present_stats(UINT interval, UINT flags)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("RSX_PRESENT_STATS"); on = e && *e && *e != '0'; }
+    if (!on || !s_swap) return;
+    static LARGE_INTEGER qf; static double t_next, last_sync_t;
+    static UINT last_pc, last_prc, last_src, last_pc_rep, n_calls, n_fail, sync_n;
+    static UINT bins[8];   /* <0.9, 0.9-1.1, 1.1-1.9, 1.9-2.1, 2.1-2.9, 2.9-3.1, >3.1 periods; [7] unused */
+    static double dmin = 1e9, dmax;
+    if (!qf.QuadPart) QueryPerformanceFrequency(&qf);
+    LARGE_INTEGER q; QueryPerformanceCounter(&q);
+    const double now = (double)q.QuadPart / (double)qf.QuadPart;
+    DEVMODEW dm; memset(&dm, 0, sizeof dm); dm.dmSize = sizeof dm;
+    static DWORD hz;
+    if (!hz && EnumDisplaySettingsW(NULL, ENUM_CURRENT_SETTINGS, &dm)) hz = dm.dmDisplayFrequency;
+    const double period = hz ? 1.0 / (double)hz : 0.0;
+    n_calls++;
+    DXGI_FRAME_STATISTICS st;
+    if (FAILED(CALL(s_swap, GetFrameStatistics, &st))) { n_fail++; }
+    else if (st.PresentCount != last_pc) {
+        const double t = (double)st.SyncQPCTime.QuadPart / (double)qf.QuadPart;
+        const UINT dp = st.PresentCount - last_pc;
+        if (last_pc && last_sync_t > 0.0 && dp == 1 && period > 0.0) {
+            const double d = t - last_sync_t, r = d / period;
+            const int b = r < 0.9 ? 0 : r < 1.1 ? 1 : r < 1.9 ? 2 : r < 2.1 ? 3 : r < 2.9 ? 4 : r < 3.1 ? 5 : 6;
+            bins[b]++; sync_n++;
+            if (d < dmin) dmin = d; if (d > dmax) dmax = d;
+        }
+        last_sync_t = t; last_pc = st.PresentCount;
+    }
+    if (now >= t_next) {
+        if (t_next > 0.0 && SUCCEEDED(CALL(s_swap, GetFrameStatistics, &st))) {
+            fprintf(stderr, "[present-stats] display %lu Hz, interval %u flags 0x%X: %u presents, %u shown, %u refreshes"
+                    " (sync), %u (present); frame on screen in periods <0.9:%u ~1:%u 1-2:%u ~2:%u 2-3:%u ~3:%u >3:%u"
+                    " (min %.2f max %.2f ms), %u stats failures\n",
+                    (unsigned long)hz, interval, flags, n_calls, st.PresentCount - last_pc_rep,
+                    st.SyncRefreshCount - last_src, st.PresentRefreshCount - last_prc,
+                    bins[0], bins[1], bins[2], bins[3], bins[4], bins[5], bins[6],
+                    sync_n ? dmin * 1000.0 : 0.0, sync_n ? dmax * 1000.0 : 0.0, n_fail);
+        }
+        if (t_next > 0.0) {   /* the window's place: variable refresh (G-Sync) follows the foreground window */
+            RECT wr = {0}; GetWindowRect(s_hwnd, &wr);
+            fprintf(stderr, "[present-stats] window %ld,%ld %ldx%ld, %s%s\n",
+                    wr.left, wr.top, wr.right - wr.left, wr.bottom - wr.top,
+                    GetForegroundWindow() == s_hwnd ? "in the foreground" : "NOT in the foreground",
+                    IsIconic(s_hwnd) ? ", minimised" : "");
+        }
+        if (SUCCEEDED(CALL(s_swap, GetFrameStatistics, &st))) { last_src = st.SyncRefreshCount; last_prc = st.PresentRefreshCount; last_pc_rep = st.PresentCount; }
+        n_calls = 0; n_fail = 0; sync_n = 0; memset(bins, 0, sizeof bins); dmin = 1e9; dmax = 0.0;
+        t_next = now + 5.0;
+    }
+}
+
 static DWORD WINAPI eng_present_thread(LPVOID arg)
 {
     (void)arg;
@@ -4451,6 +4759,8 @@ static DWORD WINAPI eng_present_thread(LPVOID arg)
         if (s_pres_quit) break;
         rsx_present_pace();
         const HRESULT hr = CALL(s_swap, Present, s_pres_interval, s_pres_flags);
+        eng_present_stats(s_pres_interval, s_pres_flags);
+        eng_vrr_track(s_pres_interval);
         if (FAILED(hr)) {
             static int n = 0;
             if (n < 8 && ++n) fprintf(stderr, "[rsx engine/d3d12] Present failed: 0x%08lX (removed 0x%08lX)\n",
@@ -4629,9 +4939,10 @@ static void eng_rescale(void)
         if (o->retired || !o->res || !o->gw || !o->gh) continue;
         if (o->kind != OBJ_COLOR && o->kind != OBJ_DEPTH) continue;
         const int was = o->w != o->gw || o->h != o->gh;
-        const int now = eng_scales(o->gw, o->gh);
+        const float nfx = eng_target_fx(o->gw, o->gh, o->shadow);
+        const int now = nfx != 1.0f;
         if (!was && !now) continue;
-        const u32 nw = now ? sc_dim(o->gw) : o->gw, nh = now ? sc_dim(o->gh) : o->gh;
+        const u32 nw = now ? sc_dimf(o->gw, nfx) : o->gw, nh = now ? sc_dimf(o->gh, nfx) : o->gh;
         if (nw == o->w && nh == o->h) continue;
         RELEASE(o->res);
         RELEASE(o->ms);   /* made again at its next MSAA pass */
@@ -4919,6 +5230,8 @@ static void eng_submit(u32 present_surface, int wait)
             eng_present_join();
             rsx_present_pace();
             HRESULT hr = CALL(s_swap, Present, (UINT)s_vsync, pflags);
+            eng_present_stats((UINT)s_vsync, pflags);
+            eng_vrr_track((UINT)s_vsync);
             if (FAILED(hr)) {
                 static int n = 0;
                 if (n < 8 && ++n) fprintf(stderr, "[rsx engine/d3d12] Present failed: 0x%08lX (removed 0x%08lX)\n",
@@ -4967,6 +5280,32 @@ static ID3D12Resource* s_readback; static u32 s_readback_cap;
 /* Diagnostics only (present log, trace triggers, surface dumps, frame grabs):
  * wait for the GPU so the bytes are the frame just submitted. */
 /* host: the rectangle is in the texture's own pixels, read as they are. */
+/* Rows of a mapped readback (pitch, host w x h) out to the caller's gw x gh: nearest resample when
+ * scaled, a 16-bit UNORM target narrowed to bytes when the caller's rows hold 4 bytes a pixel. */
+static void eng_rb_convert(const u8* p, u32 pitch, u32 w, u32 h, u32 gw, u32 gh, int scaled, int narrow,
+                           u32 bpp, void* out, u32 out_pitch)
+{
+    if (narrow) {
+        for (u32 r = 0; r < gh; r++) {
+            const u8* srow = p + (size_t)(scaled ? ((u64)r * h + h / 2) / gh : r) * pitch;
+            u8* drow = (u8*)out + (size_t)r * out_pitch;
+            for (u32 c = 0; c < gw; c++) {
+                const u16* q = (const u16*)(srow + (size_t)(scaled ? ((u64)c * w + w / 2) / gw : c) * 8u);
+                for (int k = 0; k < 4; k++) drow[(size_t)c * 4 + k] = (u8)((q[k] * 255u + 32767u) / 65535u);
+            }
+        }
+    } else if (!scaled) {
+        for (u32 r = 0; r < h; r++) memcpy((u8*)out + (size_t)r * out_pitch, p + (size_t)r * pitch, (size_t)w * bpp);
+    } else {
+        for (u32 r = 0; r < gh; r++) {
+            const u8* srow = p + (size_t)(((u64)r * h + h / 2) / gh) * pitch;
+            u8* drow = (u8*)out + (size_t)r * out_pitch;
+            for (u32 c = 0; c < gw; c++)
+                memcpy(drow + (size_t)c * bpp, srow + (size_t)(((u64)c * w + w / 2) / gw) * bpp, bpp);
+        }
+    }
+}
+
 static void eng_readback_at(u32 surface, u32 x, u32 y, u32 w, u32 h, void* out, u32 out_pitch, int host)
 {
     EngObj* o = eng_owner(surface);
@@ -4975,6 +5314,10 @@ static void eng_readback_at(u32 surface, u32 x, u32 y, u32 w, u32 h, void* out, 
      * Read the matching host rectangle and resample it (nearest) on the way
      * out, so the caller sees the surface at the size it asked for. */
     const u32 gw = w, gh = h;
+    /* A 16-bit UNORM target (RSX_RT_16BIT) is handed back as R,G,B,A bytes,
+     * as the guest's A8R8G8B8 would be, unless the caller's rows hold 8 bytes
+     * a pixel (the surface dump: the full 16 bits). */
+    const int narrow = o->fmt == DXGI_FORMAT_R16G16B16A16_UNORM && out_pitch < gw * 8u;
     const int scaled = !host && o->gw && o->gh && (o->gw != o->w || o->gh != o->h);
     if (scaled) {
         if (x + w > o->gw || y + h > o->gh) return;
@@ -5016,16 +5359,7 @@ static void eng_readback_at(u32 surface, u32 x, u32 y, u32 w, u32 h, void* out, 
     fence_wait(fence_signal());
     u8* p = NULL; D3D12_RANGE rg = { 0, need };
     if (SUCCEEDED(CALL(s_readback, Map, 0, &rg, (void**)&p))) {
-        if (!scaled) {
-            for (u32 r = 0; r < h; r++) memcpy((u8*)out + (size_t)r * out_pitch, p + (size_t)r * pitch, (size_t)w * bpp);
-        } else {
-            for (u32 r = 0; r < gh; r++) {
-                const u8* srow = p + (size_t)(((u64)r * h + h / 2) / gh) * pitch;
-                u8* drow = (u8*)out + (size_t)r * out_pitch;
-                for (u32 c = 0; c < gw; c++)
-                    memcpy(drow + (size_t)c * bpp, srow + (size_t)(((u64)c * w + w / 2) / gw) * bpp, bpp);
-            }
-        }
+        eng_rb_convert(p, pitch, w, h, gw, gh, scaled, narrow, bpp, out, out_pitch);
         D3D12_RANGE wr = {0, 0}; CALL(s_readback, Unmap, 0, &wr);
     }
 }
@@ -5033,6 +5367,109 @@ static void eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h, vo
 {
     (void)user;
     eng_readback_at(surface, x, y, w, h, out, out_pitch, 0);
+}
+
+/* readback_async: a whole small surface, without the wait. eng_readback_at waits for every frame
+ * submitted so far (fence_wait), so a per-frame readback (RSX_SMALL_RT_WRITEBACK, the 32x32 auto-exposure
+ * target) made the CPU and GPU take turns: at 60 fps it hid in the frame, uncapped it held a stage near
+ * 80 fps (frame clock thread 12% in that wait). Here each call queues a copy
+ * into a ring of readback buffers on its own list and allocator and hands out the newest copy the GPU
+ * has finished: one or two frames old. Only between frames (the frame's list closed), else 0. */
+#define ENG_ARB_SLOTS 8
+#define ENG_ARB_RING  4
+typedef struct {
+    u32 surface;
+    ID3D12Resource* buf[ENG_ARB_RING]; u32 cap[ENG_ARB_RING];
+    u64 fence[ENG_ARB_RING];           /* 0 = no copy in it */
+    u32 w[ENG_ARB_RING], h[ENG_ARB_RING], pitch[ENG_ARB_RING], gw[ENG_ARB_RING], gh[ENG_ARB_RING];
+    DXGI_FORMAT fmt[ENG_ARB_RING];
+    u32 next; u64 last_use;
+} EngArb;
+static EngArb s_arb[ENG_ARB_SLOTS];
+static ID3D12CommandAllocator* s_arb_alloc[ENG_ARB_RING]; static u64 s_arb_alloc_fence[ENG_ARB_RING]; static u32 s_arb_ai;
+static ID3D12GraphicsCommandList* s_arb_list; static u64 s_arb_clock;
+static int eng_readback_async(void* user, u32 surface, u32 gw, u32 gh, void* out, u32 out_pitch)
+{
+    (void)user;
+    EngObj* o = eng_owner(surface);
+    if (!o || !out || !gw || !gh || !s_ready || s_list_open || s_nbar) return 0;
+    { static int off = -1; if (off < 0) { const char* e = getenv("RSX_READBACK_ASYNC"); off = e && *e == '0'; }
+      if (off) return 0; }
+    s_arb_clock++;
+    EngArb* a = NULL;
+    for (int i = 0; i < ENG_ARB_SLOTS; i++) if (s_arb[i].surface == surface) { a = &s_arb[i]; break; }
+    if (!a) {   /* a free slot, else the one used longest ago (its copies are dropped) */
+        EngArb* lru = &s_arb[0];
+        for (int i = 0; i < ENG_ARB_SLOTS; i++) if (s_arb[i].last_use < lru->last_use) lru = &s_arb[i];
+        a = lru;
+        for (int k = 0; k < ENG_ARB_RING; k++) a->fence[k] = 0;
+        a->surface = surface;
+    }
+    a->last_use = s_arb_clock;
+    /* 1. The newest finished copy, if any, to the caller. */
+    int got = 0, best = -1;
+    for (int k = 0; k < ENG_ARB_RING; k++)
+        if (a->fence[k] && fence_done(a->fence[k]) && (best < 0 || a->fence[k] > a->fence[best])) best = k;
+    if (best >= 0 && a->gw[best] == gw && a->gh[best] == gh) {
+        u8* p = NULL; D3D12_RANGE rg = { 0, (SIZE_T)a->pitch[best] * a->h[best] };
+        if (SUCCEEDED(CALL(a->buf[best], Map, 0, &rg, (void**)&p))) {
+            const int narrow = a->fmt[best] == DXGI_FORMAT_R16G16B16A16_UNORM && out_pitch < gw * 8u;
+            const int scaled = a->w[best] != gw || a->h[best] != gh;
+            eng_rb_convert(p, a->pitch[best], a->w[best], a->h[best], gw, gh, scaled, narrow, eng_bpp(a->fmt[best]), out, out_pitch);
+            D3D12_RANGE wr = {0, 0}; CALL(a->buf[best], Unmap, 0, &wr);
+            got = 1;
+        }
+        for (int k = 0; k < ENG_ARB_RING; k++)   /* that one and anything older are spent */
+            if (a->fence[k] && a->fence[k] <= a->fence[best]) a->fence[k] = 0;
+    }
+    /* 2. Queue this frame's copy, unless its ring entry or the allocator is still busy (never wait). */
+    const u32 k = a->next;
+    if (a->fence[k] && !fence_done(a->fence[k])) return got;
+    const u32 ai = s_arb_ai;
+    if (!fence_done(s_arb_alloc_fence[ai])) return got;
+    if (!s_arb_alloc[ai] && FAILED(CALL(s_dev, CreateCommandAllocator, D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator, (void**)&s_arb_alloc[ai])))
+        return got;
+    if (!s_arb_list) {
+        if (FAILED(CALL(s_dev, CreateCommandList, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, s_arb_alloc[ai], NULL,
+                        &IID_ID3D12GraphicsCommandList, (void**)&s_arb_list))) return got;
+        CALL0(s_arb_list, Close);
+    }
+    const u32 w = o->w, h = o->h, bpp = eng_bpp(o->fmt);
+    const u32 pitch = (w * bpp + 255u) & ~255u, need = pitch * h;
+    if (need > a->cap[k]) {
+        RELEASE(a->buf[k]);
+        a->buf[k] = make_buffer(D3D12_HEAP_TYPE_READBACK, need, D3D12_RESOURCE_STATE_COPY_DEST);
+        a->cap[k] = a->buf[k] ? need : 0;
+        if (!a->buf[k]) return got;
+    }
+    CALL0(s_arb_alloc[ai], Reset);
+    CALL(s_arb_list, Reset, s_arb_alloc[ai], NULL);
+    if (o->state != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+        D3D12_RESOURCE_BARRIER b; memset(&b, 0, sizeof b);
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = o->res;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b.Transition.StateBefore = o->state;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        CALL(s_arb_list, ResourceBarrier, 1, &b);
+        o->state = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    }
+    D3D12_TEXTURE_COPY_LOCATION dst = {0}, src = {0};
+    src.pResource = o->res; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.SubresourceIndex = 0;
+    dst.pResource = a->buf[k]; dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Footprint.Format = o->fmt;
+    dst.PlacedFootprint.Footprint.Width = w; dst.PlacedFootprint.Footprint.Height = h;
+    dst.PlacedFootprint.Footprint.Depth = 1; dst.PlacedFootprint.Footprint.RowPitch = pitch;
+    D3D12_BOX box = { 0, 0, 0, w, h, 1 };
+    CALL(s_arb_list, CopyTextureRegion, &dst, 0, 0, 0, &src, &box);
+    CALL0(s_arb_list, Close);
+    ID3D12CommandList* lists[1] = { (ID3D12CommandList*)s_arb_list };
+    CALL(s_queue, ExecuteCommandLists, 1, lists);
+    const u64 f = fence_signal();
+    a->fence[k] = f; a->w[k] = w; a->h[k] = h; a->pitch[k] = pitch; a->gw[k] = gw; a->gh[k] = gh; a->fmt[k] = o->fmt;
+    a->next = (k + 1) % ENG_ARB_RING;
+    s_arb_alloc_fence[ai] = f; s_arb_ai = (ai + 1) % ENG_ARB_RING;
+    return got;
 }
 
 /* Opt-in readback of the presented surface to a PPM, as the Metal backend:
@@ -5057,6 +5494,25 @@ static void eng_dump_frame(u32 surface)
     int grabbing = 0;
     static const char* grab = (const char*)1;
     if (grab == (const char*)1) grab = env2("PS3RECOMP_FRAME_GRAB", "PS3RECOMP_METAL_FRAME_GRAB");
+    /* A .req holding a number N > 1 asks for N consecutive presents instead,
+     * as <prefix>.000.ppm, <prefix>.001.ppm, ... -- a flicker that lasts a
+     * frame or two is invisible to one grab a second. */
+    static int burst_left, burst_idx;
+    if (!path && grab && !burst_left) {
+        snprintf(grab_req, sizeof grab_req, "%s.req", grab);
+        FILE* rf = fopen(grab_req, "rb");
+        if (rf) {
+            int n = 0;
+            if (fscanf(rf, "%d", &n) != 1) n = 0;
+            fclose(rf);
+            if (n > 1) { burst_left = n > 999 ? 999 : n; burst_idx = 0; remove(grab_req); }
+        }
+    }
+    if (!path && grab && burst_left) {
+        snprintf(seqpath, sizeof seqpath, "%s.%03d.ppm", grab, burst_idx++);
+        path = seqpath;
+        burst_left--;
+    }
     if (!path && grab) {
         snprintf(grab_req, sizeof grab_req, "%s.req", grab);
         if (_access(grab_req, 0) == 0) {
@@ -5092,7 +5548,7 @@ static void eng_dump_frame(u32 surface)
         fwrite(rgb, 1, (size_t)w * h * 3, f);
         fclose(f);
         if (grabbing) { remove(grab_out); rename(grab_tmp, grab_out); remove(grab_req); }
-        else fprintf(stderr, "[rsx engine/d3d12] captured frame to %s\n", path);
+        else { extern uint32_t g_rsx_engine_frame; fprintf(stderr, "[rsx engine/d3d12] captured frame %u to %s\n", g_rsx_engine_frame, path); }
     }
     free(rgba); free(rgb);
 }
@@ -5125,6 +5581,8 @@ static const rsx_draw_backend s_engine_backend = {
     .color_target_release = eng_obj_release,
     .surface_view         = eng_surface_view,
     .depth_target_create  = eng_depth_target_create,
+    .target_class         = eng_target_class,
+    .draw_class           = eng_draw_class,
     .depth_target_release = eng_obj_release,
     .depth_snapshot       = eng_depth_snapshot,
     .depth_snapshot_rgba8 = eng_depth_snapshot_rgba8,
@@ -5144,6 +5602,7 @@ static const rsx_draw_backend s_engine_backend = {
     .set_viewport         = eng_set_viewport,
     .set_scissor          = eng_set_scissor,
     .set_stencil_ref      = eng_set_stencil_ref,
+    .set_depth_bias       = eng_set_depth_bias,
     .draw                 = eng_draw,
     .buffer_wrap          = eng_buffer_wrap,
     .buffer_release       = eng_buffer_release,
@@ -5153,6 +5612,7 @@ static const rsx_draw_backend s_engine_backend = {
     .clear_depth_stencil_rect = eng_clear_depth_stencil_rect,
     .present              = eng_present,
     .readback             = eng_readback,
+    .readback_async       = eng_readback_async,
     .hdr_plane_packed     = 1,
 };
 

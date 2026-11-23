@@ -126,6 +126,21 @@ float rsx_fp_alpha_ref(u32 raw, u32 surface_color_format);
 typedef struct { u32 instrs, prec[4], exp_tex; } rsx_fp_decompile_stats;
 extern rsx_fp_decompile_stats g_rsx_fp_stats;
 void rsx_fp_set_shadow_units(u32 mask, const u8* funcs);
+/* Shadow quality, read once from the environment and shared by the
+ * decompiler (filter) and the backends (shadow-map resolution):
+ *   RSX_SHADOW_QUALITY=low|medium|high|ultra (default low)
+ *     low     1 tap  (the RSX's own 2x2 bilinear PCF), map at RSX_SCALE
+ *     medium  3x3 taps, map at least x2 (a 1024 map -> 2048)
+ *     high    3x3 taps, map at least x4 (4096)
+ *     ultra   5x5 taps, map at least x4
+ *   RSX_SHADOW_PCF=<1..6>   bilinear taps per axis, overrides the preset
+ *   RSX_SHADOW_SCALE=<f>    the absolute scale of depth-only targets (0.5 to
+ *                           8; 0 = RSX_SCALE), overrides the preset
+ * *taps: taps per axis. *map_scale: the minimum scale for targets of a
+ * depth-only pass (a shadow map), or 0 to leave them at RSX_SCALE; a
+ * backend uses max(RSX_SCALE, *map_scale) unless RSX_SHADOW_SCALE is given,
+ * then *map_scale itself (*map_absolute set). Either pointer may be NULL. */
+void rsx_shadow_quality(int* taps, float* map_scale, int* map_absolute);
 /* Unnormalised units for the NEXT decompile call: bit u of mask means unit u's
  * texture carries RSX_TEX_FMT_UNNORM (addressed in texels) and dim[u] is its
  * {width, height, depth}, so every sample of it scales the coordinate by

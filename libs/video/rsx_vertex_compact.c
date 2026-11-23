@@ -429,6 +429,20 @@ static inline const u8* rsx_fa_source(const rsx_vertex_fetch_plan* plan,
     return NULL;
 }
 
+/* Fast path for the common attribute: per-vertex (rsx_vertex_freq_plain) with a prepared span. Every
+ * such attribute of a draw shares one element range (rsx_vertex_fetch_plan_prepare takes it from all the
+ * refs), so each ref's element lies inside it: its offset into the span is worked out once per draw and
+ * the per-format loops read straight from it, without rsx_fa_source's per-vertex element and bounds
+ * work. Same values as the general loops. A port may clear g_rsx_vfetch_fast (live A/B). */
+volatile int g_rsx_vfetch_fast = 1;
+#if defined(_MSC_VER)
+static __declspec(thread) u32* s_fa_off;
+static __declspec(thread) u32 s_fa_off_cap;
+#else
+static __thread u32* s_fa_off;
+static __thread u32 s_fa_off_cap;
+#endif
+
 int rsx_vertex_fetch_all(
     const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count,
     u8* out)
@@ -440,6 +454,8 @@ int rsx_vertex_fetch_all(
         return 1;
     if (!out)
         return 0;
+    int off_ready = 0;          /* s_fa_off holds element - off_first for every ref */
+    u32 off_first = 0;
     for (u32 slot = 0; slot < plan->layout.count; slot++) {
         const u32 attr = plan->layout.attrs[slot];
         const rsx_vertex_fetch_attr* fetch = &plan->attr[attr];
@@ -451,6 +467,62 @@ int rsx_vertex_fetch_all(
             continue;
         }
         const u32 n = size < 4 ? size : 4;
+        if (g_rsx_vfetch_fast && fetch->stable_base && !plan->inline_data && count &&
+            rsx_vertex_freq_plain(fetch->desc.frequency, (plan->divider_mask >> attr) & 1u) &&
+            type >= RSX_VTX_TYPE_SNORM16 && type <= RSX_VTX_TYPE_UINT8 && type != RSX_VTX_TYPE_CMP32) {
+            if (!off_ready || off_first != fetch->stable_first) {
+                if (count > s_fa_off_cap) {
+                    u32 cap = s_fa_off_cap ? s_fa_off_cap : 4096u;
+                    while (cap < count) cap *= 2u;
+                    u32* p = (u32*)realloc(s_fa_off, (size_t)cap * sizeof(u32));
+                    if (!p) goto general;
+                    s_fa_off = p; s_fa_off_cap = cap;
+                }
+                off_first = fetch->stable_first;
+                const u32 span = fetch->stable_last - off_first;
+                for (u32 i = 0; i < count; i++) {
+                    const u32 e = ((refs[i].vertex_id + refs[i].base_index) & 0x000FFFFFu) - off_first;
+                    if (e > span) goto general;   /* cannot happen (prepare spans every ref); stay exact */
+                    s_fa_off[i] = e;
+                }
+                off_ready = 1;
+            }
+            const u8* const base = fetch->stable_base;
+            const size_t fs = fetch->stride;
+            const u32* const off = s_fa_off;
+#define RSX_FF_LOOP(...)                                                                   for (u32 i = 0; i < count; i++) {                                                  float* v = (float*)(col + (size_t)i * ostride);                                const u8* s = base + (size_t)off[i] * fs;                                      v[0] = v[1] = v[2] = 0.0f; v[3] = 1.0f;                                        __VA_ARGS__                                                                }
+            switch (type) {
+            case RSX_VTX_TYPE_FLOAT:
+                if (n == 3) RSX_FF_LOOP(v[0] = rsx_fa_f32(rsx_fa_be32(s)); v[1] = rsx_fa_f32(rsx_fa_be32(s + 4));
+                                        v[2] = rsx_fa_f32(rsx_fa_be32(s + 8));)
+                else if (n == 4) RSX_FF_LOOP(v[0] = rsx_fa_f32(rsx_fa_be32(s)); v[1] = rsx_fa_f32(rsx_fa_be32(s + 4));
+                                             v[2] = rsx_fa_f32(rsx_fa_be32(s + 8)); v[3] = rsx_fa_f32(rsx_fa_be32(s + 12));)
+                else if (n == 2) RSX_FF_LOOP(v[0] = rsx_fa_f32(rsx_fa_be32(s)); v[1] = rsx_fa_f32(rsx_fa_be32(s + 4));)
+                else RSX_FF_LOOP(for (u32 c = 0; c < n; c++) v[c] = rsx_fa_f32(rsx_fa_be32(s + c * 4));)
+                break;
+            case RSX_VTX_TYPE_HALF:
+                RSX_FF_LOOP(for (u32 c = 0; c < n; c++) v[c] = rsx_compact_be_f16(s + c * 2);)
+                break;
+            case RSX_VTX_TYPE_UNORM8:
+                if (n == 4) RSX_FF_LOOP(v[0] = s[0] / 255.0f; v[1] = s[1] / 255.0f; v[2] = s[2] / 255.0f; v[3] = s[3] / 255.0f;)
+                else RSX_FF_LOOP(for (u32 c = 0; c < n; c++) v[c] = s[c] / 255.0f;)
+                break;
+            case RSX_VTX_TYPE_UINT8:
+                RSX_FF_LOOP(for (u32 c = 0; c < n; c++) v[c] = (float)s[c];)
+                break;
+            case RSX_VTX_TYPE_SNORM16:
+                RSX_FF_LOOP(for (u32 c = 0; c < n; c++) v[c] = (s16)rsx_fa_be16(s + c * 2) / 32767.0f;)
+                break;
+            case RSX_VTX_TYPE_SINT16:
+                RSX_FF_LOOP(for (u32 c = 0; c < n; c++) v[c] = (float)(s16)rsx_fa_be16(s + c * 2);)
+                break;
+            default:
+                goto general;
+            }
+#undef RSX_FF_LOOP
+            continue;
+        }
+    general:;
         /* One loop per format. A source that cannot be read, or a format
          * this engine does not decode, gets the attribute's default -- and
          * fails the draw for ATTR0 -- as in rsx_vertex_fetch_one. */

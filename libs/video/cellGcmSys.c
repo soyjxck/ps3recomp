@@ -1083,6 +1083,36 @@ static unsigned long long park_since;
  * following `put` dropped the commands in between, a fence with them, so
  * the boot stopped. The RSX itself would just wait. */
 #define GCM_PARK_GRACE_MS 50ull
+/* GCM_PARK_STATS=1: how long the walker stands on self-JUMP parks before the
+ * title (or an SPU job) patches them. Every 5 s: parks released, mean and max
+ * wait, the slowest park's offset, and how many waited over 50 ms (the default
+ * jump-park grace) -- a title whose parks routinely outlast the grace loses
+ * commands to the resync. */
+static u32 s_pst_off;
+static unsigned long long s_pst_t0;
+static void gcm_park_stats_seen(u32 off)
+{
+    static int on = -1; if (on < 0) on = getenv("GCM_PARK_STATS") ? 1 : 0;
+    if (!on || s_pst_off == off) return;
+    extern unsigned long long ps3_ms_now(void);
+    s_pst_off = off; s_pst_t0 = ps3_ms_now();}
+static void gcm_park_stats_word(u32 off, u32 w)
+{
+    if (!s_pst_off) return;
+    if (off == s_pst_off && (w & 0xE0000003u) == 0x20000000u && (w & 0x1FFFFFFCu) == off) return;
+    extern unsigned long long ps3_ms_now(void);
+    static unsigned long long n, tot, mx, over, last; static u32 mx_off;
+    const unsigned long long now = ps3_ms_now(), dt = now - s_pst_t0;
+    const u32 poff = s_pst_off;
+    s_pst_off = 0;    n++; tot += dt; if (dt > mx) { mx = dt; mx_off = poff; } if (dt > 50) over++;
+    if (!last) last = now;
+    if (now - last >= 5000) {
+        fprintf(stderr, "[park-stats] %llu parks released in %.1f s: mean %.1f ms, max %llu ms (io 0x%08X), %llu over 50 ms\n",
+                n, (now - last) / 1000.0, n ? (double)tot / n : 0.0, mx, mx_off, over);
+        n = tot = mx = over = 0; last = now;
+    }
+}
+
 static unsigned long long gcm_park_grace_ms(void)
 {
     static long long ms = -1;
@@ -2701,6 +2731,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
             continue;
         }
         u32 type = w >> 29;
+        gcm_park_stats_word(s_fifo_getoff, w);
         /* The walker is reading something other than the park it waited on:
          * it has left it, by the patched word (a JUMP elsewhere, or commands
          * written over the park) or by a resync. Forget the park here. Kept,
@@ -2820,6 +2851,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                * CPU the guest needs. Stop this pass instead; the next one
                * re-reads the word, so a patched jump is still followed. */
               if (tgt == s_fifo_getoff) {
+                  gcm_park_stats_seen(s_fifo_getoff);
                   /* GCM_PARK_WATCH=1: arm the PPU store watch and the SPU DMA
                    * watch on this park word while `put` sits beyond it, so the
                    * log names whoever patches it -- or shows that nobody did. */
@@ -3547,6 +3579,22 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
      * would simply wait for the RSX here. */
     int spins = 0, total = 0;
     u32 seen = g_gcm_fifo_drained_ea;
+    /* GCM_RECYCLE_PARK_RETURN=1: also hand the ring back once the walker is
+     * standing on a self-JUMP park in the tail, well past begin. Everything
+     * before it in this lap -- the space the title is about to reuse -- has
+     * been read. PhyreEngine ends each command segment
+     * in such a park and pushes the SPU job that patches it only AFTER this
+     * callback returns, so waiting for the tail deadlocked both sides for the
+     * full 20 s bound at every wrap that caught a park (and with the jump-park
+     * resync on, the resync dropped those segments instead -- and once in a
+     * while the fence the render thread waits on, forever). */
+    static int s_park_return = -1;
+    if (s_park_return < 0) { const char* e = getenv("GCM_RECYCLE_PARK_RETURN"); s_park_return = e && *e == '1'; }
+#define GCM_RECYCLE_TAIL_PARKED() \
+    (s_park_return && io_begin != 0xFFFFFFFFu && s_fifo_back_jumps == back_jumps0 && \
+     s_fifo_getoff >= io_begin + GCM_RECYCLE_MARGIN && gcm_io2ea(s_fifo_getoff) && \
+     vm_read32(gcm_io2ea(s_fifo_getoff)) == (0x20000000u | s_fifo_getoff))
+    int park_returned = 0;
 #ifdef _WIN32
     /* Woken by the walker's drain (WakeByAddressAll above) instead of polling
      * with Sleep(1): each poll cost a millisecond or two of timer granularity,
@@ -3558,6 +3606,7 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
                (s_fifo_back_jumps == back_jumps0 || g_gcm_fifo_drained_ea != begin)) {
             const ULONGLONG now = GetTickCount64();
             if (now - t_progress >= 20000 || now - t_start >= 120000) break;
+            if (GCM_RECYCLE_TAIL_PARKED()) { park_returned = 1; break; }
             u32 cur = g_gcm_fifo_drained_ea;
             if (cur != seen) { seen = cur; t_progress = now; }
             if (s_recdbg && now - t_log >= 1000) {
@@ -3575,6 +3624,7 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
     while (io_begin != 0xFFFFFFFFu &&
            (s_fifo_back_jumps == back_jumps0 || g_gcm_fifo_drained_ea != begin) &&
            spins < 20000 && total < 120000) {
+        if (GCM_RECYCLE_TAIL_PARKED()) { park_returned = 1; break; }
         Sleep(1); spins++; total++;
         if (g_gcm_fifo_drained_ea != seen) { seen = g_gcm_fifo_drained_ea; spins = 0; }
         if (s_recdbg && total % 1000 == 0)
@@ -3582,7 +3632,13 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
                     total, s_fifo_getoff, vm_read32(GCM_CONTROL_GUEST_ADDR + 0), s_fifo_back_jumps);
     }
 #endif
-    if (io_begin != 0xFFFFFFFFu &&
+#undef GCM_RECYCLE_TAIL_PARKED
+    if (park_returned) {
+        static unsigned long long n = 0;
+        if (++n <= 4 || n % 100 == 0)
+            fprintf(stderr, "[cellGcmSys] fifo recycle: walker parked in the tail at io 0x%08X -- ring handed back (#%llu)\n",
+                    s_fifo_getoff, n);
+    } else if (io_begin != 0xFFFFFFFFu &&
         (s_fifo_back_jumps == back_jumps0 || g_gcm_fifo_drained_ea != begin)) {
         static int warned = 0;
         if (PS3_LOG_FIRST(warned, 4))
