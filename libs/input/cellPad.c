@@ -11,7 +11,11 @@
  *
  * Define PS3RECOMP_PAD_USE_SDL2 (CMake: PS3RECOMP_PAD_SDL2=ON) for SDL2 on
  * Windows as well: DualShock 4, DualSense, Switch Pro and the other pads
- * XInput never sees, wired or over Bluetooth.
+ * XInput never sees, wired or over Bluetooth. Both backends are then built,
+ * and the choice is made at run time: SDL2 when SDL2.dll is beside the exe
+ * (it is delay-loaded, see CMakeLists.txt), XInput when it is not or when
+ * PAD_BACKEND=xinput asks for it. A missing DLL costs the Sony pads, not the
+ * start of the exe or the Xbox pads.
  */
 
 #include <time.h>
@@ -41,7 +45,10 @@ static double pad_clock(unsigned long long t0_ms)
  * Backend selection
  * -----------------------------------------------------------------------*/
 
-#if defined(PS3RECOMP_PAD_USE_SDL2)
+#if defined(PS3RECOMP_PAD_USE_SDL2) && defined(_WIN32)
+  #define PAD_BACKEND_SDL2  1
+  #define PAD_BACKEND_XINPUT 1   /* both; s_pad_use_sdl picks one at run time */
+#elif defined(PS3RECOMP_PAD_USE_SDL2)
   #define PAD_BACKEND_SDL2  1
   #define PAD_BACKEND_XINPUT 0
 #elif defined(_WIN32)
@@ -67,6 +74,42 @@ static double pad_clock(unsigned long long t0_ms)
 #if PAD_BACKEND_SDL2
   #include <SDL2/SDL.h>
 #endif
+
+/* Which backend reads the pads: 1 = SDL2, 0 = XInput (both are built only on
+ * Windows with PS3RECOMP_PAD_USE_SDL2; otherwise it is fixed). */
+#if PAD_BACKEND_SDL2 && PAD_BACKEND_XINPUT
+static int s_pad_use_sdl;
+#elif PAD_BACKEND_SDL2
+#define s_pad_use_sdl 1
+#else
+#define s_pad_use_sdl 0
+#endif
+
+/* Deadzone for analog sticks (same as XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) and
+ * the trigger level (0-255) that counts as L2/R2 pressed. The SDL2 backend
+ * uses both on Windows too, so a pad reads the same whichever backend runs. */
+#define PAD_STICK_DEADZONE  7849
+#define PAD_TRIGGER_THRESHOLD 30
+
+/* A stick axis (-32768..32767, up/left negative) to 0-255 centred on 128,
+ * with a deadzone. */
+static inline u8 pad_stick_to_u8(int raw, int deadzone)
+{
+    float normalized;
+    if (raw > deadzone)
+        normalized = (float)(raw - deadzone) / (float)(32767 - deadzone);
+    else if (raw < -deadzone)
+        normalized = (float)(raw + deadzone) / (float)(32767 - deadzone);
+    else
+        normalized = 0.0f;
+    if (normalized < -1.0f) normalized = -1.0f;   /* -32768 */
+
+    /* Map -1.0..1.0 to 0..255 with center at 128 */
+    int val = (int)(normalized * 127.0f) + 128;
+    if (val < 0) val = 0;
+    if (val > 255) val = 255;
+    return (u8)val;
+}
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -133,10 +176,21 @@ void cellPad_set_host_input(cellPad_host_input_fn fn, void* user)
     s_host_input_fn = fn;
 }
 
+/* Every host pad as port 0 (cellPad_set_merge_host_pads); the host port
+ * touched last, whose sticks port 0 reads and whose motors it drives. */
+static volatile int s_pad_merge;
+static volatile int s_pad_active;
+
+void cellPad_set_merge_host_pads(int on)
+{
+    s_pad_merge = on ? 1 : 0;
+}
+
 int cellPad_host_kind(u32 port)
 {
     if (port >= PAD_MAX_HOST_PORTS) return CELL_PAD_HOST_NONE;
     if (port == 0 && s_host_input_fn && (s_host_keyboard_last || !s_host_pad0)) return CELL_PAD_HOST_NONE;
+    if (s_pad_merge) return port == 0 ? s_host_kind[s_pad_active] : CELL_PAD_HOST_NONE;
     return s_host_kind[port];
 }
 
@@ -211,6 +265,8 @@ typedef struct {
     unsigned long long sent_ms; /* when (pad_now_ms), 0 = nothing to renew */
 } PadRumble;
 static PadRumble s_rumble[PAD_MAX_HOST_PORTS];
+/* cellPadSetActDirect: 1 = an unchanged request does nothing (see there). */
+volatile int g_pad_act_same = 1;
 
 static unsigned long long pad_now_ms(void);
 
@@ -226,10 +282,6 @@ static void pad_rumble_levels(u8 small_on, u8 large, u16* lo, u16* hi)
  * -----------------------------------------------------------------------*/
 
 #if PAD_BACKEND_XINPUT
-
-/* Deadzone for analog sticks (same as XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) */
-#define PAD_STICK_DEADZONE  7849
-#define PAD_TRIGGER_THRESHOLD 30
 
 /* XInput is resolved at run time. Only XInputGetState and XInputSetState are
  * called, and XInput9_1_0.dll exports both, so any of the three DLLs serves.
@@ -266,19 +318,7 @@ static int pad_xinput_load(void)
 
 static u8 pad_xinput_stick_to_u8(short raw, short deadzone)
 {
-    float normalized;
-    if (raw > deadzone)
-        normalized = (float)(raw - deadzone) / (float)(32767 - deadzone);
-    else if (raw < -deadzone)
-        normalized = (float)(raw + deadzone) / (float)(32767 - deadzone);
-    else
-        normalized = 0.0f;
-
-    /* Map -1.0..1.0 to 0..255 with center at 128 */
-    int val = (int)(normalized * 127.0f) + 128;
-    if (val < 0) val = 0;
-    if (val > 255) val = 255;
-    return (u8)val;
+    return pad_stick_to_u8(raw, deadzone);
 }
 
 /* An empty slot is re-probed once a second, not on every sweep. Asking
@@ -368,15 +408,22 @@ static void pad_poll_xinput(void)
     }
 }
 
-static void pad_init_backend(void)
+static void pad_xinput_init(void)
 {
     /* XInput needs no explicit init, only the run-time load of the DLL */
     pad_xinput_load();
 }
 
-static void pad_shutdown_backend(void)
+static void pad_xinput_shutdown(void)
 {
-    /* XInput needs no explicit shutdown */
+    /* XInput needs no explicit shutdown; the motors are stopped */
+    if (!p_xi_set_state) return;
+    for (int i = 0; i < PAD_MAX_HOST_PORTS && i < XUSER_MAX_COUNT; i++) {
+        if (!s_rumble[i].lo && !s_rumble[i].hi) continue;
+        XINPUT_VIBRATION vib = { 0, 0 };
+        p_xi_set_state((DWORD)i, &vib);
+    }
+    memset(s_rumble, 0, sizeof s_rumble);
 }
 
 #endif /* PAD_BACKEND_XINPUT */
@@ -414,6 +461,7 @@ static SDL_GameController* s_sdl_controllers[PAD_MAX_HOST_PORTS];
 static SDL_JoystickGUID    s_sdl_last_guid[PAD_MAX_HOST_PORTS];
 static int                 s_sdl_had[PAD_MAX_HOST_PORTS];
 
+#ifndef _WIN32   /* Windows: pad_stick_to_u8, with the XInput backend's deadzone */
 static u8 pad_sdl_axis_to_u8(int raw)
 {
     /* SDL axis: -32768..32767 -> 0..255, a centred stick exactly 128 (the
@@ -423,6 +471,7 @@ static u8 pad_sdl_axis_to_u8(int raw)
     if (val > 255) val = 255;
     return (u8)val;
 }
+#endif
 
 static u8 pad_sdl_trigger_to_u8(int raw)
 {
@@ -607,6 +656,19 @@ static void pad_sdl_read(PadHostState* st)
         /* Triggers via axis */
         int lt = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_TRIGGERLEFT);
         int rt = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_TRIGGERRIGHT);
+#ifdef _WIN32
+        /* As the XInput backend reads a pad (it is the one this replaces):
+         * the same trigger level for L2/R2 and the same stick deadzone, so an
+         * Xbox pad plays the same through either, and a DualShock 4 /
+         * DualSense gets that deadzone too. SDL's Y axes already point down. */
+        if (pad_sdl_trigger_to_u8(lt) > PAD_TRIGGER_THRESHOLD) btns |= CELL_PAD_CTRL_L2;
+        if (pad_sdl_trigger_to_u8(rt) > PAD_TRIGGER_THRESHOLD) btns |= CELL_PAD_CTRL_R2;
+        hs->buttons = btns;
+        hs->analog_lx = pad_stick_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTX), PAD_STICK_DEADZONE);
+        hs->analog_ly = pad_stick_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTY), PAD_STICK_DEADZONE);
+        hs->analog_rx = pad_stick_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTX), PAD_STICK_DEADZONE);
+        hs->analog_ry = pad_stick_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTY), PAD_STICK_DEADZONE);
+#else
         if (lt > 3000) btns |= CELL_PAD_CTRL_L2;
         if (rt > 3000) btns |= CELL_PAD_CTRL_R2;
 
@@ -617,6 +679,7 @@ static void pad_sdl_read(PadHostState* st)
         hs->analog_ly = pad_sdl_axis_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTY));
         hs->analog_rx = pad_sdl_axis_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTX));
         hs->analog_ry = pad_sdl_axis_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTY));
+#endif
 
         /* Triggers */
         hs->trigger_l2 = pad_sdl_trigger_to_u8(lt);
@@ -717,7 +780,7 @@ static void pad_poll_sdl2(void)
     SDL_UnlockMutex(s_sdl_lock);
 }
 
-static void pad_init_backend(void)
+static void pad_sdl_init(void)
 {
     if (!s_sdl_lock) s_sdl_lock = SDL_CreateMutex();
     memset(s_sdl_state, 0, sizeof s_sdl_state);
@@ -734,7 +797,7 @@ static void pad_init_backend(void)
     }
 }
 
-static void pad_shutdown_backend(void)
+static void pad_sdl_shutdown(void)
 {
     if (s_sdl_thread) {
         s_sdl_quit = 1;
@@ -945,6 +1008,161 @@ static void pad_poll_host_input(void)
     if (in.r2 > hs->trigger_r2) hs->trigger_r2 = in.r2;
 }
 
+/* ---------------------------------------------------------------------------
+ * Backend choice, rumble routing, merged pads
+ * -----------------------------------------------------------------------*/
+
+int cellPad_host_backend(void)
+{
+    return s_pad_use_sdl ? CELL_PAD_BACKEND_SDL2 : CELL_PAD_BACKEND_XINPUT;
+}
+
+/* Host port i had a pad at the last sweep (before the merge empties ports
+ * 1-3): where a rumble request may go. */
+static int s_host_present[PAD_MAX_HOST_PORTS];
+
+/* Ask host port `host`'s motors for lo/hi. poll_locked: the caller holds the
+ * poll lock (the sweep); otherwise nothing is held. */
+static void pad_rumble_host(int host, u16 lo, u16 hi, int poll_locked)
+{
+    if (host < 0 || host >= PAD_MAX_HOST_PORTS) return;
+    if (s_pad_use_sdl) {
+#if PAD_BACKEND_SDL2
+        if (s_sdl_thread) {
+            /* The pad thread sends it (pad_sdl_rumble_apply). */
+            SDL_LockMutex(s_sdl_lock);
+            s_rumble[host].lo = lo;
+            s_rumble[host].hi = hi;
+            s_sdl_rumble_new[host] = 1;
+            SDL_UnlockMutex(s_sdl_lock);
+        } else {
+            /* No pad thread: the guest's polls talk to SDL, so this waits for one. */
+            if (!poll_locked) pad_lock();
+            s_rumble[host].lo = lo;
+            s_rumble[host].hi = hi;
+            pad_sdl_rumble_send(host);
+            if (!poll_locked) pad_unlock();
+        }
+#endif
+    } else {
+#if PAD_BACKEND_XINPUT
+        s_rumble[host].lo = lo;
+        s_rumble[host].hi = hi;
+        /* XInput keeps the motors at what they were last set to: no renewal. */
+        if (s_host_present[host] && p_xi_set_state && host < XUSER_MAX_COUNT) {
+            XINPUT_VIBRATION vib;
+            vib.wLeftMotorSpeed  = (WORD)lo;
+            vib.wRightMotorSpeed = (WORD)hi;
+            p_xi_set_state((DWORD)host, &vib);
+        }
+#endif
+    }
+    (void)poll_locked;
+}
+
+/* Port 0's last actuator request, for the pad that becomes the active one. */
+static volatile u16 s_merge_lo, s_merge_hi;
+
+/* The player is on this pad: a button, a trigger or a stick well off centre
+ * (the same test as the keyboard-or-pad one in pad_poll_host_input). */
+static int pad_host_used(const PadHostState* hs)
+{
+    return hs->connected &&
+           (hs->buttons || hs->trigger_l2 > 48 || hs->trigger_r2 > 48 ||
+            abs((int)hs->analog_lx - 128) > 56 || abs((int)hs->analog_ly - 128) > 56 ||
+            abs((int)hs->analog_rx - 128) > 56 || abs((int)hs->analog_ry - 128) > 56);
+}
+
+/* cellPad_set_merge_host_pads: every host pad plays port 0, for a title with
+ * one player. Port 0 takes the buttons of all of them and the sticks of the
+ * one touched last (a resting stick on the other pad must not hold its own
+ * centre against it); ports 1-3 read as empty. The active pad changes when
+ * another one is used and the active one is not, or when it goes away, and
+ * the motors follow it. Under the poll lock. */
+static void pad_merge_hosts(void)
+{
+    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) s_host_present[i] = s_host_state[i].connected;
+    if (!s_pad_merge) return;
+
+    const int old = s_pad_active;
+    int act = old;
+    if (!s_host_state[act].connected || !pad_host_used(&s_host_state[act])) {
+        for (int i = 0; i < PAD_MAX_HOST_PORTS; i++)
+            if (i != act && pad_host_used(&s_host_state[i])) { act = i; break; }
+    }
+    if (!s_host_state[act].connected) {
+        for (int i = 0; i < PAD_MAX_HOST_PORTS; i++)
+            if (s_host_state[i].connected) { act = i; break; }
+    }
+
+    PadHostState m = s_host_state[act];
+    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
+        const PadHostState* o = &s_host_state[i];
+        if (i == act || !o->connected) continue;
+        m.buttons |= o->buttons;
+#define PAD_MAX_FIELD(f) if (o->f > m.f) m.f = o->f
+        PAD_MAX_FIELD(trigger_l2); PAD_MAX_FIELD(trigger_r2);
+        PAD_MAX_FIELD(press_right); PAD_MAX_FIELD(press_left); PAD_MAX_FIELD(press_up);
+        PAD_MAX_FIELD(press_down); PAD_MAX_FIELD(press_triangle); PAD_MAX_FIELD(press_circle);
+        PAD_MAX_FIELD(press_cross); PAD_MAX_FIELD(press_square); PAD_MAX_FIELD(press_l1);
+        PAD_MAX_FIELD(press_r1);
+#undef PAD_MAX_FIELD
+    }
+    if (!m.connected) pad_host_release(&m);   /* no pad at all */
+    s_host_state[0] = m;
+    for (int i = 1; i < PAD_MAX_HOST_PORTS; i++) pad_host_release(&s_host_state[i]);
+
+    if (act != old) {
+        s_pad_active = act;
+        const u16 lo = s_merge_lo, hi = s_merge_hi;
+        if (lo || hi) {
+            pad_rumble_host(old, 0, 0, 1);
+            pad_rumble_host(act, lo, hi, 1);
+        }
+        printf("[cellPad] port 0 follows host pad %d\n", act);
+        fflush(stdout);
+    }
+}
+
+static void pad_init_backend(void)
+{
+#if PAD_BACKEND_SDL2 && PAD_BACKEND_XINPUT
+    /* SDL2.dll is delay-loaded: load it from the exe's folder (or System32)
+     * here, and the first SDL call binds to it. Without it, XInput. */
+    const char* want = getenv("PAD_BACKEND");
+    s_pad_use_sdl = !(want && (want[0] == 'x' || want[0] == 'X'));
+    if (s_pad_use_sdl &&
+        !LoadLibraryExW(L"SDL2.dll", NULL, LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32)) {
+        printf("[cellPad] no SDL2.dll beside the exe: XInput pads only\n");
+        s_pad_use_sdl = 0;
+    }
+    if (s_pad_use_sdl) {
+        SDL_version v;
+        SDL_GetVersion(&v);
+        printf("[cellPad] SDL %d.%d.%d: Xbox, DualShock 4, DualSense and other pads\n", v.major, v.minor, v.patch);
+        pad_sdl_init();
+    } else {
+        if (want && *want) printf("[cellPad] PAD_BACKEND=%s: XInput\n", want);
+        pad_xinput_init();
+    }
+    fflush(stdout);
+#elif PAD_BACKEND_SDL2
+    pad_sdl_init();
+#else
+    pad_xinput_init();
+#endif
+}
+
+static void pad_shutdown_backend(void)
+{
+#if PAD_BACKEND_SDL2
+    if (s_pad_use_sdl) { pad_sdl_shutdown(); return; }
+#endif
+#if PAD_BACKEND_XINPUT
+    pad_xinput_shutdown();
+#endif
+}
+
 static void pad_poll_sweep(void);
 static void pad_poll_backend(void)
 {
@@ -983,11 +1201,13 @@ static void pad_poll_sweep(void)
           return;
       } }
 
-#if PAD_BACKEND_XINPUT
-    pad_poll_xinput();
-#elif PAD_BACKEND_SDL2
-    pad_poll_sdl2();
+#if PAD_BACKEND_SDL2
+    if (s_pad_use_sdl) pad_poll_sdl2();
 #endif
+#if PAD_BACKEND_XINPUT
+    if (!s_pad_use_sdl) pad_poll_xinput();
+#endif
+    pad_merge_hosts();
     if (s_host_input_fn) {
         pad_poll_host_input();
         return;
@@ -1029,9 +1249,16 @@ s32 cellPadInit(u32 max_connect)
     pad_poll_backend();
     /* What is there at start is the baseline; only later changes are
      * flagged CELL_PAD_STATUS_ASSIGN_CHANGES. */
+    /* PAD_ASSIGN_AT_INIT=1: report the pads present at init as newly assigned
+     * (ASSIGN_CHANGES on the first GetInfo/GetInfo2), as RPCS3 and libpad do
+     * for a controller that is connected when the title starts. A title that
+     * binds a pad to a player slot only on that flag otherwise read and
+     * dropped every GetData packet, and "Press START" never advanced. */
+    static int s_assign_init = -1;
+    if (s_assign_init < 0) { const char* e = getenv("PAD_ASSIGN_AT_INIT"); s_assign_init = e && *e == '1'; }
     for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
         s_port_reported[i] = s_host_state[i].connected || i == 0;
-        s_port_changed[i] = 0;
+        s_port_changed[i] = s_assign_init ? s_port_reported[i] : 0;
     }
 
     return CELL_OK;
@@ -1712,40 +1939,29 @@ s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param)
     if (port_no >= PAD_MAX_HOST_PORTS)
         return CELL_OK;
 
+    /* Merged pads: port 0's motors are the active pad's; 1-3 have none. */
+    int host = (int)port_no;
+    if (s_pad_merge) {
+        if (port_no != 0) return CELL_OK;
+        host = s_pad_active;
+    }
+
     u16 lo, hi;
     pad_rumble_levels(param->motor[CELL_PAD_ACTUATOR_PARAM_SMALL],
                       param->motor[CELL_PAD_ACTUATOR_PARAM_LARGE], &lo, &hi);
 
-#if PAD_BACKEND_XINPUT
-    s_rumble[port_no].lo = lo;
-    s_rumble[port_no].hi = hi;
-    /* XInput keeps the motors at what they were last set to: no renewal. */
-    if (s_host_state[port_no].connected) {
-        XINPUT_VIBRATION vib;
-        vib.wLeftMotorSpeed  = (WORD)lo;
-        vib.wRightMotorSpeed = (WORD)hi;
-        if (p_xi_set_state) p_xi_set_state((DWORD)port_no, &vib);
-    }
-#endif
+    /* Titles call this every frame with the same values (often
+     * zeros, from the main thread, which then waited on the pad lock / SDL
+     * mutex behind the pad thread's poll -- ~3% of the main thread in a busy
+     * stage). The motors already hold what was asked (renewal is the pad
+     * thread's), so an unchanged request does nothing. A pad that goes away
+     * clears s_rumble, so its successor still gets the next request.
+     * g_pad_act_same = 0: every call talks to the controller, as before. */
+    if (port_no == 0) { s_merge_lo = lo; s_merge_hi = hi; }
+    if (g_pad_act_same && s_rumble[host].lo == lo && s_rumble[host].hi == hi)
+        return CELL_OK;
 
-#if PAD_BACKEND_SDL2
-    if (s_sdl_thread) {
-        /* The pad thread sends it (pad_sdl_rumble_apply). */
-        SDL_LockMutex(s_sdl_lock);
-        s_rumble[port_no].lo = lo;
-        s_rumble[port_no].hi = hi;
-        s_sdl_rumble_new[port_no] = 1;
-        SDL_UnlockMutex(s_sdl_lock);
-    } else {
-        /* No pad thread: the guest's polls talk to SDL, so this waits for one. */
-        pad_lock();
-        s_rumble[port_no].lo = lo;
-        s_rumble[port_no].hi = hi;
-        pad_sdl_rumble_send((int)port_no);
-        pad_unlock();
-    }
-#endif
-
+    pad_rumble_host(host, lo, hi, 0);
     return CELL_OK;
 }
 

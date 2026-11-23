@@ -169,7 +169,14 @@ if(NOT WIN32 OR PS3RECOMP_PAD_SDL2)
             target_link_libraries(ps3recomp_runtime PRIVATE ${SDL2_LIBRARIES})
         endif()
         if(WIN32)
-            message(STATUS "  SDL2:         found (input backend)")
+            # Delay-loaded: cellPad.c loads SDL2.dll itself at cellPadInit and
+            # reads XInput when it is not there, so a missing DLL costs the
+            # pads SDL2 adds, not the start of the exe.
+            if(MSVC)
+                target_link_options(ps3recomp_runtime INTERFACE "/DELAYLOAD:SDL2.dll")
+                target_link_libraries(ps3recomp_runtime INTERFACE delayimp)
+            endif()
+            message(STATUS "  SDL2:         found (input backend; XInput when SDL2.dll is missing)")
         else()
             message(STATUS "  SDL2:         found (input + audio backends enabled)")
         endif()

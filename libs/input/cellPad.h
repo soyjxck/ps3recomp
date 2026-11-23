@@ -229,6 +229,18 @@ typedef struct CellPadHostInput {
 typedef int (*cellPad_host_input_fn)(void* user, int focused, CellPadHostInput* out);
 void cellPad_set_host_input(cellPad_host_input_fn fn, void* user);
 
+/* For a title with one player: every host pad plays port 0 (buttons from all
+ * of them, sticks from the one touched last), ports 1-3 read as empty, and
+ * port 0's rumble and cellPad_host_kind(0) follow the pad touched last. Off
+ * by default; set before cellPadInit or at any time after. */
+void cellPad_set_merge_host_pads(int on);
+
+/* Which backend reads the host's pads. XInput tells no pad family apart (all
+ * read as CELL_PAD_HOST_XBOX); SDL2 does. */
+#define CELL_PAD_BACKEND_XINPUT 1
+#define CELL_PAD_BACKEND_SDL2   2
+int cellPad_host_backend(void);
+
 #ifdef __cplusplus
 }
 #endif

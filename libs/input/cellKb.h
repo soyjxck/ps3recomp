@@ -28,7 +28,7 @@ extern "C" {
  * Constants
  * -----------------------------------------------------------------------*/
 
-#define CELL_KB_MAX_KEYBOARDS       2
+#define CELL_KB_MAX_KEYBOARDS       127   /* SDK value (RPCS3 cellKb.h); titles init with up to 127 */
 #define CELL_KB_MAX_KEYCODES        62
 
 /* Read modes */
