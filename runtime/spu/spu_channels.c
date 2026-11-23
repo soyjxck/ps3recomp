@@ -2002,6 +2002,9 @@ void spu_overlay_register_region(uint32_t content_ea, uint32_t span, int image_i
  * transfer. Any later GET into the span resets the slot to pending (contiguous
  * continuation) or clears it (anything else), see spu_overlay_note_get. */
 enum { SPU_OVERLAY_PENDING = 1, SPU_OVERLAY_VERIFIED, SPU_OVERLAY_REJECTED };
+/* Nonzero: streamed regions of image id >= this are not made resident (they run interpreted).
+ * Set by a port for an in-run A/B of newly lifted overlays; 0 = all. */
+volatile int g_spu_ovl_skip_from = 0;
 #define SPU_OVERLAY_CODE_SEGMENTS 8u
 int spu_overlay_register_verified_region(uint32_t content_ea, uint32_t load_lsa,
     uint32_t span, int image_id, const spu_overlay_code_segment* code, unsigned count)
@@ -2258,6 +2261,8 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
                 if (lsa + o->span > SPU_LS_SIZE) return;
                 /* Verified code was lifted for one load address. */
                 if (o->code && lsa != o->load_lsa) continue;
+                /* A port's live A/B switch: leave images from this id up interpreted. */
+                if (g_spu_ovl_skip_from && o->image_id >= g_spu_ovl_skip_from) continue;
                 for (unsigned slot = 0; slot < 4; ++slot) {
                     if (ctx->resident_code[slot].image_id && ctx->resident_code[slot].lsa != lsa)
                         continue;
@@ -2684,14 +2689,17 @@ static int spu_smc_microstep(spu_context* ctx)
         const uint32_t return_pc = ctx->drain_ret_pc;
         /* How much runs interpreted: the interpreter is 50-100x slower
          * than lifted code, so a job that lands here often is a stall.
-         * Reported every 64 hand-offs with the image and the time. */
+         * Reported every 65536 hand-offs (and any over 2 ms) with the image
+         * and the time: every 64th was ~600 lines a second in a busy
+         * scene (the policy module hands off ~38,000 times a second, 0 steps
+         * each), filling the log and costing the SPU workers the writes. */
         static long long s_n, s_steps; static double s_ms;
         extern uint64_t g_spu_interp_steps;
         const uint64_t t0 = spu_host_ns();
         uint32_t result = spu_interp_run_until(ctx, pc, return_pc);
         const double ms = (double)(spu_host_ns() - t0) / 1e6;
         s_ms += ms; s_steps += (long long)g_spu_interp_steps;
-        if ((++s_n % 64) == 1 || ms > 2.0)
+        if ((++s_n % 65536) == 1 || ms > 2.0)
             fprintf(stderr, "[spu-smc] interpreter hand-offs: %lld, %.1f ms, %lld steps in all; this one img=%d from 0x%05X: %.2f ms, %llu steps\n",
                     s_n, s_ms, s_steps, ctx->image_id, pc, ms, (unsigned long long)g_spu_interp_steps);
         /* A live interpreter rejoin is a transfer, not a host return. Nested
