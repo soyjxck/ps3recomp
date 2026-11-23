@@ -364,7 +364,11 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
      * it is 0 -- so the job never runs and never clears its completion
      * counter. Hand it the free 16 bytes after the context (zeroed); the crt
      * only stashes the pointer and clears the field again. */
-    uint32_t jm_iface = memcmp(ls + 0x30, "JOBCRT Ver13", 12) == 0 ? ctx_ls + 0x30 : 0;
+    /* Ver14 (SDK 3.3+; CRI Atom's mixer/decoder jobs) has the same check: with
+     * the field 0 it STOPDs (0x28000000) right after the crt's init call, so
+     * every job returned without one DMA and the title played silence. */
+    uint32_t jm_iface = (memcmp(ls + 0x30, "JOBCRT Ver13", 12) == 0 ||
+                         memcmp(ls + 0x30, "JOBCRT Ver14", 12) == 0) ? ctx_ls + 0x30 : 0;
     /* The same crt also reads the SPURS kernel context with ABSOLUTE loads
      * (lqa): spuNum at 0x1C8 (cellSpursGetCurrentSpuId), the trace buffer at
      * 0x210, a trace-enable byte at 0x175. On hardware the kernel owns
