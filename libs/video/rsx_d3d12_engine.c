@@ -1228,6 +1228,53 @@ static void eng_buffer_release(void* user, u32 h)
 
 /* ---- window ---------------------------------------------------------------- */
 
+/* The display the window is on: borderless and full screen cover that one,
+ * and a window is centred on it. With several displays the primary is only
+ * where a window starts by default -- moved to another (Win+Shift+arrow), or
+ * started from a launcher that sat on another, the window's mode is laid out
+ * for the one it is on, at that display's size and place on the desktop.
+ * Before there is a window, the display is the one RSX_WINDOW_AT=<x>,<y>
+ * names by a point of the desktop (a port's launcher: where its own window
+ * was), else the primary. */
+static HMONITOR s_monitor;      /* the display the mode was laid out for */
+static RECT s_mon_rect;         /* its rectangle on the desktop */
+static volatile LONG s_moved;   /* the window moved or the displays changed: look again (the pump) */
+
+static HMONITOR eng_monitor(RECT* rc)
+{
+    HMONITOR m;
+    if (s_hwnd) {
+        m = MonitorFromWindow(s_hwnd, MONITOR_DEFAULTTONEAREST);
+    } else {
+        POINT at = {0, 0};
+        DWORD how = MONITOR_DEFAULTTOPRIMARY;
+        const char* e = getenv("RSX_WINDOW_AT");
+        int x, y;
+        if (e && sscanf(e, "%d,%d", &x, &y) == 2) { at.x = x; at.y = y; how = MONITOR_DEFAULTTONEAREST; }
+        m = MonitorFromPoint(at, how);
+    }
+    MONITORINFO mi;
+    memset(&mi, 0, sizeof mi);
+    mi.cbSize = sizeof mi;
+    if (m && GetMonitorInfoA(m, &mi)) {
+        *rc = mi.rcMonitor;
+    } else {
+        rc->left = rc->top = 0;
+        rc->right = GetSystemMetrics(SM_CXSCREEN);
+        rc->bottom = GetSystemMetrics(SM_CYSCREEN);
+    }
+    return m;
+}
+
+/* Where a window of this outer size sits centred on the display. */
+static void eng_centred(int w, int h, int* x, int* y)
+{
+    *x = s_mon_rect.left + ((s_mon_rect.right - s_mon_rect.left) - w) / 2;
+    *y = s_mon_rect.top + ((s_mon_rect.bottom - s_mon_rect.top) - h) / 2;
+    if (*x < s_mon_rect.left) *x = s_mon_rect.left;
+    if (*y < s_mon_rect.top) *y = s_mon_rect.top;
+}
+
 static LRESULT CALLBACK eng_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     /* The mouse, for a port played with it (rsx_host_mouse.h); and Escape,
@@ -1238,6 +1285,10 @@ static LRESULT CALLBACK eng_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_CLOSE:   s_window_closed = 1; DestroyWindow(hwnd); return 0;
     case WM_ACTIVATEAPP:
         if (wp && s_display == DISP_FULLSCREEN) s_fs_restore = 1;
+        break;
+    case WM_WINDOWPOSCHANGED:
+    case WM_DISPLAYCHANGE:
+        s_moved = 1;
         break;
     case WM_DESTROY: PostQuitMessage(0); return 0;
     case WM_KEYDOWN:
@@ -1267,13 +1318,16 @@ static HWND eng_create_window(u32 width, u32 height, const char* title)
          * (no mode switch, so alt-tab and the flip model behave as in a
          * window); for exclusive full screen DXGI takes it from here. */
         return CreateWindowExA(0, "ps3recomp_d3d12_engine", title ? title : "ps3recomp (D3D12)",
-                               WS_POPUP | WS_VISIBLE, 0, 0, (int)width, (int)height,
+                               WS_POPUP | WS_VISIBLE, s_mon_rect.left, s_mon_rect.top, (int)width, (int)height,
                                NULL, NULL, GetModuleHandle(NULL), NULL);
     }
     RECT wr = {0, 0, (LONG)width, (LONG)height};
     AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
+    /* Where the system would put it, unless a launcher said which display. */
+    int x = CW_USEDEFAULT, y = CW_USEDEFAULT;
+    if (getenv("RSX_WINDOW_AT")) eng_centred(wr.right - wr.left, wr.bottom - wr.top, &x, &y);
     return CreateWindowExA(0, "ps3recomp_d3d12_engine", title ? title : "ps3recomp (D3D12)",
-                           WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT,
+                           WS_OVERLAPPEDWINDOW | WS_VISIBLE, x, y,
                            wr.right - wr.left, wr.bottom - wr.top,
                            NULL, NULL, GetModuleHandle(NULL), NULL);
 }
@@ -4511,9 +4565,10 @@ static void eng_swapchain_release(void)
 
 /* RSX_DISPLAY / RSX_FULLSCREEN / RSX_WINDOW -> s_display and the window
  * size: a windowed window of RSX_WINDOW (else the base size), the others
- * over the display at its current mode. */
+ * over the display the window is on (eng_monitor), at its current mode. */
 static void eng_read_display(void)
 {
+    s_monitor = eng_monitor(&s_mon_rect);
     const char* dm = getenv("RSX_DISPLAY");
     const char* fs = getenv("RSX_FULLSCREEN");
     s_display = DISP_WINDOWED;
@@ -4529,7 +4584,7 @@ static void eng_read_display(void)
     if (ws && *ws && !have_ws) fprintf(stderr, "[RSX d3d12] RSX_WINDOW=%s ignored (want <w>x<h>)\n", ws);
     s_win_w = s_width; s_win_h = s_height;
     if (s_display == DISP_WINDOWED) { if (have_ws) { s_win_w = ww; s_win_h = wh; } }
-    else { s_win_w = (u32)GetSystemMetrics(SM_CXSCREEN); s_win_h = (u32)GetSystemMetrics(SM_CYSCREEN); }
+    else { s_win_w = (u32)(s_mon_rect.right - s_mon_rect.left); s_win_h = (u32)(s_mon_rect.bottom - s_mon_rect.top); }
 }
 
 static int eng_read_vsync(void)
@@ -4549,6 +4604,7 @@ static void eng_display_reload(void)
     g_rsx_display_reload = 0;
     const EngDisplayMode od = s_display;
     const u32 ow = s_win_w, oh = s_win_h;
+    const RECT om = s_mon_rect;
     const int ov = s_vsync;
     const float os = s_scale;
     const int ohdr = s_hdr_want;
@@ -4564,25 +4620,30 @@ static void eng_display_reload(void)
     if (!hdr_new && s_hdr_on) { const EngHdrDisplay d = eng_hdr_display(); eng_hdr_levels(&d); }
     if ((u32)eng_ms_want() != s_ms_n) eng_ms_apply(eng_ms_want());
     if (s_vsync != ov) fprintf(stderr, "[RSX d3d12] vsync %d\n", s_vsync);
-    if (s_display == od && s_win_w == ow && s_win_h == oh && !hdr_new) return;
+    /* on another display now (a windowed window keeps its place) */
+    const int moved = s_display != DISP_WINDOWED && (om.left != s_mon_rect.left || om.top != s_mon_rect.top);
+    if (s_display == od && s_win_w == ow && s_win_h == oh && !hdr_new && !moved) return;
     fence_wait(fence_signal());
     const EngDisplayMode nd = s_display;
     s_display = od;
     eng_swapchain_release();
     s_display = nd;
-    if (s_display == od && s_win_w == ow && s_win_h == oh) {
+    if (s_display == od && s_win_w == ow && s_win_h == oh && !moved) {
         /* HDR alone: the window stays as it is */
     } else if (s_display == DISP_WINDOWED) {
         RECT wr = {0, 0, (LONG)s_win_w, (LONG)s_win_h};
         AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
         const int w = wr.right - wr.left, h = wr.bottom - wr.top;
-        const int x = (GetSystemMetrics(SM_CXSCREEN) - w) / 2, y = (GetSystemMetrics(SM_CYSCREEN) - h) / 2;
+        int x, y;
+        eng_centred(w, h, &x, &y);
         SetWindowLongPtrA(s_hwnd, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
-        SetWindowPos(s_hwnd, HWND_NOTOPMOST, x > 0 ? x : 0, y > 0 ? y : 0, w, h, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+        SetWindowPos(s_hwnd, HWND_NOTOPMOST, x, y, w, h, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
     } else {
         SetWindowLongPtrA(s_hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
-        SetWindowPos(s_hwnd, HWND_TOP, 0, 0, (int)s_win_w, (int)s_win_h, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+        SetWindowPos(s_hwnd, HWND_TOP, s_mon_rect.left, s_mon_rect.top, (int)s_win_w, (int)s_win_h,
+                     SWP_FRAMECHANGED | SWP_SHOWWINDOW);
     }
+    s_moved = 0;   /* (that placing is ours) */
     IDXGIFactory4* factory = NULL;
     if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory4, (void**)&factory)) || eng_swapchain_create(factory) != 0)
         fprintf(stderr, "[RSX d3d12] could not make a swap chain for the new display mode\n");
@@ -5275,6 +5336,14 @@ int rsx_d3d12_engine_pump_messages(void)
 {
     if (s_headless) return 0;
     if (s_ready && s_swap) eng_hdr_poll();
+    if (s_moved && s_ready && s_swap) {
+        s_moved = 0;
+        if (s_display != DISP_WINDOWED && !IsIconic(s_hwnd)) {
+            RECT rc;
+            eng_monitor(&rc);
+            if (memcmp(&rc, &s_mon_rect, sizeof rc)) g_rsx_display_reload = 1;
+        }
+    }
     if (g_rsx_display_reload && s_ready && s_swap) eng_display_reload();
     MSG msg;
     while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {

@@ -1073,6 +1073,8 @@ static void eng_collect_retired_buffers(void)
 /* ---- window ---------------------------------------------------------------------- */
 
 #ifdef _WIN32
+static RECT s_mon_rect;   /* the display the window is on (eng_screen_size) */
+
 static LRESULT CALLBACK eng_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     /* The mouse, for a port played with it (rsx_host_mouse.h); and Escape,
@@ -1104,7 +1106,8 @@ static HWND eng_create_window(u32 width, u32 height, const char* title)
     SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
     if (s_display != DISP_WINDOWED)
         return CreateWindowExA(0, wc.lpszClassName, title ? title : "ps3recomp (Vulkan)", WS_POPUP | WS_VISIBLE,
-                               0, 0, (int)width, (int)height, NULL, NULL, GetModuleHandle(NULL), NULL);
+                               s_mon_rect.left, s_mon_rect.top, (int)width, (int)height, NULL, NULL,
+                               GetModuleHandle(NULL), NULL);
     RECT wr = {0, 0, (LONG)width, (LONG)height};
     AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
     return CreateWindowExA(0, wc.lpszClassName, title ? title : "ps3recomp (Vulkan)", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
@@ -1112,12 +1115,35 @@ static HWND eng_create_window(u32 width, u32 height, const char* title)
                            NULL, NULL, GetModuleHandle(NULL), NULL);
 }
 
-/* The screen the window is (to be) on, in pixels: what a borderless window
- * covers. */
+/* The display the window is on, as a rectangle of the desktop: what a
+ * borderless window covers. Before there is a window it is the one
+ * RSX_WINDOW_AT=<x>,<y> names by a point of the desktop (a port's launcher:
+ * where its own window was), else the primary. */
 static void eng_screen_size(u32* w, u32* h)
 {
-    *w = (u32)GetSystemMetrics(SM_CXSCREEN);
-    *h = (u32)GetSystemMetrics(SM_CYSCREEN);
+    HMONITOR m;
+    if (s_hwnd) {
+        m = MonitorFromWindow(s_hwnd, MONITOR_DEFAULTTONEAREST);
+    } else {
+        POINT at = {0, 0};
+        DWORD how = MONITOR_DEFAULTTOPRIMARY;
+        const char* e = getenv("RSX_WINDOW_AT");
+        int x, y;
+        if (e && sscanf(e, "%d,%d", &x, &y) == 2) { at.x = x; at.y = y; how = MONITOR_DEFAULTTONEAREST; }
+        m = MonitorFromPoint(at, how);
+    }
+    MONITORINFO mi;
+    memset(&mi, 0, sizeof mi);
+    mi.cbSize = sizeof mi;
+    if (m && GetMonitorInfoA(m, &mi)) {
+        s_mon_rect = mi.rcMonitor;
+    } else {
+        s_mon_rect.left = s_mon_rect.top = 0;
+        s_mon_rect.right = GetSystemMetrics(SM_CXSCREEN);
+        s_mon_rect.bottom = GetSystemMetrics(SM_CYSCREEN);
+    }
+    *w = (u32)(s_mon_rect.right - s_mon_rect.left);
+    *h = (u32)(s_mon_rect.bottom - s_mon_rect.top);
 }
 #else   /* Linux: an SDL2 window */
 

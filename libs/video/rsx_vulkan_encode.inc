@@ -1940,12 +1940,18 @@ static void eng_display_reload(void)
             RECT wr = {0, 0, (LONG)s_win_w, (LONG)s_win_h};
             AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
             const int w = wr.right - wr.left, h = wr.bottom - wr.top;
-            const int x = (GetSystemMetrics(SM_CXSCREEN) - w) / 2, y = (GetSystemMetrics(SM_CYSCREEN) - h) / 2;
+            /* centred on the display the window is on */
+            u32 mw, mh;
+            eng_screen_size(&mw, &mh);
+            int x = s_mon_rect.left + ((int)mw - w) / 2, y = s_mon_rect.top + ((int)mh - h) / 2;
+            if (x < s_mon_rect.left) x = s_mon_rect.left;
+            if (y < s_mon_rect.top) y = s_mon_rect.top;
             SetWindowLongPtrA(s_hwnd, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
-            SetWindowPos(s_hwnd, HWND_NOTOPMOST, x > 0 ? x : 0, y > 0 ? y : 0, w, h, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+            SetWindowPos(s_hwnd, HWND_NOTOPMOST, x, y, w, h, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
         } else {
             SetWindowLongPtrA(s_hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
-            SetWindowPos(s_hwnd, HWND_TOP, 0, 0, (int)s_win_w, (int)s_win_h, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+            SetWindowPos(s_hwnd, HWND_TOP, s_mon_rect.left, s_mon_rect.top, (int)s_win_w, (int)s_win_h,
+                         SWP_FRAMECHANGED | SWP_SHOWWINDOW);
         }
 #endif
     }
