@@ -575,6 +575,59 @@ static void pad_sdl_rumble_send(int i)
     r->sent_ms = on ? pad_now_ms() : 0;
 }
 
+/* More controllers than SDL knows by itself. SDL opens a device as a game
+ * controller only when it has a mapping for it, and a third-party pad in its
+ * DirectInput mode -- how many leave the box -- has none built in. The
+ * community's list (gamecontrollerdb.txt, github.com/mdqinc/
+ * SDL_GameControllerDB) has most of them: it is read from beside the
+ * executable when a port ships it there, or from the file PAD_MAPPINGS
+ * names. SDL_GAMECONTROLLERCONFIG in the environment adds to it as ever. */
+static void pad_sdl_load_mappings(void)
+{
+    const char* path = getenv("PAD_MAPPINGS");
+    char beside[1024];
+    if (!path || !*path) {
+        char* base = SDL_GetBasePath();
+        if (!base) return;
+        snprintf(beside, sizeof beside, "%sgamecontrollerdb.txt", base);
+        SDL_free(base);
+        path = beside;
+    }
+    const int n = SDL_GameControllerAddMappingsFromFile(path);
+    if (n > 0) {
+        printf("[cellPad] %d controller mappings from %s\n", n, path);
+        fflush(stdout);
+    }
+}
+
+/* A stick's dead zone, in axis units (32767 is full): 8% unless
+ * PAD_DEADZONE=<percent> says otherwise (0: none). A stick at rest does not
+ * sit at its centre -- a worn one rests several percent off it -- and a PS3
+ * title's own dead zone is cut for the DualShock 3 it expects, not for the
+ * pad in the player's hands: a menu that scrolls by itself, a camera that
+ * drifts. Radial, and scaled so the edge of the dead zone reads as the centre
+ * and a full push as a full push. */
+static int s_sdl_deadzone = 32767 * 8 / 100;
+
+static void pad_sdl_stick(SDL_GameController* gc, SDL_GameControllerAxis ax, SDL_GameControllerAxis ay,
+                          u8* out_x, u8* out_y)
+{
+    int x = SDL_GameControllerGetAxis(gc, ax), y = SDL_GameControllerGetAxis(gc, ay);
+    const double dz = (double)s_sdl_deadzone;
+    if (dz > 0.0) {
+        const double m = sqrt((double)x * x + (double)y * y);
+        if (m <= dz) {
+            x = y = 0;
+        } else {
+            const double k = (m - dz) / (32767.0 - dz) * 32767.0 / m;
+            x = (int)lround(x * k);
+            y = (int)lround(y * k);
+        }
+    }
+    *out_x = pad_sdl_axis_to_u8(x);
+    *out_y = pad_sdl_axis_to_u8(y);
+}
+
 /* The subsystem, started on the pad thread. */
 static int pad_sdl_start(void)
 {
@@ -627,6 +680,11 @@ static int pad_sdl_start(void)
      * from filling with every stick movement. */
     SDL_JoystickEventState(SDL_IGNORE);
     SDL_GameControllerEventState(SDL_IGNORE);
+    pad_sdl_load_mappings();
+    if (getenv("PAD_DEADZONE")) {
+        const int pct = atoi(getenv("PAD_DEADZONE"));
+        s_sdl_deadzone = (pct < 0 ? 0 : pct > 50 ? 50 : pct) * 32767 / 100;
+    }
     return 1;
 }
 
@@ -666,11 +724,32 @@ static int pad_sdl_kind(SDL_GameController* gc)
  * after player 1 unplugged, and both ports would then read it.
  * SDL_NumJoysticks also refreshes sdl2-compat's device list, which with no
  * SDL window nothing else does. */
+/* A joystick SDL has no controller mapping for is not opened. Say so, once
+ * a device, with what identifies it: a report of "my pad does nothing" can
+ * then name the pad, and the mode it is in. */
+static void pad_sdl_note_unmapped(int d)
+{
+    static SDL_JoystickID noted[16];
+    static int count;
+    const SDL_JoystickID id = SDL_JoystickGetDeviceInstanceID(d);
+    for (int i = 0; i < count; i++)
+        if (noted[i] == id) return;
+    if (count == (int)(sizeof noted / sizeof noted[0])) return;
+    noted[count++] = id;
+    char guid[40];
+    SDL_JoystickGetGUIDString(SDL_JoystickGetDeviceGUID(d), guid, sizeof guid);
+    const char* name = SDL_JoystickNameForIndex(d);
+    printf("[cellPad] %s [%04x:%04x, %s]: no controller mapping for it, left out "
+           "(its XInput mode, or a gamecontrollerdb.txt entry, makes it a pad)\n",
+           name ? name : "joystick", SDL_JoystickGetDeviceVendor(d), SDL_JoystickGetDeviceProduct(d), guid);
+    fflush(stdout);
+}
+
 static void pad_sdl_open_new(void)
 {
     const int num = SDL_NumJoysticks();
     for (int d = 0; d < num; d++) {
-        if (!SDL_IsGameController(d)) continue;
+        if (!SDL_IsGameController(d)) { pad_sdl_note_unmapped(d); continue; }
         const SDL_JoystickID id = SDL_JoystickGetDeviceInstanceID(d);
         if (id < 0) continue;
         int slot = -1, open = 0;
@@ -694,7 +773,8 @@ static void pad_sdl_open_new(void)
         s_host_kind[slot] = pad_sdl_kind(gc);
         SDL_GameControllerRumble(gc, 0, 0, 0);   /* a new pad starts with its motors off */
         const char* name = SDL_GameControllerName(gc);
-        printf("[cellPad] port %d: %s%s\n", slot, name ? name : "controller", back ? " (reconnected)" : "");
+        printf("[cellPad] port %d: %s [%04x:%04x]%s\n", slot, name ? name : "controller",
+               SDL_GameControllerGetVendor(gc), SDL_GameControllerGetProduct(gc), back ? " (reconnected)" : "");
         fflush(stdout);
     }
 }
@@ -752,10 +832,8 @@ static void pad_sdl_read(PadHostState* st)
         hs->buttons = btns;
 
         /* Analog sticks */
-        hs->analog_lx = pad_sdl_axis_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTX));
-        hs->analog_ly = pad_sdl_axis_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTY));
-        hs->analog_rx = pad_sdl_axis_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTX));
-        hs->analog_ry = pad_sdl_axis_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTY));
+        pad_sdl_stick(gc, SDL_CONTROLLER_AXIS_LEFTX, SDL_CONTROLLER_AXIS_LEFTY, &hs->analog_lx, &hs->analog_ly);
+        pad_sdl_stick(gc, SDL_CONTROLLER_AXIS_RIGHTX, SDL_CONTROLLER_AXIS_RIGHTY, &hs->analog_rx, &hs->analog_ry);
 
         /* Triggers */
         hs->trigger_l2 = pad_sdl_trigger_to_u8(lt);
@@ -859,7 +937,7 @@ static void pad_poll_sdl2(void)
 static void pad_init_backend(void)
 {
     if (!s_sdl_lock) s_sdl_lock = SDL_CreateMutex();
-    memset(s_sdl_state, 0, sizeof s_sdl_state);
+    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) pad_host_release(&s_sdl_state[i]);
     memset(s_rumble, 0, sizeof s_rumble);
     memset(s_sdl_rumble_new, 0, sizeof s_sdl_rumble_new);
     if (s_sdl_thread) return;
