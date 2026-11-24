@@ -1,4 +1,9 @@
 /* Explicit current vertex colors must survive disabled-array fetches.
+ * What tells an explicit colour from an unwritten one is the write count on
+ * ATTR3's first 4F slot, which the draw engine's method entry keeps
+ * (rsx_draw_engine.c, eng_method_watched; rsx_dispatch_method does not count
+ * writes). The engine is not linked here: set_current() below counts as it
+ * does, and test_rsx_draw_engine.c checks the engine's own counting.
  * Build without a graphics device:
  *   cc -std=gnu17 -O2 -I include -I libs/video \
  *     libs/video/tests/test_vertex_current_color.c libs/video/rsx_vertex_compact.c \
@@ -10,7 +15,19 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* rsx_dispatch.c reads it for RSX_CONST_LOG; rsx_draw_engine.c, not linked
+ * here, defines it. */
+uint32_t g_rsx_engine_frame;
+
 static int failures;
+
+/* A write of ATTR3's current value, as it arrives through the draw engine:
+ * counted on the attribute's first 4F slot whatever the encoding, then stored. */
+static void set_current(rsx_dispatch* rsx, u32 method, u32 value)
+{
+    rsx->seen[0x1C30u >> 2]++;
+    rsx_dispatch_method(rsx, method, value);
+}
 
 static u32 float_bits(float value)
 {
@@ -60,24 +77,24 @@ int main(void)
     /* A shader can swizzle x into output alpha. Replacing this explicit
      * value with white makes transparent geometry opaque. */
     for (u32 i = 0; i < 4; i++)
-        rsx_dispatch_method(rsx, 0x1C30 + i * 4, float_bits(black[i]));
+        set_current(rsx, 0x1C30 + i * 4, float_bits(black[i]));
     check_fetch("explicit 4F color", rsx, 3, black);
 
     rsx_dispatch_init(rsx, NULL);
-    rsx_dispatch_method(rsx, 0x194C, 0xFF000000);
+    set_current(rsx, 0x194C, 0xFF000000);
     check_fetch("explicit packed 4UB color", rsx, 3, black);
 
     /* Presence is independent of value, and a write to any component
      * establishes an explicit current attribute. */
     for (u32 lane = 0; lane < 4; lane++) {
         rsx_dispatch_init(rsx, NULL);
-        rsx_dispatch_method(rsx, 0x1C30 + lane * 4, float_bits(black[lane]));
+        set_current(rsx, 0x1C30 + lane * 4, float_bits(black[lane]));
         check_fetch("single-component explicit color", rsx, 3, black);
     }
 
     rsx_dispatch_init(rsx, NULL);
     for (u32 i = 0; i < 4; i++)
-        rsx_dispatch_method(rsx, 0x1C30 + i * 4, float_bits(color[i]));
+        set_current(rsx, 0x1C30 + i * 4, float_bits(color[i]));
     check_fetch("other explicit color", rsx, 3, color);
     free(rsx);
     printf("test_vertex_current_color: %d failure(s)\n", failures);

@@ -13,6 +13,7 @@
  * substituted, so nothing here depends on real time.
  */
 #include "../cellGcmSys.c"
+#include "gcm_fork_standins.h"
 #include "../rsx_tiling.c"
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,6 +29,8 @@ void spu_coh_notify_write(uint32_t a) { (void)a; }
 void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
 ps3_guest_caller_fn g_ps3_guest_caller;
+/* The pump's GCM_USER_DELAY_LOG line names the calling guest thread. */
+PPU_THREAD_LOCAL ppu_context* g_active_ctx;
 
 static int fails;
 static void check(int ok, const char* what)

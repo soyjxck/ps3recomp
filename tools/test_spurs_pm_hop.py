@@ -37,7 +37,9 @@ with tempfile.TemporaryDirectory(prefix='spurs-pm-hop-') as tmp:
                     '-I' + str(root / 'include'), '-I' + str(root / 'runtime/spu'), '-I' + str(root / 'runtime/platform'),
                     str(root / 'tests/bench_spurs_pm_hop.c'),
                     *[str(root / 'runtime/spu' / f'{u}.c') for u in units],
-                    str(root / 'runtime/platform/win32_compat.c'), '-pthread', '-lm', '-o', str(out)], check=True)
+                    str(root / 'runtime/platform/win32_compat.c'),
+                    str(root / 'runtime/platform/env_cache.c'),
+                    str(root / 'runtime/spu/tests/fork_runtime_standins.c'), '-pthread', '-lm', '-o', str(out)], check=True)
     base = {k: v for k, v in os.environ.items() if not k.startswith(('PS3RECOMP_', 'PS3_', 'SPU_', 'SPURS_'))}
     failed = []
     for lanes in (1, 6):

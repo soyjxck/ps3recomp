@@ -35,7 +35,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix='ppu-primary-priority-') as tmp:
         tmp=Path(tmp); (tmp/'ppu_recomp.h').write_text(stub_header())
         flags=['-O1','-ffunction-sections','-fdata-sections','-pthread']
-        subprocess.run([os.environ.get('CC','cc'),*flags,'-I'+str(ROOT/'include'),'-c',str(ROOT/'runtime/syscalls/sys_ppu_thread.c'),'-o',str(tmp/'threads.o')],check=True)
+        subprocess.run([os.environ.get('CC','cc'),*flags,'-D_GNU_SOURCE','-I'+str(ROOT/'include'),'-c',str(ROOT/'runtime/syscalls/sys_ppu_thread.c'),'-o',str(tmp/'threads.o')],check=True)
         linker=['-Wl,-dead_strip'] if sys.platform=='darwin' else ['-Wl,--gc-sections','-ldl']
         subprocess.run([os.environ.get('CXX','c++'),*flags,'-std=c++17','-I'+str(tmp),'-I'+str(ROOT/'include'),'-I'+str(ROOT/'runtime/platform'),str(ROOT/'runtime/ppu/ppu_loader.cpp'),str(ROOT/'runtime/ppu/tests/test_ppu_primary_priority.cpp'),str(tmp/'threads.o'),*linker,'-o',str(tmp/'test')],check=True)
         bad_magic=bytearray(PROCESS_PARAM); bad_magic[4:8]=bytes(4)

@@ -6,10 +6,7 @@
  * the other half; a clear folded into a pass's load action covers the whole
  * attachment and took player 1's view with it.
  *
- * Run by tools/test_metal_rect_clears.py, or:
- *   clang -fobjc-arc -I include -I libs/video libs/video/tests/test_metal_rect_clears.m \
- *     libs/video/rsx_texture_layout.c -Wl,-dead_strip \
- *     -framework Metal -framework Cocoa -framework QuartzCore -o /tmp/test_metal_rect_clears
+ * Built and run by tools/test_metal_rect_clears.py.
  */
 #include "../rsx_metal_backend.m"
 

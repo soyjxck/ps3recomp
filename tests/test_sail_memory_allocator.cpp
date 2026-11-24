@@ -12,6 +12,12 @@ uint8_t* vm_base;
 uint32_t ppu_vm_size=0x10000;
 uint32_t g_ww_lo=0,g_ww_hi=0;
 int g_resv_store_active=0;
+/* the fork's runtime: no profiler, no frames drawn, no syscall in flight */
+uint32_t g_rsx_engine_frame;
+uint32_t g_sc_inflight[64];
+int ppu_prof_snapshot(int idx, unsigned* tid, unsigned* cia, const char** name)
+{ (void)idx; (void)tid; (void)cia; (void)name; return 0; }
+void ppu_prof_stamp_ra(void*,void*) {}
 ps3_guest_caller_fn g_ps3_guest_caller=nullptr;
 void ppu_hle_register_all();
 int ps3_hle_has(uint32_t);

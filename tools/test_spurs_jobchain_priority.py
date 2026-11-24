@@ -21,6 +21,7 @@ with tempfile.TemporaryDirectory(prefix='spurs-jobchain-priority-') as tmp:
         '-I'+str(root/'include'),'-I'+str(root/'runtime/spu'),'-I'+str(root/'runtime/platform'),
         str(root/'tests/test_spurs_jobchain_priority.c'),
         *[str(root/'runtime/spu'/f'{u}.c') for u in units],
-        str(root/'runtime/platform/win32_compat.c'),'-pthread','-lm','-o',str(out)],check=True)
+        str(root/'runtime/platform/win32_compat.c'),str(root/'runtime/platform/env_cache.c'),
+        str(root/'runtime/spu/tests/fork_runtime_standins.c'),'-pthread','-lm','-o',str(out)],check=True)
     env=dict(os.environ); env.pop('SPURS_JC_PARALLEL',None)
     subprocess.run([str(out)],check=True,timeout=60,env=env)

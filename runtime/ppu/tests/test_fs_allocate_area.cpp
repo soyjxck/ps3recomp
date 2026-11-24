@@ -26,6 +26,12 @@ void ppu_guest_caller(char* out, size_t n) { if (n) out[0] = 0; }
 void ps3_vfs_ps3game_fallback(char* path, size_t cap) { (void)path; (void)cap; }
 void ydkj_host_bt(const char* tag) { (void)tag; }
 void ps3_hle_register_ctx(uint32_t, const char*, void (*)(ppu_context*)) {}
+/* the fork's runtime: no page is watched, read timing off */
+void vm_watch_touch(uint32_t ea, uint32_t len) { (void)ea; (void)len; }
+void (*g_ps3_fs_host_path)(char* out, size_t cap, const char* guest);   /* cellSysutil's */
+double fs_read_time_start(void) { return 0.0; }
+void fs_read_time_log(const char* kind, int fd, uint64_t off, uint64_t size, uint64_t got, double t_start)
+{ (void)kind; (void)fd; (void)off; (void)size; (void)got; (void)t_start; }
 }
 /* ps3_dev_flash_path (runtime/platform), which host_path calls for /dev_flash: the real one, it needs nothing. */
 #include "../../platform/ps3_dev_flash.c"

@@ -15,10 +15,14 @@
  * the fallback writes CELL_OK. `sc` 53 (unregistered) pins the fallback. */
 #include "../runtime/syscalls/sys_ppu_thread.c"
 #include <assert.h>
+#include <sys/mman.h>
 #include <time.h>
 
+/* Guest memory up to the end of the stack region main() gives the threads: the fork's thread code clears a stack it
+ * hands out again (sys_ppu_thread.c, stack_take), so the stacks must be real memory. Only touched pages are backed. */
+#define GUEST_VM_SIZE 0xA0000000u
 uint8_t* vm_base;
-uint32_t ppu_vm_size = 0x10000;
+uint32_t ppu_vm_size = GUEST_VM_SIZE;
 /* Only sys_ppu_thread_yield's opt-in diagnostics read it, and sys_ppu_thread_init registers yield; no case here
  * enables one. */
 uint32_t vm_read32(uint64_t a) { uint32_t v; memcpy(&v, vm_base + (uint32_t)a, 4); return v; }
@@ -135,11 +139,12 @@ static int used_slots(void)
 
 int main(void)
 {
-    vm_base = calloc(1, 0x10000); assert(vm_base);
+    vm_base = mmap(NULL, GUEST_VM_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+    assert(vm_base != MAP_FAILED);
     lv2_syscall_table_init(&g_lv2_syscalls);
     sys_ppu_thread_init(&g_lv2_syscalls);      /* clears the thread table and registers the handlers */
     g_vm_stack_alloc.next_addr = 0x10000000u;  /* the guest stack region the threads bump-allocate from */
-    g_vm_stack_alloc.region_end = 0xA0000000u;
+    g_vm_stack_alloc.region_end = GUEST_VM_SIZE;
     g_ppu_thread_entry_trampoline = guest_entry;
     ppu_thread_register_main();
 
@@ -173,7 +178,7 @@ int main(void)
     EXPECT_EQ(g_rc53, 0);                      /* lv2_syscall()'s fallback */
     EXPECT_EQ(status, 0x53);
 
-    free(vm_base);
+    munmap(vm_base, GUEST_VM_SIZE);
     if (g_fails) { fprintf(stderr, "%d check(s) failed\n", g_fails); return 1; }
     puts("PASS: sc 41 is _sys_ppu_thread_exit and ends the caller; sc 42 answers CELL_ENOSYS; sc 53 answers the CELL_OK fallback");
     return 0;

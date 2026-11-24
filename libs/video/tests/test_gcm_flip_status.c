@@ -11,6 +11,7 @@
  * here is executed before the tick that is to complete it.
  */
 #include "../cellGcmSys.c"
+#include "gcm_fork_standins.h"
 #include "../rsx_tiling.c"
 #include <assert.h>
 uint8_t* vm_base;
@@ -25,6 +26,11 @@ void spu_coh_notify_write(uint32_t a) { (void)a; }
 void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
 ps3_guest_caller_fn g_ps3_guest_caller;
+/* The pump's GCM_USER_DELAY_LOG line and the flip request's GCM_FLIP_BT dump,
+ * unused here. */
+PPU_THREAD_LOCAL ppu_context* g_active_ctx;
+void ppu_dump_bctrl_ring(uint32_t n, const char* why) { (void)n; (void)why; }
+void ppu_dump_guest_stack(ppu_context* c, const char* why) { (void)c; (void)why; }
 int rsx_draw_engine_enabled(void) { return 0; }
 void rsx_draw_engine_note_flip(u32 id) { (void)id; }
 /* What the drain does when it reaches a flip queued in the command stream. */

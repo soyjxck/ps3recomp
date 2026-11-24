@@ -9,7 +9,13 @@
 #ifdef NDEBUG
 #undef NDEBUG
 #endif
+/* vm.h also declares the fork's texture write watch (ps3emu/vm_watch.h,
+ * runtime/platform/vm_watch.c), whose vm_watch_stats has another signature
+ * than the watch under test. That one is neither used nor linked here, so its
+ * declaration takes another name in this file. */
+#define vm_watch_stats vm_texture_watch_stats
 #include "../runtime/memory/vm.h"
+#undef vm_watch_stats
 #include "../runtime/memory/vm_watch.h"
 
 #include <assert.h>

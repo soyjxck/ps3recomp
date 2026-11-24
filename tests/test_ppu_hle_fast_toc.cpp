@@ -18,6 +18,12 @@
 extern "C" {
 uint8_t* vm_base;
 uint32_t ppu_vm_size = 0x10000;
+/* the fork's runtime: no profiler, no frames drawn, no syscall in flight */
+uint32_t g_rsx_engine_frame;
+uint32_t g_sc_inflight[64];
+int ppu_prof_snapshot(int idx, unsigned* tid, unsigned* cia, const char** name)
+{ (void)idx; (void)tid; (void)cia; (void)name; return 0; }
+void ppu_prof_stamp_ra(void*,void*) {}
 void ps3_hle_register_ctx(uint32_t, const char*, void (*)(ppu_context*));
 void ps3_hle_register_fast(uint32_t, int (*)(ppu_context*));
 void ps3_hle_call(uint32_t, ppu_context*);

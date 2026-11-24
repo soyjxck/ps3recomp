@@ -16,5 +16,6 @@ with tempfile.TemporaryDirectory(prefix='spurs-ready-count-') as tmp:
         '-I'+str(r/'include'),'-I'+str(r/'runtime/spu'),'-I'+str(r/'runtime/platform'),
         str(r/'tests/test_spurs_ready_count.c'),
         *[str(r/'runtime/spu'/f'{u}.c') for u in units],
-        str(r/'runtime/platform/win32_compat.c'),'-pthread','-lm','-o',str(out)],check=True)
+        str(r/'runtime/platform/win32_compat.c'),str(r/'runtime/platform/env_cache.c'),
+        str(r/'runtime/spu/tests/fork_runtime_standins.c'),'-pthread','-lm','-o',str(out)],check=True)
     subprocess.run([str(out)],check=True,timeout=15)

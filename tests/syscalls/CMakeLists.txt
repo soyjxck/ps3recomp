@@ -90,6 +90,9 @@ if(MSVC)
     target_compile_definitions(test_ppu_thread_join PRIVATE _CRT_SECURE_NO_WARNINGS)
 else()
     target_compile_options(test_ppu_thread_join PRIVATE -Wall -Wextra -Wno-unused-parameter -UNDEBUG)
+    # sys_ppu_thread.c names its host threads (pthread_setname_np), which
+    # glibc declares only with _GNU_SOURCE; the runtime library defines it too.
+    target_compile_definitions(test_ppu_thread_join PRIVATE _GNU_SOURCE)
     # The test's own background joiner uses CreateThread / WaitForSingleObject /
     # CloseHandle, which win32_compat.h declares off Windows and win32_compat.c
     # implements on pthreads.

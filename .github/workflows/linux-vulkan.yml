@@ -8,10 +8,9 @@
 #   - with guest programs, the shared register-file draw engine (the path the
 #     Metal backend takes): the draw scenes, including the ones only a
 #     translating backend can pass (--shader, --mip, --rtt, --depthtex, --mrt,
-#     --mrt-a), under the Khronos validation layer. Not --cube: this fork's
-#     Vulkan backend has no cube maps yet (upstream's engine work is not
-#     merged); --depthbounds runs and reports itself skipped for the same
-#     reason.
+#     --mrt-a, --cube), plus --depthbounds, which this backend's engine
+#     honours on a device that has the depth bounds test, under the Khronos
+#     validation layer.
 #
 # The second pass fails on any of: a scene's own check, a single validation
 # message, a scene that did not take the engine path, or one that reported
@@ -149,7 +148,7 @@ jobs:
           # --threads is not here: it checks guest thread stacks and returns
           # before any backend exists (the first pass still runs it).
           for m in "" "--draw" "--depth" "--quads" "--shader" \
-                   "--tex" "--tex-io" "--mip" "--rtt" "--depthtex" "--mrt" "--mrt-a" \
+                   "--tex" "--tex-io" "--mip" "--rtt" "--depthtex" "--mrt" "--mrt-a" "--cube" \
                    "--depthbounds" "--split-present" "--feedback" "--clip" "--clip-keep" \
                    "--float-rt" "--float-rt-r" "--unbound"; do
             rc=0; ./build/ps3recomp_host $m > run.log 2>&1 || rc=$?

@@ -26,7 +26,8 @@ class SpuPutWatchTests(unittest.TestCase):
         cls.exe = Path(cls.tmp.name) / ('put-watch.exe' if os.name == 'nt' else 'put-watch')
         cmd = [cc, '-std=gnu17', '-O2', '-I', str(ROOT / 'include'), '-I', str(ROOT / 'runtime/spu'),
                '-I', str(ROOT / 'runtime/platform'), str(ROOT / 'runtime/spu/tests/test_spu_put_watch.c'),
-               str(ROOT / 'runtime/platform/win32_compat.c'), '-o', str(cls.exe)]
+               str(ROOT / 'runtime/platform/win32_compat.c'),
+               str(ROOT / 'runtime/spu/tests/fork_runtime_standins.c'), '-o', str(cls.exe)]
         if os.name != 'nt':
             cmd.insert(1, '-pthread')
         subprocess.run(cmd, check=True, capture_output=True, text=True)

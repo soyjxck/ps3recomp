@@ -10,6 +10,12 @@
  * has already read, the new list never runs, and the title waits for those
  * jobs' results forever.
  *
+ * A Run that finds the END it stopped on unchanged reads it again and stops:
+ * Drakengard 3 runs its chain between appends hundreds of times a frame, and
+ * starting over would re-run every job. SPURS_JC_RERUN=1 runs the list again
+ * from its entry instead; tools/test_spurs_jobchain_resume.py runs this both
+ * ways.
+ *
  * The real libs/spurs/cellSpurs.c walker runs on its own thread. Only the job
  * binary dispatch (to count which jobs ran) and the completion-event push (to
  * hold the walker still at a chosen point) are observed; nothing in the walker
@@ -187,11 +193,14 @@ int main(void)
     quiet();
     expect(8, 1, "re-created chain");
 
-    /* Run again with nothing new where it stopped: the list runs again from its
-     * entry, as it always has here (a title re-running a fixed list relies on it). */
+    /* Run again with nothing new where it stopped: the walk reads the same END
+     * and runs nothing. With SPURS_JC_RERUN=1 the list runs again from its entry
+     * (a title re-running a fixed list relies on it). */
+    const char* rerun_env = getenv("SPURS_JC_RERUN");
+    const unsigned rerun = (rerun_env && *rerun_env == '1') ? 1u : 0u;
     assert(cellSpursRunJobChain(CHAIN) == CELL_OK);
     quiet();
-    expect(8, 2, "fixed list run again");
+    expect(8, 1 + rerun, rerun ? "fixed list run again" : "Run on an unchanged END");
 
     /* After a Join, a Run starts over at the entry too. */
     assert(cellSpursJoinJobChain(CHAIN) == CELL_OK);
@@ -199,11 +208,12 @@ int main(void)
     vm_write64(LIST(7) + 1 * 8, NEXT(LIST(8)));
     assert(cellSpursRunJobChain(CHAIN) == CELL_OK);
     quiet();
-    expect(8, 3, "Run after Join"); expect(9, 1, "Run after Join");
+    expect(8, 2 + rerun, "Run after Join"); expect(9, 1, "Run after Join");
 
     if (failed) return 1;
     free(vm_base);
-    puts("PASS: job chain resumes at the END it stopped on; no Run lost while a walk finishes; "
-         "re-create, re-run of a fixed list and Join start at the entry");
+    printf("PASS: job chain resumes at the END it stopped on; no Run lost while a walk finishes; "
+           "re-create and Join start at the entry; a Run on an unchanged END %s\n",
+           rerun ? "runs the list again (SPURS_JC_RERUN=1)" : "runs nothing");
     return 0;
 }

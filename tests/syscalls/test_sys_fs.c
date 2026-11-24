@@ -33,6 +33,8 @@ const char* edat_resolve(const char* host_path, char* buf, size_t cap)
 /* sys_fs.c's weak reference to cellGame.c: ld64 rejects an undefined weak
  * symbol (ELF links it as NULL), so the test defines it. No HDD game here. */
 const char* cellGame_get_hdd_title_id(void) { return NULL; }
+/* the fork's write watch, told of a read into guest memory: no page is watched */
+void vm_watch_touch(uint32_t ea, uint32_t len) { (void)ea; (void)len; }
 
 /* ---- harness ------------------------------------------------------------- */
 static int failures;

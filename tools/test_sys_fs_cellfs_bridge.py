@@ -35,6 +35,8 @@ FIXTURE = r'''
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
 const char* cellGame_get_hdd_title_id(void) { return NULL; }
+/* the fork's write watch, told of a read into guest memory: no page is watched */
+void vm_watch_touch(uint32_t ea, uint32_t len) { (void)ea; (void)len; }
 
 static FILE* g_cellfs_file;
 FILE* ppu_cellfs_file_for_fd(int fd) { return fd == 12 ? g_cellfs_file : NULL; }

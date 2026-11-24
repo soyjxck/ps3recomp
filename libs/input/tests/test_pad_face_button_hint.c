@@ -6,6 +6,10 @@
  * Circle (and Square and Triangle) against a PlayStation pad. The test records
  * every SDL_SetHint and SDL_InitSubSystem the backend makes, in order.
  *
+ * The backend starts SDL on its pad thread (pad_sdl_start). Here
+ * SDL_CreateThread fails, so cellPadInit starts it itself (the backend's own
+ * fallback) and everything has happened when it returns.
+ *
  *   clang -std=gnu17 -I include $(sdl2-config --cflags) -I "$(sdl2-config --prefix)/include" \
  *         libs/input/tests/test_pad_face_button_hint.c $(sdl2-config --libs) -o /tmp/test_pad_face_button_hint && /tmp/test_pad_face_button_hint
  *
@@ -57,6 +61,11 @@ int SDL_PeepEvents(SDL_Event* ev, int n, SDL_eventaction action, Uint32 lo, Uint
 { (void)ev; (void)n; (void)action; (void)lo; (void)hi; return 0; }
 void SDL_GameControllerUpdate(void) {}
 const char* SDL_GetError(void) { return "fake"; }
+int SDL_JoystickEventState(int state) { return state; }
+int SDL_GameControllerEventState(int state) { return state; }
+/* No pad thread: cellPadInit starts the subsystem itself. */
+SDL_Thread* SDL_CreateThread(SDL_ThreadFunction fn, const char* name, void* data)
+{ (void)fn; (void)name; (void)data; return NULL; }
 
 int main(void)
 {
@@ -67,6 +76,7 @@ int main(void)
      * still set, and the backend does not start it again. */
     s_inited = 1;
     assert(cellPadInit(4) == CELL_OK);
+    assert(!s_sdl_thread);
     assert(s_init_calls == 0);
     assert(s_labels_hint_seen == 1);
     assert(strcmp(s_labels_hint, "0") == 0);
@@ -74,7 +84,6 @@ int main(void)
 
     /* Nobody did: the hint is "0" and was set before the subsystem started. */
     s_inited = 0;
-    s_sdl_inited = 0;
     s_labels_hint_seen = 0;
     assert(cellPadInit(4) == CELL_OK);
     assert(s_init_calls == 1);

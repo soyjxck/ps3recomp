@@ -33,6 +33,8 @@ extern "C" void cellGcm_put_on_store(void) {}   /* cellGcmSys.c (#817) */
 
 extern "C" {
 uint8_t* vm_base;
+/* the fork's runtime: the inline accessors' page table (no page on the fast path) */
+unsigned char g_ppu_vm_page[65536];
 uint32_t ppu_hle_inject_base = 0x20000000;
 extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
 extern uint32_t ppu_vm_size;

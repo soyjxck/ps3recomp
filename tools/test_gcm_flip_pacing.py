@@ -17,7 +17,8 @@ with tempfile.TemporaryDirectory(prefix='gcm-flip-pacing-') as tmp:
     subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG',
                     '-ffunction-sections', '-fdata-sections',
                     '-I' + str(root / 'include'), '-I' + str(root / 'libs/video'),
-                    str(root / 'libs/video/tests/test_gcm_flip_pacing.c'), *linker,
+                    str(root / 'libs/video/tests/test_gcm_flip_pacing.c'),
+                    str(root / 'runtime/platform/env_cache.c'), *linker,
                     '-o', str(binary)], check=True)
     for mode in ('fixed', 'adaptive'):
         result = subprocess.run([str(binary), mode], timeout=60, capture_output=True, text=True)

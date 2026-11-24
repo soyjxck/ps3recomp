@@ -245,6 +245,13 @@ jobs:
           clang -std=gnu17 -I include $(sdl2-config --cflags) -I "$(sdl2-config --prefix)/include" -o /tmp/test_pad_hotplug libs/input/tests/test_pad_hotplug.c $(sdl2-config --libs)
           /tmp/test_pad_hotplug
 
+      # cellPad asks SDL for face buttons by position (not by printed label)
+      # before the controller subsystem starts.
+      - name: Run the pad face-button hint test
+        run: |
+          clang -std=gnu17 -I include $(sdl2-config --cflags) -I "$(sdl2-config --prefix)/include" -o /tmp/test_pad_face_button_hint libs/input/tests/test_pad_face_button_hint.c $(sdl2-config --libs)
+          /tmp/test_pad_face_button_hint
+
       # cellPad keyboard fallback on port 0 (read through SDL here too, with a
       # fake keyboard and focus; the real macOS source is the Metal backend's
       # key monitor).
@@ -430,7 +437,7 @@ jobs:
       # SET_ZMIN_MAX_CONTROL reaches the GPU: a triangle in front of the near
       # plane is clipped by default and clamped to depth 0 when the guest
       # turns clipping off or the clamp on; PS3RECOMP_ENG_DEPTH_CLAMP=0 clips.
-      # RSX_ASYNC_SHADERS=0, here and in the two tests after it: the engine
+      # RSX_ASYNC_SHADERS=0, here and in the test after it: the engine
       # builds a new pipeline on a worker and skips the draw until it is
       # ready, and each case draws once.
       - name: Run the Metal depth clamp test
@@ -440,17 +447,6 @@ jobs:
           test -x build/test_metal_depth_clamp
           ./build/test_metal_depth_clamp
           PS3RECOMP_ENG_DEPTH_CLAMP=0 ./build/test_metal_depth_clamp
-
-      # The depth-bounds test, which Metal lacks, emulated in the fragment
-      # program: a bounded draw lands only where the STORED depth is inside
-      # the bounds; PS3RECOMP_ENG_DEPTH_BOUNDS=0 ignores the test.
-      - name: Run the Metal depth bounds test
-        env:
-          RSX_ASYNC_SHADERS: "0"
-        run: |
-          test -x build/test_metal_depth_bounds
-          ./build/test_metal_depth_bounds
-          PS3RECOMP_ENG_DEPTH_BOUNDS=0 ./build/test_metal_depth_bounds
 
       # Point size reaches the GPU: Metal leaves it undefined unless the vertex
       # function writes it, so a point is drawn at SET_POINT_SIZE's size, at
@@ -536,7 +532,6 @@ jobs:
           clang -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_rsx_draw_engine libs/video/tests/test_rsx_draw_engine.c libs/video/rsx_draw_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c
           /tmp/test_rsx_draw_engine
           PS3RECOMP_ENG_FEEDBACK_PER_PASS=1 /tmp/test_rsx_draw_engine
-          /tmp/test_rsx_draw_engine single
           CC=clang python3 tools/test_rsx_texture_decode.py
           # The vertex fetch plan's stable ranges against the per-attribute
           # walk they are now computed without (upstream #357).

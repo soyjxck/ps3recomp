@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """A job chain resumes at the END it stopped on, and a Run that lands while a
 walk is finishing is still walked (tests/test_spurs_jobchain_resume.c runs the
-real cellSpurs.c walker on its own thread)."""
+real cellSpurs.c walker on its own thread). Run twice: a Run on an unchanged END
+runs nothing by default and the list again with SPURS_JC_RERUN=1."""
 import os
 from pathlib import Path
 import platform
@@ -24,10 +25,15 @@ with tempfile.TemporaryDirectory(prefix='spurs-jobchain-') as tmp:
                     '-I' + str(root / 'runtime/platform'),
                     str(root / 'tests/test_spurs_jobchain_resume.c'),
                     *[str(root / 'runtime/spu' / f'{u}.c') for u in units],
-                    str(root / 'runtime/platform/win32_compat.c'), '-pthread', '-lm', '-o', str(out)],
+                    str(root / 'runtime/platform/win32_compat.c'),
+                    str(root / 'runtime/platform/env_cache.c'),
+                    str(root / 'runtime/spu/tests/fork_runtime_standins.c'), '-pthread', '-lm', '-o', str(out)],
                    check=True)
-    result = subprocess.run([str(out)], timeout=60, capture_output=True, text=True)
-    print(result.stdout.strip().splitlines()[-1] if result.stdout.strip() else '')
-    if result.returncode:
-        print(result.stderr[-3000:])
-        raise SystemExit('test_spurs_jobchain_resume failed')
+    base = {k: v for k, v in os.environ.items() if k != 'SPURS_JC_RERUN'}
+    for env in (base, dict(base, SPURS_JC_RERUN='1')):
+        result = subprocess.run([str(out)], timeout=60, capture_output=True, text=True, env=env)
+        print(result.stdout.strip().splitlines()[-1] if result.stdout.strip() else '')
+        if result.returncode:
+            print(result.stderr[-3000:])
+            raise SystemExit('test_spurs_jobchain_resume failed'
+                             + (' (SPURS_JC_RERUN=1)' if 'SPURS_JC_RERUN' in env else ''))

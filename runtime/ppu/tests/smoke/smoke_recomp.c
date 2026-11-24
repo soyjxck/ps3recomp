@@ -539,7 +539,6 @@ void func_00010000(ppu_context* ctx)
     for (uint32_t i = 0; i < 300; i++) {
         const int joinable = (i & 1u) == 0;
         const uint32_t ran = atomic_load(&g_churn_ran);
-        ctx->gpr[11] = SC_PPU_THREAD_CREATE;
         ctx->gpr[3]  = SMOKE_SC_TID;
         ctx->gpr[4]  = SMOKE_OPD_THREAD;
         ctx->gpr[5]  = 0x7000u + i;           /* not SMOKE_THREAD_ARG: a churn thread */
@@ -547,7 +546,7 @@ void func_00010000(ppu_context* ctx)
         ctx->gpr[7]  = 0x10000;
         ctx->gpr[8]  = joinable ? 1 : 0;
         ctx->gpr[9]  = SMOKE_THREAD_NAME;
-        lv2_syscall(ctx);
+        ps3_hle_call(NID_sys_ppu_thread_create, ctx); DRAIN_TRAMPOLINE(ctx);
         if ((int32_t)ctx->gpr[3] != 0) {
             smoke_check(0, "a thread could not be made in the churn: a slot was not given back");
             break;

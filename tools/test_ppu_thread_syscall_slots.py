@@ -17,5 +17,6 @@ with tempfile.TemporaryDirectory(prefix='ppu-thread-syscall-slots-') as tmp:
         '-I'+str(root/'include'),'-I'+str(root/'runtime'),'-I'+str(root/'runtime/syscalls'),
         str(root/'tests/test_ppu_thread_syscall_slots.c'),
         str(root/'runtime/syscalls/lv2_register.c'),   # the real lv2_try_syscall and its sentinel
+        str(root/'runtime/platform/env_cache.c'),
         *linker,'-o',str(binary)],check=True)
     subprocess.run([str(binary)],check=True,timeout=60,stderr=subprocess.DEVNULL if os.environ.get('CI') else None)

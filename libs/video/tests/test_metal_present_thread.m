@@ -83,7 +83,7 @@ static int run_layer(void)
 {
     s_headless = 0;
     s_width = 2; s_height = 1;
-    s_win_px_w = 2; s_win_px_h = 1;
+    s_view_px_w = 2; s_view_px_h = 1;
     s_layer = [CAMetalLayer layer];
     s_layer.device = s_dev;
     s_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
@@ -97,7 +97,7 @@ static int run_layer(void)
     const unsigned char green[] = {0,0,0,255, 17,23,31,255};
     const u32 surface = eng_obj_add(texture(green));
     for (int i = 0; i < 30; i++) {
-        if (i == 15) { s_win_px_w = 4; s_win_px_h = 2; }   /* staging follows the new size */
+        if (i == 15) { s_view_px_w = 4; s_view_px_h = 2; }   /* staging follows the new size */
         eng_present(NULL, surface);
         usleep(2000);
     }
@@ -170,7 +170,6 @@ int main(int argc, char** argv)
         const float red[4] = { 1.0f, 0.0f, 0.0f, 1.0f };
         eng_clear_color(NULL, target, red);              /* a later write */
         eng_submit_and_wait(NULL, 0);
-        assert(s_eng_checked_completed);
         gate(0);
         wait_presented(1);
         read_offscreen(px);

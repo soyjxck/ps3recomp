@@ -18,6 +18,7 @@ with tempfile.TemporaryDirectory(prefix='ps3-usleep-yield-') as tmp:
     subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG',
                     '-ffunction-sections', '-fdata-sections', linker, '-pthread',
                     '-I' + str(root / 'include'), str(root / 'tests/test_usleep_yield.c'),
+                    str(root / 'runtime/platform/env_cache.c'),
                     '-o', str(binary)], check=True)
     env = {k: v for k, v in os.environ.items() if k != 'PS3RECOMP_USLEEP_SPIN_US'}
     subprocess.run([str(binary), 'off'], env=env, check=True, timeout=60)

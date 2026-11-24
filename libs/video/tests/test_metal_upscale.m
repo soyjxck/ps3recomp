@@ -31,15 +31,19 @@ static id<MTLTexture> tex(NSUInteger w, NSUInteger h, MTLTextureUsage usage)
     return t;
 }
 
-/* One windowed present of the W x H image `in` into a dw x dh drawable. The
- * display buffer has the usage the engine's surfaces have. */
+/* One present of the W x H image `in` into a dw x dh drawable, as the
+ * engine's commit does it: in a window the picture is laid out by
+ * rsx_present_layout, headless it fills the target. The display buffer has
+ * the usage the engine's surfaces have. */
 static void present(const px4* in, px4* out, NSUInteger dw, NSUInteger dh)
 {
     id<MTLTexture> src = tex(W, H, MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget);
     id<MTLTexture> dst = tex(dw, dh, MTLTextureUsageRenderTarget);
     [src replaceRegion:MTLRegionMake2D(0, 0, W, H) mipmapLevel:0 withBytes:in bytesPerRow:W * 4];
     id<MTLCommandBuffer> cb = [s_queue commandBuffer];
-    eng_blit_to_display(cb, src, dst);
+    float lvp[4]; int lrect[4], part = 0;
+    if (!s_headless) part = rsx_present_layout(W, H, (u32)dw, (u32)dh, lvp, lrect);
+    eng_blit_to_display(cb, src, dst, s_headless ? NULL : lvp, lrect, part);
     [cb commit];
     [cb waitUntilCompleted];
     assert(cb.status == MTLCommandBufferStatusCompleted);

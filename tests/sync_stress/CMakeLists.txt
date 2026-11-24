@@ -113,7 +113,9 @@ add_executable(test_sync_semantics
     "${RUNTIME_SYNC_DIR}/sys_mutex.c"
     "${RUNTIME_SYNC_DIR}/sys_cond.c"
     "${RUNTIME_SYNC_DIR}/sys_semaphore.c"
-    "${RUNTIME_SYNC_DIR}/sys_rwlock.c")
+    "${RUNTIME_SYNC_DIR}/sys_rwlock.c"
+    # the cached getenv the sync objects read their knobs through
+    "${PS3RECOMP_TREE_ROOT}/runtime/platform/env_cache.c")
 # The semaphore and rwlock sources call ps3_sync_test_hook (defined by the test)
 # at the points where it parks a call to order a destroy against it.
 target_compile_definitions(test_sync_semantics PRIVATE PS3_SYNC_TEST_HOOKS)
@@ -159,7 +161,9 @@ set_tests_properties(cellsync_mutex PROPERTIES LABELS "runtime;sync" TIMEOUT 20)
 add_executable(test_mutex_destroy
     test_mutex_destroy.c test_shims.c
     "${RUNTIME_SYNC_DIR}/sys_mutex.c"
-    "${RUNTIME_SYNC_DIR}/sys_cond.c")
+    "${RUNTIME_SYNC_DIR}/sys_cond.c"
+    # the cached getenv the sync objects read their knobs through
+    "${PS3RECOMP_TREE_ROOT}/runtime/platform/env_cache.c")
 if(NOT WIN32)
     target_sources(test_mutex_destroy PRIVATE
         "${PS3RECOMP_TREE_ROOT}/runtime/platform/win32_compat.c")
@@ -199,7 +203,9 @@ endif()
 # sys_event.c, and sys_timer.c off Windows (the timer's queue admission).
 add_executable(test_event_queue_destroy
     test_event_queue_destroy.c test_shims.c
-    "${RUNTIME_SYNC_DIR}/sys_event.c")
+    "${RUNTIME_SYNC_DIR}/sys_event.c"
+    # the cached getenv sys_event.c and sys_timer.c read their knobs through
+    "${PS3RECOMP_TREE_ROOT}/runtime/platform/env_cache.c")
 # sys_event.c calls ps3_sync_test_hook (defined by the test) at the points where
 # the test parks a call to order a destroy against it.
 target_compile_definitions(test_event_queue_destroy PRIVATE PS3_SYNC_TEST_HOOKS)

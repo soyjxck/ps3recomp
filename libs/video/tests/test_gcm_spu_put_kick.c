@@ -8,6 +8,7 @@
  * python3 tools/test_gcm_spu_put_kick.py
  */
 #include "../cellGcmSys.c"
+#include "gcm_fork_standins.h"
 #include "../rsx_tiling.c"
 #include <stdio.h>
 #include <stdlib.h>
@@ -49,6 +50,11 @@ int  rsx_live_draw_resolve_blit(u32 a, u32 b, u32 c, u32 d, u32 e, u32 f, u32 g,
                                 u32 i, u32 j, u32 k, u32 l)
 { (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; (void)g; (void)h; (void)i; (void)j; (void)k; (void)l; return 0; }
 void rsx_raise_user_cmd(uint32_t arg) { (void)arg; }
+/* The env cache, served straight from getenv: both switches are set and
+ * cleared between the cases below, and env_cache.c would keep the first
+ * answer. */
+ps3_env_slot g_ps3_env_cache[PS3_ENV_CACHE_SLOTS];
+const char* ps3_env_fill(const char* name, unsigned first_slot) { (void)first_slot; return (getenv)(name); }
 
 static int fails;
 static void check(int ok, const char* what)

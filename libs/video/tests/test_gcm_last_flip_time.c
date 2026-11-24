@@ -9,6 +9,7 @@
  * requested. The system clock is faked here so each stamp is exact.
  */
 #include "../cellGcmSys.c"
+#include "gcm_fork_standins.h"
 #include "../rsx_tiling.c"
 #include <assert.h>
 uint8_t* vm_base;

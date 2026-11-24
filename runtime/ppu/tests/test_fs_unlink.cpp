@@ -16,6 +16,12 @@ void ydkj_host_bt(const char*) { abort(); }
 void ps3_vfs_ps3game_fallback(char*, size_t) { abort(); }
 ps3_guest_caller_fn g_ps3_guest_caller;
 void ps3_hle_register_ctx(uint32_t, const char*, void (*)(ppu_context*)) {}
+/* the fork's runtime: no page is watched, read timing off */
+void vm_watch_touch(uint32_t ea, uint32_t len) { (void)ea; (void)len; }
+void (*g_ps3_fs_host_path)(char* out, size_t cap, const char* guest);   /* cellSysutil's */
+double fs_read_time_start(void) { return 0.0; }
+void fs_read_time_log(const char* kind, int fd, uint64_t off, uint64_t size, uint64_t got, double t_start)
+{ (void)kind; (void)fd; (void)off; (void)size; (void)got; (void)t_start; }
 }
 
 int main(int argc, char** argv)

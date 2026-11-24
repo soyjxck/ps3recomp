@@ -4,9 +4,10 @@
  *
  * Guest time is host time (never paused). No store or DMA watch for
  * GCM_PARK_WATCH to arm, no page table to refresh. The draw engine presents no
- * flip, has no occlusion queries out, and takes a transform-constant or program
- * upload run as rsx_draw_engine.c does when its register file cannot take the
- * run whole: word by word through the fixture's rsx_draw_engine_method. */
+ * flip, has no occlusion queries out, counts no frames (the pump's
+ * GCM_USER_DELAY_LOG line names the frame), and takes a transform-constant or
+ * program upload run as rsx_draw_engine.c does when its register file cannot
+ * take the run whole: word by word through the fixture's rsx_draw_engine_method. */
 #ifndef GCM_FORK_STANDINS_H
 #define GCM_FORK_STANDINS_H
 int64_t ps3_guest_ticks(int64_t host_ticks) { return host_ticks; }
@@ -14,6 +15,7 @@ uint32_t g_ww_dyn, g_spu_watchea_dyn;
 void ppu_vm_slow_any_update(void) {}
 int  rsx_draw_engine_fifo_flip(u32 buffer_id) { (void)buffer_id; return 0; }
 void rsx_draw_engine_sync_queries(void) {}
+u32  g_rsx_engine_frame;
 int  rsx_draw_engine_upload_window(u32 method, u32 count)
 {
     if (!count) return 0;

@@ -21,11 +21,17 @@ static void texture_decode_equivalence(void)
     rsx_dispatch_init(&oracle, NULL);
     engine_up();
     rsx_draw_engine_test_texture_decode_bypass(0);
+    /* A draw asks only for the units that are switched on and that its
+     * fragment program samples (eng_tex_unit_on); the other fifteen are never
+     * decoded. Unit 0 is bound here, and the draw's several loops over the
+     * units decode it once between them. */
+    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET);
     draw_triangle();
     const u64 first = rsx_draw_engine_test_texture_decodes();
     draw_triangle();
-    CHECK(first == 16 && rsx_draw_engine_test_texture_decodes() == first,
-          "unchanged draws do not repeat texture register decoding");
+    CHECK(first == 1 && rsx_draw_engine_test_texture_decodes() == first,
+          "unchanged draws do not repeat texture register decoding (%llu decodes, then %llu)",
+          (unsigned long long)first, (unsigned long long)rsx_draw_engine_test_texture_decodes());
     for (u32 unit = 0; unit < 16; unit++) {
         for (u32 w = 0; w < 9; w++) {
             const u32 method = w < 8 ? 0x1A00u + unit * 32u + w * 4u : 0x1840u + unit * 4u;

@@ -17,6 +17,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+/* This fork's rsx_dispatch.c reads it for RSX_CONST_LOG; rsx_draw_engine.c,
+ * not linked here, defines it. */
+uint32_t g_rsx_engine_frame;
+
 static int g_failures;
 
 #define CHECK(cond, ...)                                                      \

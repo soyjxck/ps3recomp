@@ -109,9 +109,14 @@ with tempfile.TemporaryDirectory(prefix='spurs-taskattr-desc-') as name:
     subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', *common, '-c',
                     str(ROOT / 'libs/spurs/cellSpurs.c'), '-o', str(obj)],
                    check=True)
+    # the cached getenv cellSpurs.c reads its switches through
+    env_cache = tmp / 'env_cache.o'
+    subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', *common, '-c',
+                    str(ROOT / 'runtime/platform/env_cache.c'), '-o', str(env_cache)],
+                   check=True)
     linker = (['-Wl,-dead_strip'] if platform.system() == 'Darwin'
               else ['-Wl,--gc-sections'])
     subprocess.run([os.environ.get('CXX', 'c++'), '-std=c++20', *common,
-                    str(fixture), str(obj), *linker, '-pthread', '-lm',
+                    str(fixture), str(obj), str(env_cache), *linker, '-pthread', '-lm',
                     '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True, timeout=10, cwd=tmp)

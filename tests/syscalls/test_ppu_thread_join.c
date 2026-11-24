@@ -11,8 +11,22 @@
 #include "../../runtime/syscalls/sys_ppu_thread.c"
 #include <assert.h>
 
+/* Guest memory that holds the stack region main() gives the threads: the fork's thread code clears a stack it hands
+ * out again (sys_ppu_thread.c, stack_take), so the stacks must be real memory -- on host pages of their own, as the
+ * guard page under each one is protected. Room for a stack per thread made here, should none be handed out again. */
+#define GUEST_VM_SIZE 0x02000000u
+#define GUEST_STACKS  0x00100000u   /* the stack region runs from here to the end */
 uint8_t* vm_base;
-uint32_t ppu_vm_size = 0x10000;
+uint32_t ppu_vm_size = GUEST_VM_SIZE;
+static uint8_t* guest_memory(void)
+{
+#ifdef _WIN32
+    return (uint8_t*)VirtualAlloc(NULL, GUEST_VM_SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* p = mmap(NULL, GUEST_VM_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    return p == MAP_FAILED ? NULL : (uint8_t*)p;
+#endif
+}
 uint32_t vm_read32(uint64_t a)         /* guest words are big-endian (sys_ppu_thread_yield peeks at some) */
 {
     const uint8_t* p = vm_base + (uint32_t)a;
@@ -99,9 +113,9 @@ static DWORD WINAPI bgjoin_main(LPVOID p)
 
 int main(void)
 {
-    vm_base = (uint8_t*)calloc(1, 0x10000); assert(vm_base);
-    g_vm_stack_alloc.next_addr = 0x10000000u;   /* the guest stack region the threads bump-allocate from */
-    g_vm_stack_alloc.region_end = 0xA0000000u;
+    vm_base = guest_memory(); assert(vm_base);
+    g_vm_stack_alloc.next_addr = GUEST_STACKS;  /* the guest stack region the threads bump-allocate from */
+    g_vm_stack_alloc.region_end = GUEST_VM_SIZE;
     g_ppu_thread_entry_trampoline = guest_entry;
     ppu_thread_register_main();
 

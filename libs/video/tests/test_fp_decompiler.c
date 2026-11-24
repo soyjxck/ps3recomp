@@ -606,12 +606,12 @@ int main(void)
         check_absent("soft_particle_no_mod_clamp", hlsl, "clamp(");
     }
 
-    /* DDX + TXD on a gamma unit: a gamma TXD used to fail the whole program, so
-     * the engine dropped every draw through it. */
+    /* DDX + TXD on a gamma unit: the unit's texels are converted by
+     * rsx_texop<u> (rsx_fp_set_texel_ops), and the gradient sample is wrapped
+     * in it like any other sample. */
     {
         u8 prog[32];
-        u8 gamma[16] = {0};
-        u8 expand[16] = {0};
+        u32 ops[16] = {0};
         u32 nk = 0;
         put_word(prog + 0, 0x15400680);   /* DDX h0.xy, h1 (xyzw) */
         put_word(prog + 4, 0x1C9DC904);
@@ -621,15 +621,16 @@ int main(void)
         put_word(prog + 20, 0x1C9D5D0C);  /* coord h3.zwzz */
         put_word(prog + 24, 0x00015D08);  /* ddx   h2.zwzz */
         put_word(prog + 28, 0x0001C90C);  /* ddy   h3.xyzw */
-        gamma[4] = 7;
-        int len = rsx_fp_decompile_buffered_shadow_color_expand_vol_ex(
-            prog, sizeof prog, CTRL_32BIT, 0, 0, NULL, gamma, expand,
-            hlsl, sizeof hlsl, &nk);
+        ops[4] = 7;                       /* sRGB to linear on R, G and B */
+        rsx_fp_set_texel_ops(ops);
+        int len = rsx_fp_decompile_buffered_ex(prog, sizeof prog, CTRL_32BIT, 0,
+                                               hlsl, sizeof hlsl, &nk);
+        rsx_fp_set_texel_ops(NULL);
         check_true("txd_gamma_translates", len > 0);
         check("txd_sample_grad", hlsl,
               "rsx_tex[4].SampleGrad(rsx_samp[4], ((h[3]).zwzz).xy, ((h[2]).zwzz).xy, ((h[3]).xyzw).xy)");
         check("txd_ddx", hlsl, "ddx((h[1]).xyzw)");
-        check("txd_gamma_wrap", hlsl, "_rsx_gamma_input(");
+        check("txd_gamma_wrap", hlsl, "rsx_texop4(rsx_tex[4].SampleGrad(");
     }
 
     printf("\n===========================================\n");

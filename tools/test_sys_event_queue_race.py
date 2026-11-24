@@ -13,6 +13,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / 'runtime/syscalls/tests/test_sys_event_queue_race.c'
+ENV_CACHE = ROOT / 'runtime/platform/env_cache.c'   # the cached getenv sys_event.c reads its knobs through
 windows = os.name == 'nt'
 compiler = os.environ.get('CC', 'clang-cl' if windows else 'cc')
 msvc_style = Path(compiler).stem.lower() in ('clang-cl', 'cl')
@@ -24,10 +25,10 @@ with tempfile.TemporaryDirectory(prefix='sys-event-race-') as tmp:
     binary = Path(tmp) / ('test.exe' if windows else 'test')
     if msvc_style:
         command = [compiler, '/nologo', '/std:c17', '/O2', '/D_CRT_SECURE_NO_WARNINGS',
-                   *('/I' + str(i) for i in includes), str(SOURCE), '/Fe' + str(binary)]
+                   *('/I' + str(i) for i in includes), str(SOURCE), str(ENV_CACHE), '/Fe' + str(binary)]
     else:
         command = [compiler, '-std=gnu17', '-O2', '-UNDEBUG', *('-I' + str(i) for i in includes),
-                   str(SOURCE), *([] if windows else ['-pthread']), '-o', str(binary)]
+                   str(SOURCE), str(ENV_CACHE), *([] if windows else ['-pthread']), '-o', str(binary)]
     subprocess.run(command, check=True, timeout=180, cwd=tmp)
     for attempt in range(3):
         run = subprocess.run([str(binary)], cwd=tmp, timeout=180, capture_output=True, text=True)

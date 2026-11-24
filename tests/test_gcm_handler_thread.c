@@ -6,6 +6,7 @@
  * (which only starts the interrupt thread). The handler checks it is not on the main thread, reads its own stack
  * size, and then runs a 16 MB deep call chain, which a 1 MB stack cannot hold. */
 #include "../libs/video/cellGcmSys.c"
+#include "../libs/video/tests/gcm_fork_standins.h"
 #include <assert.h>
 #include <pthread.h>
 #include "ps3emu/guest_host_thread.h"   /* PS3_GUEST_HOST_STACK_BYTES */
@@ -20,6 +21,8 @@ void spu_coh_notify_write(uint32_t addr) { (void)addr; abort(); }
 void spu_lockline_lock(void) { abort(); }
 void spu_lockline_unlock(void) { abort(); }
 void (*g_spu_put_hook)(uint32_t ea, uint32_t size);
+/* The pump's GCM_USER_DELAY_LOG line names the calling guest thread. */
+PPU_THREAD_LOCAL ppu_context* g_active_ctx;
 
 static unsigned long s_main_tid;
 static volatile unsigned long s_handler_tid;

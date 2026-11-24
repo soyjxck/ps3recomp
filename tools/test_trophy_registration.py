@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Trophy registration delivers its completion through the guest's sysutil
 callbacks (libs/network/tests/test_trophy_registration.c, which compiles
-sceNpTrophy.c in and links cellSysutil.c)."""
+sceNpTrophy.c in and links its pack reader and cellSysutil.c)."""
 import os
 from pathlib import Path
 import subprocess
@@ -18,6 +18,7 @@ with tempfile.TemporaryDirectory(prefix='trophy-registration-') as tmp:
     subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG',
                     '-ffunction-sections', '-fdata-sections', '-I' + str(root / 'include'),
                     str(root / 'libs/network/tests/test_trophy_registration.c'),
+                    str(root / 'libs/network/trophy_pack.c'),
                     str(root / 'libs/system/cellSysutil.c'), *linker,
                     '-o', str(binary)], check=True)
     result = subprocess.run([str(binary)], timeout=30, capture_output=True, text=True)

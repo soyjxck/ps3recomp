@@ -1497,6 +1497,42 @@ static void test_inline_array(void)
     engine_down();
 }
 
+/* ---- the current colour -------------------------------------------------- */
+
+/* ATTR3 without an array is its current value: white while the title has
+ * never written one, and exactly what it wrote once it has -- opaque black
+ * included, which is also the register's reset value. The engine tells the
+ * two apart by counting the writes in its method entry, in each of the
+ * SET_VERTEX_DATA encodings. No program is resident, so the vertex carries
+ * all sixteen attributes, four floats each. */
+static void test_current_color(void)
+{
+    printf("-- current colour\n");
+    const float* c = &stub.captured_vertices[0][3 * 4];
+    engine_up();
+    draw_triangle();
+    CHECK(c[0] == 1.0f && c[1] == 1.0f && c[2] == 1.0f && c[3] == 1.0f,
+          "an unwritten current colour reads white (%g,%g,%g,%g)", c[0], c[1], c[2], c[3]);
+    m(0x194C, 0xFF000000u);                    /* SET_VERTEX_DATA4UB, ATTR3: opaque black */
+    draw_triangle();
+    CHECK(c[0] == 0.0f && c[1] == 0.0f && c[2] == 0.0f && c[3] == 1.0f,
+          "a black written as 4UB stays black (%g,%g,%g,%g)", c[0], c[1], c[2], c[3]);
+    engine_down();
+
+    engine_up();
+    m(0x1C30 + 3 * 4, f32_bits(1.0f));         /* SET_VERTEX_DATA4F, ATTR3: alpha alone */
+    draw_triangle();
+    CHECK(c[0] == 0.0f && c[1] == 0.0f && c[2] == 0.0f && c[3] == 1.0f,
+          "one written 4F component makes the colour explicit (%g,%g,%g,%g)", c[0], c[1], c[2], c[3]);
+    engine_down();
+
+    engine_up();
+    draw_triangle();
+    CHECK(c[0] == 1.0f && c[1] == 1.0f && c[2] == 1.0f && c[3] == 1.0f,
+          "a restarted engine has forgotten the write (%g,%g,%g,%g)", c[0], c[1], c[2], c[3]);
+    engine_down();
+}
+
 /* ---- the depth clear value ---------------------------------------------- */
 
 #define ZETA_OFFSET  0x00100000u        /* local memory */
@@ -2049,6 +2085,7 @@ int main(int argc, char** argv)
     test_tiled_texture();
     test_tiled_fetches();
     test_inline_array();
+    test_current_color();
     test_depth_clear_value();
     test_depth_snapshot_release();
     test_depth_snapshot_refilled_in_place();
