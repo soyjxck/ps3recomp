@@ -22,6 +22,7 @@
 #include <stddef.h>
 #include <string.h>
 #include <assert.h>
+#include "vm_watch_hooks.h"
 
 #ifdef _WIN32
   #define WIN32_LEAN_AND_MEAN
@@ -285,6 +286,7 @@ static inline int32_t vm_init(void)
 static inline void vm_shutdown(void)
 {
     if (!vm_base) return;
+    vm_watch_forget(0, UINT32_MAX, 1);
 
 #ifdef _WIN32
     VirtualFree(vm_base, 0, MEM_RELEASE);
@@ -303,6 +305,7 @@ static inline int32_t vm_commit(uint32_t addr, uint32_t size)
 {
     if (!VM_READY) return CELL_EFAULT;
     size = VM_ALIGN_UP(size, VM_PAGE_SIZE);
+    vm_watch_forget(addr, size, 1);
 
 #ifdef _WIN32
     /* Reserved pages only: re-committing a committed page resets its
@@ -322,6 +325,7 @@ static inline int32_t vm_protect(uint32_t addr, uint32_t size, int read, int wri
 {
     if (!VM_READY) return CELL_EFAULT;
     size = VM_ALIGN_UP(size, VM_PAGE_SIZE);
+    vm_watch_forget(addr, size, read && write);
 
 #ifdef _WIN32
     DWORD prot = PAGE_NOACCESS;

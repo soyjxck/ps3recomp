@@ -68,6 +68,9 @@ extern const char* ppu_vfs_root;   /* runtime/ppu/ppu_fs.cpp: the disc's folder 
  * -----------------------------------------------------------------------*/
 
 static int s_trophy_initialized = 0;
+
+/* Disk space a trophy set needs before it is installed (typical pack size). */
+#define TROPHY_PACK_SIZE ((u64)(1024 * 1024))
 static char s_storage_path[512] = "gamedata/trophies";
 static int  s_storage_path_set = 0;
 static char s_pack_dir[1024];
@@ -156,6 +159,23 @@ static void trophy_save(TrophyContext* ctx)
     trophy_get_filepath(ctx, filepath, sizeof(filepath));
     if (trophy_unlocks_save(filepath, &ctx->u, ctx->name) != 0)
         printf("[sceNpTrophy] WARNING: Could not save trophies to %s\n", filepath);
+}
+
+/* The saved file doubles as the installed trophy set: firmware installs the
+ * set on the first sceNpTrophyRegisterContext and it stays installed. */
+static int trophy_installed(const TrophyContext* ctx)
+{
+    char filepath[1024];
+
+    trophy_get_filepath(ctx, filepath, sizeof(filepath));
+#ifdef _WIN32
+    /* The path is UTF-8, as trophy_pack.c opens it. */
+    wchar_t wide[1024];
+    if (!MultiByteToWideChar(CP_UTF8, 0, filepath, -1, wide, 1024)) return 0;
+    return GetFileAttributesW(wide) != INVALID_FILE_ATTRIBUTES;
+#else
+    return access(filepath, F_OK) == 0;
+#endif
 }
 
 static u32 trophy_count_unlocked(TrophyContext* ctx)
@@ -465,6 +485,10 @@ s32 sceNpTrophyRegisterContext(SceNpTrophyContext context,
     }
     trophy_load(c);
     c->registered = 1;
+    /* Registration installs the set; record it so the next boot's
+     * sceNpTrophyGetRequiredDiskSpace reports nothing left to install. */
+    if (!trophy_installed(c))
+        trophy_save(c);
     TROPHY_UNLOCK();
 
     printf("[sceNpTrophy] RegisterContext(ctx=%d, handle=%d, statusCb=0x%08X, "
@@ -514,15 +538,20 @@ s32 sceNpTrophyGetRequiredDiskSpace(SceNpTrophyContext context,
         return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
     reqSpace = GUEST_PTR(reqSpace, u64*);
 
-    /* Typical trophy pack size. The guest is big-endian and reads this u64
+    /* The guest is big-endian and reads this u64
      * back in BE order, so the value MUST be byte-swapped on write -- otherwise
      * a host-LE 0x100000 is read as 0x0010000000000000 (2^44). LBP feeds this
      * "required disk space" straight into its save-data free-space accounting
      * (sub_379EC0: errB = budget - usedKB - reqSpaceKB); a garbage 2^44 makes
      * errB underflow negative -> cellGame GameData check returns ERROR-B ->
      * boot bails. (Same LE-write class as the cellUserInfo fix.) */
-    *reqSpace = ps3_bswap64((u64)(1024 * 1024)); /* 1 MB, big-endian */
-    printf("[sceNpTrophy] GetRequiredDiskSpace(ctx=%d) -> 1MB\n", context);
+    /* Once the set is installed nothing more is required. Resistance 3 reads
+     * a non-zero answer as "trophies not installed" and puts up its install
+     * prompt and install pass on every boot. */
+    u64 required = trophy_installed(&s_contexts[context]) ? 0 : TROPHY_PACK_SIZE;
+    *reqSpace = ps3_bswap64(required); /* big-endian */
+    printf("[sceNpTrophy] GetRequiredDiskSpace(ctx=%d) -> %llu bytes\n",
+           context, (unsigned long long)required);
     return CELL_OK;
 }
 

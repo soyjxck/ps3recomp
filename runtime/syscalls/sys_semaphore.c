@@ -10,6 +10,12 @@
 #include <string.h>
 #include <stdlib.h>      /* getenv (else the pointer return is truncated to int) */
 #include "ps3emu/log_first.h"
+#ifdef PS3_SYNC_TEST_HOOKS
+extern int ps3_sync_test_hook(const char* point, uint32_t id);
+#define SEM_TEST_HOOK(point, id) ((void)ps3_sync_test_hook((point), (id)))
+#else
+#define SEM_TEST_HOOK(point, id) ((void)0)
+#endif
 
 /* Environment switches are read where they are used, some of them per call:
  * answer from the pointer-keyed cache (ps3emu/env_cache.h). */
@@ -20,6 +26,8 @@
  * Globals
  * -----------------------------------------------------------------------*/
 sys_semaphore_info g_sys_semaphores[SYS_SEMAPHORE_MAX];
+/* Active syscall operations pin a slot across lock-free gaps and return paths. */
+static uint32_t s_sem_operations[SYS_SEMAPHORE_MAX];
 
 #ifdef _WIN32
 static CRITICAL_SECTION s_sem_table_lock;
@@ -48,6 +56,27 @@ static void sem_table_unlock(void)
 #else
     pthread_mutex_unlock(&s_sem_table_lock);
 #endif
+}
+static sys_semaphore_info* sem_operation_begin(uint32_t sem_id)
+{
+    if (sem_id == 0 || sem_id > SYS_SEMAPHORE_MAX)
+        return NULL;
+    sem_table_lock();
+    sys_semaphore_info* s = &g_sys_semaphores[sem_id - 1];
+    if (!s->active) {
+        sem_table_unlock();
+        return NULL;
+    }
+    s_sem_operations[sem_id - 1]++;
+    sem_table_unlock();
+    return s;
+}
+
+static void sem_operation_end(uint32_t sem_id)
+{
+    sem_table_lock();
+    s_sem_operations[sem_id - 1]--;
+    sem_table_unlock();
 }
 
 static void write_be32(uint32_t addr, uint32_t val)
@@ -256,8 +285,10 @@ int64_t sys_semaphore_create(ppu_context* ctx)
                    ((proto_be << 8) & 0xFF0000) | ((proto_be << 24) & 0xFF000000u);
 #endif
         s->protocol = proto_be;
-        /* name at offset 8 */
-        memcpy(s->name, attr_raw + 8, 8);
+        /* name at offset 0x18: sys_semaphore_attribute_t is protocol, pshared,
+         * ipc_key u64 @0x08, flags @0x10, pad @0x14, name[8] @0x18. Offset 8
+         * logged the ipc_key as the name. */
+        memcpy(s->name, attr_raw + 0x18, 8);
     }
 
 #ifdef _WIN32
@@ -310,11 +341,34 @@ int64_t sys_semaphore_destroy(ppu_context* ctx)
         sem_table_unlock();
         return (int64_t)(int32_t)CELL_ESRCH;
     }
+    if (s_sem_operations[sem_id - 1] != 0) {
+        sem_table_unlock();
+        return (int64_t)(int32_t)CELL_EBUSY;
+    }
 
+    /* lv2 refuses to destroy a semaphore threads are blocked on (CELL_EBUSY).
+     * Closing the handle under them turned each waiter's wait into an instant
+     * failure and its loop into a spin on a deleted lock. A waiter a pending
+     * post already covers (waiters <= value) is on its way out; only the ones
+     * left over are blocked, which is lv2's condition. */
 #ifdef _WIN32
+    EnterCriticalSection(&s->value_lock);
+    const int blocked = s->waiters > s->value;
+    LeaveCriticalSection(&s->value_lock);
+    if (blocked) {
+        sem_table_unlock();
+        return (int64_t)(int32_t)CELL_EBUSY;
+    }
     CloseHandle(s->sem_handle);
     DeleteCriticalSection(&s->value_lock);
 #else
+    pthread_mutex_lock(&s->mtx);
+    const int blocked = s->waiters > s->value;
+    pthread_mutex_unlock(&s->mtx);
+    if (blocked) {
+        sem_table_unlock();
+        return (int64_t)(int32_t)CELL_EBUSY;
+    }
     pthread_cond_destroy(&s->cv);
     pthread_mutex_destroy(&s->mtx);
 #endif
@@ -359,6 +413,10 @@ static int64_t sys_semaphore_wait_impl(ppu_context* ctx)
                   (unsigned long long)ctx->thread_id, 10); } }
     uint32_t sem_id     = LV2_ARG_U32(ctx, 0);
     uint64_t timeout_us = LV2_ARG_U64(ctx, 1);
+    /* lv2_usec_deadline multiplies by the QPC frequency in 64 bits and wraps
+     * for a timeout past about 21 days; 2^63, say, comes out as "already
+     * passed". Beyond 2^40 us (12.7 days) is indistinguishable from forever. */
+    if (timeout_us > (1ull << 40)) timeout_us = 0;
     /* Per-port hook: an engine job manager may spin on sys_semaphore_wait /
      * trywait waiting for SPU-job completions a lifted policy module never
      * writes, so a port can satisfy them here. Defined weakly below, so this is
@@ -393,8 +451,8 @@ static int64_t sys_semaphore_wait_impl(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
     }
 
-    sys_semaphore_info* s = &g_sys_semaphores[sem_id - 1];
-    if (!s->active)
+    sys_semaphore_info* s = sem_operation_begin(sem_id);
+    if (!s)
         return (int64_t)(int32_t)CELL_ESRCH;
 
 #ifdef _WIN32
@@ -407,13 +465,16 @@ static int64_t sys_semaphore_wait_impl(ppu_context* ctx)
         if (s->value > 0) {
             s->value--;
             LeaveCriticalSection(&s->value_lock);
+            sem_operation_end(sem_id);
             return CELL_OK;
         }
         if (timeout_us > 0 && lv2_deadline_passed(deadline)) {
             LeaveCriticalSection(&s->value_lock);
+            sem_operation_end(sem_id);
             return (int64_t)(int32_t)CELL_ETIMEDOUT;
         }
         s->waiters++;
+        SEM_TEST_HOOK("sem.wait.registered", sem_id);
         LeaveCriticalSection(&s->value_lock);
 
         /* Bounded slices keep timed waits on the QPC deadline. */
@@ -431,6 +492,7 @@ static int64_t sys_semaphore_wait_impl(ppu_context* ctx)
         EnterCriticalSection(&s->value_lock);
         if (s->waiters > 0) s->waiters--;
         LeaveCriticalSection(&s->value_lock);
+        SEM_TEST_HOOK("sem.wait.after_wake", sem_id);
         /* loop: re-check value */
     }
 #else
@@ -439,6 +501,7 @@ static int64_t sys_semaphore_wait_impl(ppu_context* ctx)
     if (timeout_us == 0) {
         while (s->value <= 0) {
             s->waiters++;
+            SEM_TEST_HOOK("sem.wait.registered", sem_id);
             pthread_cond_wait(&s->cv, &s->mtx);
             s->waiters--;
         }
@@ -457,6 +520,7 @@ static int64_t sys_semaphore_wait_impl(ppu_context* ctx)
             s->waiters--;
             if (rc == ETIMEDOUT) {
                 pthread_mutex_unlock(&s->mtx);
+                sem_operation_end(sem_id);
                 return (int64_t)(int32_t)CELL_ETIMEDOUT;
             }
         }
@@ -464,8 +528,10 @@ static int64_t sys_semaphore_wait_impl(ppu_context* ctx)
 
     s->value--;
     pthread_mutex_unlock(&s->mtx);
+    SEM_TEST_HOOK("sem.wait.after_wake", sem_id);
 #endif
 
+    sem_operation_end(sem_id);
     return CELL_OK;
 }
 
@@ -488,19 +554,15 @@ int64_t sys_semaphore_trywait(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
     }
 
-    sys_semaphore_info* s = &g_sys_semaphores[sem_id - 1];
-    if (!s->active) {
-        static int _n = 0; if (PS3_LOG_FIRST(_n, 6))
-            fprintf(stderr, "[sem] post(id=%u) -> ESRCH: slot inactive"
-                            " (value=%d max=%d)%c",
-                    sem_id, s->value, s->max_value, 10);
+    sys_semaphore_info* s = sem_operation_begin(sem_id);
+    if (!s)
         return (int64_t)(int32_t)CELL_ESRCH;
-    }
 
 #ifdef _WIN32
     EnterCriticalSection(&s->value_lock);
     if (s->value <= 0) {
         LeaveCriticalSection(&s->value_lock);
+        sem_operation_end(sem_id);
         return (int64_t)(int32_t)CELL_EBUSY;
     }
     s->value--;
@@ -509,12 +571,14 @@ int64_t sys_semaphore_trywait(ppu_context* ctx)
     pthread_mutex_lock(&s->mtx);
     if (s->value <= 0) {
         pthread_mutex_unlock(&s->mtx);
+        sem_operation_end(sem_id);
         return (int64_t)(int32_t)CELL_EBUSY;
     }
     s->value--;
     pthread_mutex_unlock(&s->mtx);
 #endif
 
+    sem_operation_end(sem_id);
     return CELL_OK;
 }
 
@@ -558,8 +622,8 @@ int64_t sys_semaphore_post(ppu_context* ctx)
     if (count <= 0)
         return (int64_t)(int32_t)CELL_EINVAL;
 
-    sys_semaphore_info* s = &g_sys_semaphores[sem_id - 1];
-    if (!s->active)
+    sys_semaphore_info* s = sem_operation_begin(sem_id);
+    if (!s)
         return (int64_t)(int32_t)CELL_ESRCH;
 
 #ifdef _WIN32
@@ -569,6 +633,7 @@ int64_t sys_semaphore_post(ppu_context* ctx)
             fprintf(stderr, "[SEMTRACE] post OVERFLOW id=%u value=%d+%d > max=%d\n",
                     sem_id, s->value, count, s->max_value); }
         LeaveCriticalSection(&s->value_lock);
+        sem_operation_end(sem_id);
         return (int64_t)(int32_t)CELL_EBUSY;
     }
     s->value += count;
@@ -585,6 +650,7 @@ int64_t sys_semaphore_post(ppu_context* ctx)
     pthread_mutex_lock(&s->mtx);
     if (s->value + count > s->max_value) {
         pthread_mutex_unlock(&s->mtx);
+        sem_operation_end(sem_id);
         return (int64_t)(int32_t)CELL_EBUSY;
     }
     s->value += count;
@@ -595,6 +661,7 @@ int64_t sys_semaphore_post(ppu_context* ctx)
     pthread_mutex_unlock(&s->mtx);
 #endif
 
+    sem_operation_end(sem_id);
     return CELL_OK;
 }
 
@@ -612,8 +679,8 @@ int64_t sys_semaphore_get_value(ppu_context* ctx)
     if (sem_id == 0 || sem_id > SYS_SEMAPHORE_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
 
-    sys_semaphore_info* s = &g_sys_semaphores[sem_id - 1];
-    if (!s->active)
+    sys_semaphore_info* s = sem_operation_begin(sem_id);
+    if (!s)
         return (int64_t)(int32_t)CELL_ESRCH;
 
     int32_t val;
@@ -631,6 +698,7 @@ int64_t sys_semaphore_get_value(ppu_context* ctx)
         write_be32(out_addr, (uint32_t)val);
     }
 
+    sem_operation_end(sem_id);
     return CELL_OK;
 }
 
@@ -640,6 +708,7 @@ int64_t sys_semaphore_get_value(ppu_context* ctx)
 void sys_semaphore_init(lv2_syscall_table* tbl)
 {
     memset(g_sys_semaphores, 0, sizeof(g_sys_semaphores));
+    memset(s_sem_operations, 0, sizeof(s_sem_operations));
 
 #ifdef _WIN32
     if (!s_sem_table_lock_init) {

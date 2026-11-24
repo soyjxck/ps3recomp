@@ -206,9 +206,10 @@ extern uint32_t ppu_hle_inject_base;
  * lifted store was an out-of-line call, about a fifth of God of War HD's main
  * thread. A store the out-of-line path treats specially still goes there:
  * anything outside the inline range, any armed store diagnostic (vm_inline_st_ok,
- * the barrier watch, a null-page sweep), and a store to a line an SPU holds a
+ * the barrier watch, a null-page sweep), a store to a line an SPU holds a
  * reservation on, which has to take the lock-line lock and raise the
- * lost-reservation event. */
+ * lost-reservation event, and a 32-bit store to the gcm put word, which can
+ * wake the FIFO walker. */
 extern uint32_t             g_barrier_sync_watch;
 extern uint32_t             g_null_sweep_hi;
 extern const unsigned char* g_spu_coh_bits;   /* SPU-reserved lines, NULL until the first */
@@ -228,8 +229,11 @@ extern const unsigned char* g_spu_coh_bits;   /* SPU-reserved lines, NULL until 
  * mapping, and a span of 0 while a diagnostic is armed. An access then takes
  * one compare. The range is the old checks' or narrower. The one address
  * they also turned away, the gcm ref-poll word, is only special to vm_read32,
- * so only the 32-bit load still tests it. */
-typedef struct ppu_mm { uint8_t* vb; int64_t ld_span, st_span; uint32_t poll; } ppu_mm;
+ * so only the 32-bit load still tests it. Its store-side twin is the gcm put
+ * word, special only to vm_write32 (a store there can wake the FIFO walker,
+ * as the hardware sees put whoever writes it), so only the 32-bit store tests
+ * that. */
+typedef struct ppu_mm { uint8_t* vb; int64_t ld_span, st_span; uint32_t poll, put; } ppu_mm;
 static inline ppu_mm ppu_mm_take(void)
 {
     const uint32_t hi = (ppu_vm_size != 0 && ppu_vm_size < 0xE0000000u) ? ppu_vm_size : 0xE0000000u;
@@ -239,6 +243,7 @@ static inline ppu_mm ppu_mm_take(void)
     m.ld_span = vm_inline_ok ? span : 0;
     m.st_span = (vm_inline_ok && vm_inline_st_ok) ? span : 0;
     m.poll = ppu_hle_inject_base + 0x2008u;   /* the gcm ref-poll word: vm_read32 */
+    m.put  = ppu_hle_inject_base + 0x2000u;   /* the gcm put word: vm_write32 */
     return m;
 }
 /* [ea, ea + n) inside [0x10000, 0x10000 + span). Below 0x10000 the 32-bit
@@ -316,7 +321,7 @@ static inline void vm_write16_mm(const ppu_mm* m, uint64_t a, uint16_t v)
 static inline void vm_write32_mm(const ppu_mm* m, uint64_t a, uint32_t v)
 {
     const uint32_t ea = (uint32_t)a;
-    if (__builtin_expect(vm_mm_st_ok(m, ea, 4), 1)) {
+    if (__builtin_expect(vm_mm_st_ok(m, ea, 4), 1) && __builtin_expect(ea != m->put, 1)) {
         const uint32_t be = __builtin_bswap32(v);
         if (!(ea & 3u)) __atomic_store_n((uint32_t*)(m->vb + ea), be, __ATOMIC_RELAXED);
         else memcpy(m->vb + ea, &be, 4);
@@ -1442,6 +1447,10 @@ class PPULifter:
         # {addr -> (original word, replacement word, guard symbol)}. See
         # _patched_translate.
         self.insn_patches: dict[int, tuple[int, int, str]] = {}
+        # --resv-open-count: lwarx/ldarx report themselves to the runtime's
+        # opt-in open-reservation counts (PS3RECOMP_PPU_RESV_OPEN_COUNT) before
+        # reading. Off by default; the output is then unchanged.
+        self.resv_open_count: bool = False
         # addr(int) -> recovered name label (from Ghidra analysis). Emitted as a
         # comment above func_ADDR so dispatch stays address-based.
         self.name_map: dict[int, str] = {}
@@ -3334,7 +3343,9 @@ class PPULifter:
         if mn == "lwarx":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             ea = f"ctx->gpr[{ra}] + ctx->gpr[{rb}]" if ra != "0" else f"ctx->gpr[{rb}]"
-            return (f"{{ uint64_t ea = {ea}; "
+            note = ("if (g_resv_open_active) ppu_resv_open_note(ctx, (uint32_t)ea); "
+                    if self.resv_open_count else "")
+            return (f"{{ uint64_t ea = {ea}; {note}"
                     f"ctx->gpr[{rd}] = vm_read32(ea); "
                     f"ctx->reserve_addr = (uint32_t)ea; ctx->reserve_value = ctx->gpr[{rd}]; }}")
 
@@ -3354,7 +3365,9 @@ class PPULifter:
         if mn == "ldarx":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             ea = f"ctx->gpr[{ra}] + ctx->gpr[{rb}]" if ra != "0" else f"ctx->gpr[{rb}]"
-            return (f"{{ uint64_t ea = {ea}; "
+            note = ("if (g_resv_open_active) ppu_resv_open_note(ctx, (uint32_t)ea); "
+                    if self.resv_open_count else "")
+            return (f"{{ uint64_t ea = {ea}; {note}"
                     f"ctx->gpr[{rd}] = vm_read64(ea); "
                     f"ctx->reserve_addr = (uint32_t)ea; ctx->reserve_value = ctx->gpr[{rd}]; }}")
 
@@ -4583,6 +4596,12 @@ class PPULifter:
                                             self.prefix + "function_table")
                     if self.prefix else HEADER_PREAMBLE)
         lines = [preamble]
+        if self.resv_open_count:
+            lines.append('#ifdef __cplusplus\nextern "C" {\n#endif\n'
+                         '/* --resv-open-count: see ppu_resv_open_note in the runtime. */\n'
+                         'extern int g_resv_open_active;\n'
+                         'void ppu_resv_open_note(ppu_context* ctx, uint32_t ea);\n'
+                         '#ifdef __cplusplus\n}\n#endif')
         # Forward declarations
         for func in self.functions:
             lines.append(f"void {func.name}(ppu_context* ctx);")
@@ -5683,7 +5702,7 @@ def _mtvscr_absent(segs, big_endian, lo, hi):
 def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
                  function_entries=None, code_lo=0, code_hi=None, jump_tables=None,
                  toc_base=0, nonvolatile_locals=False, so_zero=False, vscr_const=False,
-                 insn_patches=None):
+                 insn_patches=None, resv_open_count=False):
     _WORKER_STATE["nonvolatile_locals"] = nonvolatile_locals
     _WORKER_STATE["so_zero"] = so_zero
     _WORKER_STATE["vscr_const"] = vscr_const
@@ -5702,6 +5721,7 @@ def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
     _WORKER_STATE["code_hi"] = code_hi
     _WORKER_STATE["jump_tables"] = jump_tables or {}
     _WORKER_STATE["insn_patches"] = insn_patches or {}
+    _WORKER_STATE["resv_open_count"] = resv_open_count
 
 
 def _worker_lift(task):
@@ -5721,6 +5741,7 @@ def _worker_lift(task):
     lifter.so_zero = _WORKER_STATE.get("so_zero", False)
     lifter.vscr_const = _WORKER_STATE.get("vscr_const", False)
     lifter.insn_patches = _WORKER_STATE.get("insn_patches", {})
+    lifter.resv_open_count = _WORKER_STATE.get("resv_open_count", False)
     results = []
     for start, end in bounds:
         blob = b""
@@ -5759,7 +5780,7 @@ def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
                              getattr(lifter, "nonvolatile_locals", False),
                              getattr(lifter, "so_zero", False),
                              getattr(lifter, "vscr_const", False),
-                             lifter.insn_patches))
+                             lifter.insn_patches, lifter.resv_open_count))
     try:
         for idx0, results, ct, bt, nvst in pool.imap_unordered(_worker_lift, tasks):
             _nv_stats_add(nvst)
@@ -5843,6 +5864,12 @@ def main() -> None:
                         help="Keep r14-r31 in C locals inside each function, written to "
                              "the register file only at call boundaries (see "
                              "PPULifter._nonvolatile_locals_pass)")
+    parser.add_argument("--resv-open-count", action="store_true",
+                        help="Have lwarx/ldarx report themselves to the "
+                             "runtime's opt-in open-reservation counts, so "
+                             "PS3RECOMP_PPU_RESV_OPEN_COUNT=1 can skip "
+                             "reservation-break scans. Output is unchanged "
+                             "without it")
     parser.add_argument("--weak", action="store_true",
                         help="Emit lifted function definitions as weak symbols "
                              "so a port's idiomatic overrides (strong symbols "
@@ -6138,6 +6165,47 @@ def main() -> None:
                 if got_addr:
                     toc = (got_addr + 0x8000) & 0xFFFFFFFF
                     print(f"  TOC: entry descriptor bogus, using .got+0x8000 = 0x{toc:X}")
+                else:
+                    # Stripped homebrew ELFs (e.g. PSL1GHT EBOOT.BIN with an
+                    # emptied shstrtab) carry no usable section names, so the
+                    # .got lookup finds nothing and the bogus entry toc-word
+                    # (which repeats the code address) would be kept as THE
+                    # module TOC -- every `ld r2, N(r1)` restore lowering then
+                    # hardcodes that garbage and the guest spins in the first
+                    # OPD-hook poll (TanakaDOOM: 0x103F8 vs true 0xA3328).
+                    # Recover the TOC from the OPD instead: scan data segments
+                    # for descriptor pairs {known-function-start, toc} and take
+                    # the most frequent toc. The code half must be a detected
+                    # function start, so incidental pointer data can't vote.
+                    from collections import Counter
+                    _starts = set(s for s, _ in func_bounds)
+                    _toc_freq = Counter()
+                    for v0, v1, d in seg_map:
+                        if v0 <= text_lo < v1:
+                            continue    # skip the text segment itself
+                        # OPD descriptors are 16 bytes in ELF64:
+                        # {code(8), toc(8)}. Reading two consecutive
+                        # DWORDs instead would pair code_lo with
+                        # code_hi==0 and elect 0x0 as the "majority
+                        # TOC" (TanakaDOOM: 1832 bogus votes).
+                        _bo = 'big' if big_endian else 'little'
+                        for off in range(0, len(d) - 16, 4):
+                            c = int.from_bytes(d[off:off + 8], _bo)
+                            t = int.from_bytes(d[off + 8:off + 16], _bo)
+                            if c in _starts and (t & 3) == 0 and t != c:
+                                _toc_freq[t] += 1
+                    if _toc_freq:
+                        _t_best, _n_best = _toc_freq.most_common(1)[0]
+                        if _n_best >= 8:
+                            toc = _t_best
+                            print(f"  TOC: entry descriptor bogus, no .got; "
+                                  f"OPD-majority toc = 0x{toc:X} ({_n_best} descriptors)")
+                        else:
+                            print(f"  TOC: entry descriptor bogus, no .got; "
+                                  f"OPD scan inconclusive (best 0x{_t_best:X} x{_n_best})")
+                    else:
+                        print("  TOC: entry descriptor bogus, no .got; "
+                              "OPD scan found no descriptors")
             # Multi-TOC executables (large Sony-toolchain builds like LBP carry
             # two or more TOCs): harvest candidates by scanning the data
             # segments for OPD descriptor pairs {code-in-text, toc} and keeping
@@ -6335,6 +6403,7 @@ def main() -> None:
         if lifter.vscr_const:
             print("  VSCR: no mtvscr in the code, so NJ stays 0: the VMX float helpers "
                   "are handed it as a constant (PPU_VSCR_EXACT=1 reads it)")
+    lifter.resv_open_count = args.resv_open_count
     if args.insn_patches:
         lifter.insn_patches = load_insn_patches(args.insn_patches)
         print(f"  insn-patches: {len(lifter.insn_patches)} from {args.insn_patches}")

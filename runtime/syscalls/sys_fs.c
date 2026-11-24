@@ -6,6 +6,9 @@
 #include "sys_fs.h"
 #include "../../libs/filesystem/edat.h"
 #include "../memory/vm.h"
+#include "../platform/ps3_dev_flash.h"
+#include "../memory/vm_watch_hooks.h"
+#include <errno.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,6 +35,62 @@
 sys_fs_fd_info  g_sys_fs_fds[SYS_FS_FD_MAX];
 sys_fs_dir_info g_sys_fs_dirs[SYS_FS_DIR_MAX];
 char            g_sys_fs_root[512] = ".";
+
+/* fd and dir-fd slots are claimed and released under this lock. These
+ * syscalls are live from several guest threads at once (one thread opens a
+ * file while another is mid-read on its own), and the unlocked
+ * find-a-free-slot-then-mark-it-active sequence let two concurrent opens pick
+ * the same slot and share one FILE*. */
+#ifdef _WIN32
+static SRWLOCK s_fs_slot_lock = SRWLOCK_INIT;
+static void fs_slot_lock(void)   { AcquireSRWLockExclusive(&s_fs_slot_lock); }
+static void fs_slot_unlock(void) { ReleaseSRWLockExclusive(&s_fs_slot_lock); }
+#else
+#include <pthread.h>
+static pthread_mutex_t s_fs_slot_lock = PTHREAD_MUTEX_INITIALIZER;
+static void fs_slot_lock(void)   { pthread_mutex_lock(&s_fs_slot_lock); }
+static void fs_slot_unlock(void) { pthread_mutex_unlock(&s_fs_slot_lock); }
+#endif
+
+/* ---- cellFs fd bridge -------------------------------------------------------
+ *
+ * On hardware, cellFsOpen and the raw sys_fs_* calls share ONE kernel fd
+ * space: a title may open a file with cellFs and read it with sys_fs_read.
+ * Our runtime has two tables (runtime/ppu/ppu_fs.cpp for cellFs, this file
+ * for sys_fs), so that mix returned EBADF. MLB The Show 16's Bink SDK does
+ * exactly this: the game opens the .BIK with cellFsOpen, the Bink IO then calls
+ * sys_fs_lseek/sys_fs_read on that fd, and BinkOpen reported "Not a Bink file."
+ * Bridge only when the fd is not ours; the sys_fs table stays authoritative
+ * for its own descriptors.
+ *
+ * shortcut: each allocator checks the other's table without its lock, so two
+ * opens racing through different tables can still pick one number; a shared
+ * lock or one table is the real fix if a title hits it.
+ *
+ * A default, replaced by ppu_fs.cpp's, so a fixture that links this file
+ * without it still links. */
+#ifdef _MSC_VER
+FILE* ppu_cellfs_file_for_fd_absent(int fd) { (void)fd; return NULL; }
+FILE* ppu_cellfs_file_for_fd(int fd);
+#  ifdef _M_IX86
+#    pragma comment(linker, "/alternatename:_ppu_cellfs_file_for_fd=_ppu_cellfs_file_for_fd_absent")
+#  else
+#    pragma comment(linker, "/alternatename:ppu_cellfs_file_for_fd=ppu_cellfs_file_for_fd_absent")
+#  endif
+#else
+__attribute__((weak)) FILE* ppu_cellfs_file_for_fd(int fd) { (void)fd; return NULL; }
+#endif
+
+static FILE* sys_fs_bridge_file(int fd) { return ppu_cellfs_file_for_fd(fd); }
+
+/* Exposed to ppu_fs so its allocator does not hand out a number this table
+ * already owns (and vice versa in sys_fs_open below): two live fds with one
+ * number are exactly the split this bridge papers over. */
+int sys_fs_fd_active(int fd)
+{
+    int slot = fd - 3;
+    return slot >= 0 && slot < SYS_FS_FD_MAX && g_sys_fs_fds[slot].active;
+}
 
 static void write_be32(uint32_t addr, uint32_t val)
 {
@@ -127,8 +186,10 @@ static void ps3_vfs_overlay(char* path, size_t cap)
  * The title's own hook runs around it (below). */
 static void ps3game_fallback(char* path, size_t cap);
 
-/* cellGame.c; weak so fixtures that link sys_fs.c without it still link. The
- * only weak reference to it: under COFF each one emits its own fallback. */
+/* cellGame.c; weak so fixtures that link sys_fs.c without it still link on
+ * ELF. ld64 does not accept an undefined weak symbol, so on macOS such a
+ * fixture defines it (test_sys_fs.c). The only weak reference to it: under
+ * COFF each one emits its own fallback. */
 extern __attribute__((weak)) const char* cellGame_get_hdd_title_id(void);
 
 /* The title's own hook, if it sets one: a port that serves some files from
@@ -207,6 +268,16 @@ static void ps3game_fallback(char* path, size_t cap)
 
 void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size)
 {
+    /* /dev/null / dev/null device mapping */
+    if (ps3_path && (strcmp(ps3_path, "/dev/null") == 0 || strcmp(ps3_path, "dev/null") == 0)) {
+#ifdef _WIN32
+        snprintf(host_path, (size_t)host_path_size, "NUL");
+#else
+        snprintf(host_path, (size_t)host_path_size, "/dev/null");
+#endif
+        return;
+    }
+
     /* Lazily adopt PS3_VFS_ROOT if the root is still the default ".", so this
      * sys_fs layer points at the same place as the cellFs layer (ppu_vfs_root). */
     if (g_sys_fs_root[0] == '.' && g_sys_fs_root[1] == '\0') {
@@ -249,7 +320,7 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
         static const char* fw = NULL; static int fw_init = 0;
         if (!fw_init) { fw = getenv("PS3_DEV_FLASH"); fw_init = 1; }
         if (fw && *fw && strncmp(ps3_path, "/dev_flash/", 11) == 0) {
-            snprintf(host_path, (size_t)host_path_size, "%s/%s", fw, ps3_path + 11);
+            ps3_dev_flash_path(host_path, (size_t)host_path_size, fw, ps3_path + 11);
             fs_normalize_sep(host_path);
             return;
         }
@@ -430,13 +501,8 @@ int64_t sys_fs_open(ppu_context* ctx)
       const char* use = edat_resolve(host_path, dec_path, sizeof dec_path);
       if (use != host_path) snprintf(host_path, sizeof host_path, "%s", use); }
 
-    /* Find free fd slot */
-    int slot = -1;
-    for (int i = 0; i < SYS_FS_FD_MAX; i++) {
-        if (!g_sys_fs_fds[i].active) { slot = i; break; }
-    }
-    if (slot < 0)
-        return (int64_t)(int32_t)CELL_ENOMEM;
+    /* (The fd slot is claimed at the end, under fs_slot_lock, once the host
+     * file is open.) */
 
     /* Determine fopen mode from PS3 flags */
     const char* mode;
@@ -481,7 +547,16 @@ int64_t sys_fs_open(ppu_context* ctx)
             mode = "rb";
     }
 
+    /* O_EXCL (meaningful with O_CREAT): an existing file is CELL_EEXIST. It was
+     * decoded from the wrong bit before and never looked at. */
+    if ((flags & CELL_FS_O_CREAT) && (flags & CELL_FS_O_EXCL)) {
+        struct stat _sx;
+        if (stat(host_path, &_sx) == 0)
+            return (int64_t)(int32_t)CELL_EEXIST;
+    }
+
     FILE* fp = fopen(host_path, mode);
+    const int open_errno = errno;
 
     /* Transient open failures: on Windows an existing, correctly-pathed file can
      * intermittently fail to open (AV/indexer holding a share lock, or momentary
@@ -495,26 +570,32 @@ int64_t sys_fs_open(ppu_context* ctx)
      * libxml2 probes /etc/xml/catalog there, and that file is absent by design.
      * A share-lock/handle-pressure failure (the case this retry exists for)
      * reports EACCES/EBUSY, not ENOENT, so the recovery still works. */
-    if (!fp && errno != ENOENT &&
+    if (!fp && open_errno != ENOENT && open_errno != EINVAL &&
         !(flags & (CELL_FS_O_CREAT | CELL_FS_O_WRONLY | CELL_FS_O_TRUNC))) {
-        for (int _r = 0; !fp && _r < 3000; _r++) {
+        struct stat _st_retry;
+        if (stat(host_path, &_st_retry) == 0 && !S_ISDIR(_st_retry.st_mode)) {
+            for (int _r = 0; !fp && _r < 3000; _r++) {
 #ifdef _WIN32
-            Sleep(1);
+                Sleep(1);
 #else
-            /* The delay is the retry. 3000 iterations is meant to be about
-             * three seconds of waiting for a transient share lock or handle
-             * pressure to clear; without it the loop spends microseconds
-             * calling fopen 3000 times on a condition that has not changed,
-             * and the recovery this exists for never happens. */
-            { struct timespec _d = { 0, 1000 * 1000 }; nanosleep(&_d, NULL); }
+                /* The delay is the retry. 3000 iterations is meant to be about
+                 * three seconds of waiting for a transient share lock or handle
+                 * pressure to clear; without it the loop spends microseconds
+                 * calling fopen 3000 times on a condition that has not changed,
+                 * and the recovery this exists for never happens. */
+                { struct timespec _d = { 0, 1000 * 1000 }; nanosleep(&_d, NULL); }
 #endif
-            fp = fopen(host_path, mode);
+                fp = fopen(host_path, mode);
+            }
+            if (fp) fprintf(stderr, "[sys_fs] open recovered after retry: %s\n", host_path);
         }
-        if (fp) fprintf(stderr, "[sys_fs] open recovered after retry: %s\n", host_path);
     }
 
-    /* If CREAT flag set and file doesn't exist, try creating it */
-    if (!fp && (flags & CELL_FS_O_CREAT)) {
+    /* If CREAT flag set and file doesn't exist, try creating it. Only when it
+     * really does not exist: "w+b" truncates, so a file that merely failed
+     * "r+b" for another reason (a share lock, no write permission) must not be
+     * emptied by the fallback. */
+    if (!fp && (flags & CELL_FS_O_CREAT) && open_errno == ENOENT) {
         fp = fopen(host_path, "w+b");
     }
 
@@ -539,14 +620,28 @@ int64_t sys_fs_open(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ENOENT;
     }
 
-    fprintf(stderr, "[sys_fs] open OK: %s\n", host_path);
-
+    /* Claim a free fd slot (see fs_slot_lock). A full table is EMFILE. Skip
+     * numbers the cellFs table owns: one fd space on hardware, see the bridge
+     * note at the top of this file. */
+    fs_slot_lock();
+    int slot = -1;
+    for (int i = 0; i < SYS_FS_FD_MAX; i++) {
+        if (!g_sys_fs_fds[i].active && !sys_fs_bridge_file(i + 3)) { slot = i; break; }
+    }
+    if (slot < 0) {
+        fs_slot_unlock();
+        fclose(fp);
+        return (int64_t)(int32_t)CELL_EMFILE;
+    }
     sys_fs_fd_info* f = &g_sys_fs_fds[slot];
-    f->active = 1;
     f->fp     = fp;
     f->flags  = flags;
     strncpy(f->path, host_path, sizeof(f->path) - 1);
     f->path[sizeof(f->path) - 1] = '\0';
+    f->active = 1;     /* published last */
+    fs_slot_unlock();
+
+    fprintf(stderr, "[sys_fs] open OK: %s\n", host_path);
 
     /* FD is slot + 3 (reserve 0=stdin, 1=stdout, 2=stderr) */
     int32_t fd = slot + 3;
@@ -611,25 +706,26 @@ int64_t sys_fs_read(ppu_context* ctx)
     uint32_t nread_addr = LV2_ARG_PTR(ctx, 3);
 
     int slot = fd - 3;
-    if (slot < 0 || slot >= SYS_FS_FD_MAX)
-        return (int64_t)(int32_t)CELL_EBADF;
-
-    sys_fs_fd_info* f = &g_sys_fs_fds[slot];
-    if (!f->active || !f->fp)
+    sys_fs_fd_info* f = (slot >= 0 && slot < SYS_FS_FD_MAX) ? &g_sys_fs_fds[slot] : NULL;
+    /* Own table first; otherwise the same fd opened through cellFs (one fd
+     * space on hardware; see the bridge note at the top of this file). */
+    FILE* fp = (f && f->active) ? f->fp : sys_fs_bridge_file(fd);
+    if (!fp)
         return (int64_t)(int32_t)CELL_EBADF;
 
     void* buf = vm_to_host(buf_addr);
-    long pos_before = ftell(f->fp);
+    long pos_before = ftell(fp);
     /* The VM commits pages on first user-mode touch; a read the CRT hands to
      * the kernel (anything past its 4 KB buffer) into a still-reserved page
      * fails instead, and fread comes back short. GH3's Bink reader saw that
      * as a read error on every movie and never decoded a frame -- solid green
      * video. ppu_fs.cpp fs_prefault is the same fix for cellFs. */
     if (size) { vm_commit(buf_addr, (uint32_t)size); vm_watch_touch(buf_addr, (uint32_t)size); }
-
+    vm_note_write(buf_addr, (size_t)size);   /* kernel write into guest memory (#727) */
 
     const double t_rd = fs_read_time_start();
-    size_t nread = fread(buf, 1, (size_t)size, f->fp);
+    size_t nread = fread(buf, 1, (size_t)size, fp);
+    vm_note_write_check(nread < (size_t)size && ferror(fp) && errno == EFAULT, "sys_fs read");
     fs_read_time_log("lv2", fd, (uint64_t)pos_before, (uint64_t)size, (uint64_t)nread, t_rd);
 
     /* PS3_FSTRACE=<n>: every nth read, the fd and the file offset it came from.
@@ -660,7 +756,8 @@ int64_t sys_fs_read(ppu_context* ctx)
         const unsigned char* b = (const unsigned char*)buf;
         fprintf(stderr, "[FSDBG] read fd=%d '%s' pos=%ld want=%llu got=%zu"
                         " head=%02X%02X%02X%02X lr=0x%08X\n",
-                fd, f->path, pos_before, (unsigned long long)size, nread,
+                fd, (f && f->active) ? f->path : "<cellFs fd>", pos_before,
+                (unsigned long long)size, nread,
                 nread > 0 ? b[0] : 0, nread > 1 ? b[1] : 0,
                 nread > 2 ? b[2] : 0, nread > 3 ? b[3] : 0,
                 (uint32_t)ctx->lr);
@@ -693,15 +790,16 @@ int64_t sys_fs_write(ppu_context* ctx)
     }
 
     sys_fs_fd_info* f = &g_sys_fs_fds[slot];
-    if (!f->active || !f->fp) {
+    FILE* fp = f->active ? f->fp : sys_fs_bridge_file(fd);
+    if (!fp) {
         if (nwritten_addr != 0)
             write_be64(nwritten_addr, size);
         return CELL_OK;
     }
 
     const void* buf = vm_to_host(buf_addr);
-    size_t nwritten = fwrite(buf, 1, (size_t)size, f->fp);
-    fflush(f->fp);
+    size_t nwritten = fwrite(buf, 1, (size_t)size, fp);
+    fflush(fp);
 
     if (nwritten_addr != 0) {
         write_be64(nwritten_addr, (uint64_t)nwritten);
@@ -727,11 +825,12 @@ int64_t sys_fs_close(ppu_context* ctx)
     if (!f->active)
         return (int64_t)(int32_t)CELL_EBADF;
 
-    if (f->fp) {
+    if (f->fp)
         fclose(f->fp);
-        f->fp = NULL;
-    }
+    fs_slot_lock();     /* hand the slot back once the stream is closed */
+    f->fp = NULL;
     f->active = 0;
+    fs_slot_unlock();
 
     return CELL_OK;
 }
@@ -752,16 +851,11 @@ int64_t sys_fs_lseek(ppu_context* ctx)
     uint32_t pos_addr  = LV2_ARG_PTR(ctx, 3);
 
     int slot = fd - 3;
-    if (slot < 0 || slot >= SYS_FS_FD_MAX) {
+    sys_fs_fd_info* f = (slot >= 0 && slot < SYS_FS_FD_MAX) ? &g_sys_fs_fds[slot] : NULL;
+    FILE* fp = (f && f->active) ? f->fp : sys_fs_bridge_file(fd);
+    if (!fp) {
         /* Invalid fd — return position 0 instead of EBADF.
          * The CRT may call lseek on uninitialized FILE structures. */
-        if (pos_addr)
-            write_be64(pos_addr, 0);
-        return 0;
-    }
-
-    sys_fs_fd_info* f = &g_sys_fs_fds[slot];
-    if (!f->active || !f->fp) {
         if (pos_addr)
             write_be64(pos_addr, 0);
         return 0;
@@ -775,12 +869,24 @@ int64_t sys_fs_lseek(ppu_context* ctx)
         default: return (int64_t)(int32_t)CELL_EINVAL;
     }
 
+    /* A seek that fails (a negative resulting position) is CELL_EINVAL with
+     * the offset unchanged. The MSVC CRT drops its read buffer on a failed
+     * call and the stream then reports the OS position, which is past the
+     * buffered data, so the old position is put back explicitly. */
 #ifdef _WIN32
-    _fseeki64(f->fp, offset, origin);
-    int64_t pos = _ftelli64(f->fp);
+    const int64_t before = _ftelli64(fp);
+    if (_fseeki64(fp, offset, origin) != 0) {
+        if (before >= 0) _fseeki64(fp, before, SEEK_SET);
+        return (int64_t)(int32_t)CELL_EINVAL;
+    }
+    int64_t pos = _ftelli64(fp);
 #else
-    fseeko(f->fp, (off_t)offset, origin);
-    int64_t pos = (int64_t)ftello(f->fp);
+    const off_t before = ftello(fp);
+    if (fseeko(fp, (off_t)offset, origin) != 0) {
+        if (before >= 0) fseeko(fp, before, SEEK_SET);
+        return (int64_t)(int32_t)CELL_EINVAL;
+    }
+    int64_t pos = (int64_t)ftello(fp);
 #endif
 
     if (pos_addr != 0) {
@@ -867,19 +973,17 @@ int64_t sys_fs_fstat(ppu_context* ctx)
     uint32_t stat_addr = LV2_ARG_PTR(ctx, 1);
 
     int slot = fd - 3;
-    if (slot < 0 || slot >= SYS_FS_FD_MAX)
-        return (int64_t)(int32_t)CELL_EBADF;
-
-    sys_fs_fd_info* f = &g_sys_fs_fds[slot];
-    if (!f->active || !f->fp)
+    sys_fs_fd_info* f = (slot >= 0 && slot < SYS_FS_FD_MAX) ? &g_sys_fs_fds[slot] : NULL;
+    FILE* fp = (f && f->active) ? f->fp : sys_fs_bridge_file(fd);
+    if (!fp)
         return (int64_t)(int32_t)CELL_EBADF;
 
     struct stat st;
 #ifdef _WIN32
-    int fno = _fileno(f->fp);
+    int fno = _fileno(fp);
     if (_fstat64(fno, (struct _stat64*)&st) != 0)
 #else
-    int fno = fileno(f->fp);
+    int fno = fileno(fp);
     if (fstat(fno, &st) != 0)
 #endif
     {
@@ -908,31 +1012,49 @@ int64_t sys_fs_opendir(ppu_context* ctx)
     char host_path[1024];
     sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
 
+    /* Open the host directory first, then claim a slot (see fs_slot_lock): the
+     * old order filled in a slot it had not yet marked active, so a concurrent
+     * opendir could pick the same one. A full table is EMFILE. */
+#ifdef _WIN32
+    char search_path[1024];
+    WIN32_FIND_DATAA find_data;
+    snprintf(search_path, sizeof(search_path), "%s\\*", host_path);
+    HANDLE find_handle = FindFirstFileA(search_path, &find_data);
+    if (find_handle == INVALID_HANDLE_VALUE)
+        return (int64_t)(int32_t)CELL_ENOENT;
+#else
+    DIR* dp = opendir(host_path);
+    if (!dp)
+        return (int64_t)(int32_t)CELL_ENOENT;
+#endif
+
+    fs_slot_lock();
     int slot = -1;
     for (int i = 0; i < SYS_FS_DIR_MAX; i++) {
         if (!g_sys_fs_dirs[i].active) { slot = i; break; }
     }
-    if (slot < 0)
-        return (int64_t)(int32_t)CELL_ENOMEM;
+    if (slot < 0) {
+        fs_slot_unlock();
+#ifdef _WIN32
+        FindClose(find_handle);
+#else
+        closedir(dp);
+#endif
+        return (int64_t)(int32_t)CELL_EMFILE;
+    }
 
     sys_fs_dir_info* d = &g_sys_fs_dirs[slot];
     memset(d, 0, sizeof(*d));
-
 #ifdef _WIN32
-    char search_path[1024];
-    snprintf(search_path, sizeof(search_path), "%s\\*", host_path);
-    d->find_handle = FindFirstFileA(search_path, &d->find_data);
-    if (d->find_handle == INVALID_HANDLE_VALUE)
-        return (int64_t)(int32_t)CELL_ENOENT;
-    d->first_read = 1;
+    d->find_handle = find_handle;
+    d->find_data   = find_data;
+    d->first_read  = 1;
 #else
-    d->dp = opendir(host_path);
-    if (!d->dp)
-        return (int64_t)(int32_t)CELL_ENOENT;
+    d->dp = dp;
 #endif
-
-    d->active = 1;
     strncpy(d->path, host_path, sizeof(d->path) - 1);
+    d->active = 1;     /* published last */
+    fs_slot_unlock();
 
     int32_t dir_fd = slot + 1;
     write_be32(fd_out, (uint32_t)dir_fd);
@@ -1009,8 +1131,9 @@ int64_t sys_fs_readdir(ppu_context* ctx)
     }
 
     if (nread_addr != 0) {
-        /* Non-zero means success */
-        write_be64(nread_addr, (uint64_t)(name ? strlen(name) + 2 : 0));
+        /* One entry is sizeof(CellFsDirent) = 0x102 bytes, whatever the name's
+         * length; 0 marks the end of the directory. */
+        write_be64(nread_addr, (uint64_t)(name ? 0x102 : 0));
     }
 
     return CELL_OK;
@@ -1039,7 +1162,9 @@ int64_t sys_fs_closedir(ppu_context* ctx)
     if (d->dp) closedir(d->dp);
 #endif
 
+    fs_slot_lock();     /* hand the slot back once the handle is closed */
     d->active = 0;
+    fs_slot_unlock();
     return CELL_OK;
 }
 
@@ -1068,12 +1193,13 @@ int64_t sys_fs_mkdir(ppu_context* ctx)
 #endif
 
     if (rc != 0) {
-        /* Check if it already exists */
+        /* Anything already at that path is EEXIST -- a file of that name
+         * included, which used to be reported as ENOENT. */
         struct stat st;
 #ifdef _WIN32
-        if (_stat64(host_path, (struct _stat64*)&st) == 0 && S_ISDIR(st.st_mode))
+        if (_stat64(host_path, (struct _stat64*)&st) == 0)
 #else
-        if (stat(host_path, &st) == 0 && S_ISDIR(st.st_mode))
+        if (stat(host_path, &st) == 0)
 #endif
             return (int64_t)(int32_t)CELL_EEXIST;
         return (int64_t)(int32_t)CELL_ENOENT;
@@ -1130,7 +1256,19 @@ int64_t sys_fs_unlink(ppu_context* ctx)
 #else
     if (unlink(host_path) != 0)
 #endif
-        return (int64_t)(int32_t)CELL_ENOENT;
+    {
+        /* Only a missing path is ENOENT. A directory is EISDIR (the host errno
+         * for that differs per OS, so ask stat), and anything else the host
+         * refused is an I/O error. */
+        const int e = errno;
+        struct stat st;
+        if (stat(host_path, &st) != 0)
+            return (int64_t)(int32_t)CELL_ENOENT;
+        if (S_ISDIR(st.st_mode))
+            return (int64_t)(int32_t)CELL_EISDIR;
+        fprintf(stderr, "[sys_fs] unlink '%s' failed (host errno %d) -> EIO\n", host_path, e);
+        return (int64_t)(int32_t)CELL_EIO;
+    }
 
     return CELL_OK;
 }
@@ -1156,7 +1294,19 @@ int64_t sys_fs_rmdir(ppu_context* ctx)
 #else
     if (rmdir(host_path) != 0)
 #endif
-        return (int64_t)(int32_t)CELL_ENOENT;
+    {
+        /* ENOENT / ENOTDIR / ENOTEMPTY are different answers to a guest that
+         * is clearing a cache directory; they all used to be ENOENT. */
+        const int e = errno;
+        struct stat st;
+        if (stat(host_path, &st) != 0)
+            return (int64_t)(int32_t)CELL_ENOENT;
+        if (!S_ISDIR(st.st_mode))
+            return (int64_t)(int32_t)CELL_ENOTDIR;
+        if (e == ENOTEMPTY || e == EEXIST)
+            return (int64_t)(int32_t)CELL_ENOTEMPTY;
+        return (int64_t)(int32_t)CELL_EIO;
+    }
 
     return CELL_OK;
 }

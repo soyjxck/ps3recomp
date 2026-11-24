@@ -96,6 +96,9 @@ extern "C" {
 #define CELL_GAME_ERROR_IN_SHUTDOWN    (s32)(CELL_ERROR_BASE_SYSUTIL_GAME | 0x24)
 #define CELL_GAME_ERROR_INVALID_ID     (s32)(CELL_ERROR_BASE_SYSUTIL_GAME | 0x25)
 #define CELL_GAME_ERROR_EXIST          (s32)(CELL_ERROR_BASE_SYSUTIL_GAME | 0x26)
+/* The firmware's static non-patch literal is 0x8002CB06 (its INTERNAL value),
+ * but the live boot lookup value is unobserved; see the PatchCheck notes. The
+ * local name keeps the SDK's 0xCB27 until a console probe settles the mapping. */
 #define CELL_GAME_ERROR_NOTPATCH       (s32)(CELL_ERROR_BASE_SYSUTIL_GAME | 0x27)
 #define CELL_GAME_ERROR_INVALID_THEME_FILE (s32)(CELL_ERROR_BASE_SYSUTIL_GAME | 0x28)
 #define CELL_GAME_ERROR_BOOTPATH       (s32)(CELL_ERROR_BASE_SYSUTIL_GAME | 0x50)
@@ -145,11 +148,11 @@ void cellGame_set_content_path(const char* path);
  * Functions
  * -----------------------------------------------------------------------*/
 
+s32 cellGamePatchCheck(CellGameContentSize* size, u32 reserved);
 s32 cellGameBootCheck(u32* type, u32* attributes, CellGameContentSize* size,
                        char* dirName);
 
 s32 cellGameContentPermit(char* contentInfoPath, char* usrdirPath);
-s32 cellGamePatchCheck(CellGameContentSize* size, u64 reserved);
 
 s32 cellGameDataCheck(u32 type, const char* dirName, CellGameContentSize* size);
 

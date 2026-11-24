@@ -22,6 +22,7 @@ uint32_t g_sys_mem_bump_ptr = 0;
 
 /* Total user memory size (default 213 MB, after kernel reservation) */
 #define SYS_MEM_USER_TOTAL  (213 * 1024 * 1024)
+#define SYS_MEMORY_CONTAINER_DEFAULT 0xFFFFFFFFu   /* SYS_MEMORY_CONTAINER_ID_INVALID: the default container */
 
 /* Guest window handed out by sys_memory_allocate.
  * 0x40000000+ matches where the real lv2 places these allocations (verified
@@ -166,15 +167,17 @@ static void write_be32(uint32_t addr, uint32_t val)
  * r4 = flags (page size)
  * r5 = pointer to receive allocated address (u32*)
  * -----------------------------------------------------------------------*/
-int64_t sys_memory_allocate(ppu_context* ctx)
+/* sys_memory_allocate and sys_memory_allocate_from_container share this. cid 0
+ * is the process's main pool, which has no fixed size here: it ends where the
+ * two windows do. A container's memory already came out of that pool when it
+ * was created, so its allocations are charged to the container alone (its
+ * used_size), checked against its total. ctx is the caller's, for
+ * SYS_MEM_TRACE. */
+static int64_t memory_allocate(ppu_context* ctx, uint64_t requested, uint32_t flags, uint32_t cid, uint32_t addr_out)
 {
-    uint64_t requested = LV2_ARG_U64(ctx, 0);
-    uint32_t flags     = LV2_ARG_U32(ctx, 1);
-    uint32_t addr_out  = LV2_ARG_PTR(ctx, 2);
-
     if (ps3_log_verbose())   /* Drakengard 3 allocates ten times a second */
-        fprintf(stderr, "[sys_memory] allocate(size=0x%llX, flags=0x%X)\n",
-                (unsigned long long)requested, flags);
+        fprintf(stderr, "[sys_memory] allocate(size=0x%llX, flags=0x%X, cid=%u)\n",
+                (unsigned long long)requested, flags, cid);
 
     /* Determine alignment based on page size flags: 1 MB or 64 KB */
     uint32_t alignment = (flags & SYS_MEMORY_PAGE_SIZE_1M) ? 0x100000u : 0x10000u;
@@ -187,6 +190,10 @@ int64_t sys_memory_allocate(ppu_context* ctx)
     uint32_t size = (uint32_t)rounded;
 
     bump_lock();
+    sys_mem_container_info* ct = cid ? &g_sys_mem_containers[cid - 1] : NULL;
+    if (ct && size > ct->total_size - ct->used_size) {
+        bump_unlock(); return (int64_t)(int32_t)CELL_ENOMEM;
+    }
 
     /* A freed range first: the pages are already committed, so only the
      * contents need clearing to look like fresh ones. */
@@ -196,9 +203,10 @@ int64_t sys_memory_allocate(ppu_context* ctx)
           for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; i++)
               if (!g_sys_mem_allocs[i].active) { slot = i; break; }
           if (slot >= 0) {
-              s_total_allocated += size;
+              if (ct) ct->used_size += size;
+              else    s_total_allocated += size;
               sys_mem_alloc_info* a = &g_sys_mem_allocs[slot];
-              a->active = 1; a->addr = r; a->size = size; a->container_id = 0; a->page_size = alignment;
+              a->active = 1; a->addr = r; a->size = size; a->container_id = (int32_t)cid; a->page_size = alignment;
               bump_unlock();
               memset(vm_to_host(r), 0, size);
               { static unsigned long _n = 0; if (_n++ < 40 || (_n % 200) == 0)
@@ -260,13 +268,14 @@ int64_t sys_memory_allocate(ppu_context* ctx)
       } }
     uint32_t alloc_addr = g_sys_mem_bump_ptr;
     g_sys_mem_bump_ptr += size;
-    s_total_allocated += size;
+    if (ct) ct->used_size += size;
+    else    s_total_allocated += size;
 
     sys_mem_alloc_info* a = &g_sys_mem_allocs[slot];
     a->active       = 1;       /* claim the slot before unlocking */
     a->addr         = alloc_addr;
     a->size         = size;
-    a->container_id = 0;
+    a->container_id = (int32_t)cid;
     a->page_size    = alignment;  /* 0x100000 (1M) or 0x10000 (64K) */
 
     bump_unlock();
@@ -274,7 +283,11 @@ int64_t sys_memory_allocate(ppu_context* ctx)
     /* Commit the pages (window is outside the pre-committed main region);
      * fresh commits are already zeroed by the OS */
     if (vm_commit(alloc_addr, size) != CELL_OK) {
+        bump_lock();
         a->active = 0;
+        if (ct) ct->used_size -= size;
+        else    s_total_allocated -= size;
+        bump_unlock();
         return (int64_t)(int32_t)CELL_ENOMEM;
     }
 
@@ -286,6 +299,31 @@ int64_t sys_memory_allocate(ppu_context* ctx)
     }
 
     return CELL_OK;
+}
+
+int64_t sys_memory_allocate(ppu_context* ctx)
+{
+    return memory_allocate(ctx, LV2_ARG_U64(ctx, 0), LV2_ARG_U32(ctx, 1), 0, LV2_ARG_PTR(ctx, 2));
+}
+
+/* ---------------------------------------------------------------------------
+ * sys_memory_allocate_from_container (syscall 350)
+ *
+ * r3 = size, r4 = container id, r5 = flags, r6 = pointer to receive the address
+ *
+ * Was unregistered. MLB The Show 16 builds its animation and movie buffer pools
+ * ("SharedMemContAnim", "SharedMemContMovie") in containers carved from the
+ * default one; with no allocation the pool stayed empty and loading a match
+ * called a method on a NULL buffer.
+ * -----------------------------------------------------------------------*/
+int64_t sys_memory_allocate_from_container(ppu_context* ctx)
+{
+    uint32_t cid = LV2_ARG_U32(ctx, 1);
+    if (cid == SYS_MEMORY_CONTAINER_DEFAULT)
+        return memory_allocate(ctx, LV2_ARG_U64(ctx, 0), LV2_ARG_U32(ctx, 2), 0, LV2_ARG_PTR(ctx, 3));
+    if (cid == 0 || cid > SYS_MEMORY_CONTAINER_MAX || !g_sys_mem_containers[cid - 1].active)
+        return (int64_t)(int32_t)CELL_ESRCH;
+    return memory_allocate(ctx, LV2_ARG_U64(ctx, 0), LV2_ARG_U32(ctx, 2), cid, LV2_ARG_PTR(ctx, 3));
 }
 
 /* ---------------------------------------------------------------------------
@@ -301,7 +339,13 @@ int64_t sys_memory_free(ppu_context* ctx)
     for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; i++) {
         if (g_sys_mem_allocs[i].active && g_sys_mem_allocs[i].addr == addr) {
             uint32_t size = g_sys_mem_allocs[i].size;
-            s_total_allocated -= size;
+            /* The container is still active: one with live allocations
+             * cannot be destroyed. */
+            const int32_t cid = g_sys_mem_allocs[i].container_id;
+            if (cid > 0 && cid <= SYS_MEMORY_CONTAINER_MAX)
+                g_sys_mem_containers[cid - 1].used_size -= size;
+            else
+                s_total_allocated -= size;
             g_sys_mem_allocs[i].active = 0;
             sys_mem_release(addr, size);
             bump_unlock();
@@ -385,23 +429,34 @@ int64_t sys_memory_get_page_attribute(ppu_context* ctx)
  *
  * r3 = pointer to receive container ID (u32*)
  * r4 = size
+ *
+ * The container's memory is taken out of the default pool here, as LV2 does:
+ * what the title reads back as the default pool's free size drops by it, and
+ * the pool answers ENOMEM when it does not have that much left.
  * -----------------------------------------------------------------------*/
 int64_t sys_memory_container_create(ppu_context* ctx)
 {
     uint32_t id_out_addr = LV2_ARG_PTR(ctx, 0);
     uint32_t size        = LV2_ARG_U32(ctx, 1);
 
+    bump_lock();
     int slot = -1;
     for (int i = 0; i < SYS_MEMORY_CONTAINER_MAX; i++) {
         if (!g_sys_mem_containers[i].active) { slot = i; break; }
     }
-    if (slot < 0)
-        return (int64_t)(int32_t)CELL_EAGAIN;
+    if (slot < 0) {
+        bump_unlock(); return (int64_t)(int32_t)CELL_EAGAIN;
+    }
+    if (size > SYS_MEM_USER_TOTAL - s_total_allocated) {
+        bump_unlock(); return (int64_t)(int32_t)CELL_ENOMEM;
+    }
 
     sys_mem_container_info* c = &g_sys_mem_containers[slot];
     c->active     = 1;
     c->total_size = size;
     c->used_size  = 0;
+    s_total_allocated += size;
+    bump_unlock();
 
     uint32_t container_id = (uint32_t)(slot + 1);
     if (id_out_addr != 0) {
@@ -415,6 +470,10 @@ int64_t sys_memory_container_create(ppu_context* ctx)
  * sys_memory_container_destroy
  *
  * r3 = container_id
+ *
+ * EBUSY while anything is still allocated in it, as on LV2: the slot would be
+ * reused, and freeing that allocation later would charge the new container.
+ * Otherwise its memory goes back to the default pool.
  * -----------------------------------------------------------------------*/
 int64_t sys_memory_container_destroy(ppu_context* ctx)
 {
@@ -423,25 +482,48 @@ int64_t sys_memory_container_destroy(ppu_context* ctx)
     if (container_id == 0 || container_id > SYS_MEMORY_CONTAINER_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
 
+    bump_lock();
     sys_mem_container_info* c = &g_sys_mem_containers[container_id - 1];
-    if (!c->active)
-        return (int64_t)(int32_t)CELL_ESRCH;
+    if (!c->active) {
+        bump_unlock(); return (int64_t)(int32_t)CELL_ESRCH;
+    }
+    if (c->used_size) {
+        bump_unlock(); return (int64_t)(int32_t)CELL_EBUSY;
+    }
 
     c->active = 0;
+    s_total_allocated -= c->total_size;
+    bump_unlock();
     return CELL_OK;
 }
 
 /* ---------------------------------------------------------------------------
  * sys_memory_container_get_size
  *
- * r3 = container_id
- * r4 = pointer to output struct: { u32 total, u32 used }
+ * r3 = pointer to output struct: sys_memory_info_t { u32 total, u32 available }
+ * r4 = container_id; SYS_MEMORY_CONTAINER_ID_INVALID (0xFFFFFFFF) means the
+ *      process's default container, i.e. the title's own user memory.
+ *
+ * The argument order and the second field were both wrong: the game passes the
+ * struct first, and the second word is what is still free, not what is used. A
+ * title carving a container out of the default one ("get the size, destroy,
+ * recreate smaller, create mine") got ESRCH, then a container id of 0.
  * -----------------------------------------------------------------------*/
 int64_t sys_memory_container_get_size(ppu_context* ctx)
 {
-    uint32_t container_id = LV2_ARG_U32(ctx, 0);
-    uint32_t out_addr     = LV2_ARG_PTR(ctx, 1);
+    uint32_t out_addr     = LV2_ARG_PTR(ctx, 0);
+    uint32_t container_id = LV2_ARG_U32(ctx, 1);
 
+    if (container_id == SYS_MEMORY_CONTAINER_DEFAULT) {
+        if (out_addr != 0) {
+            bump_lock();
+            const uint32_t avail = SYS_MEM_USER_TOTAL - s_total_allocated;
+            bump_unlock();
+            write_be32(out_addr + 0, SYS_MEM_USER_TOTAL);
+            write_be32(out_addr + 4, avail);
+        }
+        return CELL_OK;
+    }
     if (container_id == 0 || container_id > SYS_MEMORY_CONTAINER_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
 
@@ -451,7 +533,7 @@ int64_t sys_memory_container_get_size(ppu_context* ctx)
 
     if (out_addr != 0) {
         write_be32(out_addr + 0, c->total_size);
-        write_be32(out_addr + 4, c->used_size);
+        write_be32(out_addr + 4, c->total_size - c->used_size);
     }
 
     return CELL_OK;
@@ -712,6 +794,7 @@ void sys_memory_init(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_MEMORY_CONTAINER_CREATE,     sys_memory_container_create);
     lv2_syscall_register(tbl, SYS_MEMORY_CONTAINER_DESTROY,    sys_memory_container_destroy);
     lv2_syscall_register(tbl, SYS_MEMORY_CONTAINER_GET_SIZE,   sys_memory_container_get_size);
+    lv2_syscall_register(tbl, SYS_MEMORY_ALLOCATE_FROM_CONTAINER, sys_memory_allocate_from_container);
     lv2_syscall_register(tbl, SYS_MMAPPER_ALLOCATE_ADDRESS,    sys_mmapper_allocate_address);
     lv2_syscall_register(tbl, SYS_MMAPPER_FREE_ADDRESS,        sys_mmapper_free_address);
     lv2_syscall_register(tbl, SYS_MMAPPER_ALLOCATE_SHARED_MEMORY, sys_mmapper_allocate_shared_memory);

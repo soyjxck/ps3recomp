@@ -38,6 +38,8 @@ void fs_read_time_log(const char* kind, int fd, uint64_t off, uint64_t size, uin
 { (void)kind; (void)fd; (void)off; (void)size; (void)got; (void)t_start; }
 void ps3_hle_register_ctx(uint32_t, const char*, void (*)(ppu_context*)) {}
 }
+/* ps3_dev_flash_path (runtime/platform), which host_path calls for /dev_flash: the real one, it needs nothing. */
+#include "../../platform/ps3_dev_flash.c"
 ps3_guest_caller_fn g_ps3_guest_caller = nullptr;
 const char* edat_resolve(const char* host_path, char* buf, size_t cap) { (void)buf; (void)cap; return host_path; }
 

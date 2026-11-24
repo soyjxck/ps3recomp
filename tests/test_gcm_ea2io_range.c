@@ -5,9 +5,11 @@
  * and overlapping ranges, and that every active slot is below the mark.
  * Includes the real implementation, as test_gcm_map_flags.c does. */
 #include "../libs/video/cellGcmSys.c"
+#include "../libs/video/rsx_tiling.c"
 #include <assert.h>
 
 uint8_t* vm_base;
+uint64_t ps3_system_time_us(void) { return 0; }   /* sys_timer.c */
 uint32_t g_ww_lo, g_ww_hi;
 void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; abort(); }
 int g_resv_store_active;

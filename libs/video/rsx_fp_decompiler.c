@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "ps3emu/log_first.h"
+#include "ps3emu/ps3_env_once.h"
 
 /* ---- DWORD 0 (OPDEST) --------------------------------------------------- */
 #define FP_END              (1u << 0)
@@ -377,8 +378,35 @@ typedef struct {
     int half;
     int negate;
     int abs;
+    int prec;       /* input precision modifier, 0 = none (see fp_src_prec_clamp) */
     char swz[5];    /* e.g. "xyzw" */
 } Src;
+
+/* Each source operand carries a 3-bit input precision modifier in DWORD2:
+ * bits 19-21 for SRC0, 22-24 for SRC1, 25-27 for SRC2. The hardware clamps the
+ * operand to that precision's range after abs and before negate:
+ *   1 half    [-65504, 65504]
+ *   2 fixed12 [-2, 2]
+ *   3 fixed9  [-1, 1]
+ *   4 saturate [0, 1]
+ * 0 (and the values above 4) leave the operand as it is. A soft-particle
+ * program that fades with MUL r, tex, |depth difference| and marks that source
+ * fixed9 relies on it: unclamped, the difference in metres saturates every
+ * fade to full opacity. */
+#define FP_SRC0_PREC_SHIFT  19
+#define FP_SRC1_PREC_SHIFT  22
+#define FP_SRC2_PREC_SHIFT  25
+
+static const char* fp_src_prec_clamp(int prec)
+{
+    switch (prec) {
+    case 1: return "-65504.0, 65504.0";
+    case 2: return "-2.0, 2.0";
+    case 3: return "-1.0, 1.0";
+    case 4: return "0.0, 1.0";
+    default: return NULL;
+    }
+}
 
 static void decode_src(u32 w, int abs_bit, Src* s)
 {
@@ -388,6 +416,7 @@ static void decode_src(u32 w, int abs_bit, Src* s)
     s->half   = (w & FP_SRC_HALF) ? 1 : 0;
     s->negate = (w & FP_SRC_NEGATE) ? 1 : 0;
     s->abs    = abs_bit ? 1 : 0;
+    s->prec   = 0;
     for (int i = 0; i < 4; i++)
         s->swz[i] = comp[(w >> (FP_SRC_SWZ_SHIFT + 2 * i)) & 3];
     s->swz[4] = '\0';
@@ -458,6 +487,12 @@ static void emit_src(const Src* s, u32 input_src, int persp, const float* k, int
     const char* pre = "";
     const char* post = "";
     if (s->abs)    { pre = "abs("; post = ")"; }
+    const char* range = fp_src_prec_clamp(s->prec);
+    if (range) {   /* abs, then the precision clamp, then negate */
+        snprintf(buf, bufsz, s->negate ? "-(clamp(%s%s%s, %s))" : "clamp(%s%s%s, %s)",
+                 pre, swz, post, range);
+        return;
+    }
     if (s->negate) snprintf(buf, bufsz, "-(%s%s%s)", pre, swz, post);
     else           snprintf(buf, bufsz, "%s%s%s", pre, swz, post);
 }
@@ -736,6 +771,15 @@ static int rsx_fp_decompile_internal(
         decode_src(w1, w1 & FP_SRC0_ABS, &s0);
         decode_src(w2, w2 & FP_SRC1_ABS, &s1);
         decode_src(w3, 0,                &s2);
+        /* RSX_NO_FP_PREC=1 reads the operands unclamped, as it leaves the
+         * results (the OPDEST precision, below). */
+        static int no_src_prec = -1;
+        if (no_src_prec < 0) no_src_prec = getenv("RSX_NO_FP_PREC") ? 1 : 0;
+        if (!(w2 & FP_BRANCH) && !no_src_prec) {   /* a branch's DWORD2 holds other fields */
+            s0.prec = (int)((w2 >> FP_SRC0_PREC_SHIFT) & 7u);
+            s1.prec = (int)((w2 >> FP_SRC1_PREC_SHIFT) & 7u);
+            s2.prec = (int)((w2 >> FP_SRC2_PREC_SHIFT) & 7u);
+        }
 
         /* Inline constant: any CONST source pulls the next 16 bytes as a
          * float4 literal and advances past it. */
@@ -853,11 +897,18 @@ static int rsx_fp_decompile_internal(
         case OP_MAX: snprintf(rhs, sizeof(rhs), "max((%s), (%s))", a, b); break;
         case OP_FRC: snprintf(rhs, sizeof(rhs), "frac(%s)", a); break;
         case OP_FLR: snprintf(rhs, sizeof(rhs), "floor(%s)", a); break;
-        /* The screen-space derivatives (RPCS3: dFdx / dFdy of the source).
-         * They had no case: the program went on without them. */
+        /* Screen-space derivatives. God of War: Ascension's font is a distance
+         * field whose edge width is max(|ddx|, |ddy|) of the sampled value; as
+         * an unhandled op the destination kept 0 and every glyph bloated. */
         case OP_DDX: snprintf(rhs, sizeof(rhs), "ddx(%s)", a); break;
         case OP_DDY: snprintf(rhs, sizeof(rhs), "ddy(%s)", a); break;
-        case OP_RCP: snprintf(rhs, sizeof(rhs), "(1.0 / (%s).x)", a); break;
+        case OP_RCP:
+            /* RSX_FP_SAFE_DIV=1: guard OP_RCP, OP_DIV, and _rsx_inv_w against zero-division NaNs. */
+            if (ps3_env_once("RSX_FP_SAFE_DIV"))
+                snprintf(rhs, sizeof(rhs), "((%s).x != 0.0 ? 1.0 / (%s).x : 0.0)", a, a);
+            else
+                snprintf(rhs, sizeof(rhs), "(1.0 / (%s).x)", a);
+            break;
         /* Real RSX RSQ ignores the input's sign — 1/sqrt(|x|), not 1/sqrt(x)
          * (oracle: RPCS3 FragmentProgramDecompiler.cpp, "RSQ ignores the sign
          * of the inputs (Metro Last Light, GTA4)"). The strict form NaN'd the
@@ -871,7 +922,12 @@ static int rsx_fp_decompile_internal(
         case OP_COS: snprintf(rhs, sizeof(rhs), "cos((%s).x)", a); break;
         case OP_SIN: snprintf(rhs, sizeof(rhs), "sin((%s).x)", a); break;
         case OP_POW: snprintf(rhs, sizeof(rhs), "pow((%s).x, (%s).x)", a, b); break;
-        case OP_DIV: snprintf(rhs, sizeof(rhs), "(%s) / (%s).x", a, b); break;
+        case OP_DIV:
+            if (ps3_env_once("RSX_FP_SAFE_DIV"))
+                snprintf(rhs, sizeof(rhs), "((%s).x != 0.0 ? (%s) / (%s).x : (float4)0.0)", b, a, b);
+            else
+                snprintf(rhs, sizeof(rhs), "(%s) / (%s).x", a, b);
+            break;
         /* Real RSX DIVSQ shares RSQ's sign-ignoring sqrt on the denominator
          * (oracle: RPCS3 FragmentProgramDecompiler.cpp's _builtin_sqrt macro,
          * reused by _builtin_divsq) AND forces the result to exactly 0,
@@ -933,6 +989,33 @@ static int rsx_fp_decompile_internal(
             else
                 snprintf(rhs, sizeof(rhs),
                          "rsx_tex[%u].Sample(rsx_samp[%u], %s)", tex_unit, tex_unit, c2);
+            break;
+        }
+        /* Explicit-derivative fetch: SRC0 is the coordinate, SRC1 and SRC2 its
+         * partial derivatives along window x and y -- in texels, all three, on
+         * an unnormalised unit. A shadow unit compares without them, as for
+         * TXB and TXL. */
+        case OP_TXD: {
+            if ((s_shadow_mask >> tex_unit) & 1u) {
+                char xy[224], c2[320];
+                snprintf(xy, sizeof xy, "(%s).xy", a);
+                fp_coord2(tex_unit, xy, c2, sizeof c2);
+                snprintf(rhs, sizeof(rhs), "rsx_shadow%u(float3(%s, (%s).z))", tex_unit, c2, a);
+                break;
+            }
+            const int three = (tex_sep_mask >> tex_unit) & 1u;   /* cube or volume: xyz */
+            const char* const src[3] = { a, b, c };
+            char tn[32], v[3][224], s3[3][320];
+            snprintf(tn, sizeof(tn), tex_sep_mask ? "rsx_tex%u" : "rsx_tex[%u]", tex_unit);
+            for (int i = 0; i < 3; i++) {
+                snprintf(v[i], sizeof v[i], "(%s).%s", src[i], three ? "xyz" : "xy");
+                if (!three) fp_coord2(tex_unit, v[i], s3[i], sizeof s3[i]);
+                else if ((s_vol_mask >> tex_unit) & 1u) fp_coord3(tex_unit, v[i], s3[i], sizeof s3[i]);
+                else snprintf(s3[i], sizeof s3[i], "%s", v[i]);
+            }
+            const int length = snprintf(rhs, sizeof(rhs), "%s.SampleGrad(rsx_samp[%u], %s, %s, %s)",
+                                        tn, tex_unit, s3[0], s3[1], s3[2]);
+            if (length < 0 || (size_t)length >= sizeof rhs) return -1;
             break;
         }
         case OP_TXP: {
@@ -1040,7 +1123,8 @@ static int rsx_fp_decompile_internal(
         if (no_bx2 < 0) no_bx2 = getenv("RSX_NO_FP_BX2") ? 1 : 0;
         const int bx2 = handled && rhs[0] && (w0 & (1u << 21)) && !no_bx2 &&
                         !((s_shadow_mask >> tex_unit) & 1u) &&
-                        (opcode == OP_TEX || opcode == OP_TXP || opcode == OP_TXB || opcode == OP_TXL);
+                        (opcode == OP_TEX || opcode == OP_TXP || opcode == OP_TXB || opcode == OP_TXL ||
+                         opcode == OP_TXD);
         if (bx2) {
             char wrapped[sizeof rhs];
             if (snprintf(wrapped, sizeof wrapped, "((%s) * 2.0 - 1.0)", rhs) < (int)sizeof wrapped)
@@ -1049,7 +1133,8 @@ static int rsx_fp_decompile_internal(
         /* A unit with texel conversions returns its sample through
          * rsx_texop<u> (gamma / biased expansion, emitted in the prologue). */
         if (!bx2 && handled && rhs[0] && ((s_texop_mask >> tex_unit) & 1u) && !((s_shadow_mask >> tex_unit) & 1u) &&
-            (opcode == OP_TEX || opcode == OP_TXP || opcode == OP_TXB || opcode == OP_TXL)) {
+            (opcode == OP_TEX || opcode == OP_TXP || opcode == OP_TXB || opcode == OP_TXL ||
+             opcode == OP_TXD)) {
             char wrapped[sizeof rhs];
             if (snprintf(wrapped, sizeof wrapped, "rsx_texop%u(%s)", tex_unit, rhs) < (int)sizeof wrapped)
                 memcpy(rhs, wrapped, sizeof rhs);
@@ -1269,13 +1354,23 @@ static int rsx_fp_decompile_internal(
      * SPIR-V FragCoord (Vulkan, and Metal's [[position]] is (x, y, z, 1/w));
      * the glslang paths define RSX_FRAGCOORD_W_IS_RCP. Emitted only where the
      * body uses it, so every other program stays byte-identical. */
-    if (strstr(o.p, "_rsx_inv_w("))
-        out_puts(&p,
-            "#ifdef RSX_FRAGCOORD_W_IS_RCP\n"
-            "#define _rsx_inv_w(i) ((i).position.w)\n"
-            "#else\n"
-            "#define _rsx_inv_w(i) (1.0 / (i).position.w)\n"
-            "#endif\n");
+    if (strstr(o.p, "_rsx_inv_w(")) {
+        if (ps3_env_once("RSX_FP_SAFE_DIV")) {
+            out_puts(&p,
+                "#ifdef RSX_FRAGCOORD_W_IS_RCP\n"
+                "#define _rsx_inv_w(i) ((i).position.w)\n"
+                "#else\n"
+                "#define _rsx_inv_w(i) ((i).position.w != 0.0 ? (1.0 / (i).position.w) : 0.0)\n"
+                "#endif\n");
+        } else {
+            out_puts(&p,
+                "#ifdef RSX_FRAGCOORD_W_IS_RCP\n"
+                "#define _rsx_inv_w(i) ((i).position.w)\n"
+                "#else\n"
+                "#define _rsx_inv_w(i) (1.0 / (i).position.w)\n"
+                "#endif\n");
+        }
+    }
     /* WPOS in the RSX window convention. The host position has its origin at the
      * top left; with SET_SHADER_WINDOW origin BOTTOM the RSX counts y up from the
      * bottom edge. A full-screen pass that builds its UV from it, e.g.
@@ -1546,6 +1641,44 @@ int rsx_fp_apply_alpha_test(char* hlsl, u32 out_size, u32 func, float ref)
     if (prefix + (size_t)n + 1 > out_size)
         return -1;
     memcpy(marker, suffix, (size_t)n + 1);
+    return 1;
+}
+
+int rsx_fp_apply_depth_bounds(char* hlsl, u32 capacity, u32 unit)
+{
+    if (!hlsl || capacity == 0 || unit >= 16u) return -1;
+    const size_t len = strlen(hlsl);
+    if (len >= capacity || strstr(hlsl, "fp_dbounds")) return -1;
+    /* The units are declared one by one (Texture2D, TextureCube, Texture3D)
+     * or, when none is a cube or a volume, as one Texture2D array. */
+    char decl[64], name[24];
+    snprintf(decl, sizeof decl, "Texture2D   rsx_tex%u : register(t%u);\n", unit, unit);
+    if (strstr(hlsl, decl)) snprintf(name, sizeof name, "rsx_tex%u", unit);
+    else if (strstr(hlsl, "Texture2D    rsx_tex[16] : register(t0);\n"))
+        snprintf(name, sizeof name, "rsx_tex[%u]", unit);
+    else return -1;   /* a cube or volume slot */
+    static const char cb[] = "    float4 fp_alpha;\n";
+    static const char cb_add[] = "    float4 fp_dbounds;\n";
+    char* at_cb = strstr(hlsl, cb);
+    char* at_main = strstr(hlsl, " main(PSInput input)");
+    if (!at_cb || !at_main || at_cb > at_main) return -1;
+    char* body = strstr(at_main, "{\n");
+    if (!body) return -1;
+    body += 2;
+    char test[256];
+    const int tn = snprintf(test, sizeof test,
+        "    { const float _rsx_zs = %s.Load(int3(int2(input.position.xy), 0)).r;\n"
+        "      if (_rsx_zs < fp_dbounds.x || _rsx_zs > fp_dbounds.y) discard; }\n", name);
+    if (tn < 0 || (size_t)tn >= sizeof test) return -1;
+    const size_t add = (sizeof cb_add - 1) + (size_t)tn;
+    if (len + add + 1 > capacity) return -1;
+    const size_t a = (size_t)(at_cb - hlsl) + (sizeof cb - 1);   /* after fp_alpha's line */
+    const size_t b = (size_t)(body - hlsl);                      /* after main's brace    */
+    /* Shift the tail, then the middle, then write the two insertions. */
+    memmove(hlsl + b + add, hlsl + b, len - b + 1);
+    memmove(hlsl + a + (sizeof cb_add - 1), hlsl + a, b - a);
+    memcpy(hlsl + a, cb_add, sizeof cb_add - 1);
+    memcpy(hlsl + b + (sizeof cb_add - 1), test, (size_t)tn);
     return 1;
 }
 

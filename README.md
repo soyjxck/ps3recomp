@@ -53,11 +53,12 @@ that.
 | Render backend | D3D12 | Metal | Vulkan (opt-in); null (headless, CI) |
 | Runs a recompiled game, in this tree | **yes** | **no** | **no** |
 
-**What stops macOS and Linux running a title is the PPU boot scaffold.**
-`ppu_loader.cpp`, `boot_main.cpp` and the HLE dispatch are compiled per game,
-not into the library. They compile on POSIX with zero errors (a CI ratchet
-keeps it that way) and the frame clock runs there, but no title has yet been
-booted to gameplay from this tree on either OS.
+**The POSIX boot path runs in CI, but not yet with a retail title in this
+tree.** `ps3recomp_boot_smoke` loads a synthetic PPU ELF through
+`ppu_loader.cpp`, the HLE dispatch, guest threads, the frame clock and the
+renderer. CI also builds and boots that ELF through `templates/project` on
+macOS and Linux. That proves the per-game scaffold runs on both hosts; it is
+not a compatibility claim for a retail game.
 
 **The renderers are further along than that.** `ps3recomp_host` drives cellGcm
 → RSX → backend end to end with no game. With guest programs on, Metal and
@@ -284,15 +285,27 @@ We've written extensive docs covering every aspect of the project. Whether you'r
 **Downloads:** each [release](https://github.com/sp00nznet/ps3recomp/releases/latest)
 includes a prebuilt SDK bundle per platform (`ps3recomp-<version>-win-x64.zip`,
 `-mac-arm64.zip`, `-linux-x64.zip`) plus `SHA256SUMS.txt`. A bundle contains the
-runtime library, its headers and the Python pipeline. `VERSION.txt` inside it
-says what that platform can and cannot do yet.
+runtime library, its headers, the Python dependency manifest and pipeline, and
+the project template with the support sources it builds. Point `PS3RECOMP_DIR`
+at the extracted bundle just as you would at a source checkout. `VERSION.txt`
+inside it says what that platform can and cannot do yet.
 
-> **Prerequisites (building from source)**: Python 3.10+ (CI uses 3.12), CMake 3.20+, Ninja, and a C17/C++20 compiler: clang-cl with Visual Studio 2022 on Windows (plain MSVC builds the runtime library, but lifted game code needs clang-cl), GCC or Clang on Linux, Apple Clang (Xcode) on macOS. CI builds with the compilers on GitHub's `windows-latest`, `ubuntu-latest` and `macos-14` runner images; no older compiler version is tested.
+> **Prerequisites (building from source)**: Python 3.10+ (CI uses 3.12), CMake
+> 3.20+, Ninja, and a C17/C++20 compiler: clang-cl with Visual Studio 2022 on
+> Windows (plain MSVC builds the runtime library, but lifted game code needs
+> clang-cl), GCC or Clang on Linux, Apple Clang (Xcode) on macOS. SDL2 is
+> required on Linux and macOS. On macOS, install the command-line dependencies
+> with `brew install cmake ninja python@3.12 sdl2`. CI builds with the compilers on
+> GitHub's `windows-latest`, `ubuntu-latest` and `macos-14` runner images; no
+> older compiler version is tested.
 
 ```bash
 git clone https://github.com/sp00nznet/ps3recomp.git
 cd ps3recomp
-pip install -r requirements.txt
+# macOS (on Linux, use: python3 -m venv .venv)
+"$(brew --prefix python@3.12)/bin/python3.12" -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
 
 # Stage 1: image, OPD function table, TOC and firmware imports
 python tools/ppu_loader.py /path/to/EBOOT.ELF -o out/
@@ -414,8 +427,314 @@ Contributors are credited in **[CONTRIBUTORS.md](CONTRIBUTORS.md)**.
 
 MIT License. See [LICENSE](LICENSE) for details.
 
+ps3recomp was created by Ned Heller ([@sp00nznet](https://github.com/sp00nznet)).
+Ports, videos and write-ups built on it are welcome. Please name ps3recomp and
+link this repository, and keep the copyright notice in LICENSE, which the MIT
+licence requires.
+
 
 ## Changelog
+
+### v0.20.0 — *"One Hundred Eleven"* (November 2026)
+
+*111 pull requests from sixteen contributors, merged in #839. Five of them are
+here for the first time. Most of the batch is opt-in: new behaviour sits
+behind an environment switch or a build option and is off by default. The
+changes that are on by default are marked below.*
+
+**Default-behaviour changes**
+- **Pad face buttons map by position** (*[@djrobson5](https://github.com/djrobson5)*,
+  new, #810). On a Nintendo-layout pad the bottom button is now Cross, not the
+  button printed A. Xbox and PlayStation pads are unchanged. Set
+  `SDL_GAMECONTROLLER_USE_BUTTON_LABELS=1` for the old mapping.
+- **lwmutex unlock hands the lock to the oldest waiter**, as lv2 does
+  (*[@zeropaulsy](https://github.com/zeropaulsy)*, new, #822). A thread that
+  dropped and retook the lock in a loop always won before.
+- **The POSIX cellAudio mixer is paced on the clock**, 187.5 blocks a second,
+  with the device queue as a guard (*[@mmkzer0](https://github.com/mmkzer0)*,
+  #826). It had run about 5% fast, so music drifted behind the picture.
+- **lv2 syscall slots 41/42** (*@mmkzer0*, #794): `sys_ppu_thread_exit` is
+  41, and 42 answers `ENOSYS`, per the stock firmware table.
+- **On Windows the timebase and system time count from host boot**, not from
+  the process's first call (*[@CapTiveEel20](https://github.com/CapTiveEel20)*,
+  new, #788). Titles that seed an RNG from the clock no longer get the same
+  seed every launch.
+- **A draw under a scissor written empty is dropped** (*@djrobson5*, #811),
+  not drawn unclipped.
+- **Metal writes `[[point_size]]`** (*@djrobson5*, #813), so guest points draw
+  at the size the RSX set.
+
+**RSX and graphics**
+- **Presenting** (*[@tekulvw](https://github.com/tekulvw)*): one host present
+  per executed flip (`PS3RECOMP_RSX_SINGLE_PRESENT=1`, #721), adaptive flip
+  pacing (`PS3RECOMP_GCM_FLIP_PACING=adaptive`, #724), direct Vulkan engine
+  presents (`PS3RECOMP_VK_DIRECT_PRESENT=1`, #738), and a present thread for
+  Metal and Vulkan (`PS3RECOMP_RSX_PRESENT_THREAD=1`, #741, #752) that keeps
+  periodic frame dumps (#818). MetalFX spatial upscaling with
+  `PS3_UPSCALE=metalfx` (*[@erikomis](https://github.com/erikomis)*, #785).
+- **Vulkan**: the backend builds on Windows (*@tekulvw*, #746); unbound engine
+  units read as transparent black (#754); the guest's polygon offset is
+  applied (*[@MatRanc](https://github.com/MatRanc)*, #702;
+  `PS3RECOMP_ENG_POLY_OFFSET=0` turns it off); blend constant factors and
+  `SET_BLEND_COLOR` (*[@MaChInEgUn3](https://github.com/MaChInEgUn3)*, #782).
+- **D3D12** (*[@DriifterSelf](https://github.com/DriifterSelf)*): the
+  fallback projection fires only on an all-zero matrix (#771), slotted-VS FP
+  PSO entries survive `vp_gen` bumps (#774), and the offscreen target and
+  shader/PSO caches are larger (#780). Immediate vertices render in the live
+  backend (*@tekulvw*, #662), fence waits are validated
+  (*[@Tzeentchnet](https://github.com/Tzeentchnet)*, #713), and GPU waits give
+  up only on a removed device (*[@undecuple](https://github.com/undecuple)*,
+  #764).
+- **Metal** (*[@n0madic](https://github.com/n0madic)*): a full record array is
+  submitted mid-frame instead of dropping the rest, and the cap and the draw
+  engine's texture cache size can be set at build time (#719, #798).
+- **Draw engine and decompilers**: `RSX_FP_SAFE_DIV=1` guards `DIV`, `RCP` and
+  `_rsx_inv_w` against zero-division NaNs (*@DriifterSelf*, #601); `TXD`
+  (*@MatRanc*, #701) and the `Y16_X16_FLOAT` remap (#836); CMP (11-11-10)
+  vertex components (*@DriifterSelf*, #775). Current-target feedback across
+  size aliases (#665), depth-bounds snapshots in one texture with a per-pass
+  `PS3RECOMP_ENG_DEPTH_BOUNDS=2` (#755), reused texture register decodes
+  (#762) (all *@tekulvw*), and one own-target copy shared across a pass with
+  `PS3RECOMP_ENG_FEEDBACK_PER_PASS=1` (*@djrobson5*, #814).
+- **GCM**: the interrupt thread gets a guest thread's host stack,
+  `cellGcmSetPrepareFlip` returns the buffer id, and an unmap clears a partial
+  last page (*@MatRanc*, #698, #703, #704). Get is published before an NV4097
+  semaphore release, and `PS3RECOMP_GCM_REPORT_BUSY_SCALE` scales the walker's
+  drain time out of report time stamps (*@n0madic*, #797, #753).
+  `cellGcmGetLastFlipTime` returns the last completed flip's time
+  (*@undecuple*, #783). The FIFO walker can wake on an SPU write of put
+  (`PS3RECOMP_GCM_SPU_PUT_KICK=1`, #816) or a PPU store of it
+  (`PS3RECOMP_GCM_PPU_PUT_KICK=1`, #817) (*@tekulvw*).
+- **Diagnostics** (*@tekulvw*): `PS3RECOMP_VK_FPS=1` (#736),
+  `PS3RECOMP_RSX_TARGET_CHURN=1` (#737), `D3D12_DROP_STATS_EVERY` (#747).
+
+**SPU and SPURS**
+- **SPURS**: workload `maxContention` from the guest stack (*@MatRanc*, #646),
+  the task attribute descriptor form auto-detected (#708), real workload
+  shutdown bounded by `SPURS_SHUTDOWN_MS` (#711), `CellSpursQueue` at its SDK
+  layout with `cellSpursQueuePopBody` (#832), and job `$sp` word 1 (#829). A
+  job chain resumes where it stopped and a Run on a busy chain is kept
+  (*[@ohkora](https://github.com/ohkora)*, #784); a chain's jobs see an SPU
+  number its priority table allows
+  (*[@pedrowallybandeira](https://github.com/pedrowallybandeira)*, new, #803);
+  `cellSpursGetJobChainId` (*@DriifterSelf*, #777).
+  `SPURS_IDLE_PROBE=0` admits as the real kernel does (*@n0madic*, #756), and
+  `sys_spu_thread_write_snr` reaches a SPURS instance's policy contexts (#802).
+  The default workload registry holds 4096 entries
+  (*[@xuxinsss](https://github.com/xuxinsss)*, #787).
+- **SPU**: semantics measured on a console — `fesd` sign, invalid DP words,
+  `cflts`/`cfltu` small scales (*@mmkzer0*, #793). The drain resume resolves
+  through resident code spans (*@n0madic*, #799), the SPU thread LS window at
+  `0xF0000000 + spu_num * 0x100000` is mapped for DMA (#800), and a call
+  bracket publishes its return pc for the whole call (#801). A depth-0 restart
+  leaves no drain return point (*@tekulvw*, #806).
+- **Opt-in wake-ups and counters** (*@tekulvw*): `PS3RECOMP_SPURS_WORKER_WAKE=1`
+  (#819), `PS3RECOMP_SPURS_STORE_WAKE=1` (#820),
+  `PS3RECOMP_RSX_RELEASE_LINE_WAKE=1` (#729), `PS3RECOMP_SPU_LIVE_HOLDERS=1`
+  (#731), `PS3RECOMP_SPU_TASK_POOL=1` (#733), `PS3RECOMP_SPU_PUT_WATCH` (#744).
+
+**lv2, PPU and HLE**
+- **lv2**: semaphore and rwlock calls pin their slot, and a destroyed event
+  queue waits for calls inside it (*@mmkzer0*, #794); event queues are
+  published only once initialised (*@tekulvw*, #804); `sys_gpio_set`/`get`
+  and a watchdog guest stack unwind (*@DriifterSelf*, #767); memory containers
+  reserve from the default pool (*@MatRanc*, #699); a heap delete frees its
+  blocks (*@mmkzer0*, #796).
+- **PPU**: the HLE fast path writes the caller's TOC slot (*@tekulvw*, #805);
+  reservation contexts register once (*@undecuple*, #758);
+  `PS3RECOMP_PPU_RESV_OPEN_COUNT=1` (*@tekulvw*, #732); the HLE in-flight slot
+  clears on return (*@DriifterSelf*, #776); `ps3_hle_unresolved` is wired in
+  with a first-hit call dump, default unchanged
+  (*[@Lincoln16yyy](https://github.com/Lincoln16yyy)*, new, #697). Hardware
+  `fmaf()` for VMX on arm64 (*@MatRanc*, #834).
+- **Timers**: `PS3_USLEEP_WAIT_US` (*@MaChInEgUn3*, #628) and
+  `PS3RECOMP_USLEEP_SPIN_US` (*@tekulvw*, #725) for short sleeps.
+- **System**: firmware answers for pad `NO_DEVICE`, the port bound and
+  `cellGamePatchCheck` (*@mmkzer0*, #795); `cellGemGetState` answers
+  `CELL_GEM_NOT_CONNECTED` and sceNpTrophy reports no disk space needed once
+  installed (*@n0madic*, #792, #791); Sail keeps its Start/Stop tokens
+  (*@tekulvw*, #663); a native OSK lifecycle with `PS3RECOMP_NATIVE_OSK`
+  (#739); `-DPS3RECOMP_FIBER_BACKEND=aarch64` for cellFiber (*@mmkzer0*, #827).
+
+**Filesystem and saves**
+- cellFs shares one AIO path and id space (*@MatRanc*, #700), reports failed
+  and short writes (#705), and shares one fd space with `sys_fs` (#707);
+  `cellGameDeleteGameData` translates its `dirName` (#830).
+  `cellFsAllocateFileAreaWithoutZeroFill`, `cellFsReadWithOffset` and
+  `cellFsWriteWithOffset` (*@pedrowallybandeira*, #714, #715); `cellFsUnlink`
+  deletes (*@tekulvw*, #661). The transient retry skips directories and
+  `EINVAL`, and `/dev/null` maps to `NUL` on Windows (*@DriifterSelf*, #768,
+  #770).
+- `cellSaveDataUserListAutoLoad`/`AutoSave`, and `listParam` in the directory
+  list (*@n0madic*, #789, #790).
+- `PS3RECOMP_VM_WRITE_WATCH=1` lets host caches prove guest pages unchanged,
+  with preservation sessions (*@tekulvw*, #727, #728).
+
+**Tooling, templates and CI**
+- Release archives are a self-contained SDK that `PS3RECOMP_DIR` can point at
+  (*@Tzeentchnet*, #655).
+- For ports (*@tekulvw*): `check_public_tree.py` and `fetch_sdk_pins.py`
+  (#726), `ppu_function_splice.py` (#730), `lift_hooks.py` (#743), template
+  build extensions and lifecycle callbacks (#742), a 4 GB-aligned POSIX arena
+  (#723), glibc static-TLS in thread stack sizes (#720), and regression
+  fixtures (#722).
+- `PS3RECOMP_SPU_RETURN_ENTRIES` in CMake (*@MatRanc*, #831); SPU
+  `run_tests.sh` 11/11 (#709) and a wider `test_ps3_tprof` window for macOS
+  (#837); macOS links two syscall tests (*@n0madic*, #717); Windows CI on a
+  pinned LLVM 22 clang-cl (*@mmkzer0*, #828).
+
+**Held for the next round**: #718, #745, #807 and #808 need a rebase onto this
+batch; #757, #809, #812, #815, #734, #773 and #772 change default behaviour and
+wait for a gate A/B.
+
+### v0.19.0 — *"Eighty-One"* (November 2026)
+
+*81 pull requests from fourteen contributors, merged in #696. Six of them are
+here for the first time. Most of the batch comes from ports in progress: God
+of War HD and Ascension drive the SPURS, GCM and SPU work, a SoulCalibur II HD
+port drives the main-memory tiles and the macOS window, and a lv2 conformance
+pass brings the sync, event, file and SPU-group syscalls closer to the SDK.*
+
+**RSX and graphics**
+- **Tiles over main memory** (*[@n0madic](https://github.com/n0madic)*, #569):
+  a tile bound with location MAIN is now tiled for every RSX access, as on the
+  hardware, rather than read and written linearly. Block-compressed (DXT) 3D
+  textures go up as volumes, in NVIDIA's VTC slice order (#585), and a
+  recreated depth target's snapshot is released once (#604).
+- **GCM** (*[@rigaz29](https://github.com/rigaz29)*): `GCM_FIFO_SEGMENT=<bytes>`
+  hands the command ring out in segments, as libgcm does, so the walker can
+  start on a frame while the title is still writing it (#566; unset, nothing
+  changes). Offset tables follow later maps and unmaps, a report is held until
+  the SPU task round it signals has caught up, FP helpers are emitted on
+  branched programs, and X16 and DDX/DDY are handled (#635). The FIFO walker
+  decodes the new-style JUMP (*[@undecuple](https://github.com/undecuple)*,
+  #675), and the tile and zcull call lines print only in verbose mode (#676).
+  The context end sits at the wrap JUMP slot, `begin + size - 4`
+  (*[@MatRanc](https://github.com/MatRanc)*, new, #648), and
+  `GCM_HANDLER_THREAD=1` delivers handlers from a dedicated thread (#647).
+  `cellGcmGetConfiguration` reports 249 MiB of local memory, which fits a
+  28-bit heap size field (*[@StepanovGV2021](https://github.com/StepanovGV2021)*,
+  new, #660).
+- **D3D12** (*[@DriifterSelf](https://github.com/DriifterSelf)*, new):
+  descriptor ranges cover all 16 texture units, the offscreen target limit
+  goes from 16 to 64, linear texture row pitch is tracked, and
+  `D3D12_NO_DBG` turns off the debug layer (#600). `QUAD_STRIP` and `POLYGON`
+  draw (#617), and unnormalized texture scaling reaches the fragment-program
+  pipeline (#618). Both renderers pick the high-performance adapter, with a
+  WARP fallback (*@undecuple*, #669), and a frame with no RSX commands
+  presents the CPU-blit scanout (*[@xuxinsss](https://github.com/xuxinsss)*,
+  #695).
+- **Metal**: `PS3_AA=smaa` (SMAA 1x), `PS3_VIBRANCE` and `PS3_CONTRAST` in the
+  present pass, all off by default
+  (*[@erikomis](https://github.com/erikomis)*, #470). The depth-bounds test is
+  emulated where the backend has none (#694), and the MSL cache names the
+  translator by a hash of its sources (*@n0madic*, #609).
+- **Vulkan** (*[@tekulvw](https://github.com/tekulvw)*): R32F and RGBA32F
+  colour targets (#681), and stale engine releases kept off live objects
+  (#682).
+- **Draw engine and decompilers**: `SET_ZMIN_MAX_CONTROL`'s depth clamp is
+  honoured (*@erikomis*, #693), explicit current vertex colours are preserved
+  (*@tekulvw*, #658), missing vertex attribute components expand with
+  w = 1.0 (*@DriifterSelf*, #597), and fragment programs honour the
+  per-source input precision modifiers (*@undecuple*, #670).
+
+**SPU and SPURS**
+- **SPURS** (*@rigaz29*, #629): `CellSpurs2` with 32 workloads,
+  `cellSpursInitializeWithAttribute2`, Taskset2 and Task2, and tasks an SPU
+  creates. These were faked as `CELL_OK` or stopped at 16 workloads before.
+  `argTaskset` is carried through the taskset attribute (*@MatRanc*, #643),
+  `maxContention` is clamped and `cellSpursRequestIdleSpu` implemented (#649),
+  and `SPURS_IDLE_MAX` caps the kernel's idle back-off, default unchanged
+  (*[@MaChInEgUn3](https://github.com/MaChInEgUn3)*, #659).
+- **Relocatable lifts** (*@MaChInEgUn3*, #636): `spu_lifter.py --reloc` lifts
+  position-independent SPU code once and runs it wherever a title copies it in
+  local store.
+- **Faster paths**: quadword LS access as one load or store plus a word-swap
+  `pshufb` on SSSE3 x86 (`SPU_LS_VEC`, #637); MFC parameter channel writes
+  latch without a `mfc_for` lookup (#626); the lock-line spin sleeps after
+  about 1 ms (#666), and the holder list is a contiguous, prefetched array
+  (#672) (all *@MaChInEgUn3*). NEON `fi` and `cflts` on ARM64 (*@tekulvw*,
+  #677) and a four-lane SSE4.1 form of the single-precision helpers (#683).
+  The interpreter decodes through one 2048-entry table indexed by
+  `insn >> 21`, generated by `tools/gen_spu_interp.py`
+  (*[@mmkzer0](https://github.com/mmkzer0)*, new, #688).
+- **Channels** (*[@MaxLeiter](https://github.com/MaxLeiter)*, new, #619):
+  ordered wakeups, a masked `RdEventStat`, a word-sized SRR0 and an aligned
+  atomic LSA. Address-only overlay registries reject unrelated large GETs
+  (*@tekulvw*, #654).
+
+**PPU and lv2**
+- **Conformance** (*@MaxLeiter*): sync primitives — trylock `EDEADLK`,
+  timeouts, rwlock timed locks and destroy rules, lwmutex `EBUSY` (#621);
+  event queue destroy honours its mode, and a timed receive runs to an
+  absolute deadline (#622); the Windows join no longer frees the slot under
+  the exiting thread (#623); SPU thread group destroy, start state and error
+  returns (#624); HLE heap `delete_heap` and bounds, and the boot window's
+  close quits through `ps3_host_quit` (#625). A contended
+  `sys_lwmutex_trylock` returns `CELL_EBUSY`
+  (*[@ohkora](https://github.com/ohkora)*, new, #684).
+- **Threads** (*@tekulvw*): the executable's primary thread priority is
+  honoured (#651), and completed callbacks are told apart from missing
+  dispatch (#652). The main thread's stack address and size are filled in
+  after it registers (*@xuxinsss*, #596).
+- **Lifter and loader**: the module TOC is recovered from the OPD majority
+  when there is no `.got` section name (*@xuxinsss*, #691). Per-thread caches
+  for HLE NID lookups, profiler breadcrumbs and indirect-call targets, and
+  exact VMX converts (*@rigaz29*, #634). `vmaddfp`/`vnmsubfp` without a libm
+  call per lane (*@undecuple*, #674).
+- `sys_memory_container_get_size` returns the right value, and syscall 350
+  is registered (*@MatRanc*, #644).
+
+**HLE libraries**
+- **Files**: SDK open flags and error codes in `sys_fs`, and
+  `EBADF`/`EMFILE`/`EINVAL`, file times and dot entries in cellFs
+  (*@MaxLeiter*, #620). `cellFsAioWrite` (*@MatRanc*, #641) and
+  `cellFsFtruncate` on the active fd table (#645). `PS3_DEV_FLASH` may name
+  several roots (*@n0madic*, #605).
+- **Audio and media**: cellAdec decodes AC3 through the run-time FFmpeg
+  loader (*@undecuple*, #671); cellAudio's `AUDIO_WAV` and `AUDIO_PEAK` work
+  on the POSIX mix thread, and `AUDIO_RATE` has no holes (*@n0madic*, #606);
+  `PS3RECOMP_ATRAC_LGPL=OFF` links a stub in place of the LGPL decoder (#611).
+  cellPamf reader calls on an uninitialised reader return `INVALID_ARG`
+  (*@ohkora*, #685), and Sail keeps its allocator argument (*@tekulvw*, #653).
+- **System and network**: cellGame reports 40 GiB − 256 KiB free above 4 GiB,
+  so `hddFreeSizeKB * 1024` cannot wrap (*@erikomis*, #692). cellVideoOut
+  reports stereoscopic 3D resolutions unavailable (*@MatRanc*, #642).
+  `cellSysutilNpEulaCheck` legacy stub (*@DriifterSelf*, #616). sceNp answers
+  presence details and entitlement lists offline (*@tekulvw*, #679);
+  sceNpSignaling gives connections for Matching2 room members, with context ids
+  from 1 and `ActivateConnection` (*@undecuple*, #690); cellSysutilAvc2
+  exports Load, Unload and the setters (#689). cellVoice's port functions cite
+  their SDK references (*@tekulvw*, #487).
+- **Input**: the keyboard fallback on pad port 0 works on macOS and with SDL
+  (*@n0madic*, #612).
+
+**Platforms and build**
+- **macOS** (*@n0madic*): a Quit item in the app menu and no alert sound on a
+  key press (#613); a resizable window that keeps the aspect ratio, and
+  `PS3RECOMP_FULLSCREEN` (#614). Apple Silicon setup docs match CI
+  (*[@Tzeentchnet](https://github.com/Tzeentchnet)*, #656), walker profiling is
+  bounded by elapsed time (#657), and CI runs on `macos-15` (*@tekulvw*, #680).
+- **MinGW**: `ppu_loader` builds with GCC (*@n0madic*, #610); header-defined
+  shared data uses `selectany`, and `timespec_get` works on msvcrt
+  (*@undecuple*, #668).
+- **Linux**: the templates use the Vulkan backend when it is built
+  (*@MatRanc*, #640).
+- The runtime exports its probed SSE4.1 requirement to consumers (*@tekulvw*,
+  #678).
+
+**Tooling and tests**
+- `ps3_env_once()` looks an environment switch up once per name, and replaces
+  the `getenv` calls on the SPURS job, workload dispatch and cellFs paths
+  (*@erikomis*, #515).
+- `test_trophy_registration` (#607) and `test_gcm_flip_status` (#608) link and
+  run in CI again (*@n0madic*). `sync_stress` takes tick differences modulo
+  2^32, so it passes after 24.8 days of host uptime (*@undecuple*, #627).
+
+**Known issue**
+- You Don't Know Jack's boot hang from v0.18.0 is unchanged: v0.18.0 and
+  this release reach the same point on the regression gate. The other four
+  gate ports match v0.18.0 too.
 
 ### v0.18.0 — *"One Hundred Fifty-Five"* (October 2026)
 
@@ -685,67 +1004,5 @@ Metal and SoulCalibur II HD.*
   `vm_commit` can `mprotect` it
   (*[@arnaudaprahamian](https://github.com/arnaudaprahamian)*, new, #412).
 - Docs: stale module counts removed (#405), Killzone 3 entry updated (#407).
-
-### v0.16.0 — *"Forty-Four"* (October 2026)
-
-*44 pull requests from six contributors, merged in #377. They come from
-inFAMOUS 2, Twisted Metal and SoulCalibur II HD, plus Tornado Outbreak.*
-
-**RSX and graphics**
-- **3D textures** in the draw engine (*[@erikomis](https://github.com/erikomis)*, #335).
-  The fragment decompiler also gains FACING, TC8 and TC9 (#328), the
-  perspective-correct flag on texcoord reads (#329), and signed results from
-  biased-remap and `_bx2` fetches (#331). Y16_X16/HILO8 crossbars present
-  R-G-R-G (#332).
-- **A flip in the command stream completes when the RSX reaches it**
-  (*[@Kurtisone](https://github.com/Kurtisone)*, #343), and a late flip
-  completion no longer marks a newer flip done (*@erikomis*, #354). Also:
-  get follows the walker across a JUMP (#347), the semaphore acquire is
-  bounded (#327), and GCM callbacks are delivered at `sys_timer_usleep`/`sleep`
-  (#353).
-- NV3089: the source origin is 12.4 fixed point, and copies were 256 times too
-  short (*[@n0madic](https://github.com/n0madic)*, #358). Unscaled blits copy
-  a row at a time (#334). 2D transfers read FP16 targets (#367) and convert a
-  pixel at a time (#348).
-- Speed: the D3D12 vertex program cache is keyed on the program instead of the
-  store behind it, which took most of the D3DCompile calls off the FIFO thread
-  (*@n0madic*, #361). HLSL to SPIR-V translations are cached (#346), cached
-  textures are re-hashed sparsely (#375), and the per-vertex span is found once
-  per draw (#357).
-- Vulkan: colour feedback snapshots for draws that sample their own target
-  (#352), and present on its own command buffer (#351).
-- Metal: per-MRT colour mask and blend (#330), `PS3_ANISO` (#373),
-  `PS3_AA=fxaa` and `PS3_SHARPEN` (#374), `cellVideoOutSetGamma` (#355), and
-  `precise::` math from spirv-cross (#356).
-- Diagnostics: `PS3_FTRACE`, a frame timeline of who waits for whom (#339), and
-  fragment-program debug knobs keyed by structural hash (#336).
-
-**SPU and SPURS**
-- An SPU thread starts in the lifted image its own bytes identify, instead of
-  whichever image registered first at that entry point (*@n0madic*, #362). An
-  SPU user event finds the port the PPU binds, and waits for it (#363).
-- A task's signalled bit is updated atomically against SPU commits (#340), and
-  a job's first frame stays below its cache buffers (#366)
-  (*@Kurtisone*).
-- Single-precision fast paths run four lanes at a time with AVX2 (#369) and
-  SSE2 (#370).
-- Syscall 14 classifies lock-line addresses by guest segment
-  (*[@kalpakprod](https://github.com/kalpakprod)*, #341).
-
-**System libraries**
-- cellFs: the `CELL_FS_O_*` flag values are corrected, so `O_CREAT` creates
-  (*@kalpakprod*, #349); `/dev_hdd1` maps to a writable host root (#350); and
-  an AIO read keeps the fd's position (*@Kurtisone*, #376).
-- `cellGameBootCheck` reports the game type from PARAM.SFO (#359), and
-  `CELL_MSGDIALOG_BUTTON_NONE`/`INVALID` are no longer swapped (#360)
-  (*@n0madic*). An HDD title's `/dev_hdd0/game/<id>/` now resolves to the
-  booted game tree, which kept Simpsons Arcade reading its data once #359
-  reported it as an HDD game.
-- `PS3_LANG` picks the system language (#333), and `PS3_GAMEDATA_ROOT` moves
-  saves and trophies out of the working directory (#338). The small rumble
-  motor runs at full strength (#372) (*@erikomis*).
-- Guest spinlocks use a 32-bit atomic on LP64 hosts, which fixes a fault on
-  arm64 (*[@tekulvw](https://github.com/tekulvw)*, #326).
-- Tornado Outbreak: the 2x zoomed frames from #281 are fixed (#344).
 
 Older releases: **[CHANGELOG.md](CHANGELOG.md)**.

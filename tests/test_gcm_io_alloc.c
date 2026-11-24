@@ -6,9 +6,11 @@
  * cellGcmInit with an 8MB IO window at io 0 (ea 0x40300000), then more maps. With a bump pointer kept across Init the
  * pre-Init map moved it to 0x300000, and the next map landed on io 0x300000 inside the Init window. */
 #include "../libs/video/cellGcmSys.c"
+#include "../libs/video/rsx_tiling.c"
 #include <assert.h>
 
 uint8_t* vm_base;
+uint64_t ps3_system_time_us(void) { return 0; }   /* sys_timer.c */
 uint32_t g_ww_lo, g_ww_hi;
 void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; abort(); }
 int g_resv_store_active;

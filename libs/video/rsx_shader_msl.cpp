@@ -76,7 +76,11 @@ bool hlsl_to_spirv(const char* hlsl, EShLanguage lang, std::vector<unsigned int>
     shader.setEnvTarget(glslang::EShTargetSpv, glslang::EShTargetSpv_1_3);
     /* SPIR-V FragCoord.w is 1/w (FXC's SV_POSITION.w is w): tells the FP
      * decompiler's _rsx_inv_w helper which one it gets. */
-    shader.setPreamble("#define RSX_FRAGCOORD_W_IS_RCP 1\n");
+    shader.setPreamble("#define RSX_FRAGCOORD_W_IS_RCP 1\n"
+                       /* Metal-only vertex point size: the decompilers' VSOutput
+                        * gains a PointSize built-in and VPConst a vp_pointsize
+                        * row behind this macro (rsx_vp_decompiler.h). */
+                       "#define RSX_POINT_SIZE_BUILTIN 1\n");
     shader.setEntryPoint("main");
     shader.setAutoMapBindings(true);
     shader.setAutoMapLocations(true);
@@ -160,6 +164,9 @@ bool spirv_to_msl(const std::vector<unsigned int>& spirv, bool vertex, char* out
     spvc_compiler_options_set_uint(opt, SPVC_COMPILER_OPTION_MSL_VERSION, 20100u);
     spvc_compiler_options_set_uint(opt, SPVC_COMPILER_OPTION_MSL_PLATFORM, SPVC_MSL_PLATFORM_MACOS);
     spvc_compiler_options_set_bool(opt, SPVC_COMPILER_OPTION_MSL_ENABLE_DECORATION_BINDING, SPVC_TRUE);
+    /* A vertex function's PointSize built-in is emitted as [[point_size]] only
+     * with this on; Metal's point size is undefined unless one is written. */
+    spvc_compiler_options_set_bool(opt, SPVC_COMPILER_OPTION_MSL_ENABLE_POINT_SIZE_BUILTIN, SPVC_TRUE);
     if (spvc_compiler_install_compiler_options(comp, opt) != SPVC_SUCCESS) {
         put_log(log, log_size, "MSL options install", spvc_context_get_last_error_string(ctx));
         goto done;
@@ -224,7 +231,16 @@ done:
  * this file's build: a file written by any other combination is a miss. */
 const u32 kCacheFormat = 1;
 const u32 kCacheMagic = 0x4C534D52u;   /* "RMSL" */
+/* The translator's identity: what it was built from stands for the front-end
+ * and spirv-cross options above and the binding contract in rsx_shader_msl.h.
+ * The build passes a hash of those two files (CMakeLists.txt), so the files an
+ * older translator wrote become misses and a plain rebuild keeps them; without
+ * it, this file's compile time stands in, which retires them on every rebuild. */
+#ifdef PS3RECOMP_MSL_TRANSLATOR_ID
+const char kTranslatorBuild[24] = PS3RECOMP_MSL_TRANSLATOR_ID;
+#else
 const char kTranslatorBuild[24] = __DATE__ " " __TIME__;
+#endif
 
 struct Cache {
     std::mutex lock;

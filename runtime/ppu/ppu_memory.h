@@ -122,6 +122,13 @@ extern "C" {
 #endif
 extern int  g_resv_store_active;
 void        ppu_resv_break_store(uint64_t ea);
+/* PS3RECOMP_PPU_RESV_OPEN_COUNT (opt-in; ppu_loader.cpp): every load-reserve
+ * notes itself before it reads, and a store-conditional releases the note after
+ * it stores. g_resv_open_active is -1 until resolved, 0 off, 1 on, so the
+ * default path is one predictable branch. */
+extern int  g_resv_open_active;
+void        ppu_resv_open_note(ppu_context* ctx, uint32_t ea);
+void        ppu_resv_open_done(ppu_context* ctx);
 
 /* PPU <-> SPU lock-line coherence (runtime/spu/spu_coherency.c). A PPU store to
  * a 128-byte line an SPU has reserved with GETLLAR has to serialize through the
@@ -295,6 +302,7 @@ static inline uint32_t ppu_lwarx(ppu_context* ctx, uint32_t addr)
     /* Read the current value from memory (big-endian, so swap). */
     uint32_t raw;
     _Atomic(uint32_t)* atom = (_Atomic(uint32_t)*)vm_ptr32(addr);
+    if (g_resv_open_active) ppu_resv_open_note(ctx, addr);
     raw = atomic_load_explicit(atom, memory_order_acquire);
 
     ctx->reserve_addr  = addr;
@@ -310,6 +318,7 @@ static inline int ppu_stwcx(ppu_context* ctx, uint32_t addr, uint32_t val)
         /* No reservation or address mismatch -- fail */
         ppu_cr_set(ctx, 0, PPU_CR_SO * ppu_xer_get_so(ctx));
         ctx->reserve_valid = 0;
+        if (g_resv_open_active > 0) ppu_resv_open_done(ctx);
         return 0;
     }
 
@@ -339,6 +348,7 @@ static inline int ppu_stwcx(ppu_context* ctx, uint32_t addr, uint32_t val)
     }
 
     ctx->reserve_valid = 0;
+    if (g_resv_open_active > 0) ppu_resv_open_done(ctx);
 
     if (ok)
         ppu_cr_set(ctx, 0, PPU_CR_EQ | (PPU_CR_SO * ppu_xer_get_so(ctx)));
@@ -352,6 +362,7 @@ static inline int ppu_stwcx(ppu_context* ctx, uint32_t addr, uint32_t val)
 static inline uint64_t ppu_ldarx(ppu_context* ctx, uint32_t addr)
 {
     _Atomic(uint64_t)* atom = (_Atomic(uint64_t)*)vm_ptr64(addr);
+    if (g_resv_open_active) ppu_resv_open_note(ctx, addr);
     uint64_t raw = atomic_load_explicit(atom, memory_order_acquire);
 
     ctx->reserve_addr  = addr;
@@ -366,6 +377,7 @@ static inline int ppu_stdcx(ppu_context* ctx, uint32_t addr, uint64_t val)
     if (!ctx->reserve_valid || ctx->reserve_addr != addr) {
         ppu_cr_set(ctx, 0, PPU_CR_SO * ppu_xer_get_so(ctx));
         ctx->reserve_valid = 0;
+        if (g_resv_open_active > 0) ppu_resv_open_done(ctx);
         return 0;
     }
 
@@ -391,6 +403,7 @@ static inline int ppu_stdcx(ppu_context* ctx, uint32_t addr, uint64_t val)
     }
 
     ctx->reserve_valid = 0;
+    if (g_resv_open_active > 0) ppu_resv_open_done(ctx);
 
     if (ok)
         ppu_cr_set(ctx, 0, PPU_CR_EQ | (PPU_CR_SO * ppu_xer_get_so(ctx)));

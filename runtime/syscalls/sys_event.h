@@ -65,6 +65,12 @@ typedef struct sys_event_queue_info {
      * arrive; later receives fail the same way rather than re-blocking. */
     int          cancelled;
 
+    /* Receivers currently inside sys_event_queue_receive's locked section (under
+     * `lock`). sys_event_queue_destroy needs it: lv2 answers EBUSY to a plain
+     * destroy while receivers wait, and a FORCE destroy wakes them with
+     * ECANCELED and has to let them leave before the slot can be reused. */
+    int          waiters;
+
 #ifdef _WIN32
     CRITICAL_SECTION lock;
     CONDITION_VARIABLE not_empty;
@@ -74,6 +80,9 @@ typedef struct sys_event_queue_info {
 #endif
 
 } sys_event_queue_info;
+
+/* sys_event_queue_destroy's mode argument. */
+#define SYS_EVENT_QUEUE_DESTROY_FORCE  1
 
 extern sys_event_queue_info g_sys_event_queues[SYS_EVENT_QUEUE_MAX];
 
@@ -161,6 +170,13 @@ int sys_event_queue_push_by_id(uint32_t queue_id,
 
 /* Resolve an event queue by its ipc_key; returns queue_id (1-based) or 0. */
 uint32_t sys_event_find_queue_by_key(uint64_t key);
+
+/* The periodic timer's send: pushes {source, data1, data2, *next_expire} and
+ * advances *next_expire by period_usec, unless the queue is gone (returns 0,
+ * *next_expire untouched). */
+int sys_event_queue_push_periodic_by_id(uint32_t queue_id, uint64_t source,
+                                        uint64_t data1, uint64_t data2,
+                                        uint64_t* next_expire, uint64_t period_usec);
 
 /* Create a queue without a guest context (for HLE libs that must hand the
  * game a queue id, e.g. cellAudioCreateNotifyEventQueue). 0 = table full. */

@@ -36,10 +36,11 @@ static PPU_TLS int     s_exit_armed = 0;
 #include <errno.h>
 #endif
 
-/* Host stack reserved per guest thread, for pthread_attr_setstacksize. The
- * same 256 MB the Win32 branch hands _beginthreadex a few hundred lines
- * down; keep the two in step so a stack-depth bug reproduces on both. */
-#define PPU_HOST_STACK_BYTES  (256u * 1024u * 1024u)
+/* Host stack reserved per guest thread, on both branches below, so a
+ * stack-depth bug reproduces on both. guest_host_thread.h holds the size, so
+ * a runtime thread that calls into the guest gets the same one. */
+#include "ps3emu/guest_host_thread.h"
+#define PPU_HOST_STACK_BYTES  PS3_GUEST_HOST_STACK_BYTES
 
 #ifdef _WIN32
 #include <process.h>   /* _beginthreadex: CRT-aware thread creation (raw CreateThread
@@ -183,12 +184,13 @@ void ppu_thread_note_block(uint64_t tid)
         __atomic_store_n(blocked, 1, __ATOMIC_RELEASE);
 }
 
-/* Priority the creator runs at. Must be called under the table lock. Main registers with priority 0, which means
- * "never set" until it calls sys_ppu_thread_set_priority; it is treated as the default. */
+/* Priority the creator runs at. Must be called under the table lock. Main
+ * registration now initializes a real priority; zero is the highest valid
+ * priority and must not be treated as an unset/default sentinel. */
 static int32_t creator_priority(uint64_t tid)
 {
     const ppu_thread_info* c = find_thread(tid);
-    if (!c || (c == &g_ppu_threads[0] && c->priority == 0)) return PPU_DEFAULT_PRIORITY;
+    if (!c) return PPU_DEFAULT_PRIORITY;
     return c->priority;
 }
 
@@ -230,7 +232,7 @@ static void* ppu_host_thread_proc(void* param)
      * without the guarantee the handler faults while reporting -- the process
      * then dies silently with an access violation INSIDE the handler and the
      * backtrace that would name the recursing function is lost. */
-    { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
+    { ULONG g = PS3_GUEST_HOST_STACK_GUARANTEE; SetThreadStackGuarantee(&g); }
 #endif
 
     /* Register this thread's context for lwarx/stwcx cross-thread reservation
@@ -451,6 +453,7 @@ uint64_t ppu_thread_register_main(void)
         t->ctx.thread_id = 1;
         t->state    = PPU_THREAD_STATE_RUNNING;
         t->joinable = 0;                    /* nobody joins the main thread */
+        t->priority = 1001;                 /* default PS3 process priority */
         strncpy(t->name, "main", sizeof(t->name) - 1);
         ps3_ft_name(1, "main");
         ps3_tprof_thread('P', 1);
@@ -464,6 +467,36 @@ uint64_t ppu_thread_register_main(void)
     }
     table_unlock();
     return 1;
+}
+
+/* The ELF entry path may follow a host bootstrap which already claimed slot
+ * zero. Apply its process priority in either case, before guest dispatch. The
+ * legacy no-argument registration API remains available for other harnesses. */
+uint64_t ppu_thread_register_main_priority(int32_t priority)
+{
+    uint64_t id = ppu_thread_register_main();
+    table_lock();
+    g_ppu_threads[0].priority = (priority >= 0 && priority <= 3071) ? priority : 1001;
+    table_unlock();
+    return id;
+}
+
+/* Fill in the main thread's stack fields after the boot harness has chosen
+ * where the stack lives. register_main() memset()s the whole struct, so
+ * without this sys_ppu_thread_get_stack_information(49) finds tid 1 in the
+ * table with stack_addr/stack_size == 0 and reports a {0,0} stack -- a guest
+ * that dumps its own stack (RPCS3's dump_stack test) then calls
+ * cellFsWrite(fd, NULL, 0) and produces an empty file while the real kernel
+ * reports the actual region. RPCS3's main stack: base 0xD0010000, 1 MB. */
+void ppu_thread_set_main_stack(uint32_t stack_base, uint32_t stack_size)
+{
+    table_lock();
+    ppu_thread_info* t = &g_ppu_threads[0];
+    if (t->state != PPU_THREAD_STATE_FREE) {
+        t->stack_addr = stack_base;
+        t->stack_size = stack_size;
+    }
+    table_unlock();
 }
 
 /* ---------------------------------------------------------------------------
@@ -702,7 +735,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
     unsigned _initflag = STACK_SIZE_PARAM_IS_A_RESERVATION;
     int _gate_this = (g_gate_on > 0 && entry >= 0x10000 && entry < 0x10000000);
     if (_gate_this) _initflag |= CREATE_SUSPENDED;
-    t->host_thread = (HANDLE)_beginthreadex(NULL, 256u * 1024 * 1024,
+    t->host_thread = (HANDLE)_beginthreadex(NULL, PPU_HOST_STACK_BYTES,
                                   (unsigned (__stdcall*)(void*))ppu_host_thread_proc, t,
                                   _initflag, (unsigned*)&t->host_tid);
     if (t->host_thread == NULL) {
@@ -837,21 +870,43 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
     { static int n=0; if(PS3_LOG_FIRST(n, 30)) fprintf(stderr,"[WAIT] ppu_thread_join(tid=%llu)\n", (unsigned long long)tid); }
     ppu_thread_note_block(ctx->thread_id);   /* PS3_PRIO_START */
 
+    /* Joining yourself is EDEADLK (it used to wait on its own finish event
+     * for good). */
+    if (tid == ctx->thread_id)
+        return (int64_t)(int32_t)CELL_EDEADLK;
+
     table_lock();
     ppu_thread_info* t = find_thread(tid);
     if (!t) {
         table_unlock();
         return (int64_t)(int32_t)CELL_ESRCH;
     }
-    if (!t->joinable || t->state == PPU_THREAD_STATE_DETACHED) {
+    /* A thread has one joiner: a second one gets EINVAL instead of both
+     * waiting, both closing the same handles and both freeing the slot. */
+    if (!t->joinable || t->joining || t->state == PPU_THREAD_STATE_DETACHED) {
         table_unlock();
         return (int64_t)(int32_t)CELL_EINVAL;
     }
+    t->joining = 1;
     table_unlock();
 
     /* Wait for completion */
 #ifdef _WIN32
     WaitForSingleObject(t->finish_event, INFINITE);
+    /* sys_ppu_thread_exit signals finish_event from INSIDE the thread, which
+     * then still unwinds through ppu_host_thread_proc's epilogue, touching the
+     * slot (it stamps the state and signals the event again). Freeing the slot
+     * and closing the handles before that finished let the epilogue write to
+     * a closed handle and put a slot this join had freed back to FINISHED, so
+     * it never came back. Wait for the host thread itself first, as
+     * pthread_join does below. Bounded, so that a thread kept running past its
+     * exit (PS3_NO_THREAD_EXIT_UNWIND=1) cannot hang the joiner. */
+    if (t->host_thread && WaitForSingleObject(t->host_thread, 5000) == WAIT_TIMEOUT) {
+        static int s_warned = 0;
+        if (s_warned++ < 4)
+            fprintf(stderr, "[SYS] ppu_thread_join(tid=%llu): host thread still running 5 s "
+                            "after exit -- freeing the slot anyway\n", (unsigned long long)tid);
+    }
 #else
     pthread_mutex_lock(&t->finish_mutex);
     while (!t->finished) {
@@ -882,16 +937,10 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
 
     /* Clean up */
 #ifdef _WIN32
-    /* The thread signalled from inside sys_ppu_thread_exit and is still on
-     * its way out through the thread procedure, which takes the table lock
-     * and reads this slot. Wait for the host thread itself, with the lock
-     * released, as the pthread_join below does. (Not for ever: a thread
-     * whose exit did not unwind would never end, and the epilogue no longer
-     * needs the slot left alone to get its state right.) */
-    const int out = WaitForSingleObject(t->host_thread, 10000) == WAIT_OBJECT_0;
-    if (!out)
-        fprintf(stderr, "[SYS] sys_ppu_thread_join(tid=%llu): the host thread has not ended 10 s after it signalled\n",
-                (unsigned long long)tid);
+    /* Whether the host thread has ended (the bounded wait above, made with
+     * the table lock released): one that has not is still in its guest code
+     * and keeps its stack. */
+    const int out = !t->host_thread || WaitForSingleObject(t->host_thread, 0) == WAIT_OBJECT_0;
     table_lock();
     CloseHandle(t->host_thread);
     CloseHandle(t->finish_event);
@@ -1614,6 +1663,18 @@ int64_t sys_ppu_thread_get_stack_information(ppu_context* ctx)
 /* ---------------------------------------------------------------------------
  * Registration
  * -----------------------------------------------------------------------*/
+/* lv2 slot 42 is the shared ENOSYS stub (FW 4.93 stock syscall table; RPCS3 at
+ * d00d8023 binds uns_func there). It must be a real handler, not the
+ * lv2_syscall_unimplemented sentinel: lv2_try_syscall filters that sentinel as
+ * "no handler", so a guest `sc 42` would fall to lv2_syscall()'s CELL_OK
+ * fallback where the firmware answers CELL_ENOSYS. */
+int64_t sys_ppu_thread_enosys_stub(ppu_context* ctx)
+{
+    const uint32_t num = (uint32_t)ctx->gpr[11];
+    fprintf(stderr, "[LV2] unimplemented syscall %u (0x%X)\n", num, num);
+    return (int64_t)(int32_t)CELL_ENOSYS;
+}
+
 void sys_ppu_thread_init(lv2_syscall_table* tbl)
 {
     /* Initialize stack allocator */
@@ -1629,8 +1690,8 @@ void sys_ppu_thread_init(lv2_syscall_table* tbl)
     }
 #endif
 
-    lv2_syscall_register(tbl, SYS_PPU_THREAD_CREATE,              sys_ppu_thread_create);
     lv2_syscall_register(tbl, SYS_PPU_THREAD_EXIT,                sys_ppu_thread_exit);
+    lv2_syscall_register(tbl, 42,                                 sys_ppu_thread_enosys_stub);  /* the shared ENOSYS stub */
     lv2_syscall_register(tbl, SYS_PPU_THREAD_YIELD,               sys_ppu_thread_yield);
     lv2_syscall_register(tbl, SYS_PPU_THREAD_JOIN,                sys_ppu_thread_join);
     lv2_syscall_register(tbl, SYS_PPU_THREAD_DETACH,              sys_ppu_thread_detach);

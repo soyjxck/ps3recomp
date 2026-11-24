@@ -34,7 +34,7 @@
  *                             order) instead of the first non-CPU device.
  *   PS3RECOMP_VK_DUMP=<path>  write every presented frame to <path> as a
  *                             binary PPM (overwritten each present).
- *   PS3RECOMP_VK_WINDOW=1     also show each presented frame in an SDL2
+ *   PS3RECOMP_VK_WINDOW=1     also show each presented frame in an SDL2 (Win32 on Windows)
  *                             window. Rendering and readback are unchanged, so
  *                             every test gives the same result with or without
  *                             it; if the window cannot be opened the run
@@ -68,7 +68,8 @@ int  rsx_vulkan_backend_init(u32 width, u32 height, const char* title);
 /* Unregister and destroy every Vulkan object, then unload the library. */
 void rsx_vulkan_backend_shutdown(void);
 
-/* Headless: always 0. Windowed: drains SDL's event queue; -1 once the
+/* Headless: always 0. Windowed: drains the window's events (SDL2, or the
+ * Win32 message queue of the thread that called init); -1 once the
  * window has been closed or Esc pressed. */
 int  rsx_vulkan_backend_pump_messages(void);
 
@@ -108,6 +109,11 @@ u32  rsx_vulkan_backend_readback_center(void);
 
 /* Draws of the last presented frame that ran the guest's own programs. */
 u32  rsx_vulkan_backend_guest_draws(void);
+
+/* 1 when draws honour the depth bounds test: the draw engine drives the
+ * backend and the device has the depthBounds feature (lavapipe in Mesa 25
+ * does not). Valid after init. */
+int  rsx_vulkan_backend_depth_bounds(void);
 
 /* 1 when draws run the guest's own programs: the HLSL -> SPIR-V translator
  * was built (glslang found) and PS3RECOMP_VK_GUEST_PROGRAMS=1 opts in. Then

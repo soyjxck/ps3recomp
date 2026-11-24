@@ -52,9 +52,7 @@
 #  define host_backend_color    rsx_vulkan_backend_debug_color
 #  define host_backend_center   rsx_vulkan_backend_readback_center
 #  define host_backend_guest_draws rsx_vulkan_backend_guest_draws
-/* This fork's Vulkan backend has no depth bounds test (upstream's engine
- * work, not merged): --depthbounds reports itself skipped. */
-#  define HOST_BACKEND_DEPTH_BOUNDS 0
+#  define HOST_BACKEND_DEPTH_BOUNDS rsx_vulkan_backend_depth_bounds()
 #else
 #  include "rsx_null_backend.h"
 #  define HOST_BACKEND_NAME     "null (headless software)"
@@ -183,6 +181,17 @@ static const u32 CUBE_FACE_ARGB[6] = {
 };
 #define CUBE_ARGB        0xFF8040E0u      /* face 5, -Z: what --cube must read */
 
+/* --float-rt / --float-rt-r: an offscreen RGBA32F (SET_SURFACE_FORMAT colour
+ * 0xC) or R32F (0xD) surface, the size the guest clips it to, and the bytes
+ * per pixel of each. The backing is one float per channel in R, G, B, A
+ * order, (0, 1, 1, 1) for RGBA32F and 0 for R32F: no reading of those bytes
+ * in any channel order presents the red the surface is drawn, so a surface
+ * that was never created and was sampled from guest memory instead shows. */
+#define FRT_OFFSET       0x001D0000u
+#define FRT_DIM          64u
+#define FRT_RGBA_BPP     16u
+#define FRT_R_BPP        4u
+
 /* Functions the RSX side exports but does not declare in a public header. */
 extern void cellGcm_rsx_process_fifo(void);
 extern int  cellGcm_take_flip_pending_synced(void);
@@ -297,6 +306,16 @@ static void upload_rtt_backing(void)
 {
     for (uint32_t i = 0; i < RTT_DIM * RTT_DIM; i++)
         guest_w32(IO_ADDR + RTT_OFFSET + i * 4u, RTT_BACKING);
+}
+
+/* Guest memory behind the --float-rt surfaces (see FRT_OFFSET). */
+static void upload_float_rt_backing(int one_channel)
+{
+    static const float rgba[4] = { 0.0f, 1.0f, 1.0f, 1.0f };
+    const uint32_t bpp = one_channel ? FRT_R_BPP : FRT_RGBA_BPP;
+    for (uint32_t i = 0; i < FRT_DIM * FRT_DIM; i++)
+        for (uint32_t c = 0; c < bpp / 4u; c++)
+            guest_f32(IO_ADDR + FRT_OFFSET + i * bpp + c * 4u, rgba[c]);
 }
 
 /* ...and the same for --depthtex's zeta: the bytes a CPU-cleared depth buffer
@@ -632,8 +651,8 @@ static void emit_triangle_draw(void)
  *
  * Parameterised on where the texture is and how big it is, because --rtt
  * points the same draw at a render target instead of an uploaded image. */
-static void emit_textured_draw_full(u32 tex_offset, u32 w, u32 h, u32 fmt_byte,
-                                    int cube, u32 vtx_offset)
+static void emit_textured_draw_unit(u32 tex_offset, u32 w, u32 h, u32 fmt_byte,
+                                    int cube, u32 vtx_offset, int unit_enabled)
 {
     u8 vp[48];
     rsx_test_vp_mov_out(vp +  0, 0, RSX_TEST_VP_SWZ_IDENT, 0, 0);   /* MOV o0, v0      */
@@ -650,7 +669,7 @@ static void emit_textured_draw_full(u32 tex_offset, u32 w, u32 h, u32 fmt_byte,
      * [19:16]. */
     emit(NV4097_SET_TEXTURE_FORMAT     + 0, 2u | (cube ? 4u : 0u) | (2u << 4) | (fmt_byte << 8) |
                                             (1u << 16));
-    emit(NV4097_SET_TEXTURE_CONTROL0   + 0, 0x80000000u);   /* unit enable */
+    emit(NV4097_SET_TEXTURE_CONTROL0   + 0, unit_enabled ? 0x80000000u : 0u);   /* unit enable */
     emit(NV4097_SET_TEXTURE_CONTROL1   + 0, 0xAAE4u);       /* identity crossbar */
     emit(NV4097_SET_TEXTURE_IMAGE_RECT + 0, (w << 16) | h);
 
@@ -664,6 +683,12 @@ static void emit_textured_draw_full(u32 tex_offset, u32 w, u32 h, u32 fmt_byte,
     emit(NV4097_SET_BEGIN_END, 5u);                       /* TRIANGLES       */
     emit(NV4097_DRAW_ARRAYS,   0u | ((6u - 1u) << 24));   /* first=0 count=6 */
     emit(NV4097_SET_BEGIN_END, 0u);
+}
+
+static void emit_textured_draw_full(u32 tex_offset, u32 w, u32 h, u32 fmt_byte,
+                                    int cube, u32 vtx_offset)
+{
+    emit_textured_draw_unit(tex_offset, w, h, fmt_byte, cube, vtx_offset, 1);
 }
 
 static void emit_textured_draw_fmt(u32 tex_offset, u32 w, u32 h, u32 fmt_byte)
@@ -688,6 +713,22 @@ static void emit_border_draw(void)
     emit(NV4097_SET_BLEND_FUNC_DFACTOR,  0x0303u | (0x0303u << 16));   /* ONE_MINUS_SRC_ALPHA */
     emit(NV4097_SET_BLEND_EQUATION,      0x8006u | (0x8006u << 16));   /* FUNC_ADD            */
     emit_textured_draw_full(TEX_OFFSET, TEX_W, TEX_H, 0x85u | 0x20u, 0, RVTX_OFFSET);
+}
+
+/* --unbound: --tex's quad and fragment program with texture unit 0 switched
+ * off (TEXTURE_CONTROL0 enable clear), so TEX r0 reads a unit with nothing
+ * bound. That reads transparent black (0,0,0,0), as the Metal backend's
+ * placeholder does, and blended SRC_ALPHA / ONE_MINUS_SRC_ALPHA over the
+ * clear it leaves the clear colour. A coloured "not bound" texture shows
+ * through instead, and so does the texture behind the disabled unit's offset
+ * if a backend samples it anyway. */
+static void emit_unbound_draw(void)
+{
+    emit(NV4097_SET_BLEND_ENABLE,        1u);
+    emit(NV4097_SET_BLEND_FUNC_SFACTOR,  0x0302u | (0x0302u << 16));   /* SRC_ALPHA           */
+    emit(NV4097_SET_BLEND_FUNC_DFACTOR,  0x0303u | (0x0303u << 16));   /* ONE_MINUS_SRC_ALPHA */
+    emit(NV4097_SET_BLEND_EQUATION,      0x8006u | (0x8006u << 16));   /* FUNC_ADD            */
+    emit_textured_draw_unit(TEX_OFFSET, TEX_W, TEX_H, 0x85u | 0x20u, 0, TVTX_OFFSET, 0);
 }
 
 /* The same quad on a cube map: SET_TEXTURE_FORMAT's bit 2 says cube, and the
@@ -784,6 +825,46 @@ static void emit_feedback_draws(void)
     emit(NV4097_SET_SURFACE_CLIP_HORIZONTAL, 1280u << 16);
     emit(NV4097_SET_SURFACE_CLIP_VERTICAL,   720u << 16);
     emit_textured_draw_at(RTT_OFFSET, RTT_DIM, RTT_DIM);
+}
+
+/* --float-rt / --float-rt-r: the red triangle into a 32-bit float colour
+ * surface with blending on, then the display samples it, as --feedback does
+ * for an A8R8G8B8 one: the surface's pitch and format are declared so a
+ * W32_Z32_Y32_X32_FLOAT (0x9B) or X32_FLOAT (0x9C) texture over the same bytes
+ * describes one layout. A title renders small reductions (a scene's average
+ * luminance) into targets like these and blends into them.
+ *
+ * SRC_ALPHA / ONE_MINUS_SRC_ALPHA over the surface's seeded contents with the
+ * triangle's alpha of 1 leaves red, so the check is the same as --rtt's; what
+ * the mode adds is a blended pipeline and a render pass in a float format,
+ * which the Vulkan workflow runs under the validation layer. */
+static void emit_float_rt_draws(int one_channel)
+{
+    const u32 bpp = one_channel ? FRT_R_BPP : FRT_RGBA_BPP;
+    emit(NV4097_SET_CONTEXT_DMA_COLOR_A,     CELL_GCM_CONTEXT_DMA_MEMORY_HOST_BUFFER);
+    emit(NV4097_SET_SURFACE_COLOR_AOFFSET,   FRT_OFFSET);
+    emit(NV4097_SET_SURFACE_PITCH_A,         FRT_DIM * bpp);
+    /* colour 0xC (A32B32G32R32F) or 0xD (B32F), Z24S8, linear. */
+    emit(NV4097_SET_SURFACE_FORMAT,          one_channel ? 0x14Du : 0x14Cu);
+    emit(NV4097_SET_SURFACE_COLOR_TARGET,    CELL_GCM_SURFACE_TARGET_0);
+    emit(NV4097_SET_SURFACE_CLIP_HORIZONTAL, FRT_DIM << 16);
+    emit(NV4097_SET_SURFACE_CLIP_VERTICAL,   FRT_DIM << 16);
+    emit(NV4097_SET_SHADER_PROGRAM,          0u);
+    emit(NV4097_SET_BLEND_ENABLE,            1u);
+    emit(NV4097_SET_BLEND_FUNC_SFACTOR,      0x0302u | (0x0302u << 16));   /* SRC_ALPHA           */
+    emit(NV4097_SET_BLEND_FUNC_DFACTOR,      0x0303u | (0x0303u << 16));   /* ONE_MINUS_SRC_ALPHA */
+    emit(NV4097_SET_BLEND_EQUATION,          0x8006u | (0x8006u << 16));   /* FUNC_ADD            */
+    emit_triangle_draw();
+    emit(NV4097_SET_BLEND_ENABLE,            0u);
+
+    emit(NV4097_SET_CONTEXT_DMA_COLOR_A,     CELL_GCM_CONTEXT_DMA_MEMORY_FRAME_BUFFER);
+    emit(NV4097_SET_SURFACE_COLOR_AOFFSET,   0u);
+    emit(NV4097_SET_SURFACE_PITCH_A,         1280u * 4u);
+    emit(NV4097_SET_SURFACE_FORMAT,          0x148u);                      /* A8R8G8B8 again */
+    emit(NV4097_SET_SURFACE_CLIP_HORIZONTAL, 1280u << 16);
+    emit(NV4097_SET_SURFACE_CLIP_VERTICAL,   720u << 16);
+    emit(NV4097_SET_TEXTURE_CONTROL3 + 0,    FRT_DIM * bpp);
+    emit_textured_draw_fmt(FRT_OFFSET, FRT_DIM, FRT_DIM, (one_channel ? 0x9Cu : 0x9Bu) | 0x20u);
 }
 
 /* Declare an MRT1 set, write both of its members from ONE draw, then sample
@@ -1087,7 +1168,8 @@ static void submit_frame(int with_draw)
             emit(NV4097_CLEAR_SURFACE,            0xF0u);
         }
     }
-    if (with_draw == 15)     emit_border_draw();
+    if (with_draw == 20)     emit_unbound_draw();
+    else if (with_draw == 15) emit_border_draw();
     else if (with_draw == 12) emit_depth_bounds_draw();
     else if (with_draw == 11) emit_cube_draw();
     else if (with_draw == 10) emit_mrt_draws(0);
@@ -1095,6 +1177,7 @@ static void submit_frame(int with_draw)
     else if (with_draw == 8) emit_depthtex_draws();
     else if (with_draw == 7) emit_quad_draws();
     else if (with_draw == 14) emit_feedback_draws();
+    else if (with_draw == 18 || with_draw == 19) emit_float_rt_draws(with_draw == 19);
     else if (with_draw == 6) emit_rtt_draws();
     else if (with_draw == 5) emit_mip_draw();
     else if (with_draw == 4) emit_depth_draw();
@@ -1497,7 +1580,7 @@ static int mode_needs_translator(int mode)
 {
     return mode == 3 || mode == 5 || mode == 6 || mode == 8 || mode == 14 ||
            mode == 9 || mode == 10 || mode == 11 || mode == 15 ||
-           mode == 16 || mode == 17;
+           mode == 16 || mode == 17 || mode == 18 || mode == 19 || mode == 20;
 }
 
 /* ...and which ones must, on a backend that has a translator, have run the
@@ -1521,6 +1604,9 @@ static const char* mode_flag_name(int mode)
     case 15: return "--border";
     case 16: return "--clip";
     case 17: return "--clip-keep";
+    case 18: return "--float-rt";
+    case 19: return "--float-rt-r";
+    case 20: return "--unbound";
     default: return "(mode)";
     }
 }
@@ -1647,6 +1733,11 @@ int main(int argc, char** argv)
         /* --clip / --clip-keep: see emit_clip_draw. */
         else if (strcmp(argv[i], "--clip") == 0) do_draw = 16;
         else if (strcmp(argv[i], "--clip-keep") == 0) do_draw = 17;
+        /* --float-rt / --float-rt-r: see emit_float_rt_draws. */
+        else if (strcmp(argv[i], "--float-rt") == 0) do_draw = 18;
+        else if (strcmp(argv[i], "--float-rt-r") == 0) do_draw = 19;
+        /* --unbound: see emit_unbound_draw. */
+        else if (strcmp(argv[i], "--unbound") == 0) do_draw = 20;
     }
 #if !defined(__APPLE__)
     if (do_draw == 15) {
@@ -1698,7 +1789,7 @@ int main(int argc, char** argv)
                0xC0000000u + TEX_OFFSET, guest_r32(out));
     }
     if (do_draw == 1 || do_draw == 13) upload_triangle();
-    if (do_draw == 2) { upload_texture(); upload_textured_quad(); }
+    if (do_draw == 2 || do_draw == 20) { upload_texture(); upload_textured_quad(); }
     if (do_draw == 15) { upload_texture(); upload_border_quad(); }
     if (do_draw == 3 || do_draw == 16 || do_draw == 17) upload_shader_triangle();
     if (do_draw == 4) upload_depth_triangles();
@@ -1706,6 +1797,11 @@ int main(int argc, char** argv)
     if (do_draw == 5) { upload_mip_texture(); upload_mip_quad(); }
     /* --rtt draws both: the triangle into the surface, the quad out of it. */
     if (do_draw == 6 || do_draw == 14) { upload_triangle(); upload_textured_quad(); upload_rtt_backing(); }
+    if (do_draw == 18 || do_draw == 19) {
+        upload_triangle();
+        upload_textured_quad();
+        upload_float_rt_backing(do_draw == 19);
+    }
     if (do_draw == 7) upload_quad_geometry();
     /* --depthtex draws both too: the flat triangle into the zeta, the quad
      * out of it. */
@@ -1808,7 +1904,11 @@ int main(int argc, char** argv)
          * here, and MRT_BACKING means the guest bytes behind the surface were
          * sampled instead of the surface itself. With --cube it is the -Z
          * face's colour: any other face's colour means a face went missing on
-         * the way up or the image was sampled as 2D.
+         * the way up or the image was sampled as 2D. With --float-rt it is
+         * red once more, out of an RGBA32F surface; --float-rt-r's R32F
+         * surface has only a red channel, so only red is compared there.
+         * With --unbound it is the clear colour: the quad read a unit with
+         * nothing bound as transparent black and blended nothing over it.
          */
         u32 want = (do_draw == 15) ? BORDER_ARGB   /* the border, not the texture */
                  : (do_draw == 12) ? 0xFF0000FFu   /* blue, inside its bounds */
@@ -1819,6 +1919,8 @@ int main(int argc, char** argv)
                  : (do_draw == 7) ? 0xFFFF0000u   /* the quad strip over the polygon */
                  : (do_draw == 17) ? 0xFFFF0000u  /* plane 1 keeps d >= 0        */
                  : (do_draw == 16) ? CLEAR_ARGB   /* plane 1 clipped it all      */
+                 : (do_draw == 20) ? CLEAR_ARGB   /* unbound reads (0,0,0,0)     */
+                 : (do_draw == 18 || do_draw == 19) ? 0xFFFF0000u   /* only the surface holds red */
                  : (do_draw == 14) ? 0xFFFF0000u  /* the copy kept the triangle  */
                  : (do_draw == 6) ? 0xFFFF0000u   /* only the surface holds red  */
                  : (do_draw == 5) ? (s_mip_aniso ? MIP_L0_ARGB : MIP_L1_ARGB)
@@ -1827,9 +1929,11 @@ int main(int argc, char** argv)
                  : (do_draw == 2) ? TEX_ARGB
                  : (do_draw == 1) ? 0xFFFF0000u
                                   : CLEAR_ARGB;
-        printf("[host] presented pixel: 0x%08X (expected 0x%08X) %s\n",
-               back, want, (back & 0x00FFFFFFu) == (want & 0x00FFFFFFu) ? "OK" : "MISMATCH");
-        if ((back & 0x00FFFFFFu) != (want & 0x00FFFFFFu)) rc = 3;
+        const u32 cmp = (do_draw == 19) ? 0x00FF0000u : 0x00FFFFFFu;
+        printf("[host] presented pixel: 0x%08X (expected 0x%08X%s) %s\n",
+               back, want, (do_draw == 19) ? ", red only" : "",
+               (back & cmp) == (want & cmp) ? "OK" : "MISMATCH");
+        if ((back & cmp) != (want & cmp)) rc = 3;
     }
     if (mode_runs_guest_programs(do_draw) && HOST_BACKEND_GUEST_SHADERS) {
         /* The pixel alone cannot prove the programs ran: a backend that

@@ -13,7 +13,6 @@
 #define PPU_NO_INLINE_LOADS   /* declares its own out-of-line vm_read* below */
 #include "ppu_recomp.h"     /* ppu_context */
 #include "ps3emu/nid.h"     /* ps3_compute_nid */
-extern "C" int64_t ps3_guest_ticks(int64_t host_ticks);   /* sys_timer.c: still while paused */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,10 +25,8 @@ extern "C" int64_t ps3_guest_ticks(int64_t host_ticks);   /* sys_timer.c: still 
  * lwmutex exclusion) and the POSIX shims elsewhere -- Sleep, DWORD, QPC. */
 #include "../platform/win32_compat.h"
 #include "../memory/vm.h"   /* VM_HLE_INJECT_BASE -- not platform-specific */
-#ifndef _WIN32
 /* sys_timer.h: not included, its lv2 headers redefine ppu_context. */
-extern "C" uint64_t host_monotonic_ns(void);
-#endif
+extern "C" uint64_t ps3_system_time_us(void);
 #include "ps3emu/log_first.h"
 
 extern "C" uint8_t* vm_base;
@@ -72,18 +69,11 @@ static void sys_initialize_tls(ppu_context* ctx)
  * wall-time. LBP's Bink movie clock (sysGetSystemTime import 0x8461E528
  * lands here) paced the intro at ~1/10th speed: video decoded at <1 fps,
  * the audio preload threshold took forever to fill (movie stayed silent),
- * and every frontend animation timed off it crawled. */
+ * and every frontend animation timed off it crawled. The clock is
+ * ps3_system_time_us (sys_timer.c), shared with cellGcmGetLastFlipTime. */
 static void sys_time_get_system_time(ppu_context* ctx)
 {
-#ifdef _WIN32
-    static LARGE_INTEGER s_freq, s_base;
-    if (!s_freq.QuadPart) { QueryPerformanceFrequency(&s_freq); QueryPerformanceCounter(&s_base); }
-    LARGE_INTEGER now; QueryPerformanceCounter(&now);
-    const int64_t g = ps3_guest_ticks(now.QuadPart);
-    ctx->gpr[3] = g > s_base.QuadPart ? (uint64_t)((g - s_base.QuadPart) * 1000000ull / (uint64_t)s_freq.QuadPart) : 0;
-#else
-    ctx->gpr[3] = (uint64_t)ps3_guest_ticks((int64_t)host_monotonic_ns()) / 1000ull;
-#endif
+    ctx->gpr[3] = ps3_system_time_us();   /* stands still while the title is paused */
 }
 
 /* sys_process_is_stack(u32 addr) -> 1 if addr is in the stack region. We model
@@ -130,9 +120,12 @@ static void sys_lwmutex_create(ppu_context* ctx)
       if (getenv("LWM_COUNT") && (_n<=24 || (_n%50000)==0))
         fprintf(stderr, "[LWM] create #%lld lwm=0x%08X attr=0x%08X\n", _n, lwm, attr); }
     uint32_t protocol = attr ? vm_read32(attr + 0) : 0;
+    /* sys_lwmutex_t.attribute is protocol | recursive (the two words of
+     * sys_lwmutex_attribute_t OR-ed together); the recursive word was dropped. */
+    uint32_t recursive = attr ? vm_read32(attr + 4) : 0;
     vm_write32(lwm + 0x00, 0);          /* owner */
     vm_write32(lwm + 0x04, 0);          /* waiter */
-    vm_write32(lwm + LWM_ATTR, protocol);
+    vm_write32(lwm + LWM_ATTR, protocol | recursive);
     vm_write32(lwm + LWM_RECUR, 0);     /* recursive_count */
     vm_write32(lwm + 0x10, 0);          /* sleep_queue */
     vm_write32(lwm + 0x14, 0);
@@ -161,8 +154,10 @@ static void sys_lwmutex_create(ppu_context* ctx)
  * we stamp (only the holder ever writes owner=self, so the re-lock check is
  * race-free). Keyed by guest address in an open-addressed table. */
 #define LWM_HASH 65536u
-static struct LwmSlot { volatile long addr; HANDLE sem;
+struct LwmWaiter { struct LwmWaiter* next; HANDLE ev; volatile long granted; };
+static struct LwmSlot { volatile long addr;
     volatile long state;   /* the lock: 0 free, 1 held, 2 held with a waiter (lwm_try) */
+    volatile long qlock; struct LwmWaiter* qhead; struct LwmWaiter* qtail;   /* waiters, FIFO */
     volatile long holder; volatile long long acq_us; volatile long long acq_fences;
     volatile unsigned long long acq_cpu_us; } g_lwm[LWM_HASH];
 extern "C" { extern volatile long long g_gcm_ref_pub_count;    /* cellGcmSys.c */
@@ -204,7 +199,6 @@ static struct LwmSlot* lwm_slot(uint32_t addr)
             while (_InterlockedExchange(&g_lwm_tab_lock, 1)) YieldProcessor();
             struct LwmSlot* r = nullptr;
             if (g_lwm[idx].addr == 0) {
-                g_lwm[idx].sem = CreateSemaphoreA(NULL, 0, 1, NULL);   /* wake channel, empty */
                 g_lwm[idx].state = 0;                                   /* free */
                 /* publish AFTER init; release pairs with the acquire load above
                  * (x86 is TSO, but arm64 needs the ordering spelled out) */
@@ -224,25 +218,56 @@ static struct LwmSlot* lwm_slot(uint32_t addr)
  * thread waiting (or that was) -- what the PS3's own lwmutex is (the
  * "lightweight" is that an uncontended lock never enters the kernel). Taking a
  * free lock and releasing one nobody waits for are one atomic operation each.
- * Every lock and unlock used to go through the semaphore, two kernel calls a
+ * Every lock and unlock used to go through a semaphore, two kernel calls a
  * pair around every guest malloc and free: God of War HD makes some 320,000
  * pairs in one frame when a fight's next wave spawns, and that frame took
  * 360 ms; Drakengard 3's main and render threads both listed sys_lwmutex_lock
  * among their top waits and NtReleaseSemaphore at 4-5% of their CPU.
  *
- * A contended lock sleeps until a release wakes it, then tries again. On
- * Windows it first spins a little (the common malloc-sized critical section),
- * then waits on the word itself (WaitOnAddress). Elsewhere, and on Windows
- * with LWM_KERNEL=1, it sleeps on the slot's semaphore, which is only a wake
- * channel and starts empty. A waiter that gives up leaves the word at 2, so
- * the next release posts a wake nobody takes; the next waiter consumes it and
- * waits again. Any thread may release, and releasing a free lock does
- * nothing. */
+ * A contended lock waits in one of two ways.
+ *
+ * Queued (every host but Windows, and Windows with LWM_KERNEL=1): a release
+ * with threads queued HANDS the lock to the oldest one, as lv2 does (its
+ * unlock wakes a waiter that already owns the mutex): the word stays nonzero,
+ * so no other thread can take the lock in between. It used to set the word to
+ * 0 and wake a waiter to try again, and a thread that unlocks and relocks in a
+ * loop always won that race: LBP2's main thread renders loading frames holding
+ * lwmutex 0x158C0400 and drops it briefly once per frame, while the 'bringup'
+ * thread it waits for retries that lock with a 2 s timeout. The bringup thread
+ * got it after ~70 s on some boots and never on others (init step 13
+ * 'ScratchPad', 2026-11-17). The queue and its spin lock are only touched
+ * under contention; each waiter sleeps on its own thread's event.
+ *
+ * On the word (Windows): the thread spins a little (the common malloc-sized
+ * critical section), then sleeps on the word itself (WaitOnAddress) until a
+ * release wakes it, and tries again. The release frees the word before it
+ * wakes anyone, so a thread that is running takes a free lock at once and no
+ * thread waits for a sleeper to be scheduled in before the lock can be used
+ * again -- the two busy threads that share the guest heap's lock do not turn
+ * each allocation into a context switch. The price is that the order is not
+ * lv2's: the unlock-and-relock loop described above passes a sleeper over. A
+ * waiter that gives up leaves the word at 2, so the next release wakes a
+ * waiter that is not there.
+ *
+ * Any thread may release, and releasing a free lock does nothing. */
 #ifdef _WIN32
 #pragma comment(lib, "synchronization.lib")
 static int lwm_kernel(void)
 { static int k = -1; if (k < 0) k = getenv("LWM_KERNEL") ? 1 : 0; return k; }
 #endif
+static inline void lwm_qlock(struct LwmSlot* sl)
+{
+    while (_InterlockedExchange(&sl->qlock, 1)) { while (sl->qlock) YieldProcessor(); }
+}
+static inline void lwm_qunlock(struct LwmSlot* sl) { _InterlockedExchange(&sl->qlock, 0); }
+/* Per-thread auto-reset wake event. Never closed: a releaser may still signal
+ * it just after its waiter returned, so it must outlive any wait. */
+static HANDLE lwm_thread_event(void)
+{
+    static thread_local HANDLE ev = NULL;
+    if (!ev) ev = CreateEventA(NULL, FALSE, FALSE, NULL);
+    return ev;
+}
 static int lwm_try(struct LwmSlot* sl)
 {
     return InterlockedCompareExchange(&sl->state, 1, 0) == 0;
@@ -252,42 +277,90 @@ static int lwm_acquire(struct LwmSlot* sl, uint64_t timeout_us)
 {
     if (lwm_try(sl)) return 1;
 #ifdef _WIN32
-    const int on_word = !lwm_kernel();
-    if (on_word)
+    if (!lwm_kernel()) {
         for (int i = 0; i < 200; i++) {
             if (sl->state == 0 && lwm_try(sl)) return 1;
             YieldProcessor();
         }
+        const long long until = timeout_us ? lwm_now_us() + (long long)timeout_us : 0;
+        /* Taking it as 2 is conservative: the release then wakes a waiter that
+         * may not exist, which costs a system call, not a hang. */
+        while (InterlockedExchange(&sl->state, 2) != 0) {
+            DWORD ms = INFINITE;
+            if (timeout_us) {
+                const long long left = until - lwm_now_us();
+                if (left <= 0) return 0;
+                const unsigned long long m = ((unsigned long long)left + 999) / 1000;
+                ms = m > 0xFFFFFFFEull ? 0xFFFFFFFEu : (DWORD)m;
+            }
+            long two = 2;
+            WaitOnAddress((volatile VOID*)&sl->state, &two, sizeof(long), ms);
+        }
+        return 1;
+    }
 #endif
     const long long deadline = timeout_us ? lwm_now_us() + (long long)timeout_us : 0;
-    /* Taking it as 2 is conservative: the release then wakes a waiter that may
-     * not exist, which costs a system call, not a hang. */
-    while (InterlockedExchange(&sl->state, 2) != 0) {
+    struct LwmWaiter w;
+    w.next = NULL; w.ev = lwm_thread_event(); w.granted = 0;
+    lwm_qlock(sl);
+    for (;;) {                                  /* free now: take it; else mark queued */
+        const long s = sl->state;
+        if (s == 0) {
+            if (InterlockedCompareExchange(&sl->state, 1, 0) == 0) { lwm_qunlock(sl); return 1; }
+        } else if (s == 2 || InterlockedCompareExchange(&sl->state, 2, 1) == 1) {
+            break;
+        }
+    }
+    if (sl->qtail) sl->qtail->next = &w; else sl->qhead = &w;
+    sl->qtail = &w;
+    lwm_qunlock(sl);
+    while (!w.granted) {
         DWORD ms = INFINITE;
         if (timeout_us) {
             const long long left = deadline - lwm_now_us();
-            if (left <= 0) return 0;
+            if (left <= 0) {
+                lwm_qlock(sl);
+                if (w.granted) { lwm_qunlock(sl); return 1; }   /* handed over at the deadline */
+                struct LwmWaiter* prev = NULL;
+                for (struct LwmWaiter* p = sl->qhead; p; prev = p, p = p->next)
+                    if (p == &w) {
+                        if (prev) prev->next = w.next; else sl->qhead = w.next;
+                        if (sl->qtail == &w) sl->qtail = prev;
+                        break;
+                    }
+                if (!sl->qhead) InterlockedCompareExchange(&sl->state, 1, 2);   /* held, nobody queued */
+                lwm_qunlock(sl);
+                return 0;
+            }
             const unsigned long long m = ((unsigned long long)left + 999) / 1000;
             ms = m > 0xFFFFFFFEull ? 0xFFFFFFFEu : (DWORD)m;
         }
-#ifdef _WIN32
-        if (on_word) {
-            long two = 2;
-            WaitOnAddress((volatile VOID*)&sl->state, &two, sizeof(long), ms);
-            continue;
-        }
-#endif
-        WaitForSingleObject(sl->sem, ms);
+        WaitForSingleObject(w.ev, ms);          /* a stale signal just loops */
     }
     return 1;
 }
 static void lwm_release(struct LwmSlot* sl)
 {
-    if (InterlockedExchange(&sl->state, 0) != 2) return;
 #ifdef _WIN32
-    if (!lwm_kernel()) { WakeByAddressSingle((PVOID)&sl->state); return; }
+    if (!lwm_kernel()) {
+        if (InterlockedExchange(&sl->state, 0) == 2) WakeByAddressSingle((PVOID)&sl->state);
+        return;
+    }
 #endif
-    ReleaseSemaphore(sl->sem, 1, NULL);
+    if (InterlockedCompareExchange(&sl->state, 0, 1) == 1) return;   /* nobody queued */
+    lwm_qlock(sl);
+    struct LwmWaiter* w = sl->qhead;
+    if (!w) {                                   /* free already, or every waiter gave up */
+        InterlockedExchange(&sl->state, 0);
+        lwm_qunlock(sl);
+        return;
+    }
+    sl->qhead = w->next;
+    if (!sl->qhead) { sl->qtail = NULL; InterlockedExchange(&sl->state, 1); }
+    const HANDLE ev = w->ev;                    /* w lives on the waiter's stack: read it first */
+    w->granted = 1;
+    lwm_qunlock(sl);
+    SetEvent(ev);
 }
 /* Contention-probe window flag: 0 by default (prints stay bounded). A title's
  * diagnostic code may set it around a suspect wait to uncap the [LWM-BLOCK]
@@ -385,7 +458,10 @@ static void sys_lwmutex_trylock(ppu_context* ctx)
             ctx->gpr[3] = 0;
             return;
         }
-        if (!lwm_try(sl0)) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Bu; return; } // EBUSY
+        /* Held by another thread: lv2 answers CELL_EBUSY (0x8001000A). 0x8001000B
+         * is ETIMEDOUT, which only a lock with an expired timeout returns; titles
+         * that poll with trylock and check for EBUSY treat it as a hard failure. */
+        if (!lwm_try(sl0)) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Au; return; }
     }
     if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm); if (sl) { sl->holder = (long)self; sl->acq_us = lwm_now_us(); sl->acq_fences = g_gcm_ref_pub_count; sl->acq_cpu_us = ppu_thread_cpu_us(self); } }
     vm_write32(lwm + LWM_OWNER, self);
@@ -707,6 +783,7 @@ static void hle_cellGcmInitBody(ppu_context* ctx)
 #define SYS_NET_EWOULDBLOCK_V 35
 extern "C" void ps3_net_host_register(unsigned int (*guest_alloc)(unsigned int, unsigned int));
 extern "C" void np_score_register_ctx(void);   /* libs/network/sceNpScore.c */
+extern "C" void cellSpurs_register_ctx_handlers(void); /* libs/spurs/cellSpurs.c */
 extern "C" void cellSaveData_register_ctx_handlers(void); /* libs/system/cellSaveData.c */
 extern "C" void avconf_register_ctx(void);     /* libs/misc/cellAvconfExt.c */
 static uint32_t g_net_errno_ea = 0;
@@ -1046,6 +1123,8 @@ extern "C" void ppu_sysprx_register(void)
      * (userdata) is on the guest stack, so they need the full context too.
      * Registered here so no project has to remember the call. */
     cellSaveData_register_ctx_handlers();
+    /* _cellSpursWorkloadAttributeInitialize's ninth argument (maxContention) is on the stack. */
+    cellSpurs_register_ctx_handlers();
     /* cellVideoOutSetGamma's float argument is in f1. */
     avconf_register_ctx();
     /* sys_net offline model (NIDs from PSL1GHT libnet exports). Covers every

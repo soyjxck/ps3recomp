@@ -7,9 +7,8 @@
 # its public headers, and the Python pipeline -- so a port can be attempted with
 # nothing but a tag download.
 #
-# Only Windows and macOS are built, because those are the only two platforms
-# with CI proving they compile. Shipping an untested Linux binary would repeat
-# the mistake of documenting macOS support the tree did not have.
+# Windows, macOS arm64 and Linux are built. Each has a dedicated CI workflow
+# proving the same source revision before a tagged bundle is published.
 name: Release
 
 on:
@@ -42,7 +41,7 @@ jobs:
           - platform: win-x64
             runs-on: windows-latest
           - platform: mac-arm64
-            runs-on: macos-14
+            runs-on: macos-15
           # Linux ships as the toolkit and the runtime library, not a game
           # runner: it has no renderer (the null backend's headless software path
           # is a CI check, not a graphics backend) and the PPU boot scaffold does
@@ -58,6 +57,27 @@ jobs:
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
         with:
           arch: x64
+
+      # Same pin as windows.yml (#828). The runner image's MSVC STL decides which clang it accepts: STL 14.52
+      # (image 20261111 onwards) stops with "STL1000: Unexpected compiler
+      # version, expected Clang 22 or newer", and the image's own LLVM is
+      # 20.1.8. A pinned, hash-checked LLVM keeps the build independent of
+      # which image a job lands on. It goes first on PATH, so every clang-cl
+      # below (CMake and the direct test compiles) is this one.
+      - name: Install LLVM 22 (clang-cl)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ver = '22.1.8'
+          $sha = '16e5709785fef73c854646241c4a92c5cd574318d1b33c63330dd7721903e55c'
+          $exe = "$env:RUNNER_TEMP\LLVM-$ver-win64.exe"
+          Invoke-WebRequest "https://github.com/llvm/llvm-project/releases/download/llvmorg-$ver/LLVM-$ver-win64.exe" -OutFile $exe
+          $got = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          if ($got -ne $sha) { throw "LLVM installer sha256 $got, expected $sha" }
+          $dir = "$env:RUNNER_TEMP\llvm-$ver"
+          Start-Process -FilePath $exe -ArgumentList '/S', "/D=$dir" -Wait
+          if (-not (Test-Path "$dir\bin\clang-cl.exe")) { throw "clang-cl.exe missing after install" }
+          "$dir\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
 
       - name: Install dependencies (Windows)
         if: runner.os == 'Windows'
@@ -124,11 +144,15 @@ jobs:
           # bundle layout cannot drift from what a local `cmake --install` gives.
           cmake --install build --prefix "${STAGE}"
 
-          # The static library alone cannot recompile anything; the pipeline that
-          # turns an EBOOT into C is these scripts.
-          cp -r tools "${STAGE}/tools"
-          find "${STAGE}/tools" -name __pycache__ -type d -prune -exec rm -rf {} +   # test-run leftovers
-          cp README.md LICENSE CONTRIBUTORS.md "${STAGE}/"
+          # Keep the bundle source-layout compatible with PS3RECOMP_DIR. A port
+          # needs more than the installed archive: the project template compiles
+          # the per-title PPU scaffold, gen_hle_nids.py scans libs/, and SPU
+          # projects include cmake/PS3RecompSPU.cmake. Shipping those together
+          # makes the downloaded SDK usable without a second source checkout.
+          cp CMakeLists.txt requirements.txt "${STAGE}/"
+          cp -R cmake libs runtime templates third_party tools "${STAGE}/"
+          find "${STAGE}" -name __pycache__ -type d -prune -exec rm -rf {} +   # test-run leftovers
+          cp README.md CHANGELOG.md CONTRIBUTING.md CONTRIBUTORS.md LICENSE CITATION.cff "${STAGE}/"
           mkdir -p "${STAGE}/docs" && cp docs/*.md "${STAGE}/docs/"
 
           # What this bundle can actually do, per platform. Someone who
@@ -136,8 +160,8 @@ jobs:
           # here rather than after building one.
           case "${{ matrix.platform }}" in
             win-x64)    CAN="renders and runs recompiled titles (D3D12)" ;;
-            mac-arm64)  CAN="renders through Metal; cannot yet load a title -- the PPU boot scaffold does not run on POSIX" ;;
-            linux-x64)  CAN="toolkit and runtime library only -- no renderer in this bundle (the Vulkan backend is opt-in, build from source with -DPS3RECOMP_RSX_VULKAN=ON), and the PPU boot scaffold does not run on POSIX" ;;
+            mac-arm64)  CAN="renders through Metal; the bundled project template boots the synthetic PPU smoke title, but no retail title has been validated in this tree" ;;
+            linux-x64)  CAN="the bundled project template boots the synthetic PPU smoke title through the headless null backend; Vulkan is opt-in (-DPS3RECOMP_RSX_VULKAN=ON), and no retail title has been validated in this tree" ;;
             *)          CAN="unknown" ;;
           esac
 
@@ -147,6 +171,23 @@ jobs:
             echo "run:      ${{ github.run_id }}"
             echo
             echo "status:   ${CAN}"; } > "${STAGE}/VERSION.txt"
+
+          # Exercise the staged POSIX SDK, not the checkout. This catches a
+          # missing template/support file before the archive is published and
+          # proves that PS3RECOMP_DIR may point at the extracted bundle.
+          if [ "$RUNNER_OS" != "Windows" ]; then
+            BUNDLE_ROOT="$PWD/${STAGE}"
+            test -f build/smoke/lift/ppu_recomp.h
+            cmake -S "${BUNDLE_ROOT}/templates/project" -B build-bundle-template -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DPS3RECOMP_DIR="${BUNDLE_ROOT}" \
+              -DRECOMP_DIR="$PWD/build/smoke/lift"
+            cmake --build build-bundle-template
+            PS3RECOMP_METAL_HEADLESS=1 ./build-bundle-template/MyGameRecomp \
+              build/smoke/smoke.elf > bundle-template.log 2>&1
+            grep -q "\[smoke\] OK: all 11 markers, in order" bundle-template.log
+            grep -q "\[smoke\] PASS" bundle-template.log
+          fi
 
           # cmake -E tar rather than zip/Compress-Archive: CMake is already a
           # hard requirement on both runners, so this is one code path instead of

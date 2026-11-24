@@ -105,6 +105,55 @@ foreach(watch 1 2)
     )
 endforeach()
 
+# Error returns and timeouts of the lv2 mutex, semaphore, rwlock and cond
+# (trylock EDEADLK, destroy EBUSY, a destroy racing a call in flight, timed
+# rwlock, huge timeouts, attribute names).
+add_executable(test_sync_semantics
+    test_sync_semantics.c test_shims.c
+    "${RUNTIME_SYNC_DIR}/sys_mutex.c"
+    "${RUNTIME_SYNC_DIR}/sys_cond.c"
+    "${RUNTIME_SYNC_DIR}/sys_semaphore.c"
+    "${RUNTIME_SYNC_DIR}/sys_rwlock.c")
+# The semaphore and rwlock sources call ps3_sync_test_hook (defined by the test)
+# at the points where it parks a call to order a destroy against it.
+target_compile_definitions(test_sync_semantics PRIVATE PS3_SYNC_TEST_HOOKS)
+if(NOT WIN32)
+    target_sources(test_sync_semantics PRIVATE
+        "${PS3RECOMP_TREE_ROOT}/runtime/platform/win32_compat.c")
+    find_package(Threads REQUIRED)
+    target_link_libraries(test_sync_semantics PRIVATE Threads::Threads)
+else()
+    target_link_libraries(test_sync_semantics PRIVATE winmm)   # timeBeginPeriod
+endif()
+target_include_directories(test_sync_semantics PRIVATE
+    "${PS3RECOMP_TREE_ROOT}" "${PS3RECOMP_TREE_ROOT}/include"
+    "${RUNTIME_SYNC_DIR}" "${PS3RECOMP_TREE_ROOT}/runtime")
+if(MSVC)
+    target_compile_definitions(test_sync_semantics PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(test_sync_semantics PRIVATE /experimental:c11atomics)
+else()
+    target_compile_options(test_sync_semantics PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+add_test(NAME sync_semantics COMMAND test_sync_semantics)
+set_tests_properties(sync_semantics PROPERTIES LABELS "runtime;sync" TIMEOUT 60)
+
+# cellSyncMutex*: CELL_SYNC_ERROR_ALIGN for a mutex that is not 4-byte aligned.
+# Links libs/sync/cellSync.c alone; the SPU lock-line hooks are stubbed.
+add_executable(test_cellsync_mutex
+    test_cellsync_mutex.c
+    "${PS3RECOMP_TREE_ROOT}/libs/sync/cellSync.c")
+target_include_directories(test_cellsync_mutex PRIVATE
+    "${PS3RECOMP_TREE_ROOT}" "${PS3RECOMP_TREE_ROOT}/include"
+    "${PS3RECOMP_TREE_ROOT}/libs/sync")
+if(MSVC)
+    target_compile_definitions(test_cellsync_mutex PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(test_cellsync_mutex PRIVATE /experimental:c11atomics)
+else()
+    target_compile_options(test_cellsync_mutex PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+add_test(NAME cellsync_mutex COMMAND test_cellsync_mutex)
+set_tests_properties(cellsync_mutex PROPERTIES LABELS "runtime;sync" TIMEOUT 20)
+
 # sys_mutex_destroy: EBUSY while the mutex is held or a thread is blocked
 # acquiring it. Win32 host threads, through the shim off Windows.
 add_executable(test_mutex_destroy
@@ -143,3 +192,32 @@ if(WIN32)
         set_tests_properties(cond_${mode} PROPERTIES TIMEOUT 10)
     endforeach()
 endif()
+
+# sys_event_queue_destroy modes (EINVAL / EBUSY / FORCE -> ECANCELED), ports
+# disconnected from a destroyed queue, a destroy racing a receive or a periodic
+# timer send in flight, and the absolute deadline of a timed receive. Links
+# sys_event.c, and sys_timer.c off Windows (the timer's queue admission).
+add_executable(test_event_queue_destroy
+    test_event_queue_destroy.c test_shims.c
+    "${RUNTIME_SYNC_DIR}/sys_event.c")
+# sys_event.c calls ps3_sync_test_hook (defined by the test) at the points where
+# the test parks a call to order a destroy against it.
+target_compile_definitions(test_event_queue_destroy PRIVATE PS3_SYNC_TEST_HOOKS)
+if(NOT WIN32)
+    target_sources(test_event_queue_destroy PRIVATE
+        "${PS3RECOMP_TREE_ROOT}/runtime/platform/win32_compat.c"
+        "${RUNTIME_SYNC_DIR}/sys_timer.c")
+    find_package(Threads REQUIRED)
+    target_link_libraries(test_event_queue_destroy PRIVATE Threads::Threads)
+endif()
+target_include_directories(test_event_queue_destroy PRIVATE
+    "${PS3RECOMP_TREE_ROOT}" "${PS3RECOMP_TREE_ROOT}/include"
+    "${RUNTIME_SYNC_DIR}" "${PS3RECOMP_TREE_ROOT}/runtime")
+if(MSVC)
+    target_compile_definitions(test_event_queue_destroy PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(test_event_queue_destroy PRIVATE /experimental:c11atomics)
+else()
+    target_compile_options(test_event_queue_destroy PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+add_test(NAME event_queue_destroy COMMAND test_event_queue_destroy)
+set_tests_properties(event_queue_destroy PROPERTIES LABELS "runtime;sync" TIMEOUT 60)

@@ -93,6 +93,13 @@ typedef struct rsx_be_render_state {
     u32 color_mask_mrt, blend_mrt;
     u32 rt_fp16;                    /* the target is an FP16 HDR surface */
     u32 stencil_enable, stencil_two_sided;
+    /* SET_DEPTH_BOUNDS_TEST_ENABLE, for a backend with a depth-bounds test
+     * (set_depth_bounds); 0 for one without. */
+    u32 depth_bounds_test;
+    /* 1: clamp the depth to [0, 1] instead of clipping at the near and far
+     * planes (SET_ZMIN_MAX_CONTROL 0x1D78: clamp set, or near/far clipping
+     * off). A backend without depth clamping draws it clipped. */
+    u32 depth_clamp;
     u32 s_func, s_func_mask, s_write_mask, s_fail, s_zfail, s_zpass;
     u32 bs_func, bs_fail, bs_zfail, bs_zpass;
 } rsx_be_render_state;
@@ -114,8 +121,13 @@ typedef struct rsx_be_render_state {
 
 /* How many distinct guest textures the engine keeps before it evicts the
  * least recently used one. Public so the eviction test can be exact about
- * where the boundary is rather than assuming a number. */
+ * where the boundary is rather than assuming a number. A title whose frame
+ * binds more defines a larger cache at build time
+ * (-DRSX_DRAW_ENGINE_TEXTURE_CACHE=N): past the cap every frame evicts and
+ * re-decodes the textures it is about to bind again. */
+#ifndef RSX_DRAW_ENGINE_TEXTURE_CACHE
 #define RSX_DRAW_ENGINE_TEXTURE_CACHE 1024
+#endif
 
 /* ---- the backend interface ---------------------------------------------- */
 
@@ -158,7 +170,11 @@ typedef struct rsx_draw_backend {
     u32  (*depth_target_create)(void* user, u32 w, u32 h);
     void (*depth_target_release)(void* user, u32 depth);
     /* Resolve a depth target into a sampleable texture and return it; 0 when
-     * the backend cannot. The engine only asks after a depth-writing draw. */
+     * the backend cannot. The engine only asks after a depth-writing draw. The
+     * engine owns the result and releases it with texture_release once it has
+     * a newer snapshot of the same target. A backend may keep one texture per
+     * depth target and return that same handle again, refilled: the engine
+     * then keeps it and releases nothing. */
     u32  (*depth_snapshot)(void* user, u32 depth, u32 w, u32 h);
     /* The depth target packed into RGBA8 as its D24S8 bytes read through an
      * A8R8G8B8 texture (R = depth[15:8], G = depth[7:0], B = stencil,
@@ -221,6 +237,17 @@ typedef struct rsx_draw_backend {
     void (*set_viewport)(void* user, float x, float y, float w, float h);
     void (*set_scissor)(void* user, u32 x, u32 y, u32 w, u32 h);
     void (*set_stencil_ref)(void* user, u32 ref);
+    /* Optional: the depth bounds for the next draw, called before every
+     * draw like the stencil reference. The test itself is pipeline state
+     * (rsx_be_render_state.depth_bounds_test); a backend that leaves this
+     * NULL draws as if the test were off. */
+    void (*set_depth_bounds)(void* user, float min, float max);
+    /* Optional: the blend constant (SET_BLEND_COLOR, and _COLOR2 on a
+     * half-float target) as r, g, b, a in 0..1, called before every draw.
+     * It is what the CONSTANT_COLOR / CONSTANT_ALPHA blend factors
+     * (0x8001..0x8004) multiply by; a backend that leaves this NULL must not
+     * map those factors. */
+    void (*set_blend_color)(void* user, const float rgba[4]);
     /* Optional. The NV4097 polygon offset for the next draw, called before
      * every draw like the stencil reference (SET_POLY_OFFSET_{POINT,LINE,
      * FILL}_ENABLE 0x0A60/0x0A64/0x0A68, SCALE_FACTOR 0x0A78, BIAS 0x0A7C).
@@ -305,6 +332,12 @@ typedef struct rsx_draw_backend {
      * and other formats read guest memory. Kept for the backends that have
      * it. */
     u32  (*depth_as_color)(void* user, u32 depth, u32 w, u32 h, u32 rsx_fmt);
+    /* Optional. depth_snapshot into `dst`, a texture an earlier depth_snapshot
+     * of the same size returned, instead of a new one. Ordered after every
+     * draw already handed over that samples `dst`. Returns dst, or 0 when the
+     * backend cannot. This engine does not ask for it (it has no depth-bounds
+     * copy to re-take); kept for the backends that have it. */
+    u32  (*depth_snapshot_into)(void* user, u32 depth, u32 dst);
     /* Nonzero when the backend's HDR plane (a title's own composite that
      * names rsx_hdr_plane, at its second target) is the packed one: R32G32
      * uint, x the HDR colour as RGB9E5, y the 8-bit colour that went to the

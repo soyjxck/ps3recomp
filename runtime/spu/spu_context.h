@@ -317,7 +317,15 @@ typedef struct spu_context {
         /* 0: unchecked legacy region; otherwise SPU_OVERLAY_* state of a
          * region registered with its code bytes (spu_overlay_residency.h). */
         int verify_state, source_index;
+        /* Nonzero for position-independent code lifted once at this canonical LS base
+         * (spu_overlay_register_region_reloc): its functions are registered at
+         * canon + offset, wherever the title placed this copy. 0 = ordinary placed lift. */
+        uint32_t canon;
     } resident_code[4];
+    /* Placement minus canonical base of the relocatable code running now (spu_lifter.py
+     * --reloc): lifted relocatable code adds it to every address it derives from its own
+     * pc. Set by the dispatcher on entry into such code; only that code reads it. */
+    int32_t reloc_delta;
 
     /* Dispatch cache (spu_lifted_lookup, spu_channels.c). dcache_id names this
      * context's current lifetime: 0 after spu_context_init (or a zeroed
@@ -452,6 +460,12 @@ typedef struct spu_context {
      * the locked way; it must never be nonzero for a context that is not
      * listed. */
     int coh_listed;
+
+    /* PS3RECOMP_SPU_LIVE_HOLDERS (spu_coherency.c): the line this context is
+     * counted on in the live-holder table, from its GETLLAR until its
+     * reservation ends on this thread. Owner thread only. */
+    uint32_t coh_live_line;
+    int coh_live_counted;
 } spu_context;
 
 /* event_status is written from more than one host thread: the SPU's own
@@ -498,6 +512,14 @@ typedef struct spu_context {
  * the context. Pair with spu_coh_unregister before a reset or destruction. */
 void spu_mfc_release(spu_context* ctx);
 void spu_mfc_forget_range(uintptr_t lo, uintptr_t hi);
+
+/* Effective-address window of the SPU thread group's local stores. */
+#define SPU_THREAD_EA_BASE   0xF0000000u
+#define SPU_THREAD_EA_STRIDE 0x00100000u
+#define SPU_THREAD_LS_MAX    6u
+/* The context whose local store SPU spu_num of self's thread group holds, or
+ * NULL (spurs_policy.c). */
+spu_context* spu_thread_ls_peer(const spu_context* self, uint32_t spu_num);
 
 static inline void spu_context_init(spu_context* ctx, uint32_t spu_id)
 {
@@ -546,9 +568,9 @@ static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
  * helpers in `spu_helpers.h` were written against. */
 /* The 128-bit LS accessors are THE hot primitive of lifted SPU execution
  * (every load/store in a Bink movie frame's ~millions of lifted instructions
- * runs through here). On x86 the whole BE<->LE quadword swizzle is one
- * SSSE3 byte-shuffle instead of 16 scalar byte ops -- measured against the
- * scalar path with the same per-lane _u32 semantics. */
+ * runs through here). SPU_LS_FAST swaps each word with a bswap; on an SSSE3
+ * x86 host SPU_LS_VEC (below) does the whole BE<->LE quadword swizzle as one
+ * byte-shuffle, as rev32 does on NEON, with the same per-lane _u32 semantics. */
 #if defined(_MSC_VER)
 #include <stdlib.h>
 #define SPU_BSWAP32(x) _byteswap_ulong(x)
@@ -559,6 +581,20 @@ static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
 #endif
 #if defined(__ARM_NEON)
 #include <arm_neon.h>     /* the quadword swap is one rev32 */
+#endif
+/* SPU_LS_VEC: the quadword as one 16-byte load or store and one pshufb that
+ * byte-swaps each word. The four 32-bit stores of the scalar form, read back by
+ * the next 16-byte load of the register, cannot be store-forwarded: a stall on
+ * every lqd/lqx of lifted code. Define SPU_LS_VEC=0 to keep the scalar form. */
+#if !defined(SPU_LS_VEC) && !defined(__ARM_NEON) && defined(__SSSE3__) && \
+    (defined(__x86_64__) || defined(_M_X64))
+#define SPU_LS_VEC 1
+#endif
+#if SPU_LS_VEC
+#include <tmmintrin.h>
+static inline __m128i spu_ls_bswap_words(__m128i x) {
+    return _mm_shuffle_epi8(x, _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12));
+}
 #endif
 
 /* Debug probes of spu_ls_read128/write128, out of line: inlined they kept
@@ -655,6 +691,8 @@ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
     const uint8_t* p = &ctx->ls[lsa];
 #if defined(__ARM_NEON)
     vst1q_u8(v._u8, vrev32q_u8(vld1q_u8(p)));     /* ldr q; rev32 */
+#elif SPU_LS_VEC
+    _mm_storeu_si128((__m128i*)v._u8, spu_ls_bswap_words(_mm_loadu_si128((const __m128i*)p)));
 #elif SPU_LS_FAST
     uint32_t w0, w1, w2, w3;
     memcpy(&w0, p,      4); memcpy(&w1, p + 4,  4);
@@ -752,6 +790,8 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
     uint8_t* p = &ctx->ls[lsa];
 #if defined(__ARM_NEON)
     vst1q_u8(p, vrev32q_u8(vld1q_u8(val._u8)));   /* rev32; str q */
+#elif SPU_LS_VEC
+    _mm_storeu_si128((__m128i*)p, spu_ls_bswap_words(_mm_loadu_si128((const __m128i*)val._u8)));
 #elif SPU_LS_FAST
     uint32_t w0 = SPU_BSWAP32(val._u32[0]), w1 = SPU_BSWAP32(val._u32[1]);
     uint32_t w2 = SPU_BSWAP32(val._u32[2]), w3 = SPU_BSWAP32(val._u32[3]);

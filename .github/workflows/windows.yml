@@ -37,12 +37,33 @@ jobs:
         with:
           arch: x64
 
+      # The runner image's MSVC STL decides which clang it accepts: STL 14.52
+      # (image 20261111 onwards) stops with "STL1000: Unexpected compiler
+      # version, expected Clang 22 or newer", and the image's own LLVM is
+      # 20.1.8. A pinned, hash-checked LLVM keeps the build independent of
+      # which image a job lands on. It goes first on PATH, so every clang-cl
+      # below (CMake and the direct test compiles) is this one.
+      - name: Install LLVM 22 (clang-cl)
+        shell: pwsh
+        run: |
+          $ver = '22.1.8'
+          $sha = '16e5709785fef73c854646241c4a92c5cd574318d1b33c63330dd7721903e55c'
+          $exe = "$env:RUNNER_TEMP\LLVM-$ver-win64.exe"
+          Invoke-WebRequest "https://github.com/llvm/llvm-project/releases/download/llvmorg-$ver/LLVM-$ver-win64.exe" -OutFile $exe
+          $got = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          if ($got -ne $sha) { throw "LLVM installer sha256 $got, expected $sha" }
+          $dir = "$env:RUNNER_TEMP\llvm-$ver"
+          Start-Process -FilePath $exe -ArgumentList '/S', "/D=$dir" -Wait
+          if (-not (Test-Path "$dir\bin\clang-cl.exe")) { throw "clang-cl.exe missing after install" }
+          "$dir\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
       - name: Install Ninja
         run: choco install ninja -y --no-progress
 
       - name: Show toolchain
         run: |
           clang-cl --version
+          if (-not ((clang-cl --version) -match 'clang version 22\.')) { throw "clang-cl on PATH is not LLVM 22" }
           ninja --version
           cmake --version
 
@@ -94,6 +115,23 @@ jobs:
       # did. That gap let a broken xswd case sit red on both POSIX runners
       # while Windows reported green, which is exactly the wrong way round for
       # the platform most contributors build on.
+      # ps3_env_once with plain MSVC (cl) as well as clang-cl: the helper must
+      # cache on the compiler the Windows CRT's environment lock matters for.
+      - name: Run the ps3_env_once test (cl and clang-cl)
+        run: |
+          cl /nologo /W3 /WX /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_env_once_cl.exe tests/test_env_once.c
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\test_env_once_cl.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          cl /nologo /W3 /WX /TP /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_env_once_cl_cpp.exe tests/test_env_once.c
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\test_env_once_cl_cpp.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          clang-cl /nologo /W3 /WX /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_env_once_clang.exe tests/test_env_once.c
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\test_env_once_clang.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
       - name: Run self-contained SPU helper tests
         run: |
           clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /I runtime/spu /Fe:test_spu_helpers.exe runtime/spu/tests/test_spu_helpers.c
@@ -119,6 +157,15 @@ jobs:
           .\test_np_matching2.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
+      # sceNpSignaling for Matching2 room members: context ids from 1,
+      # ActivateConnection, the events a title's handlers get, the peer address.
+      - name: Run the sceNpSignaling room connection test
+        run: |
+          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_np_signaling_rooms.exe libs/network/tests/test_np_signaling_rooms.c
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\test_np_signaling_rooms.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
       # The player name: --username, PS3_NP_ONLINE_ID, the OS login online,
       # and PSN's online ID rules.
       - name: Run the player-name test
@@ -135,6 +182,15 @@ jobs:
           clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_np_nat.exe libs/network/tests/test_np_nat.c ws2_32.lib
           if ($LASTEXITCODE -ne 0) { exit 1 }
           .\test_np_nat.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      # cellSysutilAvc2: the synchronous Load is exported under the NID titles
+      # import and its callback gets LOAD_SUCCEEDED and JOIN_SUCCEEDED.
+      - name: Run the Avc2 Load test
+        run: |
+          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_avc2_load.exe libs/network/tests/test_avc2_load.c
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\test_avc2_load.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
       # arithmetic with no host API in it, so it runs everywhere, and it is the

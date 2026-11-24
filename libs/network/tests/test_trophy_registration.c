@@ -15,7 +15,9 @@ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
 void spu_coh_notify_write(uint32_t a) { (void)a; }
 void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
-/* cellSysutilCheckCallback's other pumps */
+/* g_ps3_guest_caller is cellSysutil.c's (defining it here too is a duplicate
+ * symbol under gcc). cellSysutilCheckCallback also pumps the message dialog,
+ * the PSN room transport and the PSN terms check; none is under test here. */
 void cellMsgDialog_tick(void) {}
 void np_psnr_pump(void) {}
 void ps3_np_eula_tick(void) {}
@@ -38,10 +40,15 @@ int main(void)
     assert(sceNpTrophyInit(NULL, 0, 0, 0) == CELL_OK);
     assert(sceNpTrophyCreateContext((void*)0x200, (void*)0x100, NULL, 0) == CELL_OK);
     assert(sceNpTrophyCreateHandle((void*)0x204) == CELL_OK);
+    assert(sceNpTrophyGetRequiredDiskSpace(1, 1, (void*)0x208, 0) == CELL_OK);
+    assert(vm_read64(0x208) == TROPHY_PACK_SIZE);
     assert(sceNpTrophyRegisterContext(1, 1, 0x300, 0xCAFE, 0) == SCE_NP_TROPHY_ERROR_UNKNOWN);
     g_ps3_guest_caller = callback;
     assert(sceNpTrophyRegisterContext(1, 1, 0x300, 0xCAFE, 0) == CELL_OK);
     assert(calls == 1 && s_contexts[1].registered);
+    /* Registration installed the set: nothing more to install. */
+    assert(sceNpTrophyGetRequiredDiskSpace(1, 1, (void*)0x208, 0) == CELL_OK);
+    assert(vm_read64(0x208) == 0);
     cellSysutilCheckCallback(); assert(calls == 2);
     cellSysutilCheckCallback(); assert(calls == 2);
     assert(sceNpTrophyTerm() == CELL_OK);

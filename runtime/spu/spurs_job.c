@@ -44,6 +44,7 @@
 #include <string.h>
 #include <stddef.h>
 #include "ps3emu/log_first.h"
+#include "ps3emu/ps3_env_once.h"   /* ps3_env_once: each switch looked up once */
 
 /* Environment switches are read where they are used, some of them per call:
  * answer from the pointer-keyed cache (ps3emu/env_cache.h). */
@@ -475,7 +476,13 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
      * cacheBuffer[0] (Twisted Metal's Edge jobs read their viewport there and
      * got width = height = 0). Leave the caller's 32-byte frame inside the
      * stack. */
-    ctx->gpr[1]._u32[0] = (stack_top - 32u) & ~15u;
+    uint32_t sp = (stack_top - 32u) & ~15u;
+    uint32_t stk_base = s_ls + size_scr;
+    ctx->gpr[1]._u32[0] = sp;
+    /* SPU ABI: word 1 of $sp holds available stack bytes for -mstack-check
+     * guards (ai $sp,$sp,-N; xswd $t,$sp; heqi $t,-1). Leaving it 0 causes
+     * jobs compiled with stack checks to HALT-ASSERT on their first frame. */
+    ctx->gpr[1]._u32[1] = (sp > stk_base) ? (sp - stk_base) : 0u;
     /* Link register: where the job returns when it is done. The job manager
      * would pass an address inside itself; 0 makes the job re-enter its own
      * entry at LS 0 and run a bogus second lap. */
@@ -505,7 +512,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     /* TEMP SPURS_JOB_LSWORD=<img>:<lsa>: after a job of that image, print the
      * LS word at lsa and every other LS offset holding the same value. */
     { static int img = -2; static uint32_t lsa; static int n = 0;
-      if (img == -2) { const char* e = getenv("SPURS_JOB_LSWORD"); img = -1;
+      if (img == -2) { const char* e = ps3_env_once("SPURS_JOB_LSWORD"); img = -1;
           if (e) { img = atoi(e); const char* c = strchr(e, ':'); lsa = c ? (uint32_t)strtoul(c + 1, 0, 16) : 0; } }
       if (img == image_id && PS3_LOG_FIRST(n, 3)) {
           const uint8_t* q = ctx->ls + (lsa & 0x3FFFC);
@@ -532,7 +539,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     }
     { uint32_t _cb = g32(job_ea + 0x4C);
       g_spurs_job_cmd = _cb ? (g32(_cb) >> 16) : 0; }
-    { static int s_t = -1; if (s_t < 0) s_t = getenv("SPURS_JOB_MBOX") ? 1 : 0;
+    { static int s_t = -1; if (s_t < 0) s_t = ps3_env_once("SPURS_JOB_MBOX") ? 1 : 0;
       static int n = 0;
       if (s_t && PS3_LOG_FIRST(n, 16) && g_spurs_job_mbox_valid)
           fprintf(stderr, "[spurs-job] job 0x%08X posted mbox=0x%08X intr=0x%08X\n",

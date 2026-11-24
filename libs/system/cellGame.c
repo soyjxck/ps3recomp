@@ -184,6 +184,27 @@ static s32 content_free_kb(void)
     return 0;
 }
 
+/* hddFreeSizeKB as the guest reads it. Games compute hddFreeSizeKB * 1024
+ * in 32 bits to get bytes, so a real free space of 4 GiB or more wraps to
+ * whatever is left over modulo 4 GiB: depending on how full the host disk
+ * happens to be, the install check sees a few MB and fails with "not enough
+ * space" (inFAMOUS 2 did, at boot, with 41.7 GB free). RPCS3 reports 40 GiB
+ * - 256 KiB for every one of these calls for that reason (cellGame.cpp,
+ * cellHddGameCheck): times 1024 that is 0xFFFC0000, still nearly 4 GiB
+ * after the wrap. Here the measured value is kept below 4 GiB, where it
+ * cannot wrap and a nearly full disk still reads as one, and RPCS3's figure
+ * is reported above it. PS3_GAME_FREE_SPACE_RAW=1 reports the measured
+ * value (capped at INT32_MAX KB) always, as before. */
+#define CELL_GAME_FREE_KB_WRAP     (4 * 1024 * 1024)        /* x1024 = 2^32 */
+#define CELL_GAME_FREE_KB_REPORTED (40 * 1024 * 1024 - 256) /* RPCS3 */
+static s32 content_free_kb_reported(void)
+{
+    const s32 kb = content_free_kb();
+    const char* raw = getenv("PS3_GAME_FREE_SPACE_RAW");
+    if (raw && *raw && *raw != '0') return kb;
+    return kb >= CELL_GAME_FREE_KB_WRAP ? CELL_GAME_FREE_KB_REPORTED : kb;
+}
+
 /* ---------------------------------------------------------------------------
  * Configuration
  * -----------------------------------------------------------------------*/
@@ -374,7 +395,7 @@ s32 cellGameBootCheck(u32* type, u32* attributes, CellGameContentSize* size,
     if (attr_ea) vm_write32(attr_ea, boot_as_patch() ? CELL_GAME_ATTRIBUTE_PATCH : 0);
 
     if (size_ea) {
-        vm_write32(size_ea + 0, (u32)content_free_kb());
+        vm_write32(size_ea + 0, (u32)content_free_kb_reported());
         vm_write32(size_ea + 4, (uint32_t)CELL_GAME_SIZEKB_NOTCALC);
         vm_write32(size_ea + 8, 0);                           /* sysSizeKB */
     }
@@ -444,10 +465,22 @@ s32 cellGameContentPermit(char* contentInfoPath, char* usrdirPath)
 /* cellGamePatchCheck (NID 0xCE4374F6): is the title running as its update?
  * Only when it booted as one (PS3_GAME_PATCH, above); the ContentPermit that
  * follows then reports the update's directory. Unregistered, it faked
- * CELL_OK -- a patch that is not there. */
-s32 cellGamePatchCheck(CellGameContentSize* size, u64 reserved)
+ * CELL_OK -- a patch that is not there.
+ *
+ * libsysutil_game (FW 4.93) cellGamePatchCheck(size, reserved): a non-NULL
+ * `reserved` is PARAM (0x8002CB07), tested before anything else. `size` is not
+ * tested up front: the firmware looks at it only once the title is known to be
+ * a patch, to decide whether to write the sizes, so a NULL `size` changes
+ * nothing on a non-patch boot. RPCS3 does not test `reserved`. The non-patch
+ * answer stays the local NOTPATCH: the firmware's static non-patch literal
+ * (0x8002CB06, its INTERNAL value) was only proven on a successful lookup and
+ * the live boot value is unobserved, so that mapping awaits a console probe. */
+s32 cellGamePatchCheck(CellGameContentSize* size, u32 reserved)
 {
-    (void)reserved;
+    if (reserved) {
+        printf("[cellGame] PatchCheck(reserved=0x%X) -> PARAM\n", reserved);
+        return CELL_GAME_ERROR_PARAM;
+    }
     const int patch = boot_as_patch();
     printf("[cellGame] PatchCheck() -> %s\n", patch ? s_title_id : "not booted as a patch");
     if (!patch) return CELL_GAME_ERROR_NOTPATCH;
@@ -456,7 +489,7 @@ s32 cellGamePatchCheck(CellGameContentSize* size, u64 reserved)
     s_check_dir[sizeof(s_check_dir) - 1] = '\0';
     uint32_t size_ea = (uint32_t)(uintptr_t)size;
     if (size_ea) {
-        vm_write32(size_ea + 0, (u32)content_free_kb());
+        vm_write32(size_ea + 0, (u32)content_free_kb_reported());
         vm_write32(size_ea + 4, (uint32_t)CELL_GAME_SIZEKB_NOTCALC);
         vm_write32(size_ea + 8, 0);
     }
@@ -483,7 +516,7 @@ s32 cellGameDataCheck(u32 type, const char* dirName, CellGameContentSize* size)
 
     uint32_t size_ea = (uint32_t)(uintptr_t)size;
     if (size_ea) {
-        vm_write32(size_ea + 0, (u32)content_free_kb());
+        vm_write32(size_ea + 0, (u32)content_free_kb_reported());
         vm_write32(size_ea + 4, (uint32_t)CELL_GAME_SIZEKB_NOTCALC);
         vm_write32(size_ea + 8, 0);
     }
@@ -548,7 +581,7 @@ static s32 gamedata_stat_callback(const char* tag, u32 version, uint32_t dir_ea,
     memset(vm_base + cb, 0, (set + 0x20) - cb);
 
     /* CellGameDataStatGet (offsets per SDK, RPCS3-verified). */
-    vm_write32(get + 0x000, (u32)content_free_kb());
+    vm_write32(get + 0x000, (u32)content_free_kb_reported());
     vm_write32(get + 0x004, is_new_data);                            /* isNewData = 0 (data exists) */
     snprintf((char*)(vm_base + get + 0x008), 96, "/dev_hdd0/game/%s", dir);          /* contentInfoPath */
     snprintf((char*)(vm_base + get + 0x427), 96, "/dev_hdd0/game/%s/USRDIR", dir);   /* gameDataPath */
@@ -786,9 +819,13 @@ s32 cellGameCreateGameData(CellGameSetInitParams* init, char* tmp_contentInfoPat
 
 s32 cellGameDeleteGameData(const char* dirName)
 {
-    printf("[cellGame] DeleteGameData(dir='%s')\n", dirName ? dirName : "<null>");
+    uintptr_t raw = (uintptr_t)dirName;
+    const char* host_dir = (raw && raw < 0x100000000ull && vm_base)
+        ? (const char*)(vm_base + (uint32_t)raw)
+        : dirName;
+    printf("[cellGame] DeleteGameData(dir='%s')\n", host_dir ? host_dir : "<null>");
 
-    if (!dirName)
+    if (!raw)
         return CELL_GAME_ERROR_PARAM;
 
     /* We won't recursively delete host directories for safety.

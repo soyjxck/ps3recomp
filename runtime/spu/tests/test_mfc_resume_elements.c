@@ -33,6 +33,7 @@ uint32_t g_spu_dma_rng_lo, g_spu_dma_rng_hi;
 long g_spu_dma_rng_cap;
 void spu_dma_range_init(void) {}
 int vm_commit_reserved(void* p, uint64_t n) { (void)p; (void)n; return 1; }
+spu_context* spu_thread_ls_peer(const spu_context* self, uint32_t n) { (void)self; (void)n; return NULL; }
 void spu_lockline_unlock(void) {}
 void spu_lockguard_check(spu_context* c,uint32_t ea,const uint8_t* p,uint32_t n,const char* what)
 { (void)c;(void)ea;(void)p;(void)n;(void)what; }

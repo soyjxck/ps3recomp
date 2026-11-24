@@ -388,6 +388,11 @@ static spu_group_t* spu_alloc_group(void)
             s_spu_groups[i].state  = SPU_GROUP_STATE_INITIALIZED;
             s_spu_groups[i].exit_status = 0;
             s_spu_groups[i].cause  = SPU_GROUP_CAUSE_ALL_THREADS_EXIT;
+            /* A slot that has not been given a thread by sys_spu_thread_initialize
+             * must not read as index 0: every per-group loop would then start,
+             * join or free s_spu_threads[0], which belongs to another group. */
+            for (int k = 0; k < 8; k++)
+                s_spu_groups[i].thread_indices[k] = MAX_SPU_THREADS;
             return &s_spu_groups[i];
         }
     }
@@ -521,8 +526,8 @@ static int64_t sys_spu_thread_group_create_handler(ppu_context* ctx)
     if (!g) {
         fprintf(stderr, "[SPU] group_create: out of groups\n");
         fflush(stderr);
-        ctx->gpr[3] = (uint64_t)(int64_t)-1; /* EAGAIN-ish */
-        return -1;
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EAGAIN;
+        return (int64_t)ctx->gpr[3];
     }
     if (num > 8) num = 8;
     g->num_threads = num;
@@ -597,13 +602,13 @@ static int64_t sys_spu_thread_initialize_handler(ppu_context* ctx)
     if (!g) {
         fprintf(stderr, "[SPU] thread_init: group 0x%X not found\n", group_id);
         fflush(stderr);
-        ctx->gpr[3] = (uint64_t)(int64_t)-1;
-        return -1;
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ESRCH;
+        return (int64_t)ctx->gpr[3];
     }
     spu_thread_t* t = spu_alloc_thread();
     if (!t) {
-        ctx->gpr[3] = (uint64_t)(int64_t)-1;
-        return -1;
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EAGAIN;
+        return (int64_t)ctx->gpr[3];
     }
     t->group_id = group_id;
     t->index    = thread_num;
@@ -971,7 +976,21 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
 {
     uint32_t id = (uint32_t)ctx->gpr[3];
     spu_group_t* g = spu_find_group(id);
-    if (!g) { ctx->gpr[3] = (uint64_t)(int64_t)-1; return -1; }
+    /* An unknown group is ESRCH (it was a bare -1). */
+    if (!g) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ESRCH; return (int64_t)ctx->gpr[3]; }
+    /* Starting a group whose thread is still running is ESTAT. For a lifted
+     * thread it would run spu_lifted_thread_setup over the live context and
+     * spawn a second host thread on it. */
+    for (uint32_t i = 0; i < g->num_threads && i < 8; i++) {
+        uint32_t idx = g->thread_indices[i];
+        if (idx < MAX_SPU_THREADS && s_spu_threads[idx].in_use &&
+            *(volatile int*)&s_spu_threads[idx].running && s_spu_threads[idx].sctx) {
+            fprintf(stderr, "[SPU] group_start id=0x%X: thread 0x%X still running -> CELL_ESTAT\n",
+                    id, s_spu_threads[idx].tid);
+            ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ESTAT;
+            return (int64_t)ctx->gpr[3];
+        }
+    }
     g->state = SPU_GROUP_STATE_RUNNING;
     /* This run has produced no cause yet. group_join now preserves a cause a
      * thread reported, so a group id started a second time has to begin with a
@@ -1345,6 +1364,35 @@ static int64_t sys_spu_thread_group_destroy_handler(ppu_context* ctx)
     }
     spu_group_t* g = spu_find_group(id);
     if (g) {
+        /* A thread still running on its host thread owns its context and local
+         * store, so freeing them below is a use-after-free inside that thread.
+         * lv2 refuses to destroy a group that has not stopped (CELL_EBUSY). A
+         * middleware shutdown commonly writes its "quit" word to a signal
+         * register and destroys the group straight away without a join, so give
+         * running threads a moment to see it and stop; if one is still running,
+         * refuse and free nothing. Only threads that own memory freed below
+         * count (a lifted context or a local store). */
+        int busy = 0;
+        const uint64_t t0 = GetTickCount64();   /* wall time: Sleep(1) can be a 15.6 ms tick */
+        for (;;) {
+            busy = 0;
+            for (int i = 0; i < 8 && i < (int)g->num_threads; i++) {
+                uint32_t idx = g->thread_indices[i];
+                if (idx < MAX_SPU_THREADS && s_spu_threads[idx].in_use &&
+                    *(volatile int*)&s_spu_threads[idx].running &&
+                    (s_spu_threads[idx].sctx || s_spu_threads[idx].local_store))
+                    busy = 1;
+            }
+            if (!busy || GetTickCount64() - t0 >= 250) break;
+            Sleep(1);
+        }
+        if (busy) {
+            fprintf(stderr, "[SPU] group_destroy id=0x%X: a thread is still running "
+                            "-> CELL_EBUSY (nothing freed)\n", id);
+            fflush(stderr);
+            ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EBUSY;
+            return (int64_t)ctx->gpr[3];
+        }
         for (int i = 0; i < 8 && i < (int)g->num_threads; i++) {
             uint32_t idx = g->thread_indices[i];
             if (idx < MAX_SPU_THREADS) {
@@ -1399,13 +1447,13 @@ static int64_t sys_spu_thread_get_exit_status_handler(ppu_context* ctx)
     spu_thread_t* t = spu_find_thread(tid);
     if (!t) {
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010005; /* CELL_ESRCH */
-        return -1;
+        return (int64_t)ctx->gpr[3];
     }
     if (t->running) {
         /* Still in flight — Sony's behaviour. Games that want the exit code
          * synchronously should call group_join first. */
-        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010003; /* CELL_ESTAT */
-        return -1;
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ESTAT;   /* was 0x80010003 = ENOSYS */
+        return (int64_t)ctx->gpr[3];
     }
     vm_write_be32(status_ea, (uint32_t)t->exit_status);
     ctx->gpr[3] = 0;
@@ -1597,7 +1645,7 @@ static int64_t sys_spu_thread_group_connect_event_handler(ppu_context* ctx)
     spu_group_t* g = spu_find_group(group_id);
     if (!g) {
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010005; /* CELL_ESRCH */
-        return -1;
+        return (int64_t)ctx->gpr[3];
     }
     g->event_queue_id = queue_id;
     fprintf(stderr, "[SPU] group_connect_event group=0x%X queue=0x%X\n",
@@ -1757,8 +1805,10 @@ static int64_t sys_spu_thread_connect_event_handler(ppu_context* ctx)
     fprintf(stderr, "[SPU] thread_connect_event tid=0x%X queue=0x%X et=0x%X spup=0x%X%s\n",
             tid, eq, et, (uint32_t)ctx->gpr[6], t ? "" : " (thread not found)");
     fflush(stderr);
-    ctx->gpr[3] = 0;
-    return 0;
+    /* Nothing is bound for an unknown thread, so say so (ESRCH) instead of
+     * CELL_OK. */
+    ctx->gpr[3] = t ? 0 : (uint64_t)(int64_t)(int32_t)CELL_ESRCH;
+    return (int64_t)ctx->gpr[3];
 }
 
 /* SPU -> PPU outbound mailbox delivery. Installed into spu_channels.c's
@@ -1837,16 +1887,16 @@ static int64_t sys_spu_thread_write_ls_handler(ppu_context* ctx)
     spu_thread_t* t = spu_find_thread(tid);
     if (!t) {
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010005; /* CELL_ESRCH */
-        return -1;
+        return (int64_t)ctx->gpr[3];
     }
     if (ls_offset + type > SPU_LS_SIZE) {
-        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010002; /* CELL_EFAULT */
-        return -1;
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010002; /* CELL_EINVAL */
+        return (int64_t)ctx->gpr[3];
     }
     uint8_t* ls = spu_thread_get_or_alloc_ls(t);
     if (!ls) {
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010004; /* CELL_ENOMEM */
-        return -1;
+        return (int64_t)ctx->gpr[3];
     }
     /* Big-endian store, mirroring guest convention. */
     switch (type) {
@@ -1861,7 +1911,7 @@ static int64_t sys_spu_thread_write_ls_handler(ppu_context* ctx)
             break;
     default:
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010002;
-        return -1;
+        return (int64_t)ctx->gpr[3];
     }
     ctx->gpr[3] = 0;
     return 0;
@@ -1907,16 +1957,16 @@ static int64_t sys_spu_thread_read_ls_handler(ppu_context* ctx)
     spu_thread_t* t = spu_find_thread(tid);
     if (!t || !value_ea || !vm_base) {
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010005; /* CELL_ESRCH */
-        return -1;
+        return (int64_t)ctx->gpr[3];
     }
     if (ls_offset + type > SPU_LS_SIZE) {
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010002;
-        return -1;
+        return (int64_t)ctx->gpr[3];
     }
     uint8_t* ls = spu_thread_get_or_alloc_ls(t);
     if (!ls) {
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010004;
-        return -1;
+        return (int64_t)ctx->gpr[3];
     }
     /* Big-endian load → write to guest as 8 bytes (always); the syscall
      * is documented to write a u64 with the value zero-extended in the
@@ -1935,7 +1985,7 @@ static int64_t sys_spu_thread_read_ls_handler(ppu_context* ctx)
         break;
     default:
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010002;
-        return -1;
+        return (int64_t)ctx->gpr[3];
     }
     /* Write 8-byte BE value to guest. */
     uint8_t* p = vm_base + value_ea;
@@ -2009,8 +2059,8 @@ static int64_t sys_spu_image_import_handler(ppu_context* ctx)
 
     if (!img_ea || !src_ea || !vm_base) {
         if (img_ea && vm_base) memset(vm_base + img_ea, 0, 16);
-        ctx->gpr[3] = (uint64_t)(int64_t)-14;  /* EFAULT */
-        return -14;
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EFAULT;    /* was -14, a host errno */
+        return (int64_t)ctx->gpr[3];
     }
 
     /* Validate SPU ELF32 (big-endian) magic. */
@@ -2019,8 +2069,8 @@ static int64_t sys_spu_image_import_handler(ppu_context* ctx)
         memset(vm_base + img_ea, 0, 16);
         fprintf(stderr, "[SPU] image_import img=0x%08X src=0x%08X -- not an ELF\n", img_ea, src_ea);
         fflush(stderr);
-        ctx->gpr[3] = (uint64_t)(int64_t)-8;   /* ENOEXEC */
-        return -8;
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ENOEXEC;   /* was -8, a host errno */
+        return (int64_t)ctx->gpr[3];
     }
 
     uint32_t entry   = vm_read_be32(src_ea + 0x18);
@@ -2381,12 +2431,18 @@ static int64_t sys_spu_thread_write_snr_handler(ppu_context* ctx)
     uint32_t val = (uint32_t)ctx->gpr[5];
     if (num > 1) {
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010002;
-        return -1;
+        return (int64_t)ctx->gpr[3];
     }
     spu_thread_t* t = spu_find_thread(tid);
     if (!t) {
+        /* A SPU thread of a SPURS instance (ids from cellSpursGetInfo), which has no spu_thread_t of its own. */
+        extern int cellSpurs_post_snr(uint32_t tid, uint32_t num, uint32_t val) __attribute__((weak));
+        if (cellSpurs_post_snr && cellSpurs_post_snr(tid, num, val) == 0) {
+            ctx->gpr[3] = 0;
+            return 0;
+        }
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010005;
-        return -1;
+        return (int64_t)ctx->gpr[3];
     }
     if (t->sctx) {
         spu_channel* ch = &t->sctx->ch_sig_notify[num];
@@ -2413,12 +2469,12 @@ static int64_t sys_spu_thread_set_spu_cfg_handler(ppu_context* ctx)
     uint64_t val = (uint64_t)ctx->gpr[4];
     if (val & ~3ull) {
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010002;
-        return -1;
+        return (int64_t)ctx->gpr[3];
     }
     spu_thread_t* t = spu_find_thread(tid);
     if (!t) {
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010005;
-        return -1;
+        return (int64_t)ctx->gpr[3];
     }
     t->spu_cfg = (uint32_t)val;
     ctx->gpr[3] = 0;
@@ -2432,8 +2488,13 @@ static int64_t sys_spu_thread_get_spu_cfg_handler(ppu_context* ctx)
     spu_thread_t* t = spu_find_thread(tid);
     if (!t) {
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010005;
-        return -1;
+        return (int64_t)ctx->gpr[3];
     }
+    /* The ABI is (id, u64* value): the config is stored THROUGH the pointer in
+     * r4. Setting r4 alone left the caller's u64 unwritten. r4 is still set, as
+     * before. */
+    { uint32_t out_ea = (uint32_t)ctx->gpr[4];
+      if (out_ea) { vm_write_be32(out_ea, 0); vm_write_be32(out_ea + 4, (uint32_t)t->spu_cfg); } }
     ctx->gpr[4] = (uint64_t)t->spu_cfg;
     ctx->gpr[3] = 0;
     return 0;
@@ -2623,6 +2684,15 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
  * -----------------------------------------------------------------------*/
 lv2_syscall_table g_lv2_syscalls;
 
+/* The one default handler lv2_syscall_table_init fills empty slots with (see
+ * lv2_syscall_table.h). */
+int64_t lv2_syscall_unimplemented(ppu_context* ctx)
+{
+    uint32_t num = (uint32_t)ctx->gpr[11];
+    fprintf(stderr, "[LV2] unimplemented syscall %u (0x%X)\n", num, num);
+    return (int64_t)(int32_t)CELL_ENOSYS;
+}
+
 /* Firmware imports that are ALSO lv2 syscalls.
  *
  * A title can reach these two ways: issue the raw `sc` (-> the syscall table
@@ -2657,8 +2727,8 @@ void lv2_init_syscalls(void)
 
 /* Returns 1 (and sets gpr[3] from the handler) if `num` is a registered
  * syscall; 0 if unregistered (the caller keeps its own stub behaviour). The
- * comparison against the static-inline sentinel is reliable here because this
- * TU and lv2_syscall_table_init share the same instance. */
+ * sentinel is one real function (lv2_register.c), so the pointer comparison
+ * is the same in every translation unit. */
 int lv2_try_syscall(ppu_context* ctx)
 {
     uint32_t num = (uint32_t)ctx->gpr[11];

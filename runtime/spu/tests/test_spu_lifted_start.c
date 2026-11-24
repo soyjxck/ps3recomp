@@ -106,6 +106,7 @@ int64_t lv2_spu_lock_line_classify(uint32_t a, uint64_t f) { (void)a; (void)f; r
 #include "../spu_helpers.h"
 void spu_wrch(spu_context*, uint32_t, u128);
 void spu_overlay_register_region(uint32_t, uint32_t, int);
+void spu_overlay_register_region_reloc(uint32_t, uint32_t, uint32_t, int);
 void spu_overlay_note_get(spu_context*, uint32_t, const uint8_t*, uint32_t);
 void spu_overlay_register_source(uint32_t, int);
 void spu_overlay_register_sig(const uint8_t sig[16], int);
@@ -387,6 +388,43 @@ static void test_smc_xori(void)
 static void code_a(spu_context* ctx) { ctx->gpr[3]._u32[0] = 81; }
 static void code_b(spu_context* ctx) { ctx->gpr[3]._u32[0] = 82; }
 static void code_stale(spu_context* ctx) { ctx->gpr[3]._u32[0] = 83; }
+/* Relocatable resident code (spu_overlay_register_region_reloc): one canonical lift
+ * served wherever the title copies the code, with ctx->reloc_delta set. */
+static void rl_fn0(spu_context* c) { c->gpr[9]._u32[0] = 0x40; }
+static void rl_fn1(spu_context* c) { c->gpr[9]._u32[0] = 0x41; }
+static void test_reloc_regions(void)
+{
+    spu_context* c = calloc(1, sizeof *c);
+    if (!c) { check(0, "reloc: allocate"); return; }
+    spu_context_init(c, 0); c->image_id = 121;
+    spu_begin_image(140); spu_register_function(0x10000, rl_fn0); spu_register_function(0x10040, rl_fn1);
+    spu_begin_image(0);
+    spu_overlay_register_region_reloc(0x910000, 0x100, 0, 141);          /* rejected: canon 0 */
+    spu_overlay_register_region_reloc(0x920000, 0x100, 0x3FF80, 142);    /* rejected: past LS */
+    spu_overlay_note_get(c, 0x910000, c->ls + 0x5000, 16);
+    spu_overlay_note_get(c, 0x920000, c->ls + 0x6000, 16);
+    check(!c->resident_code[0].image_id, "reloc: invalid canon registrations are refused");
+    spu_overlay_register_region_reloc(0x900000, 0x100, 0x10000, 140);
+    spu_overlay_note_get(c, 0x900000, c->ls + 0x23450, 16);
+    check(c->resident_code[0].image_id == 140 && c->resident_code[0].canon == 0x10000, "reloc: GET at any LSA makes the copy resident");
+    c->reloc_delta = 0;
+    check(spu_lifted_lookup(c, 0x23450) == rl_fn0, "reloc: placed entry runs the canonical lift");
+    check(c->reloc_delta == 0x13450, "reloc: lookup sets placement - canon");
+    check(spu_lifted_lookup(c, 0x23490) == rl_fn1, "reloc: second function at canon + offset");
+    c->reloc_delta = 0;
+    check(spu_lifted_lookup(c, 0x23450) == rl_fn0, "reloc: repeated lookup (cache hit)");
+    check(c->reloc_delta == 0x13450, "reloc: a cache hit restores the delta");
+    check(spu_lifted_lookup(c, 0x10000) == NULL, "reloc: the canonical address itself is not served");
+    spu_overlay_note_get(c, 0x900000, c->ls + 0x30000, 16);
+    int n = 0; for (unsigned s = 0; s < 4; ++s) n += c->resident_code[s].image_id == 140;
+    check(n == 1, "reloc: a new placement takes over the image's slot");
+    check(spu_lifted_lookup(c, 0x30040) == rl_fn1 && c->reloc_delta == 0x20000, "reloc: new placement, new delta");
+    check(spu_lifted_lookup(c, 0x23450) == NULL, "reloc: the old placement is no longer resident");
+    c->reloc_delta = 7;
+    check(spu_lifted_lookup(c, 0x30000) == rl_fn0 && c->reloc_delta == 0x20000, "reloc: delta after placement change");
+    free(c);
+}
+
 static void test_resident_code_regions(void)
 {
     spu_context* ctx = (spu_context*)calloc(1, sizeof *ctx);
@@ -678,14 +716,17 @@ extern void spu_register_stack_reset_entry(uint32_t, int);
 extern void spu_halt(spu_context*);
 extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
 static int stack_reset_depth, stale_caller_ran;
+static uint32_t stack_reset_ret = 0xFFFFFFFFu;
 static void reset_target(spu_context* ctx)
 {
     stack_reset_depth = (int)ctx->host_depth;
+    stack_reset_ret = ctx->drain_ret_pc;
     spu_halt(ctx);
 }
 static void nested_reset(spu_context* ctx)
 {
     ctx->host_depth += 4;
+    ctx->drain_ret_pc = 0x1234;   /* an enclosing drain's return point */
     ctx->pc = 0x838;
     spu_indirect_branch(ctx);
     stale_caller_ran = 1;
@@ -711,6 +752,9 @@ static void test_guest_stack_reset(void)
     spu_run_with_halt(nested_reset, ctx);
     check(stack_reset_depth == 0, "one-way kernel entry discards nested host call frames");
     check(!stale_caller_ran, "exited workload cannot resume its obsolete caller");
+    /* The abandoned drains' return point goes with their frames: a later
+     * return to that address must not stop the interpreter fallback there. */
+    check(stack_reset_ret == 0, "stack reset leaves no drain return point behind");
     stack_reset_depth = -1; stale_caller_ran = 0;
     spu_run_with_halt(direct_reset, ctx);
     check(stack_reset_depth == 0 && !stale_caller_ran,
@@ -1059,6 +1103,7 @@ int main(void)
     test_smc_branch_hints();
     test_smc_xori();
     test_resident_code_regions();
+    test_reloc_regions();
     test_verified_resident_code_regions();
     test_registry_lookup_memo();
     test_resident_interpreter_rejoin();
@@ -1233,6 +1278,8 @@ void sys_memory_init(lv2_syscall_table* t)     { (void)t; }
 void sys_vm_init(lv2_syscall_table* t)         { (void)t; }
 void sys_fs_init(lv2_syscall_table* t)         { (void)t; }
 const char* np_psnr_identity(void)            { return NULL; }
+/* cellSpurs.c: sys_spu_thread_write_snr on a SPURS pseudo SPU thread id. */
+int cellSpurs_post_snr(uint32_t tid, uint32_t num, uint32_t val) { (void)tid; (void)num; (void)val; return -1; }
 
 int sys_event_queue_push_by_id(uint32_t q, uint64_t d0, uint64_t d1,
                                uint64_t d2, uint64_t d3)

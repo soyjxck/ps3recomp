@@ -283,6 +283,44 @@ int main(int argc, char** argv)
             check("VP MSL", g_msl, getenv("PS3RECOMP_MSL_INVARIANT") ? "[[position" : "[[position, invariant]]");
             check("VP MSL", g_msl, "[[user(locn0)]]");    /* COLOR0 */
             check("VP MSL", g_msl, "[[user(locn10)]]");   /* TEXCOORD7 */
+            /* Metal's point size is undefined unless written: the vertex
+             * function writes [[point_size]] from the vp_pointsize row of
+             * VPConst, after vp_posoffset (rsx_vp_decompiler.h), as
+             * clamp(size, 1, max). The MSL is the one thing the D3D12 text
+             * does not carry, so the plain decompile has none. */
+            check("VP MSL point size", g_msl, "[[point_size]]");
+            check("VP MSL point size", g_msl, "float4 vp_pointsize;");
+            check("VP MSL point size", g_msl, "vp_pointsize.z");
+            {
+                const char* po = strstr(g_msl, "float4 vp_posoffset;");
+                const char* pp = strstr(g_msl, "float4 vp_pointsize;");
+                check_true("VP MSL point size: the row follows vp_posoffset", po && pp && pp > po);
+            }
+            /* The program's own size is o[6].x (output mask bit 5), taken
+             * only when vp_pointsize.y says so; the translated text keeps
+             * both sources. */
+            check("VP MSL point size", g_msl, "vp_pointsize.y");
+            check("VP MSL point size", g_msl, "vp_pointsize.x");
+        }
+        /* The text the other backends compile is the macro's guard, nothing
+         * more: undefined there, the member, row and store do not exist. */
+        check("VP HLSL point size", g_hlsl, "#ifdef RSX_POINT_SIZE_BUILTIN");
+        check("VP HLSL point size", g_hlsl, "[[vk::builtin(\"PointSize\")]] float psz:PSIZE;");
+        check("VP HLSL point size", g_hlsl, "Out.psz = vp_point_size(o[6].x);");
+    }
+
+    /* ---- vertex program: MOV o6, v3 -- the program writes the point size ---- */
+    {
+        u8 vp[32];
+        rsx_test_vp_mov_out(vp +  0, 0, RSX_TEST_VP_SWZ_IDENT, 0, 0);   /* MOV o0, v0 */
+        rsx_test_vp_mov_out(vp + 16, 3, RSX_TEST_VP_SWZ_IDENT, 6, 1);   /* MOV o6, v3, END */
+        check_count("VP point size", rsx_vp_decompile(vp, sizeof vp, g_hlsl, sizeof g_hlsl), 2);
+        check("VP point size HLSL", g_hlsl, "o[6].xyzw = _v.xyzw;");
+        if (translate("VP point size", RSX_SHADER_STAGE_VERTEX) == 0) {
+            check("VP point size MSL", g_msl, "[[point_size]]");
+            check("VP point size MSL", g_msl, "vp_pointsize");
+            /* TEX9 still comes out of the same register. */
+            check("VP point size MSL", g_msl, "[[user(locn");
         }
     }
 
@@ -676,6 +714,48 @@ int main(int argc, char** argv)
             check("precise math FP MSL", g_msl, "precise::normalize");
             check_absent("precise math FP MSL", g_msl, "fast::");
         }
+    }
+
+    /* ---- depth bounds (NV4097 0x0380), emulated in the program ----------
+     * The stored depth comes from a float copy on a unit the program does
+     * not sample (15 here); outside [fp_dbounds.x, fp_dbounds.y] the
+     * fragment is discarded before anything else runs. Single target behind
+     * the alpha-test wrapper, then the MRT form; a cube slot is refused. */
+    {
+        u8 fp[16];
+        rsx_test_fp_mov_r0_col0(fp, RSX_TEST_FP_SWZ_IDENT);
+        check_count("dbounds FP", rsx_fp_decompile_buffered_ex(fp, sizeof fp, 0x40u, 0, g_hlsl, sizeof g_hlsl, NULL), 1);
+        const int at = rsx_fp_apply_alpha_test_buffered(g_hlsl, sizeof g_hlsl, 0x204u /* GREATER */);
+        const int db = rsx_fp_apply_depth_bounds(g_hlsl, sizeof g_hlsl, 15);
+        const int again = rsx_fp_apply_depth_bounds(g_hlsl, sizeof g_hlsl, 15);   /* refuses twice */
+        if (at == 1 && db == 1 && again == -1) { printf("[PASS] dbounds FP patches\n"); g_pass++; }
+        else { printf("[FAIL] dbounds FP patches %d %d %d (want 1 1 -1)\n", at, db, again); g_fail++; }
+        check("dbounds FP HLSL", g_hlsl, "    float4 fp_alpha;\n    float4 fp_dbounds;\n};");
+        check("dbounds FP HLSL", g_hlsl, "rsx_tex[15].Load(int3(int2(input.position.xy), 0)).r");
+        check("dbounds FP HLSL", g_hlsl, "_rsx_zs > fp_dbounds.y) discard;");
+        if (translate("dbounds FP", RSX_SHADER_STAGE_FRAGMENT) == 0) {
+            check("dbounds FP MSL", g_msl, "discard_fragment()");
+            check("dbounds FP MSL", g_msl, "fp_dbounds");
+        }
+    }
+    {
+        u8 fp[32];
+        rsx_test_fp_mrt_col0(fp, RSX_TEST_FP_SWZ_IDENT, RSX_TEST_FP_SWZ(2, 1, 0, 3));
+        check_count("dbounds MRT FP", rsx_fp_decompile_buffered_ex(fp, sizeof fp, 0x40u, 0, g_hlsl, sizeof g_hlsl, NULL), 2);
+        if (rsx_fp_apply_depth_bounds(g_hlsl, sizeof g_hlsl, 12) == 1) { printf("[PASS] dbounds MRT FP patch\n"); g_pass++; }
+        else { printf("[FAIL] dbounds MRT FP patch\n"); g_fail++; }
+        check("dbounds MRT FP HLSL", g_hlsl, "PSOutput main(PSInput input) {\n    { const float _rsx_zs = rsx_tex[12].Load(");
+        if (translate("dbounds MRT FP", RSX_SHADER_STAGE_FRAGMENT) == 0)
+            check("dbounds MRT FP MSL", g_msl, "[[color(1)]]");
+        rsx_test_fp_mov_r0_col0(fp, RSX_TEST_FP_SWZ_IDENT);
+        rsx_fp_decompile_buffered_ex(fp, 16, 0x40u, 1u << 3 /* unit 3 a cube */, g_hlsl, sizeof g_hlsl, NULL);
+        if (rsx_fp_apply_depth_bounds(g_hlsl, sizeof g_hlsl, 3) == -1) { printf("[PASS] dbounds refuses a cube slot\n"); g_pass++; }
+        else { printf("[FAIL] dbounds took a cube slot\n"); g_fail++; }
+        if (rsx_fp_apply_depth_bounds(g_hlsl, sizeof g_hlsl, 15) == 1) { printf("[PASS] dbounds beside a cube\n"); g_pass++; }
+        else { printf("[FAIL] dbounds beside a cube\n"); g_fail++; }
+        check("dbounds cube FP HLSL", g_hlsl, "rsx_tex15.Load(int3(int2(input.position.xy), 0)).r");
+        if (translate("dbounds cube FP", RSX_SHADER_STAGE_FRAGMENT) == 0)
+            check("dbounds cube FP MSL", g_msl, "[[texture(15)]]");
     }
 
     test_cache();

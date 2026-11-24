@@ -15,9 +15,11 @@
  *   -o /tmp/test_gcm_flip_wrap        (clang on macOS: -Wl,-dead_strip)
  */
 #include "../cellGcmSys.c"
+#include "../rsx_tiling.c"
 #include <stdio.h>
 #include <stdlib.h>
 uint8_t* vm_base;
+uint64_t ps3_system_time_us(void) { return 0; }   /* sys_timer.c */
 uint32_t ppu_vm_size;
 int g_resv_store_active;
 uint32_t g_ww_lo, g_ww_hi;
@@ -102,6 +104,14 @@ int main(void)
     u32 ctx_out = host_alloc(4, 4);
     u32 rt = cellGcmSetupContext(ctx_out, CMD_SIZE, IO_SIZE, IO_ADDR, host_alloc, host_w32);
     s_display_buffer_set[1] = 1;
+
+    /* CellGcmContextData: end reserves the last word for the wrap JUMP */
+    const u32 rt_begin = vm_read32(rt);
+    const u32 rt_end = vm_read32(rt + 4);
+    if (rt_end != rt_begin + CMD_SIZE - 4) {
+        printf("FAIL: rt_end (0x%08X) != rt_begin + CMD_SIZE - 4 (0x%08X)\n", rt_end, rt_begin + CMD_SIZE - 4);
+        fails++;
+    }
 
     /* The title's draw context: 0x30000 bytes inside the IO window, with its
      * own callback descriptor. */
