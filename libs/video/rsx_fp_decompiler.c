@@ -384,7 +384,8 @@ typedef struct {
 
 /* Each source operand carries a 3-bit input precision modifier in DWORD2:
  * bits 19-21 for SRC0, 22-24 for SRC1, 25-27 for SRC2. The hardware clamps the
- * operand to that precision's range after abs and before negate:
+ * operand to that precision's range after abs (saturate: before it) and before
+ * negate:
  *   1 half    [-65504, 65504]
  *   2 fixed12 [-2, 2]
  *   3 fixed9  [-1, 1]
@@ -488,6 +489,12 @@ static void emit_src(const Src* s, u32 input_src, int persp, const float* k, int
     const char* post = "";
     if (s->abs)    { pre = "abs("; post = ")"; }
     const char* range = fp_src_prec_clamp(s->prec);
+    if (range && s->prec == 4) {
+        /* Saturate clamps before abs (RPCS3's order, from hardware tests):
+         * a negative operand reads 0, not its magnitude. */
+        snprintf(buf, bufsz, s->negate ? "-(clamp(%s, %s))" : "clamp(%s, %s)", swz, range);
+        return;
+    }
     if (range) {   /* abs, then the precision clamp, then negate */
         snprintf(buf, bufsz, s->negate ? "-(clamp(%s%s%s, %s))" : "clamp(%s%s%s, %s)",
                  pre, swz, post, range);
