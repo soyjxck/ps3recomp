@@ -551,3 +551,113 @@ s32 l10n_convert_str(s32 src_code, const void* src, u32* src_len,
                           (u32)dst_code, dst, out_len, dst_len);
     return rc;
 }
+
+/* ---------------------------------------------------------------------------
+ * Shift-JIS string conversions, against GUEST memory
+ *
+ * The functions above take host pointers and so cannot be handed guest
+ * arguments as the HLE dispatcher passes them (raw guest addresses, big-endian
+ * lengths). These take the addresses as they arrive and follow RPCS3's
+ * _L10nConvertStr: *src_len units are converted (NULs included); with no dst
+ * the size is reported; a dst too small is DSTExhausted. Results:
+ * 0 ConversionOK, 1 SRCIllegal, 2 DSTExhausted, 3 ConverterUnknown.
+ *
+ * Shift-JIS is code page 932 (a superset), decoded by the host on Windows;
+ * elsewhere only the ASCII subset converts until a table is added.
+ * Some titles call SJISstoUTF8s during boot.
+ * -----------------------------------------------------------------------*/
+#include "../../runtime/ppu/ppu_memory.h"
+#include <stdlib.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
+enum { L10N_K_SJIS, L10N_K_UTF8, L10N_K_UCS2 };
+enum { L10N_OK = 0, L10N_SRC_ILLEGAL = 1, L10N_DST_EXHAUSTED = 2 };
+
+/* src -> host UTF-16 (malloc'd), returns unit count or -1 on bad input */
+static int l10n_to_wide(int kind, u32 src, u32 n, wchar_t** out)
+{
+    wchar_t* w = (wchar_t*)malloc(sizeof(wchar_t) * (n + 1));
+    if (!w) return -1;
+    int len = 0;
+    if (kind == L10N_K_UCS2) {
+        for (u32 i = 0; i < n; i++) w[len++] = (wchar_t)vm_read16(src + 2 * i);
+    } else if (n) {
+#ifdef _WIN32
+        len = MultiByteToWideChar(kind == L10N_K_SJIS ? 932 : CP_UTF8, MB_ERR_INVALID_CHARS,
+                                  (const char*)(vm_base + src), (int)n, w, (int)n);
+        if (len <= 0) { free(w); return -1; }
+#else
+        for (u32 i = 0; i < n; i++) {
+            u8 c = vm_base[src + i];
+            if (c >= 0x80) { free(w); return -1; }
+            w[len++] = c;
+        }
+#endif
+    }
+    *out = w;
+    return len;
+}
+
+static s32 l10n_conv_guest(int sk, u32 src, u32 src_len_ea, int dk, u32 dst, u32 dst_len_ea)
+{
+    if (!src_len_ea || !dst_len_ea) return (s32)CELL_L10N_ERROR_INVALID_PARAM;
+    const u32 n = vm_read32(src_len_ea);
+    wchar_t* w = NULL;
+    const int wl = l10n_to_wide(sk, src, n, &w);
+    if (wl < 0) return L10N_SRC_ILLEGAL;
+
+    /* host UTF-16 -> dst kind, sized first */
+    u32 need = 0;
+    char* bytes = NULL;
+    if (dk == L10N_K_UCS2) {
+        need = (u32)wl;
+    } else if (wl) {
+#ifdef _WIN32
+        const UINT cp = dk == L10N_K_SJIS ? 932 : CP_UTF8;
+        const int bl = WideCharToMultiByte(cp, 0, w, wl, NULL, 0, NULL, NULL);
+        if (bl <= 0) { free(w); return L10N_SRC_ILLEGAL; }
+        bytes = (char*)malloc((size_t)bl);
+        if (!bytes) { free(w); return (s32)CELL_L10N_ERROR_INVALID_PARAM; }
+        WideCharToMultiByte(cp, 0, w, wl, bytes, bl, NULL, NULL);
+        need = (u32)bl;
+#else
+        bytes = (char*)malloc((size_t)wl);
+        for (int i = 0; i < wl; i++) {
+            if (w[i] >= 0x80) { free(bytes); free(w); return L10N_SRC_ILLEGAL; }
+            bytes[i] = (char)w[i];
+        }
+        need = (u32)wl;
+#endif
+    }
+
+    s32 rc = L10N_OK;
+    if (dst) {
+        if (need > vm_read32(dst_len_ea)) rc = L10N_DST_EXHAUSTED;
+        else if (dk == L10N_K_UCS2)
+            for (u32 i = 0; i < need; i++) vm_write16(dst + 2 * i, (u16)w[i]);
+        else if (need)
+            memcpy(vm_base + dst, bytes, need);
+    }
+    if (rc == L10N_OK) vm_write32(dst_len_ea, need);
+    {   static int s_logs = 0;
+        if (s_logs < 16) {
+            s_logs++;
+            printf("[cellL10n] convert %d->%d src=0x%08X len=%u dst=0x%08X -> %u units, rc=%d\n",
+                   sk, dk, src, n, dst, need, rc);
+        }
+    }
+    free(bytes);
+    free(w);
+    return rc;
+}
+
+s32 SJISstoUTF8s(u32 src, u32 src_len, u32 dst, u32 dst_len)
+{ return l10n_conv_guest(L10N_K_SJIS, src, src_len, L10N_K_UTF8, dst, dst_len); }
+s32 UTF8stoSJISs(u32 src, u32 src_len, u32 dst, u32 dst_len)
+{ return l10n_conv_guest(L10N_K_UTF8, src, src_len, L10N_K_SJIS, dst, dst_len); }
+s32 SJISstoUCS2s(u32 src, u32 src_len, u32 dst, u32 dst_len)
+{ return l10n_conv_guest(L10N_K_SJIS, src, src_len, L10N_K_UCS2, dst, dst_len); }
+s32 UCS2stoSJISs(u32 src, u32 src_len, u32 dst, u32 dst_len)
+{ return l10n_conv_guest(L10N_K_UCS2, src, src_len, L10N_K_SJIS, dst, dst_len); }

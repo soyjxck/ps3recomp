@@ -109,6 +109,16 @@ static int msg_offers_to_abort(const char* msg)
     return 0;
 }
 
+/* Port hook: told when a dialog opens (open=1, its type and text) and when it
+ * goes away (open=0: Close, Abort, auto-response or auto-dismiss). A title
+ * may use it for its own pacing -- e.g. run fast through a notice that only
+ * covers a frame-paced check. NULL = no hook. */
+void (*g_msgdialog_hook)(int open, unsigned type, const char* msg) = NULL;
+static void msgdialog_notify(int open, const char* msg)
+{
+    if (g_msgdialog_hook) g_msgdialog_hook(open, (unsigned)s_type, msg);
+}
+
 s32 cellMsgDialogOpen2(CellMsgDialogType type, const char* msgString,
                         CellMsgDialogCallback callback, void* userdata,
                         void* extParam)
@@ -125,6 +135,7 @@ s32 cellMsgDialogOpen2(CellMsgDialogType type, const char* msgString,
     s_userdata    = userdata;
     s_type        = type;
     memset(s_progress, 0, sizeof(s_progress));
+    msgdialog_notify(1, msgString ? guest_str(msgString) : "");
 
     /* Print the message so developers can see it */
     if (msgString) {
@@ -233,7 +244,7 @@ s32 cellMsgDialogOpen2(CellMsgDialogType type, const char* msgString,
         }
 
         /* Close and queue the callback; never enter guest code here. */
-        s_dialog_open = 0;
+        s_dialog_open = 0; msgdialog_notify(0, NULL);
         if (s_callback) {
             CellMsgDialogCallback cb = s_callback;
             s_callback = NULL;
@@ -269,7 +280,7 @@ s32 cellMsgDialogClose(float delayMs)
         return CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED;
     }
 
-    s_dialog_open = 0;
+    s_dialog_open = 0; msgdialog_notify(0, NULL);
     s_nobutton_deadline = 0;
 
     if (s_callback) {
@@ -288,7 +299,7 @@ s32 cellMsgDialogAbort(void)
     /* Abort removes a dialog without reporting a button press. It also
      * succeeds when no dialog is open (RPCS3 documents this as HW-tested).
      * A queued ESCAPE here can cancel the title's next dialog or operation. */
-    s_dialog_open = 0;
+    s_dialog_open = 0; msgdialog_notify(0, NULL);
     s_nobutton_deadline = 0;
     s_callback = NULL;
     s_userdata = NULL;
@@ -355,7 +366,7 @@ void cellMsgDialog_tick(void)
     if (!s_dialog_open || !s_nobutton_deadline) return;
     if (GetTickCount64() < s_nobutton_deadline) return;
     s_nobutton_deadline = 0;
-    s_dialog_open = 0;
+    s_dialog_open = 0; msgdialog_notify(0, NULL);
     printf("[cellMsgDialog] no-button dialog auto-dismissed after %u ms\n",
            nobutton_grace_ms());
     if (s_callback) {

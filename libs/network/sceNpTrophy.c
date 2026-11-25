@@ -49,6 +49,8 @@ static SRWLOCK s_lock = SRWLOCK_INIT;
 #define TROPHY_UNLOCK() ReleaseSRWLockExclusive(&s_lock)
 #else
 #include <pthread.h>
+#include <unistd.h>
+#define Sleep(ms) usleep((useconds_t)(ms) * 1000u)   /* RegisterContext's event pacing */
 #include <sys/stat.h>
 #include <unistd.h>
 #define mkdir_p(path) mkdir(path, 0755)
@@ -503,11 +505,38 @@ s32 sceNpTrophyRegisterContext(SceNpTrophyContext context,
     if (!s_trophy_initialized) return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
     if (!s_contexts[context].in_use) return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
     if (!s_handles[handle].in_use) return SCE_NP_TROPHY_ERROR_INVALID_HANDLE;
-    const u64 completion[8] = {(u32)context, SCE_NP_TROPHY_STATUS_PROCESSING_COMPLETE,
-                               0, 0, arg, 0, 0, 0};
-    if (cellSysutilQueueGuestCallbackArgs(statusCb, completion) != CELL_OK) {
-        s_contexts[context].registered = 0;
-        return SCE_NP_TROPHY_ERROR_OUT_OF_MEMORY;
+    /* The processing events, as the VSH sends them and RPCS3 emulates them:
+     * SETUP x4, PROGRESS once per trophy, FINALIZE, then COMPLETE, each
+     * delivered through sysutil polling, spread over about two seconds while
+     * this call blocks the registering thread. Titles poll for the
+     * intermediate statuses: a title's boot may move on only when it
+     * sees a PROCESSING status while registration is still in progress, and a
+     * lone COMPLETE queued at once raced past that poll and stalled the boot
+     * forever. (Status values 5..8; args: context, status, completed, total.) */
+    {
+        const s32 progress_n = (s32)(s_contexts[context].total_trophies ? s_contexts[context].total_trophies : 1) - 1;
+        const s32 finalize_n = (progress_n > 9 ? progress_n : 9) - 5;
+        const struct { u32 status; s32 count; } seq[4] = {
+            { 5 /* PROCESSING_SETUP    */, 3 },
+            { 6 /* PROCESSING_PROGRESS */, progress_n },
+            { 7 /* PROCESSING_FINALIZE */, finalize_n },
+            { SCE_NP_TROPHY_STATUS_PROCESSING_COMPLETE, 0 },
+        };
+        u32 total_events = 0;
+        for (int i = 0; i < 4; i++) total_events += (u32)seq[i].count + 1;
+        const u32 step_ms = total_events ? 2000u / total_events : 0;
+        for (int i = 0; i < 4; i++) {
+            for (s32 done = 0; done <= seq[i].count; done++) {
+                const u64 ev[8] = {(u32)context, seq[i].status, (u64)(u32)done,
+                                   (u64)(u32)seq[i].count, arg, 0, 0, 0};
+                if (cellSysutilQueueGuestCallbackArgs(statusCb, ev) != CELL_OK) {
+                    s_contexts[context].registered = 0;
+                    return SCE_NP_TROPHY_ERROR_OUT_OF_MEMORY;
+                }
+                if (step_ms) Sleep(step_ms);
+                if (!s_trophy_initialized) return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
+            }
+        }
     }
 
     const char* pv = getenv("PS3_TROPHY_PREVIEW");
