@@ -338,6 +338,52 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
                     method, arg);
         return;
     }
+    /* RSX_REG_LOG=<m>[,<m>...] with RSX_REG_LOG_FRAMES=<from>-<to>: every write
+     * to those methods (changed or not) in those frames, one compact line per
+     * frame ("m=v m=v ..."), so a frame's state sequence can be compared with
+     * another's. */
+    { static int n = -1; static u32 ms[16]; static long lf = 0, lt = -1; static u32 cur = 0xFFFFFFFFu; static int open = 0;
+      if (n < 0) { n = 0; const char* e = getenv("RSX_REG_LOG");
+                   while (e && *e && n < 16) { char* d; ms[n++] = (u32)strtoul(e, &d, 16) & 0xFFFFCu; e = (*d == ',') ? d + 1 : NULL; }
+                   e = getenv("RSX_REG_LOG_FRAMES"); if (e) { char* d; lf = strtol(e, &d, 10); lt = (*d == '-') ? strtol(d + 1, 0, 10) : lf; } }
+      if (n) { extern uint32_t g_rsx_engine_frame; const u32 fr = g_rsx_engine_frame;
+          if ((long)fr >= lf && (long)fr <= lt) {
+              for (int k = 0; k < n; k++) if (ms[k] == method) {
+                  if (fr != cur) { if (open) fputc('\n', stderr); fprintf(stderr, "[reg-log] f%u:", fr); cur = fr; open = 1; }
+                  fprintf(stderr, " %X=%X", method, arg); break; }
+          } else if (open) { fputc('\n', stderr); open = 0; } } }
+    /* RSX_REG_WATCH=<method hex>: every write that changes that register, with
+     * the 12 method writes before it (which packet set it, and what came
+     * before: a state block or something misparsed). At most 200 lines. */
+    { static int watch = -2; static long wval = -1; static u32 hist_m[12], hist_a[12], hist_n = 0; static int said = 0;
+      if (watch == -2) { const char* e = getenv("RSX_REG_WATCH"); watch = e ? (int)(strtoul(e, 0, 16) & 0xFFFFCu) : -1;
+                         e = getenv("RSX_REG_WATCH_VAL"); wval = e ? (long)strtoul(e, 0, 16) : -1; }
+      if (watch >= 0) {
+          /* RSX_REG_WATCH_VAL=<hex>: only the changes to that value. */
+          /* RSX_REG_WATCH_COND=<method hex>=<value hex>: only while that other
+           * register holds that value. */
+          /* RSX_REG_WATCH_FROM=<frame>, RSX_REG_WATCH_MAX=<lines> (default 200). */
+          static long cm = -2, cv = 0, wfrom = 0, wmax = 200;
+          if (cm == -2) { const char* e = getenv("RSX_REG_WATCH_COND"); char* d = NULL;
+                          cm = e ? (long)(strtoul(e, &d, 16) & 0xFFFFCu) : -1;
+                          cv = (d && *d == '=') ? (long)strtoul(d + 1, 0, 16) : 0;
+                          e = getenv("RSX_REG_WATCH_FROM"); wfrom = e ? atol(e) : 0;
+                          e = getenv("RSX_REG_WATCH_MAX"); wmax = e ? atol(e) : 200; }
+          extern uint32_t g_rsx_engine_frame;
+          if ((u32)watch == method && rsx->regs[idx] != arg && (wval < 0 || (u32)wval == arg) && said < wmax &&
+              (long)g_rsx_engine_frame >= wfrom && (cm < 0 || rsx->regs[cm >> 2] == (u32)cv)) {
+              said++;
+              extern uint32_t g_rsx_engine_frame;
+              fprintf(stderr, "[reg-watch] f%u 0x%04X: 0x%08X -> 0x%08X (alpha func 0x%X ref 0x%X); before:", g_rsx_engine_frame,
+                      method, rsx->regs[idx], arg, rsx->regs[0x0308 >> 2], rsx->regs[0x030C >> 2]);
+              for (u32 k = 0; k < 12; k++) {
+                  const u32 j = (hist_n + k) % 12;
+                  fprintf(stderr, " %04X=%X", hist_m[j], hist_a[j]);
+              }
+              fputc('\n', stderr);
+          }
+          hist_m[hist_n % 12] = method; hist_a[hist_n % 12] = arg; hist_n++;
+      } }
     rsx->regs[idx] = arg;
     if ((method >= 0x1500 && method < 0x1A00) || (method >= 0x1E40 && method < 0x1E80) ||
         (method >= 0x0A80 && method < 0x0B00))

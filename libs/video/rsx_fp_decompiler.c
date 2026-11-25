@@ -621,6 +621,56 @@ void rsx_fp_set_shadow_units(u32 mask, const u8* funcs)
     for (u32 u = 0; u < 16; u++) s_shadow_func[u] = funcs ? (u8)(funcs[u] & 7u) : 0;
 }
 
+/* Shadow quality; see the header. Characters that self-shadow from a
+ * 1024x1024 map, with one bilinear tap (the RSX's own PCF: one
+ * SampleCmpLevelZero per light), show every
+ * map texel shows as a stair step along arms and torso. A larger map makes
+ * the steps smaller, more taps blur what is left. */
+static int fp_ieq(const char* a, const char* b)
+{
+    for (; *a && *b; a++, b++) {
+        const char x = (*a >= 'A' && *a <= 'Z') ? (char)(*a + 32) : *a;
+        const char y = (*b >= 'A' && *b <= 'Z') ? (char)(*b + 32) : *b;
+        if (x != y) return 0;
+    }
+    return *a == *b;
+}
+void rsx_shadow_quality(int* taps, float* map_scale, int* map_absolute)
+{
+    static int init, s_taps = 1, s_abs;     /* unset: low, the RSX's own */
+    static float s_map = 0.0f;
+    if (!init) {
+        const char* q = getenv("RSX_SHADOW_QUALITY");
+        if (q && *q) {
+            if      (fp_ieq(q, "low")    || !strcmp(q, "0")) { s_taps = 1; s_map = 0.0f; }
+            else if (fp_ieq(q, "medium") || !strcmp(q, "1")) { s_taps = 3; s_map = 2.0f; }
+            else if (fp_ieq(q, "high")   || !strcmp(q, "2")) { s_taps = 3; s_map = 4.0f; }
+            else if (fp_ieq(q, "ultra")  || !strcmp(q, "3")) { s_taps = 5; s_map = 4.0f; }
+            else fprintf(stderr, "[rsx fp] RSX_SHADOW_QUALITY=%s ignored (low, medium, high, ultra)\n", q);
+        }
+        const char* t = getenv("RSX_SHADOW_PCF");
+        if (t && *t) {
+            const int n = atoi(t);
+            if (n >= 1 && n <= 6) s_taps = n;
+            else fprintf(stderr, "[rsx fp] RSX_SHADOW_PCF=%s ignored (1 to 6)\n", t);
+        }
+        const char* m = getenv("RSX_SHADOW_SCALE");
+        if (m && *m) {
+            const float f = (float)atof(m);
+            if (f == 0.0f) { s_map = 0.0f; s_abs = 0; }
+            else if (f >= 0.5f && f <= 8.0f) { s_map = f; s_abs = 1; }
+            else fprintf(stderr, "[rsx fp] RSX_SHADOW_SCALE=%s ignored (0.5 to 8, 0 = RSX_SCALE)\n", m);
+        }
+        if (s_map == 0.0f) fprintf(stderr, "[rsx fp] shadows: %dx%d PCF taps, map at RSX_SCALE\n", s_taps, s_taps);
+        else fprintf(stderr, "[rsx fp] shadows: %dx%d PCF taps, map scale %sx%.2g\n", s_taps, s_taps,
+                     s_abs ? "" : "at least ", (double)s_map);
+        init = 1;
+    }
+    if (taps) *taps = s_taps;
+    if (map_scale) *map_scale = s_map;
+    if (map_absolute) *map_absolute = s_abs;
+}
+
 /* Volume (3D texture) units for the next decompile; see
  * rsx_fp_set_volume_units in the header. */
 static u32 s_vol_mask;
@@ -1417,7 +1467,9 @@ static int rsx_fp_decompile_internal(
      * projections came out as solid dark rectangles, and whole floors black. */
     for (u32 u = 0; u < 16; u++) {
         if (!((s_shadow_mask >> u) & 1u) || ((tex_sep_mask >> u) & 1u)) continue;
-        char tn[24], fn[1400];
+        char tn[24], fn[2400];
+        int taps = 1;
+        rsx_shadow_quality(&taps, NULL, NULL);
         snprintf(tn, sizeof tn, tex_sep_mask ? "rsx_tex%u" : "rsx_tex[%u]", u);
         const char* op = fp_shadow_op(s_shadow_func[u]);
         /* RSX_SHADOW_FORWARD=1: the GL order, "reference OP texel". The
@@ -1433,6 +1485,41 @@ static int rsx_fp_decompile_internal(
                       op = flip[s_shadow_func[u] & 7u]; } }
         if (s_shadow_func[u] == 7u)
             snprintf(fn, sizeof fn, "float4 rsx_shadow%u(float3 c) { return (float4)1.0; }\n", u);
+        else if (taps > 1)
+            /* RSX_SHADOW_QUALITY above low: taps x taps bilinear compares,
+             * one texel apart, centred on the lookup and weighted as a tent
+             * (1 2 1 for three), so the edge fades out instead of stepping.
+             * The bilinear taps share their fraction, so they reduce to
+             * (taps+1)^2 integer loads, each compared once and weighted by
+             * its column and row: column j takes tent[j]*(1-f) from the tap
+             * it is the left texel of and tent[j-1]*f from the one it is the
+             * right texel of. Same 24-bit compare as the single tap. */
+            snprintf(fn, sizeof fn,
+                "float4 rsx_shadow%u(float3 c) {\n"
+                "    float w, h; %s.GetDimensions(w, h);\n"
+                "    float2 st = c.xy * float2(w, h) - 0.5 - %.1f;\n"
+                "    float2 f = frac(st);\n"
+                "    int2 i0 = (int2)floor(st);\n"
+                "    int2 lim = int2((int)w - 1, (int)h - 1);\n"
+                "    float rq = floor(saturate(c.z) * 16777215.0 + 0.5);\n"
+                "    float s = 0.0;\n"
+                "    [unroll] for (int y = 0; y <= %d; y++) {\n"
+                "        float ty0 = (y < %d) ? (float)min(y + 1, %d - y) : 0.0;\n"
+                "        float ty1 = (y > 0) ? (float)min(y, %d - y + 1) : 0.0;\n"
+                "        float wy = ty0 * (1.0 - f.y) + ty1 * f.y;\n"
+                "        [unroll] for (int x = 0; x <= %d; x++) {\n"
+                "            float tx0 = (x < %d) ? (float)min(x + 1, %d - x) : 0.0;\n"
+                "            float tx1 = (x > 0) ? (float)min(x, %d - x + 1) : 0.0;\n"
+                "            float wx = tx0 * (1.0 - f.x) + tx1 * f.x;\n"
+                "            int2 q = clamp(i0 + int2(x, y), int2(0, 0), lim);\n"
+                "            float dq = floor(saturate(%s.Load(int3(q.x, q.y, 0)).x) * 16777215.0 + 0.5);\n"
+                "            s += (rq %s dq) ? wx * wy : 0.0;\n"
+                "        }\n"
+                "    }\n"
+                "    return (float4)(s * %.9g);\n"
+                "}\n", u, tn, (double)(taps - 1) * 0.5,
+                taps, taps, taps, taps, taps, taps, taps, taps, tn, op,
+                1.0 / ((double)((taps + 1) / 2 * (taps / 2 + 1)) * (double)((taps + 1) / 2 * (taps / 2 + 1))));
         else
             /* The four texels of the bilinear footprint, fetched by integer
              * coordinate (a gather at the exact texel corner can round into

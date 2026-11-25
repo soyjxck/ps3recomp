@@ -55,7 +55,9 @@ typedef enum {
     RSX_BE_FMT_R16G16F,
     RSX_BE_FMT_R16G16B16A16F, /* SET_SURFACE_FORMAT 0xB, the HDR target    */
     RSX_BE_FMT_R32F,
-    RSX_BE_FMT_R32G32B32A32F
+    RSX_BE_FMT_R32G32B32A32F,
+    RSX_BE_FMT_R16G16B16A16,  /* UNORM: a guest A8R8G8B8 target held at 16 bits (RSX_RT_16BIT);
+                                 decoded / read back as R,G,B,A bytes like RSX_BE_FMT_R8G8B8A8 */
 } rsx_be_format;
 
 /* One texture unit's sampler, decoded out of SET_TEXTURE_FILTER,
@@ -74,6 +76,8 @@ typedef struct rsx_be_sampler_desc {
      * title's chroma planes border at 0x80, neutral). */
     u8  border;
     float min_lod, max_lod;
+    /* SET_TEXTURE_FILTER's LOD bias, in mip levels (0 unless RSX_TEX_LOD_BIAS). */
+    float lod_bias;
 } rsx_be_sampler_desc;
 
 /* The NV4097 render state a pipeline is built from: rsx_live_draw.c's
@@ -113,6 +117,11 @@ typedef struct rsx_be_render_state {
 /* clear_depth_stencil flags */
 #define RSX_BE_CLEAR_DEPTH   0x1u
 #define RSX_BE_CLEAR_STENCIL 0x2u
+
+/* draw_class bits */
+#define RSX_BE_DRAW_FULLSCREEN 0x1u   /* one quad over the whole viewport: a post pass */
+#define RSX_BE_DRAW_NO_DEPTH   0x2u   /* depth test and depth write both off (UI, 2D) */
+#define RSX_BE_DRAW_QUAD       0x4u   /* at most 4 vertices: a sprite, a particle, a UI quad */
 
 #define RSX_BE_MAX_TEXTURES        RSX_DSP_NUM_TEXTURES
 #define RSX_BE_MAX_VERTEX_TEXTURES RSX_DSP_NUM_VERTEX_TEXTURES
@@ -169,6 +178,16 @@ typedef struct rsx_draw_backend {
     /* One depth target per guest zeta address. */
     u32  (*depth_target_create)(void* user, u32 w, u32 h);
     void (*depth_target_release)(void* user, u32 depth);
+    /* Optional. Called before every color_target_create and
+     * depth_target_create: nonzero when the target is for a depth-only pass
+     * (colour pitch 64 or no colour target -- a shadow map), which a backend
+     * may create at a scale of its own (RSX_SHADOW_SCALE). */
+    void (*target_class)(void* user, u32 depth_only);
+    /* Optional. Called before every draw / draw_buffer with what kind of
+     * draw it is (RSX_BE_DRAW_*; 0 = an ordinary 3D draw), for a backend
+     * that treats passes differently -- MSAA multisamples only the targets
+     * that ordinary 3D draws go into, never the post chain or the UI. */
+    void (*draw_class)(void* user, u32 cls);
     /* Resolve a depth target into a sampleable texture and return it; 0 when
      * the backend cannot. The engine only asks after a depth-writing draw. The
      * engine owns the result and releases it with texture_release once it has
@@ -301,6 +320,11 @@ typedef struct rsx_draw_backend {
     void (*present)(void* user, u32 surface);
     void (*readback)(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
                      void* out, u32 out_pitch);
+    /* Optional. The whole surface (w x h guest pixels) without waiting for the
+     * GPU: queues a copy of it now and fills `out` with the newest earlier copy
+     * that has finished. Returns 1 when `out` was filled, 0 when no copy has
+     * finished yet (the caller then reads it with readback). A frame or two old. */
+    int  (*readback_async)(void* user, u32 surface, u32 w, u32 h, void* out, u32 out_pitch);
 
     /* Optional. 3D textures (SET_TEXTURE_FORMAT dimension 3, CONTROL3 depth):
      * a volume of `depth` slices per level, each slice one upload of decoded
@@ -456,11 +480,24 @@ typedef struct rsx_texture_standin {
     const u8* bytes;
     u32 fmt;               /* CELL_GCM_TEXTURE_* with its layout flags */
     u32 w, h, levels, pitch;
+    u32 flags;             /* RSX_STANDIN_* (zeroed before each call)  */
 } rsx_texture_standin;
+/* The stand-in carries its own mip chain for a larger image (a high-resolution
+ * replacement): the unit's sampler then filters between all of its levels,
+ * whatever the guest's min filter and LOD range say (they describe the
+ * original's chain, often a single level). */
+#define RSX_STANDIN_OWN_MIPS 1u
 typedef int (*rsx_texture_standin_fn)(void* user, u32 fmt, u32 w, u32 h, u32 levels,
                                       const u8* bytes, u32 span,
                                       rsx_texture_standin* out);
 void rsx_draw_engine_set_texture_standin(rsx_texture_standin_fn fn, void* user);
+/* More about the texture being asked about, valid only inside the call: the
+ * unit's TEXTURE_CONTROL1 remap (the low 16 bits), SET_TEXTURE_CONTROL3's
+ * pitch (0 = packed) and where the bytes are. */
+typedef struct rsx_texture_standin_ctx {
+    u32 remap, pitch, location, offset;
+} rsx_texture_standin_ctx;
+const rsx_texture_standin_ctx* rsx_draw_engine_standin_ctx(void);
 /* The port's answers changed (another set of button glyphs, say): every
  * cached texture is asked again at its next use. Any thread. */
 void rsx_draw_engine_texture_standins_changed(void);
