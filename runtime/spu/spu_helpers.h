@@ -766,7 +766,26 @@ SPU__SF_V2(spu__fm_s, spu__fm_any(x, y))
 SPU__SF_V3(spu__fma_s,  spu__fma_any(x, y, z, 0, 0))
 SPU__SF_V3(spu__fms_s,  spu__fma_any(x, y, z, 0, 0x80000000u))
 SPU__SF_V3(spu__fnms_s, spu__fma_any(x, y, z, 0x80000000u, 0))
-#if defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
+#if defined(SPU_NATIVE_FLOAT) && defined(__AVX2__) && defined(__FMA__) && !defined(SPU_SCALAR_HELPERS)
+/* SPU_NATIVE_FLOAT (opt-in, per translation unit): fa/fs/fm/fma/fms/fnms as one host IEEE single
+ * op each (fma fused, as the SPU's). Not bit-exact: the host rounds to nearest where the SPU
+ * truncates (one ulp), keeps denormals the SPU flushes, and has Inf/NaN where the SPU has its
+ * extended range. That is RPCS3's default SPU float mode, and is right for code whose float
+ * results are geometry (vertex skinning/transform jobs), not for code that compares float bits.
+ * The exact AVX2 path below costs ~25 host instructions and a movemask branch per op; one
+ * PhyreEngine skinning loop (189 float ops per iteration) was 70% of two host
+ * threads in a stage. */
+#include <immintrin.h>
+#define SPU__NF_INLINE static inline __attribute__((always_inline))
+SPU__NF_INLINE __m128 spu__nf_ld(u128 a) { return _mm_loadu_ps((const float*)a._u32); }
+SPU__NF_INLINE u128 spu__nf_st(__m128 v) { u128 r; _mm_storeu_ps((float*)r._u32, v); return r; }
+SPU__NF_INLINE u128 spu_fa(u128 a, u128 b) { return spu__nf_st(_mm_add_ps(spu__nf_ld(a), spu__nf_ld(b))); }
+SPU__NF_INLINE u128 spu_fs(u128 a, u128 b) { return spu__nf_st(_mm_sub_ps(spu__nf_ld(a), spu__nf_ld(b))); }
+SPU__NF_INLINE u128 spu_fm(u128 a, u128 b) { return spu__nf_st(_mm_mul_ps(spu__nf_ld(a), spu__nf_ld(b))); }
+SPU__NF_INLINE u128 spu_fma(u128 a, u128 b, u128 c)  { return spu__nf_st(_mm_fmadd_ps(spu__nf_ld(a), spu__nf_ld(b), spu__nf_ld(c))); }   /* a*b + c */
+SPU__NF_INLINE u128 spu_fms(u128 a, u128 b, u128 c)  { return spu__nf_st(_mm_fmsub_ps(spu__nf_ld(a), spu__nf_ld(b), spu__nf_ld(c))); }   /* a*b - c */
+SPU__NF_INLINE u128 spu_fnms(u128 a, u128 b, u128 c) { return spu__nf_st(_mm_fnmadd_ps(spu__nf_ld(a), spu__nf_ld(b), spu__nf_ld(c))); }  /* c - a*b */
+#elif defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
 /* Four lanes at a time, every lane exact, with no FPCR change. The host rounds to nearest (the
  * thread's default FPCR: RN, no flush-to-zero -- writing FPCR per op serializes, ~17 ns on an
  * M4); the SPU truncates. A result rounded to nearest is either the truncated one or one step

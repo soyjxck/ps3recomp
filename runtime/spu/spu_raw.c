@@ -442,7 +442,7 @@ static void raw_spu_start(raw_spu* s)
     fflush(stderr);
 
 #ifdef _WIN32
-    s->thread = CreateThread(NULL, 1u << 20, raw_spu_thread, s, 0, NULL);
+    s->thread = CreateThread(NULL, 1u << 20, raw_spu_thread, s, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
     if (!s->thread) RAW_XCHG(&s->started, 0);
 #else
     {
