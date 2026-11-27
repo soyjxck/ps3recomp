@@ -217,6 +217,34 @@ static VkImageView null_view(int cube) { EngObj* o = eng_obj(cube ? s_null_cube 
 #include "rsx_vulkan_snapshot_rect.inc"
 #include "rsx_vulkan_snapshot_channels.inc"
 
+/* RSX_SNAPSHOT_STATS=1: once a second, what the scene-feedback copies came
+ * to -- the copies asked for a frame, how many of them were not made (the
+ * snapshot reused), came to nothing, were made in part and were made whole,
+ * and the megapixels copied a frame. */
+static struct { u32 frames, asked, reused, empty, part, whole; u64 pixels; double t0; } s_snap_stat;
+static int eng_snap_stats_enabled(void)
+{
+    static int enabled=-1;
+    if(enabled<0) {const char* e=getenv("RSX_SNAPSHOT_STATS");enabled=e && !strcmp(e,"1");}
+    return enabled;
+}
+static void eng_snap_stats_frame(void)
+{
+    if(!eng_snap_stats_enabled()) return;
+    struct timespec ts; timespec_get(&ts,TIME_UTC);
+    const double now=(double)ts.tv_sec+ts.tv_nsec*1e-9;
+    if(!s_snap_stat.frames && !s_snap_stat.t0) s_snap_stat.t0=now;
+    s_snap_stat.frames++;
+    if(now-s_snap_stat.t0<1.0) return;
+    const double f=s_snap_stat.frames;
+    fprintf(stderr,"[snapshot-stats] %.1f fps; a frame: %.1f copies asked, %.1f reused, %.1f empty, %.1f in part, "
+                   "%.1f whole, %.2f MP copied\n",
+            f/(now-s_snap_stat.t0),s_snap_stat.asked/f,s_snap_stat.reused/f,s_snap_stat.empty/f,s_snap_stat.part/f,
+            s_snap_stat.whole/f,(double)s_snap_stat.pixels/f*1e-6);
+    memset(&s_snap_stat,0,sizeof s_snap_stat);
+    s_snap_stat.t0=now;
+}
+
 /* ---- MSAA --------------------------------------------------------------------------
  *
  * RSX_AA=msaa2|msaa4|msaa8, as the D3D12 engine: a pass with a real depth
@@ -802,10 +830,14 @@ static void eng_encode_records(void)
         case ENG_REC_COLOR_COPY: {
             EngObj* src = eng_owner(r->depth); EngObj* dst = eng_owner(r->resolve_dst);
             if (!src || !dst) break;
-            if(eng_snap_channels_can_skip(i,src,dst)) {s_snap_skipped[i]=1;s_ch_skipped++;break;}
+            s_snap_stat.asked++;
+            if(eng_snap_channels_can_skip(i,src,dst)) {s_snap_skipped[i]=1;s_ch_skipped++;s_snap_stat.reused++;break;}
             VkRect2D dirty = {{0,0},{src->w < dst->w ? src->w : dst->w,src->h < dst->h ? src->h : dst->h}};
+            const u64 whole_px=(u64)dirty.extent.width*dirty.extent.height;
             if(!eng_snap_any_reuse_enabled() || s_ch_valid[(u32)(dst-s_obj)]) eng_snap_copy_rect(i,src,&dirty);
-            if (!dirty.extent.width || !dirty.extent.height) {eng_snap_channels_mark_copy(src,dst,0);break;}
+            if (!dirty.extent.width || !dirty.extent.height) {eng_snap_channels_mark_copy(src,dst,0);s_snap_stat.empty++;break;}
+            {const u64 px=(u64)dirty.extent.width*dirty.extent.height;
+             s_snap_stat.pixels+=px; if(px<whole_px) s_snap_stat.part++; else s_snap_stat.whole++;}
             static int scoped = -1;
             if (scoped < 0) { const char* e=getenv("RSX_SNAPSHOT_SCOPED_BARRIERS"); scoped=e && !strcmp(e,"1"); }
             const int narrow = scoped && s_ms_n<=1 && !s_hdr_on;
@@ -881,6 +913,7 @@ static void eng_submit(u32 present_surface, int wait)
     if (!s_walker_tid) s_walker_tid = GetCurrentThreadId();
     if (!s_ready) { s_rec_count = 0; eng_stage_submitted(0); s_vis_npending = 0; return; }
     if (!s_rec_count && !present_surface) return;
+    if (present_surface) eng_snap_stats_frame();
     eng_poll_submits();
 
     s_slot = s_submit_seq % ENG_FRAMES;

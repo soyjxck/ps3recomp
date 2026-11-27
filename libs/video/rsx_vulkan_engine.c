@@ -63,11 +63,14 @@
 #define _strdup strdup
 #define _aligned_free free   /* the draw engine's buffer_wrap blocks: posix_memalign off Windows */
 #endif
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "rsx_draw_engine.h"
+#include "rsx_vp_decompiler.h"   /* the point-size blocks of a vertex program's text */
 #include "rsx_texture_layout.h"
 #include "rsx_shader_spirv.h"
 #include "rsx_vulkan_engine.h"
@@ -1503,6 +1506,74 @@ static VkShaderModule eng_fp_module(const char* ps_hlsl)
     return fs;
 }
 
+/* The programs the snapshot switches know are recognised by the text the
+ * translator made of them when they were looked at (its length and FNV-1a).
+ * That text has grown since: every vertex program now carries the point-size
+ * blocks (rsx_vp_decompiler.h). A vertex program's text less those blocks is
+ * the text that was looked at, so it is hashed without them. */
+static u64 eng_snap_vs_hash(const char* hlsl, size_t* len_out)
+{
+    static const char* const cut[] = { RSX_VP_HLSL_PSIZE_MEMBER, RSX_VP_HLSL_PSIZE_ROW, RSX_VP_HLSL_PSIZE_FUNC,
+                                       RSX_VP_HLSL_PSIZE_STORE("o[6].x") };
+    static size_t cut_len[4];
+    if (!cut_len[0]) for (u32 k = 0; k < 4; k++) cut_len[k] = strlen(cut[k]);
+    u64 h = 1469598103934665603ull;
+    size_t n = 0;
+    for (const char* p = hlsl; *p;) {
+        u32 k = 0;
+        if (*p == '#') for (; k < 4; k++) if (!strncmp(p, cut[k], cut_len[k])) break;
+        if (*p == '#' && k < 4) { p += cut_len[k]; continue; }
+        h ^= (u8)*p++;
+        h *= 1099511628211ull;
+        n++;
+    }
+    *len_out = n;
+    return h;
+}
+
+/* The fragment programs: two soft-particle readers (1, 2) and a writer that
+ * leaves alpha as it is (3). The first of each pair is the text of the
+ * translator they were looked at with; the second, the same program as the
+ * translator writes it since it clamps a source operand to its precision. */
+static int eng_snap_fp_kind(size_t len, u64 hash)
+{
+    static const struct { size_t len; u64 hash; int kind; } known[] = {
+        { 5373, 0x6913a23a6ffb37ceull, 1 }, { 5442, 0x852f3fc5e0383977ull, 2 }, { 3119, 0xb05289fbe01da8fcull, 3 },
+    };
+    for (u32 i = 0; i < sizeof known / sizeof known[0]; i++)
+        if (known[i].len == len && known[i].hash == hash) return known[i].kind;
+    return 0;
+}
+
+/* RSX_SNAPSHOT_FIND=<folder>: every pipeline on the reviewed vertex program
+ * or on one of the fragment programs is named in the log, and its fragment
+ * program's text is written there (ps_<length>_<hash>.hlsl), to look at. */
+static void eng_snap_find(const EngPipeline* p, const char* vs, size_t vs_len, u64 vs_hash, const char* ps, size_t ps_len,
+                          u64 ps_hash, u32 stride, u32 mask, u32 count)
+{
+    static const char* dir = (const char*)1;
+    if (dir == (const char*)1) { dir = getenv("RSX_SNAPSHOT_FIND"); if (dir && !*dir) dir = NULL; }
+    if (!dir) return;
+    const int particle_layout = stride == 64 && mask == 293 && count == 4;
+    if (!p->snapshot_linear_position && !p->snapshot_alpha_kind && !particle_layout) return;
+    fprintf(stderr, "[snapshot-find] vs %zu/%016llx (as written %zu)%s, ps %zu/%016llx kind %d; blend %d sf_a %u df_a %u "
+                    "eq_a %x mask %08x depth_write %d\n",
+            vs_len, (unsigned long long)vs_hash, strlen(vs), p->snapshot_linear_position ? " REVIEWED" : "", ps_len,
+            (unsigned long long)ps_hash, p->snapshot_alpha_kind, (int)p->rs.blend_enable, (unsigned)p->rs.sf_a,
+            (unsigned)p->rs.df_a, (unsigned)p->rs.eq_a, (unsigned)p->rs.color_mask, (int)p->rs.depth_write);
+    char path[1024];
+    snprintf(path, sizeof path, "%s/ps_%zu_%016llx%s.hlsl", dir, ps_len, (unsigned long long)ps_hash,
+             p->snapshot_linear_position ? "_on_reviewed_vs" : "");
+    FILE* f = fopen(path, "wb");
+    if (f) { fwrite(ps, 1, ps_len, f); fclose(f); }
+    if (p->snapshot_linear_position || particle_layout) {
+        snprintf(path, sizeof path, "%s/vs_%zu_%016llx%s.hlsl", dir, vs_len, (unsigned long long)vs_hash,
+                 p->snapshot_linear_position ? "_reviewed" : "");
+        f = fopen(path, "wb");
+        if (f) { fwrite(vs, 1, strlen(vs), f); fclose(f); }
+    }
+}
+
 static u32 eng_pipeline_create_locked(const char* vs_hlsl, const char* ps_hlsl, const rsx_be_render_state* rs,
                                       const rsx_vertex_layout_plan* layout, u32 vertex_stride,
                                       rsx_be_format rt_fmt, u32 rt_count)
@@ -1526,14 +1597,14 @@ static u32 eng_pipeline_create_locked(const char* vs_hlsl, const char* ps_hlsl, 
     p->rt_count = rt_count;
     p->cube_mask = eng_cube_mask(ps_hlsl);
     p->hdr_plane = strstr(ps_hlsl, "rsx_hdr_plane") != NULL;
+    size_t vs_len = 0;
+    const u64 vs_hash = eng_snap_vs_hash(vs_hlsl, &vs_len);
     p->snapshot_linear_position = vertex_stride == 64 && layout->mask == 293 &&
-        layout->count == 4 && layout->attrs[0] == 0 && strlen(vs_hlsl) == 13949 &&
-        fnv1a64(vs_hlsl, strlen(vs_hlsl), 1469598103934665603ull) == 0x703b54230ab7e48dull;
+        layout->count == 4 && layout->attrs[0] == 0 && vs_len == 13949 && vs_hash == 0x703b54230ab7e48dull;
     const size_t ps_len=strlen(ps_hlsl);
     const u64 ps_hash=fnv1a64(ps_hlsl,ps_len,1469598103934665603ull);
-    if(ps_len==5373 && ps_hash==0x6913a23a6ffb37ceull) p->snapshot_alpha_kind=1;
-    if(ps_len==5442 && ps_hash==0x852f3fc5e0383977ull) p->snapshot_alpha_kind=2;
-    if(ps_len==3119 && ps_hash==0xb05289fbe01da8fcull) p->snapshot_alpha_kind=3;
+    p->snapshot_alpha_kind = eng_snap_fp_kind(ps_len, ps_hash);
+    eng_snap_find(p, vs_hlsl, vs_len, vs_hash, ps_hlsl, ps_len, ps_hash, vertex_stride, layout->mask, layout->count);
     p->live = 1;
     return ++s_pipe_count;
 }
