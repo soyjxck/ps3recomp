@@ -4394,9 +4394,17 @@ static void eng_encode_records(void)
             EngObj* src = eng_owner(r->depth); EngObj* dst = eng_owner(r->resolve_dst);
             ID3D12PipelineState* pso = r->resolve_packed ? s_depth_pack_pso : s_depth_pso;
             if (!src || !dst || !dst->has_rtv || !pso) break;
-            /* An MSAA depth twin holds the depth: its first sample. */
+            /* An MSAA depth twin with passes the target lacks holds the depth:
+             * its first sample, whatever the copy's size. A copy smaller than
+             * the target is the top-left region the title's texture covers.
+             * Drakengard 3 draws its 512x512 shadow maps into a depth target
+             * the size of the frame (every depth target is at least that) and
+             * a colour target of that size an earlier pass left at the same
+             * address, so with MSAA on the pass is multisampled; the shadow
+             * map was then read from the single-sampled target, which that
+             * pass never wrote, and nothing cast a shadow. */
             ID3D12PipelineState* pms = r->resolve_packed ? s_depth_pack_ms_pso : s_depth_ms_pso;
-            if (src->ms && pms && src->w == dst->w && src->h == dst->h) {
+            if (src->ms && pms && src->ms_znewer && !src->ms_stale) {
                 res_transition(src->ms, &src->ms_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
                 res_transition(dst->res, &dst->state, D3D12_RESOURCE_STATE_RENDER_TARGET);
                 bar_flush();
