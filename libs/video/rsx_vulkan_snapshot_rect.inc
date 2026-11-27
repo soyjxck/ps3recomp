@@ -22,12 +22,17 @@ static int eng_snap_reader_cull_enabled(void)
 static int eng_snap_any_reuse_enabled(void)
 { return eng_snap_alpha_reuse_enabled() || eng_snap_reader_cull_enabled(); }
 
+/* What a draw staged, to look at: from the CPU copy the stage keeps while a
+ * switch that looks is on (eng_stage_cpu_copy_enabled), never from the
+ * mapped upload memory, which is write-combined. Without the copy (its
+ * allocation failed) there is nothing to look at and the callers take their
+ * conservative paths. */
 static const void* eng_snap_data(u32 offset, u32 bytes)
 {
     const EngStage* st=eng_stage_at(offset);
-    if(!bytes || !st || !st->mapped || offset<st->base ||
+    if(!bytes || !st || !st->cpu_copy || offset<st->base ||
        (u64)(offset-st->base)+bytes>st->cap) return NULL;
-    return (st->cpu_copy ? st->cpu_copy : st->mapped)+offset-st->base;
+    return st->cpu_copy+offset-st->base;
 }
 static EngInterval snap_iv(double x) { EngInterval r = {x,x}; return r; }
 static EngInterval snap_round(double lo, double hi)
@@ -52,6 +57,10 @@ static EngInterval snap_mul(EngInterval a, EngInterval b)
 static int eng_snap_draw_bounds_mode(const EngRecord* r, const EngObj* o, VkRect2D* rect, int box)
 {
     VkViewport vp; eng_vp_sc(r, eng_obj_scaled(r->rt[0]), o->w,o->h,&vp,rect);
+    /* A record with no viewport is drawn with a fallback of the target's
+     * size cut to its depth target's (eng_encode_draw), not the one above:
+     * its scissor stands, its vertices are not mapped. */
+    if (!(r->vp[2] > 0.0f) || !(r->vp[3] > 0.0f)) return 0;
     if (!r->pipeline || r->pipeline > s_pipe_count || r->vbuf ||
         r->topology != RSX_TOPOLOGY_TRIANGLES || r->stride != 64 ||
         !s_pipe[r->pipeline-1].snapshot_linear_position || r->vs_cb_bytes < 8224 ||

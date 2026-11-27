@@ -31,6 +31,35 @@
  * borderless here); RSX_HDR and the rest of its settings as the D3D12
  * backend too (eng_read_hdr), in scRGB or, where the driver offers no scRGB,
  * HDR10.
+ *
+ * The scene-feedback copies (a draw that samples the target it draws into
+ * samples a snapshot of it, copied whole each time; Drakengard 3's Chapter 5
+ * bosses ask for 200 to 560 a frame) have switches of their own, all off
+ * unless set to 1 (rsx_vulkan_snapshot_rect.inc, _channels.inc), and none
+ * applies with MSAA or HDR on:
+ *   RSX_SNAPSHOT_DIRTY_RECTS      a later copy in a submit covers only what
+ *                                 the draws since the last one could write
+ *                                 (their scissors; the reviewed vertex
+ *                                 program's own bounds)
+ *   RSX_SNAPSHOT_BOUNDS_BOX       those bounds from the vertices' box first
+ *   RSX_SNAPSHOT_ALPHA_REUSE      no copy for a reviewed soft-particle draw
+ *                                 that reads the snapshot's alpha alone,
+ *                                 while nothing has changed that alpha
+ *   RSX_SNAPSHOT_READER_CULL      no copy for a draw wholly behind the eye
+ *   RSX_SNAPSHOT_SCOPED_BARRIERS  the copy's dependencies on its two images
+ *                                 only, not on everything before it
+ *   RSX_SNAPSHOT_IMAGE_BARRIERS   image barriers' stages from their layouts
+ *   RSX_SNAPSHOT_CPU_SHADOW       the stage keeps a CPU copy of what draws
+ *                                 stage; on by itself with the three
+ *                                 switches that look at vertices and
+ *                                 constants (the first, third and fourth)
+ * The reviewed programs are three of Drakengard 3's particle programs, known
+ * by the text the translator makes of them (eng_snap_vs_hash,
+ * eng_snap_fp_kind): a change to that text turns the second to fourth off
+ * without a word, so the log says once when one is met with a switch on.
+ * To look: RSX_SNAPSHOT_STATS=1 (a line a second: copies asked, reused, in
+ * part, whole), RSX_SNAPSHOT_CHANNEL_STATS=1 (copies and reuses a submit),
+ * RSX_SNAPSHOT_FIND=<folder> (the particle pipelines, their programs' text).
  */
 #if (defined(_WIN32) || defined(__linux__)) && defined(PS3RECOMP_HAVE_VULKAN)
 
@@ -905,11 +934,18 @@ static void eng_submit(u32 present_surface, int wait);
 /* Bounds inspection must not read write-combined upload memory. Preserve
  * cached copies only for stage_copy data (constants/vertices/indices); row
  * uploads reserve directly and never need CPU inspection. The flag is fixed
- * for the process, and allocation failure retains the original safe path. */
+ * for the process, and allocation failure retains the original safe path.
+ * On with RSX_SNAPSHOT_CPU_SHADOW=1, and with any switch that inspects:
+ * without the copy those have nothing to read (eng_snap_data). */
 static int eng_stage_cpu_copy_enabled(void)
 {
     static int enabled=-1;
-    if(enabled<0) {const char* e=getenv("RSX_SNAPSHOT_CPU_SHADOW");enabled=e && !strcmp(e,"1");}
+    if(enabled<0) {
+        static const char* const names[]={"RSX_SNAPSHOT_CPU_SHADOW","RSX_SNAPSHOT_DIRTY_RECTS",
+                                          "RSX_SNAPSHOT_ALPHA_REUSE","RSX_SNAPSHOT_READER_CULL"};
+        enabled=0;
+        for(u32 i=0;i<sizeof names/sizeof names[0];i++) {const char* e=getenv(names[i]);if(e && !strcmp(e,"1")) enabled=1;}
+    }
     return enabled;
 }
 static int eng_stage_make(EngStage* s, u32 cap)
@@ -1604,6 +1640,17 @@ static u32 eng_pipeline_create_locked(const char* vs_hlsl, const char* ps_hlsl, 
     const size_t ps_len=strlen(ps_hlsl);
     const u64 ps_hash=fnv1a64(ps_hlsl,ps_len,1469598103934665603ull);
     p->snapshot_alpha_kind = eng_snap_fp_kind(ps_len, ps_hash);
+    if ((p->snapshot_linear_position || p->snapshot_alpha_kind) && eng_stage_cpu_copy_enabled()) {
+        static u8 said[4];
+        static const char* const what[4] = { "vertex program", "soft-particle reader (1)", "soft-particle reader (2)",
+                                             "alpha-keeping writer" };
+        const int met[2] = { p->snapshot_linear_position ? 0 : -1, p->snapshot_alpha_kind ? p->snapshot_alpha_kind : -1 };
+        for (int k = 0; k < 2; k++)
+            if (met[k] >= 0 && met[k] < 4 && !said[met[k]]) {
+                said[met[k]] = 1;
+                fprintf(stderr, "[rsx engine/vulkan] scene-feedback switches: the reviewed %s is in use\n", what[met[k]]);
+            }
+    }
     eng_snap_find(p, vs_hlsl, vs_len, vs_hash, ps_hlsl, ps_len, ps_hash, vertex_stride, layout->mask, layout->count);
     p->live = 1;
     return ++s_pipe_count;

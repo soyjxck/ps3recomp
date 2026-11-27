@@ -6,11 +6,15 @@
 static VkImageMemoryBarrier s_bar[64]; static u32 s_nbar; static int s_bar_global;
 
 /* Layout-specific image dependencies for the feedback-copy path. Global
- * dependencies and unfamiliar layouts retain the original broad barrier. */
+ * dependencies and unfamiliar layouts retain the original broad barrier.
+ * So does an image that arrives UNDEFINED: that is a swap chain image fresh
+ * from its acquire, and its change has to stay behind the semaphore the
+ * submit waits for at the transfer stage; from the top of the pipe it did
+ * not (WRITE_AFTER_READ against vkAcquireNextImageKHR in the validation
+ * layer's synchronisation checks). */
 static int snap_layout_scope(VkImageLayout layout, VkPipelineStageFlags* stage, VkAccessFlags* access)
 {
     switch(layout) {
-    case VK_IMAGE_LAYOUT_UNDEFINED: *stage=VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;*access=0;return 1;
     case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
         *stage=VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
         *access=VK_ACCESS_COLOR_ATTACHMENT_READ_BIT|VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;return 1;
@@ -76,6 +80,24 @@ static void img_layout(VkImage img, VkImageLayout* cur, VkImageAspectFlags aspec
 static void obj_layout(EngObj* o, VkImageLayout to) { if (o) img_layout(o->img, &o->layout, obj_aspect(o), to); }
 /* Does the object need a change to be in `to`? */
 static int obj_needs(const EngObj* o, VkImageLayout to) { return o && o->layout != to; }
+/* A memory dependency on an object that keeps its layout: what was written
+ * to it is there for what reads or writes it next. */
+static void obj_depend(EngObj* o)
+{
+    if (!o || !o->img) return;
+    if (s_nbar == 64) bar_flush();
+    VkImageMemoryBarrier* b = &s_bar[s_nbar++];
+    memset(b, 0, sizeof *b);
+    b->sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    b->srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    b->dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    b->oldLayout = b->newLayout = o->layout;
+    b->srcQueueFamilyIndex = b->dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b->image = o->img;
+    b->subresourceRange.aspectMask = obj_aspect(o);
+    b->subresourceRange.levelCount = VK_REMAINING_MIP_LEVELS;
+    b->subresourceRange.layerCount = VK_REMAINING_ARRAY_LAYERS;
+}
 
 /* ---- rendering instances -------------------------------------------------------------- */
 
@@ -221,7 +243,7 @@ static VkImageView null_view(int cube) { EngObj* o = eng_obj(cube ? s_null_cube 
  * to -- the copies asked for a frame, how many of them were not made (the
  * snapshot reused), came to nothing, were made in part and were made whole,
  * and the megapixels copied a frame. */
-static struct { u32 frames, asked, reused, empty, part, whole; u64 pixels; double t0; } s_snap_stat;
+static struct { u32 frames, asked, reused, empty, part, whole, narrow; u64 pixels; double t0; } s_snap_stat;
 static int eng_snap_stats_enabled(void)
 {
     static int enabled=-1;
@@ -238,9 +260,9 @@ static void eng_snap_stats_frame(void)
     if(now-s_snap_stat.t0<1.0) return;
     const double f=s_snap_stat.frames;
     fprintf(stderr,"[snapshot-stats] %.1f fps; a frame: %.1f copies asked, %.1f reused, %.1f empty, %.1f in part, "
-                   "%.1f whole, %.2f MP copied\n",
+                   "%.1f whole, %.2f MP copied; %.1f behind the source's own barrier\n",
             f/(now-s_snap_stat.t0),s_snap_stat.asked/f,s_snap_stat.reused/f,s_snap_stat.empty/f,s_snap_stat.part/f,
-            s_snap_stat.whole/f,(double)s_snap_stat.pixels/f*1e-6);
+            s_snap_stat.whole/f,(double)s_snap_stat.pixels/f*1e-6,s_snap_stat.narrow/f);
     memset(&s_snap_stat,0,sizeof s_snap_stat);
     s_snap_stat.t0=now;
 }
@@ -834,7 +856,15 @@ static void eng_encode_records(void)
             if(eng_snap_channels_can_skip(i,src,dst)) {s_snap_skipped[i]=1;s_ch_skipped++;s_snap_stat.reused++;break;}
             VkRect2D dirty = {{0,0},{src->w < dst->w ? src->w : dst->w,src->h < dst->h ? src->h : dst->h}};
             const u64 whole_px=(u64)dirty.extent.width*dirty.extent.height;
+            const u32 whole_w=dirty.extent.width,whole_h=dirty.extent.height;
             if(!eng_snap_any_reuse_enabled() || s_ch_valid[(u32)(dst-s_obj)]) eng_snap_copy_rect(i,src,&dirty);
+            /* The rectangle is the source's (its scissors): the copy has to
+             * fit the snapshot as well, as the whole copy always did. */
+            if((u32)dirty.offset.x>=whole_w || (u32)dirty.offset.y>=whole_h) dirty.extent.width=dirty.extent.height=0;
+            else {
+                if((u32)dirty.offset.x+dirty.extent.width>whole_w) dirty.extent.width=whole_w-(u32)dirty.offset.x;
+                if((u32)dirty.offset.y+dirty.extent.height>whole_h) dirty.extent.height=whole_h-(u32)dirty.offset.y;
+            }
             if (!dirty.extent.width || !dirty.extent.height) {eng_snap_channels_mark_copy(src,dst,0);s_snap_stat.empty++;break;}
             {const u64 px=(u64)dirty.extent.width*dirty.extent.height;
              s_snap_stat.pixels+=px; if(px<whole_px) s_snap_stat.part++; else s_snap_stat.whole++;}
@@ -856,10 +886,20 @@ static void eng_encode_records(void)
                    !s_pipe[d->pipeline-1].rs.depth_write && !s_pipe[d->pipeline-1].rs.stencil_enable &&
                    c0->kind==ENG_REC_COLOR_COPY && eng_owner(c0->depth)==src) only_source=1;
             }
+            /* The pass that ends here also stored its depth and stencil
+              * (render_begin loads and stores them every pass), and the next
+              * loads them: with the general barrier gone, that image gets a
+              * dependency of its own. */
+            EngObj* pass_depth = only_source ? eng_owner(s_cur_depth) : NULL;
             render_end();
+            /* A snapshot still in the copy's layout was written by a copy
+             * nothing has read since (its draw was dropped): this copy waits
+             * for that one. */
+            const int after_copy = dst->layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
             obj_layout(src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
             obj_layout(dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-            if (only_source) s_bar_global=0;
+            if (after_copy) s_bar_global=1;
+            else if (only_source) { s_bar_global=0; obj_depend(pass_depth); s_snap_stat.narrow++; }
             bar_flush();
             VkImageCopy c = {0};
             c.srcSubresource.aspectMask = c.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;

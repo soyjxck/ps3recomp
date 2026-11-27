@@ -126,6 +126,8 @@ static int eng_snap_channels_can_skip(u32 i,EngObj* src,EngObj* dst)
     if(!eng_snap_alpha_reuse_enabled() || wclass!=1 || s_ch_at_copy[did]!=s_ch_generation[sid] ||
        (!p->snapshot_alpha_kind || p->snapshot_alpha_kind>2) || !eng_snap_particle_zero_alpha(d,p) || d->ps_cb_bytes<80) return 0;
     const float* c=eng_snap_data(d->ps_cb_off,d->ps_cb_bytes);
+    /* c[17] is row 4's y, the first bias both readers add to the sampled
+     * alpha (hence the 80 bytes asked for above); the second is below. */
     if(!c || !isfinite(c[17]) || c[17]==0.0f || fabs(c[17])>4.0f) return 0;
     const float bias2=c[p->snapshot_alpha_kind==1 ? 17*4+1 : 19*4];
     const float scale=c[p->snapshot_alpha_kind==1 ? 22*4+3 : 23*4];
